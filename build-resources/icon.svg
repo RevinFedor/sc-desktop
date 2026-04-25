@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#4338ca"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.04"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+  </defs>
+
+  <!-- macOS-style squircle -->
+  <rect width="1024" height="1024" rx="224" ry="224" fill="url(#bg)"/>
+
+  <!-- subtle highlight -->
+  <ellipse cx="512" cy="280" rx="540" ry="220" fill="#ffffff" opacity="0.10" filter="url(#soft)"/>
+
+  <!-- Inbox tray (back wall) -->
+  <g transform="translate(192,232)">
+    <!-- back of the tray -->
+    <rect x="0" y="0" width="640" height="440" rx="64" ry="64" fill="url(#card)" stroke="#ffffff" stroke-opacity="0.42" stroke-width="6"/>
+
+    <!-- horizontal "stacks" inside tray (representing messages/items) -->
+    <rect x="84" y="100" width="472" height="36" rx="18" fill="#ffffff" opacity="0.55"/>
+    <rect x="84" y="170" width="392" height="36" rx="18" fill="#ffffff" opacity="0.40"/>
+    <rect x="84" y="240" width="320" height="36" rx="18" fill="#ffffff" opacity="0.28"/>
+
+    <!-- play triangle on the right hint of media -->
+    <g transform="translate(440,160)">
+      <circle cx="60" cy="60" r="62" fill="#ffffff" opacity="0.95"/>
+      <path d="M48 32 L92 60 L48 88 Z" fill="#4338ca"/>
+    </g>
+  </g>
+
+  <!-- Front lip of the tray, makes it feel 3D -->
+  <path d="M 96 624 L 928 624 Q 928 800 768 800 L 256 800 Q 96 800 96 624 Z"
+        fill="#0f1226" opacity="0.55"/>
+  <path d="M 96 624 L 928 624"
+        stroke="#ffffff" stroke-opacity="0.35" stroke-width="4" fill="none"/>
+</svg>

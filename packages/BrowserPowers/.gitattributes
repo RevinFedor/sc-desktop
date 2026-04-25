@@ -1,0 +1,12 @@
+# ── Normalize line endings ────────────────────────────
+# Windows-friendly: checkout Windows-style, commit LF
+
+* text=auto eol=lf
+
+# Binary files — don't touch
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary
+
+

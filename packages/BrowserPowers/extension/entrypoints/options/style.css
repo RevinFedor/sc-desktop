@@ -1,0 +1,8 @@
+/*
+ * FILE: extension/entrypoints/options/style.css
+ * PURPOSE: Load the shared settings surface styles for the options page.
+ * OWNS: Thin entrypoint-local stylesheet indirection.
+ * DOCS: agent_chat/plan_ui_approval_flow_2026-05-10.md
+ */
+
+@import "../shared/settings-surface.css";

@@ -1,0 +1,50 @@
+# ── Dependencies ──────────────────────────────────────
+node_modules/
+.pnpm-store/
+
+# ── Build output ──────────────────────────────────────
+dist/
+.output/
+.wxt/
+
+# ── Environment ───────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── OS files ──────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# ── Logs ──────────────────────────────────────────────
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# ── Test artifacts ────────────────────────────────────
+test-results/
+
+# ── IDE ───────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+
+# ── Nested workspace lockfiles ────────────────────────
+# Root pnpm-lock.yaml is the single source of truth
+core/pnpm-lock.yaml
+extension/pnpm-lock.yaml
+
+private/
+memory/
+agent_chat/
+.opencode/
+ideas_research/
+
+.agents/

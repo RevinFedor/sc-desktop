@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+
+# Build output
+dist/
+release/
+*.app
+*.dmg
+*.pkg
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Electron
+out/
+build/
+
+# Icon generation
+build-resources/icon.iconset/
+build-resources/.DS_Store
+
+# Vite
+.vite/
+vite.config.js.timestamp-*
+/.gemini-clipboard
+/.gemini-clipboard
+/auto/screenshots
+/docs/tmp

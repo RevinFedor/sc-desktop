@@ -1,0 +1,129 @@
+{
+  "manifest_version": 3,
+  "name": "SC Browser Parser",
+  "version": "1.4.0",
+  "description": "SC Browser Parser — экспорт диалогов с Gemini Studio, Perplexity и Claude, плюс кнопка «забрать в sc-desktop» на карточках YouTube. Браузерный канал парсинга sc-desktop.",
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "scripting",
+    "clipboardRead",
+    "clipboardWrite",
+    "downloads",
+    "storage",
+    "nativeMessaging",
+    "alarms",
+    "cookies",
+    "userScripts",
+    "webNavigation",
+    "debugger"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "images/icon16.png",
+      "32": "images/icon32.png",
+      "48": "images/icon48.png",
+      "128": "images/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "images/icon16.png",
+    "32": "images/icon32.png",
+    "48": "images/icon48.png",
+    "128": "images/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["images/icon16.png", "images/icon32.png", "images/icon48.png", "images/icon128.png"],
+      "matches": ["https://*/*"]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'self' http://127.0.0.1:53127 http://localhost:53127 ws://127.0.0.1:53129 ws://localhost:53129 ws://localhost:3457"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://aistudio.google.com/prompts/*",
+        "https://aistudio.google.com/u/*/prompts/*"
+      ],
+      "js": [
+        "logger.js",
+        "settings.js",
+        "libs/jszip.min.js",
+        "aistudio-export.js",
+        "research-badge.js",
+        "aistudio-core.js",
+        "aistudio-autoscrape.js",
+        "aistudio-mcp.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.perplexity.ai/search/*",
+        "https://www.perplexity.ai/computer/tasks/*"
+      ],
+      "js": [
+        "logger.js",
+        "settings.js",
+        "perplexity-content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.perplexity.ai/*"
+      ],
+      "js": [
+        "research-badge.js",
+        "perplexity-research.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "research-badge.js",
+        "chatgpt-research.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://claude.ai/*"
+      ],
+      "js": [
+        "logger.js",
+        "settings.js",
+        "claude-content.js",
+        "research-badge.js",
+        "claude-autoscrape.js",
+        "claude-research.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://m.youtube.com/*"
+      ],
+      "js": [
+        "logger.js",
+        "settings.js",
+        "youtube-content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjGvqcRFi8nn7HCYEp6R/59u6C+xYbwno9DwCauF8VI/0Els0H5/87SkwJijFGJ9js757feDAWs+0SlnhkxewXkRmn8cgE0I00piy1EnBANGYpeJiJl3IF4cI9Mr/wjbSbW8tlyZZRkT7thBYaky+e8OEKy0jKe1QFEPdkw7tAblQE6C0+yTdf8CewUW3ZRrfVVrW/hxdJkdEKUeWncfFlNhvZebJdwtBlnL4SaLM/37KIH7L27+RxvqWUYWnBlgiqE/NDMxHNoOyHBhhOkfZr7mBZVmzwvspcCRn8/nLGgVAZ2CRepcT7UQP9CzHt5yaa4DcCVfGkM0Q2l2dEAFTyQIDAQAB"
+}

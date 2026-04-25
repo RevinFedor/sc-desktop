@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SC Browser Parser</title>
+  <style>
+    :root {
+      --bg-color: #1a1b1e;
+      --card-bg: #25262b;
+      --text-primary: #e9ecef;
+      --text-secondary: #a5a5a5;
+      --accent-color: #667eea;
+      --border-color: #2c2e33;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      width: 640px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background-color: var(--bg-color);
+      color: var(--text-primary);
+    }
+
+    .container { padding: 16px; }
+
+    h1 {
+      font-size: 16px;
+      font-weight: 600;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 14px;
+    }
+
+    .content {
+      background-color: var(--card-bg);
+      border-radius: 10px;
+      padding: 14px;
+      border: 1px solid var(--border-color);
+    }
+
+    .status {
+      margin-bottom: 12px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background-color: var(--bg-color);
+      border: 1px solid var(--border-color);
+    }
+    .status.active   { border-color: #2b8a3e; color: #69db7c; }
+    .status.inactive { border-color: #c92a2a; color: #ff8787; }
+    .status-icon { font-size: 13px; flex-shrink: 0; }
+    #statusText { line-height: 1.3; }
+
+    .export-btn {
+      width: 100%;
+      padding: 11px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.25s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .export-btn:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+    }
+    .export-btn:active:not(:disabled) { transform: translateY(0); }
+    .export-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      background: var(--border-color);
+      color: var(--text-secondary);
+    }
+    .export-btn.loading { opacity: 0.85; }
+    .export-btn.stop-mode { background: linear-gradient(135deg, #ff6b6b 0%, #c92a2a 100%); }
+    .export-btn.stop-mode:hover { box-shadow: 0 4px 12px rgba(201, 42, 42, 0.4); }
+
+    .spinner {
+      display: inline-block;
+      width: 12px; height: 12px;
+      border: 2px solid rgba(255,255,255,0.3);
+      border-top-color: white;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .message {
+      margin-top: 10px;
+      padding: 6px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      text-align: center;
+      display: none;
+    }
+    .message.success {
+      background-color: rgba(43, 138, 62, 0.2);
+      color: #69db7c;
+      border: 1px solid rgba(43, 138, 62, 0.3);
+      display: block;
+    }
+    .message.error {
+      background-color: rgba(201, 42, 42, 0.2);
+      color: #ff8787;
+      border: 1px solid rgba(201, 42, 42, 0.3);
+      display: block;
+    }
+
+    .settings {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-color);
+    }
+
+    .settings-title {
+      font-size: 13px;
+      font-weight: 600;
+      margin: 0 0 8px;
+      color: var(--text-primary);
+    }
+
+    .settings-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin: 0 0 8px;
+    }
+    .settings-heading .settings-title { margin: 0; }
+    .inline-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-secondary);
+      font-size: 11px;
+      white-space: nowrap;
+      user-select: none;
+    }
+
+    .export-tabs {
+      display: flex;
+      background: var(--bg-color);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 3px;
+      gap: 2px;
+      margin-bottom: 10px;
+    }
+    .export-tabs button {
+      flex: 1;
+      padding: 7px 10px;
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      border-radius: 6px;
+      transition: background 0.15s, color 0.15s;
+      position: relative;
+    }
+    .export-tabs button:hover:not(.active) { color: var(--text-primary); }
+    .export-tabs button.active {
+      background: var(--accent-color);
+      color: white;
+    }
+    .export-tabs button.site-active::after {
+      content: "";
+      position: absolute;
+      right: 7px;
+      top: 7px;
+      width: 5px;
+      height: 5px;
+      border-radius: 999px;
+      background: #69db7c;
+    }
+
+    .export-panel[hidden] { display: none; }
+
+    .setting-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 0;
+      font-size: 13px;
+    }
+    .setting-row.sub {
+      padding-left: 22px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    /* Text label takes all the slack — switch keeps its 32px. */
+    .setting-row .row-text {
+      flex: 1;
+      cursor: default;
+      user-select: none;
+    }
+    .setting-row .row-text[title] { cursor: help; }
+
+    /* Section heading for AI Studio / Perplexity / YouTube blocks — заголовок
+       панели всегда виден, чтобы юзер сразу понимал какие настройки относятся
+       к какому сайту, даже если он сейчас не на нём. Активный сайт подсвечен. */
+    .panel-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .panel-title.active {
+      color: var(--accent-color);
+    }
+    .panel-title .dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--border-color);
+      flex-shrink: 0;
+    }
+    .panel-title.active .dot { background: var(--accent-color); }
+
+    /* Free-text instruction input — multiline, mono-ish for prompt readability. */
+    .ta-input {
+      width: 100%;
+      background: var(--bg-color);
+      color: var(--text-primary);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      resize: vertical;
+      min-height: 60px;
+      max-height: 200px;
+      box-sizing: border-box;
+      margin-top: 4px;
+    }
+    .ta-input:focus { outline: 1px solid var(--accent-color); border-color: var(--accent-color); }
+
+    /* Expand chevron for "Вложения" group. */
+    .row-expand {
+      flex: 0 0 14px;
+      width: 14px; height: 14px;
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      font-size: 9px;
+      cursor: pointer;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.15s, color 0.15s;
+    }
+    .row-expand:hover { color: var(--text-primary); }
+    .row-expand.expanded { transform: rotate(90deg); }
+    .row-expand:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    .sub-options { overflow: hidden; }
+    .sub-options.collapsed { display: none; }
+    .sub-options.disabled { opacity: 0.4; pointer-events: none; }
+
+    /* Toggle switch — fixed width that finally sticks. */
+    .switch {
+      position: relative;
+      display: inline-block;
+      flex: 0 0 32px;
+      width: 32px;
+      height: 18px;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background-color: #373a40;
+      transition: .25s;
+      border-radius: 18px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 13px; width: 13px;
+      left: 2.5px; bottom: 2.5px;
+      background-color: white;
+      transition: .25s;
+      border-radius: 50%;
+    }
+    input:checked + .slider { background-color: var(--accent-color); }
+    input:checked + .slider:before { transform: translateX(14px); }
+
+    /* ─────────── Two-column YouTube settings ──────────────────────────
+       Грид из двух карточек: Gemini Studio (left) и Claude (right).
+       На compact-режиме popup (320px) — одна колонка вертикально. */
+    .yt-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .yt-card {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-width: 0;
+    }
+    /* Активный target подсвечен — юзер сразу видит куда уйдёт следующий клик. */
+    .yt-card.active {
+      border-color: var(--accent-color);
+      background: rgba(102, 126, 234, 0.06);
+    }
+    .yt-card h3 {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 2px;
+    }
+    .yt-card h3 .dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--border-color);
+      flex-shrink: 0;
+    }
+    .yt-card.active h3 { color: var(--accent-color); }
+    .yt-card.active h3 .dot { background: var(--accent-color); }
+
+    /* Группа полей с явным заголовком («Sys-prompt», «Модель»). Без
+       визуальной группировки 4 input'а в карточке читаются как сплошной
+       список. Гради по 2 в каждой группе делает видимым «было/станет». */
+    .field-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .field-group + .field-group {
+      margin-top: 4px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(255, 255, 255, 0.04);
+    }
+    .field-group-title {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--text-secondary);
+      opacity: 0.7;
+    }
+    .field-row {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .field-row label {
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+    .field-row .ta-input {
+      margin-top: 0;
+    }
+
+    /* Segmented control: target switcher — Gemini ⟷ Claude. */
+    .target-switcher {
+      display: flex;
+      background: var(--bg-color);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 3px;
+      gap: 2px;
+      margin-bottom: 4px;
+    }
+    .target-switcher button {
+      flex: 1;
+      padding: 6px 10px;
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      border-radius: 6px;
+      transition: background 0.15s, color 0.15s;
+    }
+    .target-switcher button:hover:not(.active) { color: var(--text-primary); }
+    .target-switcher button.active {
+      background: var(--accent-color);
+      color: white;
+    }
+    .target-hint {
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+      padding: 0 2px;
+    }
+
+    /* Switch row внутри карточки — слева текст, справа toggle. */
+    .field-row.with-switch {
+      flex-direction: row;
+      align-items: center;
+      gap: 8px;
+    }
+    /* :not(.switch) — иначе наш `<label class="switch">` (toggle-обёртка
+       тоже label!) подхватил бы `flex:1` и расплылся бы на всю строку
+       вместо фиксированных 32px. Видно как баг где switch занимает всю
+       ширину карточки. */
+    .field-row.with-switch > label:not(.switch) {
+      flex: 1;
+      font-size: 12px;
+      color: var(--text-primary);
+      margin: 0;
+    }
+    input:disabled + .slider { opacity: 0.4; cursor: not-allowed; }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <h1 id="appTitle">SC Browser Parser</h1>
+
+    <div class="content">
+      <div id="status" class="status inactive">
+        <span class="status-icon">⚠️</span>
+        <span id="statusText">Откройте диалог в Gemini Studio, Perplexity или Claude</span>
+      </div>
+
+      <div id="formatHint" style="margin-bottom: 10px; padding: 7px 10px; border-radius: 6px; font-size: 11px; background-color: rgba(102, 126, 234, 0.1); border: 1px solid rgba(102, 126, 234, 0.25); color: var(--accent-color); display: flex; align-items: center; gap: 6px;">
+        <span id="formatIcon">📄</span>
+        <span id="formatText">Скопируется: markdown в буфер обмена</span>
+      </div>
+
+      <button id="exportBtn" class="export-btn" disabled>
+        <span id="btnText">Экспортировать</span>
+      </button>
+
+      <div id="message" class="message"></div>
+
+      <!-- ──────────────── Export settings ──────────────── -->
+      <div class="settings" id="exportSettings">
+        <div class="settings-heading">
+          <div class="settings-title">Настройка экспорта</div>
+          <label class="inline-toggle" title="Если выключено, текстовый экспорт копируется в буфер обмена. ZIP с картинками Gemini всё равно скачивается файлом.">
+            <span>Скачивать файл</span>
+            <span class="switch">
+              <input type="checkbox" id="export_download_file">
+              <span class="slider"></span>
+            </span>
+          </label>
+        </div>
+        <div class="export-tabs" role="tablist" aria-label="Настройка экспорта">
+          <button type="button" id="tabAistudio" role="tab" aria-selected="true" aria-controls="settingsAistudio">Gemini Studio</button>
+          <button type="button" id="tabPerplexity" role="tab" aria-selected="false" aria-controls="settingsPerplexity">Perplexity</button>
+          <button type="button" id="tabClaude" role="tab" aria-selected="false" aria-controls="settingsClaude">Claude</button>
+        </div>
+
+        <!-- ──────────────── Gemini Studio settings ──────────────── -->
+        <div class="export-panel" id="settingsAistudio" role="tabpanel" aria-labelledby="tabAistudio">
+          <!-- 1. Рассуждения модели -->
+          <div class="setting-row">
+            <span class="row-text" title="Скрытые «мысли» модели до финального ответа (chain-of-thought)">Рассуждения модели</span>
+            <label class="switch">
+              <input type="checkbox" id="scrapeReasoning">
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <!-- 2. Картинки -->
+          <div class="setting-row">
+            <span class="row-text" title="Изображения, которые ты прикреплял в чат как фото (drag-and-drop)">Картинки</span>
+            <label class="switch">
+              <input type="checkbox" id="scrapeImages">
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <!-- 3. Вложения (collapsible sub-options) -->
+          <div class="setting-row">
+            <button class="row-expand" id="attachmentsExpand" type="button" aria-expanded="false" aria-controls="attachmentSubs" title="Раскрыть параметры вложений">▶</button>
+            <span class="row-text" title="Файлы (PDF, видео, документы), приложенные к сообщениям">Вложения</span>
+            <label class="switch">
+              <input type="checkbox" id="scrapeAttachments">
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div id="attachmentSubs" class="sub-options collapsed">
+            <div class="setting-row sub">
+              <span class="row-text">Имя файла</span>
+              <label class="switch">
+                <input type="checkbox" id="scrapeAttachmentTitle">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-row sub">
+              <span class="row-text" title="Например: «120 738 токенов»">Размер / токены</span>
+              <label class="switch">
+                <input type="checkbox" id="scrapeAttachmentSize">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-row sub">
+              <span class="row-text" title="Маленькая картинка-превью самого файла (страница PDF, кадр из видео). Не сам файл — его уже не достать.">Превью файла</span>
+              <label class="switch">
+                <input type="checkbox" id="scrapeAttachmentPreview">
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- ──────────────── Perplexity settings ──────────────── -->
+        <div class="export-panel" id="settingsPerplexity" role="tabpanel" aria-labelledby="tabPerplexity" hidden>
+          <div class="setting-row">
+            <span class="row-text" title="Под каждым ответом — нумерованный список цитируемых веб-источников из web_results">Источники (web_results)</span>
+            <label class="switch">
+              <input type="checkbox" id="show_sources">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <span class="row-text" title="«Связанные вопросы», которые Perplexity предлагает после последнего ответа">Связанные вопросы</span>
+            <label class="switch">
+              <input type="checkbox" id="show_related">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <!-- ──────────────── Claude settings ──────────────── -->
+        <div class="export-panel" id="settingsClaude" role="tabpanel" aria-labelledby="tabClaude" hidden>
+          <div class="setting-row">
+            <span class="row-text" title="Текстовые карточки файлов, которые были прикреплены или перекреплены в сообщениях Claude. Бинарники и картинки пока не скачиваются.">Перекреплённые файлы</span>
+            <label class="switch">
+              <input type="checkbox" id="claude_include_reattached">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- ──────────────── YouTube settings ──────────────── -->
+      <div class="settings" id="settingsYoutube">
+        <div class="panel-title" id="titleYoutube"><span class="dot"></span>YouTube</div>
+
+        <!-- Target switcher: куда улетит транскрипт после клика «+ ai» -->
+        <div class="target-switcher" role="tablist" aria-label="Target">
+          <button type="button" id="ytTargetAistudio" role="tab" aria-selected="true">Gemini Studio</button>
+          <button type="button" id="ytTargetClaude"   role="tab" aria-selected="false">Claude</button>
+        </div>
+        <div class="target-hint" id="ytTargetHint">«+ ai» на YouTube-карточке отправляет в выбранный target. Настройки сохраняются для обоих — переключение target'а не теряет конфигурацию.</div>
+
+        <!-- Общий toggle: comments. Применяется к обоим target'ам. -->
+        <div class="setting-row">
+          <span class="row-text" title="Дополнительно тянуть комменты к видео — они склеятся с транскриптом одним блобом">Комментарии</span>
+          <label class="switch">
+            <input type="checkbox" id="yt_with_comments">
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <!-- Два side-by-side card'а: Gemini (left) и Claude (right). -->
+        <div class="yt-grid">
+
+          <!-- ── Gemini Studio ── -->
+          <div class="yt-card" id="cardAistudio">
+            <h3><span class="dot"></span>Gemini Studio</h3>
+
+            <div class="field-group">
+              <div class="field-group-title">System instruction</div>
+              <div class="field-row">
+                <label title="Название сохранённого пресета. Расширение откроет dropdown и выберет его.">До отправки</label>
+                <input id="yt_system_instruction" class="ta-input" type="text" placeholder="пересказ ютуб" spellcheck="false" style="min-height: auto; font-family: inherit;">
+              </div>
+              <div class="field-row">
+                <label title="Сбрасывает sys-prompt после Run чтобы не висел над следующими вопросами. Пусто = «+ Create new instruction».">После Run</label>
+                <input id="yt_post_system_instruction" class="ta-input" type="text" placeholder="пусто = пустая инструкция" spellcheck="false" style="min-height: auto; font-family: inherit;">
+              </div>
+            </div>
+
+            <div class="field-group">
+              <div class="field-group-title">Модель</div>
+              <div class="field-row">
+                <label title="Модель для первоначального пересказа. Flash быстрее, Pro умнее.">Для пересказа</label>
+                <select id="yt_model_title" class="ta-input" style="min-height: auto; font-family: inherit; padding: 6px 8px;"></select>
+              </div>
+              <div class="field-row">
+                <label title="Модель, на которую переключим после Run. Идея: пересказ — Flash, дальнейшие вопросы — Pro.">После Run</label>
+                <select id="yt_post_model_title" class="ta-input" style="min-height: auto; font-family: inherit; padding: 6px 8px;"></select>
+              </div>
+            </div>
+          </div>
+
+          <!-- ── Claude ── -->
+          <div class="yt-card" id="cardClaude">
+            <h3><span class="dot"></span>Claude</h3>
+
+            <div class="field-group">
+              <div class="field-group-title">Проект</div>
+              <div class="field-row">
+                <label title="Имя проекта в claude.ai — будет выбран через «+ → Add to project». Пусто = отправить в обычный чат без проекта.">До отправки</label>
+                <input id="yt_claude_project" class="ta-input" type="text" placeholder="пересказ ютуб" spellcheck="false" style="min-height: auto; font-family: inherit;">
+              </div>
+              <div class="field-row">
+                <label title="Проект для дефолтного значения в будущих вкладках. Внутри той же вкладки проект сменить нельзя — Claude фиксирует его при создании чата.">После Run</label>
+                <input id="yt_claude_post_project" class="ta-input" type="text" placeholder="пусто = не менять" spellcheck="false" style="min-height: auto; font-family: inherit;">
+              </div>
+            </div>
+
+            <div class="field-group">
+              <div class="field-group-title">Модель</div>
+              <div class="field-row">
+                <label>Для пересказа</label>
+                <select id="yt_claude_model" class="ta-input" style="min-height: auto; font-family: inherit; padding: 6px 8px;"></select>
+              </div>
+              <div class="field-row with-switch">
+                <label title="«Adaptive thinking» (на некоторых моделях — «Extended thinking»). Включает рассуждения перед ответом для сложных задач.">Adaptive thinking</label>
+                <label class="switch">
+                  <input type="checkbox" id="yt_claude_adaptive_thinking">
+                  <span class="slider"></span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="settings.js"></script>
+  <script src="popup.js"></script>
+</body>
+
+</html>

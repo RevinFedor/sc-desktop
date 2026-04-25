@@ -1,0 +1,447 @@
+/*
+ * FILE: extension/entrypoints/shared/settings-surface.css
+ * PURPOSE: Share the popup and options-page styling for the settings surface.
+ * OWNS: Visual theme, layout, tabs, capability rows, and approvals presentation.
+ * DOCS: agent_chat/plan_ui_approval_flow_2026-05-10.md
+ */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --bg: #0f0f14;
+  --surface: #1a1a25;
+  --border: #2a2a3a;
+  --text: #e0e0e0;
+  --text-muted: #888;
+  --accent: #a78bfa;
+  --accent-dim: #7c3aed;
+  --success: #22c55e;
+  --warning: #eab308;
+  --danger: #ef4444;
+  --radius: 8px;
+}
+
+body {
+  width: 420px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+body.options-page {
+  width: min(100vw, 1080px);
+  min-width: 760px;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.status {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 10px;
+  font-weight: 500;
+}
+
+.status.connected {
+  background: #16653420;
+  color: var(--success);
+}
+
+.status.disconnected {
+  background: #991b1b20;
+  color: var(--danger);
+}
+
+.status.connecting {
+  background: #854d0e20;
+  color: var(--warning);
+}
+
+main {
+  padding: 8px 16px;
+}
+
+body.options-page main {
+  padding: 16px 20px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.card h2 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
+
+.toggle-row input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  margin-top: 0;
+}
+
+input[type="text"] {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  margin-top: 2px;
+  transition: border-color 0.2s;
+}
+
+input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.btn {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 4px;
+  background: var(--accent-dim);
+  color: white;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn:hover {
+  background: var(--accent);
+}
+
+.btn-danger {
+  background: transparent;
+  border: 1px solid var(--danger);
+  color: var(--danger);
+}
+
+.btn-danger:hover {
+  background: var(--danger);
+  color: white;
+}
+
+/* Capability rows */
+.cap-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.cap-row:last-child {
+  border-bottom: none;
+}
+
+.cap-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.cap-info strong {
+  font-size: 12px;
+}
+
+.cap-info small {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.cap-row select {
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.perm-allow {
+  border-color: var(--success) !important;
+  color: var(--success);
+}
+
+.perm-ask {
+  border-color: var(--warning) !important;
+  color: var(--warning);
+}
+
+.perm-deny {
+  border-color: var(--danger) !important;
+  color: var(--danger);
+}
+
+/* Footer */
+footer {
+  display: flex;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+}
+
+/* ── Tab Navigation ── */
+.tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  padding: 0 16px;
+  background: var(--surface);
+}
+
+.tab {
+  padding: 10px 16px;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.active {
+  display: block;
+}
+
+/* ── Badge ── */
+.badge {
+  background: var(--warning);
+  color: #000;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 8px;
+  min-width: 16px;
+  text-align: center;
+  line-height: 1.4;
+}
+
+.badge.hidden {
+  display: none;
+}
+
+/* ── Approvals List ── */
+#approvals-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.approval-item {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+}
+
+.approval-site {
+  font-size: 10px;
+  color: var(--warning);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
+}
+
+.approval-item .tool-name {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.approval-item .tool-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+  word-break: break-all;
+}
+
+.approval-item .tool-params {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: monospace;
+  background: var(--surface);
+  padding: 4px 6px;
+  border-radius: 4px;
+  margin-bottom: 8px;
+  overflow-x: auto;
+  max-height: 60px;
+}
+
+.approval-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.btn-approve-once,
+.btn-approve-session,
+.btn-approve-forever {
+  background: #166534;
+  color: white;
+  border: none;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn-approve-once:hover,
+.btn-approve-session:hover,
+.btn-approve-forever:hover {
+  background: #22c55e;
+}
+
+.btn-deny {
+  background: #991b1b;
+  color: white;
+  border: none;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn-deny:hover {
+  background: #ef4444;
+}
+
+.empty-state {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 16px 0;
+}
+
+/* ── Site Permission Textareas ── */
+.page-cap-section {
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.page-cap-section:last-child {
+  border-bottom: none;
+  margin-bottom: 0;
+}
+
+.page-cap-section h3 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 2px;
+}
+
+.page-cap-section > .hint {
+  margin-bottom: 8px;
+}
+
+.site-list-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin: 6px 0 2px;
+}
+
+.site-list-allow { color: var(--success); }
+.site-list-ask { color: var(--warning); }
+.site-list-deny { color: var(--danger); }
+
+.site-pattern-ta {
+  width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 32px;
+  transition: border-color 0.2s;
+}
+
+.site-pattern-ta:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.site-pattern-ta::placeholder {
+  color: var(--text-muted);
+  opacity: 0.5;
+}

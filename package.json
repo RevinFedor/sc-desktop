@@ -1,0 +1,75 @@
+{
+  "name": "sc-desktop",
+  "version": "0.1.0",
+  "description": "SC Desktop — GUI for the sc CLI (Instagram / Telegram / YouTube / TikTok)",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "concurrently \"vite\" \"npm run electron:dev\"",
+    "electron:dev": "wait-on http://localhost:5156 && NODE_ENV=development electron . --remote-debugging-port=9223",
+    "electron": "electron .",
+    "build": "vite build",
+    "build:install": "pkill -f 'SC Desktop' || true && vite build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder && rm -rf /Applications/SC\\ Desktop.app && cp -R release/mac-arm64/SC\\ Desktop.app /Applications/ && open /Applications/SC\\ Desktop.app",
+    "build:i": "npm run build:install",
+    "rebuild": "electron-rebuild -f -w better-sqlite3",
+    "python:setup": "PYTHON_BIN=${SC_DESKTOP_SETUP_PYTHON:-/usr/bin/python3} && test -x \"$PYTHON_BIN\" && rm -rf .venv && \"$PYTHON_BIN\" -m venv .venv && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r python-workers/requirements.txt",
+    "index": "bash scripts/ai/build-index.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@tailwindcss/vite": "^4.1.18",
+    "better-sqlite3": "^12.6.2",
+    "lucide-react": "^1.14.0",
+    "react": "^18.3.1",
+    "react-arborist": "^3.4.3",
+    "react-dom": "^18.3.1",
+    "react-icons": "^5.5.0",
+    "sqlite-vec": "^0.1.9",
+    "tailwindcss": "^4.1.18",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "code-inspector-plugin": "^1.5.1",
+    "concurrently": "^9.2.1",
+    "electron": "^34.5.8",
+    "electron-builder": "^25.1.8",
+    "vite": "^6.0.7",
+    "wait-on": "^9.0.3"
+  },
+  "build": {
+    "appId": "com.sc.desktop",
+    "productName": "SC Desktop",
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "build-resources/icon.icns",
+      "target": "dir"
+    },
+    "directories": {
+      "buildResources": "build-resources",
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "asarUnpack": [
+      "node_modules/sqlite-vec-darwin-*/**",
+      "node_modules/sqlite-vec-darwin-*/vec0.dylib"
+    ],
+    "extraResources": [
+      {
+        "from": "python-workers",
+        "to": "python-workers",
+        "filter": [
+          "**/*.py",
+          "requirements.txt",
+          "!**/__pycache__/**",
+          "!**/test_*.py",
+          "!**/*.session",
+          "!**/output/**"
+        ]
+      }
+    ]
+  }
+}

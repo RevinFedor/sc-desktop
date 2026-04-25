@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "sc-desktop-tg-search": {
+      "command": "/Users/fedor/Desktop/sc-desktop/mcp/run.sh",
+      "args": [],
+      "env": {}
+    }
+  }
+}

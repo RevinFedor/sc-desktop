@@ -1,0 +1,50 @@
+{
+    "name": "browserpowers",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Core server for multi-browser LLM agent — MCP, REST, CLI, and WebSocket",
+    "author": "lirrensi",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/lirrensi/BrowserPowers.git"
+    },
+    "bugs": {
+        "url": "https://github.com/lirrensi/BrowserPowers/issues"
+    },
+    "homepage": "https://github.com/lirrensi/BrowserPowers#readme",
+    "keywords": [
+        "browser-automation",
+        "llm",
+        "mcp",
+        "websocket",
+        "hono"
+    ],
+    "type": "module",
+    "scripts": {
+        "dev": "tsx watch src/index.ts",
+        "build": "tsc",
+        "start": "node dist/index.js",
+        "cli": "tsx src/index.ts cli",
+        "clean": "rimraf dist"
+    },
+    "bin": {
+        "browserpowers": "./dist/index.js"
+    },
+    "dependencies": {
+        "@hono/node-server": "^2.0.2",
+        "@modelcontextprotocol/sdk": "^1.29.0",
+        "commander": "^14.0.3",
+        "hono": "^4.12.18",
+        "ws": "^8.20.0",
+        "yaml": "^2.8.4",
+        "zod": "^4.4.3"
+    },
+    "devDependencies": {
+        "@types/node": "^25.6.2",
+        "@types/ws": "^8.18.1",
+        "rimraf": "^6.0.1",
+        "tsx": "^4.21.0",
+        "typescript": "^6.0.3"
+    }
+}
