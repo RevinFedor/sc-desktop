@@ -20,8 +20,29 @@ console.warn('something deprecated')      // ❌ только stdout
 - `[Startup]` — initialisation, app lifecycle
 - `[Jobs]` — job-runner транзишены
 - `[IPC]` — IPC handlers (если нужно)
+- `[Perf:*]` — встроенная диагностика лагов main/renderer/data-bus/job-update
+  storm'ов. Это не обычный debug-spam: при жалобе на «скролл лагает» сначала
+  смотрим эти строки и связываем renderer symptom с main-process причиной.
 - `[ERROR]` — добавляется автоматически если console.error без тега
 - `[uncaughtException]`, `[unhandledRejection]` — глобальные ловушки в logger.js
+
+## 🧪 Performance diagnostics
+
+`electron/perf-diagnostics.js` ставится сразу после logger init и monkey-patch'ит
+`ipcMain.handle`, поэтому slow IPC виден без ручной обвязки каждого handler'а:
+`[Perf:IpcSlow] channel=... durMs=... args=...`. Main-loop watchdog пишет
+`[Perf:MainLoopGap]` с active/recent IPC ops и 5-секундной агрегацией; это
+важнее stack trace, когда main thread занят sync SQLite и лог молчит.
+
+Renderer отправляет через `diag:rendererEvent`: `[Perf:RendererLongTask]`,
+`[Perf:InputDelay]`, `[Perf:RendererLoopGap]` и `[Perf:DataBusBurst]`. Loop-gap
+игнорирует hidden renderer'ы — иначе фоновые/свернутые окна дают ложные
+750ms gaps и уводят расследование от пользовательского лага.
+
+`[Perf:JobUpdateBurst]` агрегирует поток `job:update`. Для Telegram auto/catch-up
+это связка с `DataBusBurst`: если много job updates не превращаются в тяжёлые
+keys (`sources`, `source:<id>`), UI может жить нормально; если превращаются —
+ищи storm в `jobInvalidation.js`, а не в Python fetch.
 
 ## 🗂 Пути логов
 | Среда | Путь |

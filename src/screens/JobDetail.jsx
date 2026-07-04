@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { Copy, FileText, FolderOpen, Save, Play, Trash2 } from 'lucide-react'
+import { Brain, Copy, FileText, FolderOpen, Save, Play, Trash2 } from 'lucide-react'
 import { popScreen, pushScreen } from '../lib/store'
 import PlatformLogo from '../components/PlatformLogo'
 import JobProgress, { cleanErrorMessage } from '../components/JobProgress'
@@ -85,7 +85,7 @@ export default function JobDetail({ payload }) {
     if (!window.api || !id) return
     window.api.jobDetail(id).then(j => alive && setJob(j))
     const off = window.api.onJobUpdate(updated => {
-      if (alive && updated && updated.id === id) setJob(updated)
+      if (alive && updated && (updated.id === id || updated.db_id === id)) setJob(updated)
     })
     return () => { alive = false; off && off() }
   }, [id])
@@ -167,6 +167,38 @@ export default function JobDetail({ payload }) {
                          : isInstagram ? 'instagram'
                          : isLocal     ? 'local'
                          : 'telegram'
+  const isTelegramFetch = job.type === 'tg_fetch'
+  const canShowAutoRag = isTelegramFetch
+    && job.params?.mode !== 'single'
+    && job.params?.mode !== 'media_only'
+  const autoRagEnabled = job.params?._auto_index_after_fetch === true
+  const autoRagStarted = job.params?._auto_index_after_fetch_started || null
+  const autoRagNoop = job.params?._auto_index_after_fetch_noop || null
+  const autoRagError = job.params?._auto_index_after_fetch_error || null
+  const autoRagLocked = !!autoRagStarted || !!autoRagNoop
+  const canToggleAutoRag = canShowAutoRag
+    && !autoRagLocked
+    && !['error', 'cancelled', 'interrupted'].includes(job.status)
+    && busy !== 'auto-rag'
+  const showStopButton = job.status === 'running'
+    || job.status === 'pending'
+    || job.status === 'awaiting_ai'
+  const autoRagLabel = autoRagStarted
+    ? 'RAG запущен'
+    : autoRagNoop
+      ? 'RAG готов'
+      : autoRagEnabled
+        ? 'Google RAG включён'
+        : 'Google RAG'
+  const autoRagTitle = autoRagStarted
+    ? 'Семантическая индексация уже запущена после этого парсинга'
+    : autoRagNoop
+      ? 'Все сохранённые сообщения уже были проиндексированы'
+      : autoRagError
+        ? `Автозапуск RAG не сработал: ${autoRagError}`
+        : autoRagEnabled
+          ? 'После успешного завершения этого парсинга запустится RAG-индексация Gemini'
+          : 'Включить автозапуск RAG-индексации Gemini после завершения парсинга'
 
   async function deleteJob() {
     if (!window.confirm(isYoutubeSingle
@@ -175,6 +207,40 @@ export default function JobDetail({ payload }) {
     )) return
     await window.api.jobsDeleteOne(id)
     popScreen()
+  }
+
+  async function toggleAutoRag() {
+    if (!canToggleAutoRag || !window.api?.jobSetAutoIndexAfterFetch) return
+    const nextEnabled = !autoRagEnabled
+    setBusy('auto-rag')
+    try {
+      const r = await window.api.jobSetAutoIndexAfterFetch({
+        jobId: job.db_id || job.id,
+        enabled: nextEnabled,
+      })
+      if (r?.ok) {
+        if (r.job) setJob(r.job)
+        else {
+          setJob(j => ({
+            ...j,
+            params: { ...(j.params || {}), _auto_index_after_fetch: nextEnabled },
+          }))
+        }
+        const auto = r.auto || null
+        if (auto?.noop) {
+          setToast('RAG уже готов: новых сообщений для индексации нет')
+        } else if (auto?.jobId) {
+          setToast(`RAG-индексация запущена · #${auto.jobId}`)
+        } else {
+          setToast(nextEnabled ? 'Google RAG включён' : 'Google RAG выключен')
+        }
+      } else {
+        setToast(`Ошибка: ${r?.error || 'не удалось изменить RAG-переключатель'}`)
+      }
+    } finally {
+      setBusy(null)
+      setTimeout(() => setToast(null), 2600)
+    }
   }
 
   return (
@@ -189,24 +255,49 @@ export default function JobDetail({ payload }) {
             <span className="text-zinc-700">·</span>
             <span className="text-zinc-500">#{job.id}</span>
             <StatusPill status={job.status} />
-            {/* Stop button — same IPC ActivityPanel uses. Visible only while
-                the job is alive. After click status flips to 'cancelled'
-                via job:update and this branch unmounts on its own. */}
-            {(job.status === 'running' || job.status === 'pending'
-              || job.status === 'awaiting_ai') && (
-              <button
-                onClick={async () => {
-                  setBusy('cancel')
-                  try { await window.api.cancelJob(job.id) } catch {}
-                  setBusy(null)
-                }}
-                disabled={busy === 'cancel'}
-                title="Остановить выполнение"
-                className="ml-auto min-w-[7.5rem] text-center px-2.5 py-1 rounded text-amber-400 border border-amber-700/40 hover:bg-amber-900/20 hover:text-amber-300 disabled:opacity-50"
-                style={{ fontSize: '13px' }}
-              >
-                {busy === 'cancel' ? 'Останавливаю…' : 'Стоп'}
-              </button>
+            {(canShowAutoRag || showStopButton) && (
+              <div className="ml-auto flex items-center gap-2">
+                {canShowAutoRag && (
+                  <button
+                    type="button"
+                    onClick={toggleAutoRag}
+                    disabled={!canToggleAutoRag}
+                    aria-pressed={autoRagEnabled || !!autoRagStarted || !!autoRagNoop}
+                    title={autoRagTitle}
+                    className={`min-w-[9.75rem] h-8 px-3 rounded-md inline-flex items-center justify-center gap-1.5 border tabular-nums disabled:cursor-not-allowed ${
+                      autoRagStarted || autoRagNoop
+                        ? 'bg-zinc-800 border-zinc-700 text-zinc-400'
+                        : autoRagEnabled
+                          ? 'bg-emerald-900/30 border-emerald-700/60 text-emerald-300 hover:bg-emerald-900/45'
+                          : autoRagError
+                            ? 'bg-red-950/20 border-red-800/50 text-red-300 hover:bg-red-950/30'
+                            : 'text-zinc-400 border-zinc-800 hover:bg-zinc-900 hover:text-zinc-200'
+                    } ${busy === 'auto-rag' ? 'opacity-60' : ''}`}
+                    style={{ fontSize: '13px' }}
+                  >
+                    <Brain size={14} className="shrink-0" />
+                    {busy === 'auto-rag' ? 'Сохраняю…' : autoRagLabel}
+                  </button>
+                )}
+                {/* Stop button — same IPC ActivityPanel uses. Visible only while
+                    the job is alive. After click status flips to 'cancelled'
+                    via job:update and this branch unmounts on its own. */}
+                {showStopButton && (
+                  <button
+                    onClick={async () => {
+                      setBusy('cancel')
+                      try { await window.api.cancelJob(job.id) } catch {}
+                      setBusy(null)
+                    }}
+                    disabled={busy === 'cancel'}
+                    title="Остановить выполнение"
+                    className="min-w-[7.5rem] text-center px-2.5 py-1 rounded text-amber-400 border border-amber-700/40 hover:bg-amber-900/20 hover:text-amber-300 disabled:opacity-50"
+                    style={{ fontSize: '13px' }}
+                  >
+                    {busy === 'cancel' ? 'Останавливаю…' : 'Стоп'}
+                  </button>
+                )}
+              </div>
             )}
           </div>
 
@@ -644,7 +735,13 @@ function TelegramBody({ job, busy, toast, copyFile, openIn, reveal }) {
       <Section title="Параметры запуска">
         <KV k="Режим"  v={MODE_LABELS[job.params?.mode] || job.params?.mode || '—'} />
         {job.params?.limit != null && <KV k="Лимит" v={job.params.limit} />}
-        {job.params?.date  && <KV k="Дата"  v={job.params.date} />}
+        {job.params?.date  && (
+          <KV k={job.params?.date_to ? 'Период' : 'Дата'}
+              v={job.params?.date_to ? `${job.params.date} — ${job.params.date_to}` : job.params.date} />
+        )}
+        {job.params?._range_plan?.intervals_total > 1 && (
+          <KV k="План" v={`${job.params._range_plan.intervals_total} непокрытых интервала`} />
+        )}
         {job.params?.url   && <KV k="URL"   v={
           <a
             href="#"

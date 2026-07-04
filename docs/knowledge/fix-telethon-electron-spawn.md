@@ -50,7 +50,7 @@ if sys.platform == 'darwin':
 from telethon import TelegramClient
 ```
 
-Должен быть **в каждом Python-скрипте**, который spawn'ится из Electron. Если будет больше скриптов (`yt_fetch_json.py`, `ig_fetch_json.py`) — выносить в `cli-tools/shared/_electron_compat.py` и импортировать первым.
+Должен быть **в каждом Python-скрипте**, который spawn'ится из Electron. Если будет больше скриптов (`yt_fetch_json.py`, `ig_fetch_json.py`) — выносить в `python-workers/shared/_electron_compat.py` и импортировать первым.
 
 ## 🧪 Как воспроизвести фикс вручную
 ```bash
@@ -58,8 +58,8 @@ from telethon import TelegramClient
 env -i PATH=/usr/bin:/bin python3 -c "from telethon import TelegramClient"
 
 # С фиксом — после monkey-patch import проходит:
-env -i PATH=/usr/bin:/bin /Users/fedor/Desktop/telethon/venv/bin/python3 \
-  /Users/fedor/Desktop/sc-desktop/cli-tools/telegram/tg_fetch_json.py durov --mode last_n --limit 3
+env -i PATH=/usr/bin:/bin /Users/fedor/Desktop/sc-desktop/.venv/bin/python3 \
+  /Users/fedor/Desktop/sc-desktop/python-workers/telegram/tg_fetch_json.py durov --mode last_n --limit 3
 # {"type": "entity", ...}
 # {"type": "item", ...}
 # {"type": "done", "items_total": 3, ...}

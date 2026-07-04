@@ -1,12 +1,13 @@
-# Knowledge: YouTube → sc-desktop → Gemini Studio (расширение)
+# Knowledge: YouTube → sc-desktop → AI target (расширение)
 
-End-to-end flow «забрать видео с YouTube в Library + автоматически открыть
-Gemini Studio с готовым промптом». Реализован тремя content-script'ами
-расширения SC Browser Parser, background tracker'ом и HTTP-bridge'ом
-sc-desktop'а (см. `fact-yt-extension-bridge.md`).
+End-to-end flow «забрать видео с YouTube в Library + автоматически отправить
+готовый текст в выбранный AI-target». Правая половина pill'а `+ ai` сейчас
+умеет Gemini Studio, Claude и ChatGPT. Реализовано content-script'ами
+расширения SC Browser Parser, background tracker'ом и HTTP-bridge'ом sc-desktop'а
+(см. `fact-yt-extension-bridge.md`).
 
 ```
-[YouTube card / watch]                  [Gemini Studio /prompts/new_chat]
+[YouTube card / watch]                  [AI target tab]
   📋 copy / + клик                              ↑
        │                                        │ tabs.create({active:false})
        ▼                                        │   (только когда транскрипт готов)
@@ -18,10 +19,8 @@ sc-desktop'а (см. `fact-yt-extension-bridge.md`).
   poll /yt-status                               │
   done → tabs.sendMessage                       │
        (state: done)                            │
-       + tabs.create #sc=…  ─────────────► [aistudio-autoscrape.js]
-                                                  читает payload из storage,
-                                                  выбирает model + preset,
-                                                  paste'ит транскрипт, Run
+       + openTargetBackground ───────────► Gemini/Claude autoscrape
+                                            или ChatGPT sc-compose
 ```
 
 ## 🎬 Pill-кнопка на карточке — гибрид из 3 источников
@@ -149,14 +148,20 @@ hover/render берёт `videoStateMap.get(currentVideoId) ?? idle`.
 | `searching` | `🔎 Ищу субтитры…` | `🔎` | bridge отрапортовал `yt_stage=searching\|subs_found\|awaiting_ai` |
 | `transcribing` | `🤖 Запрос к Gemini…` или `🎙 Запрос к AssemblyAI…` (по `yt_engine`) | `🤖`/`🎙` | bridge отрапортовал `yt_stage=transcribing` с engine |
 | `working` | `⏳ Транскрипция…` | `⏳` | legacy fallback когда bridge не передал yt_stage |
-| `opening` | `🤖 Gemini Studio…` | `🤖` | (autoAistudio=true) открывается вкладка AI Studio |
+| `opening` | `🤖 <target>…` | `🤖` | (autoAistudio=true) открывается выбранная AI-вкладка |
 | `done` | **возвращается в idle сразу** | `✓` (зелёный border, 3с TTL) | sc-desktop сохранил файл + положил в clipboard |
 | `pasted` | **возвращается в idle сразу** | `🤖✓` (зелёный border, 4.5с TTL) | autoscrape вставил текст в Gemini Studio textarea |
 | `error` | **возвращается в idle сразу** | `✗` (красный border, 4с TTL) + текст ошибки в title-attr | финал с ошибкой |
 
 **Pill НЕ показывает done/error/pasted.** Юзер видит результат в тосте; pill сразу готова к новому клику — иначе после транскрибации нужно было бы ждать TTL прежде чем нажать заново.
 
-**`done` и `pasted` — два разных события.** Юзер кликает `+ ai`, ожидает увидеть последовательно: `🔎 → 🤖 → ✓ → 🤖✓` (ищу субтитры → транскрибирую → сохранил в clipboard → вставил в AI Studio). Без разных иконок две `✓` подряд читались бы как дублирующиеся уведомления — юзер не понимал что произошло.
+**`done` и `pasted` — два разных события.** Для autoscrape-target'ов
+Gemini/Claude юзер кликает `+ ai` и ожидает последовательно: `🔎 → 🤖 → ✓ → 🤖✓`
+(ищу субтитры → транскрибирую → сохранил в clipboard → вставил в AI-вкладку).
+Без разных иконок две `✓` подряд читались бы как дублирующиеся уведомления —
+юзер не понимал что произошло. ChatGPT target идёт через отдельный `sc-compose`
+handoff, поэтому у него нет отдельного autoscrape-сигнала `pasted`: после submit
+вкладка остаётся открытой, а итог живёт в обычном ChatGPT-чате.
 
 **Pill НЕ показывает done/error.** Юзер видит результат в тосте; pill
 сразу готова к новому клику — иначе после транскрибации нужно было бы
@@ -331,7 +336,7 @@ YouTube **нативно** перехватывает эти клавиши:
 
 ### Split SC-pill (copy / `+`)
 
-Двух-частная кнопка: левая (`📋 copy`) — только сохранить в sc-desktop, правая (`+`) — сохранить + автооткрыть Gemini Studio. **Identical background, identical hover-фон, identical text-color** — единый pill, разница только в иконке/лейбле, vertical 1px-divider визуально показывает зону клика. Юзер итерировал на этом: исходно правая половина была акцентно-фиолетовой, потом откатили — слишком кричит, две одинаковых половинки с разделителем читаются понятнее.
+Двух-частная кнопка: левая (`📋 copy`) — только сохранить в sc-desktop, правая (`+`) — сохранить + отправить в выбранный AI-target. **Identical background, identical hover-фон, identical text-color** — единый pill, разница только в иконке/лейбле, vertical 1px-divider визуально показывает зону клика. Юзер итерировал на этом: исходно правая половина была акцентно-фиолетовой, потом откатили — слишком кричит, две одинаковых половинки с разделителем читаются понятнее.
 
 **handleClick(url, btn, autoAistudioOverride, withCommentsOverride)** — explicit override. Левая кнопка передаёт `false, false`, правая `true, false`. Background-tracker дальше обрабатывает идентично — единственное различие: при `autoAistudioOverride=true` он откроет `aistudio.google.com` в фоновой вкладке после готовности транскрипта. `withCommentsOverride` отвечает за добавление комментариев — см. секцию **Cmd-row** ниже.
 
@@ -461,12 +466,32 @@ preview пересоздан/пуст). Без сброса pill «зависа�
 читает `window.*` и `data-*`, а текстовое содержимое `<pre>` читается
 надёжно через `get_text`.
 
-## 🤖 Gemini Studio: автоскрапинг
+## 🤖 AI target: dispatch и автоскрапинг
 
-Параллельно живёт **Claude target** (тот же flow, другая площадка) — см.
-`fact-claude-autoscrape.md`. Выбор target'а (Gemini ⟷ Claude) делается
-в popup'е расширения; настройки обоих хранятся одновременно — переключение
-target'а не теряет конфигурацию.
+Выбор target'а делается селектом в строке заголовка «YouTube пересказ» в
+popup'е расширения. Popup показывает **только карточку выбранной цели**:
+не выбранный Claude/Gemini/ChatGPT не занимает половину экрана и не выглядит
+как активная конфигурация. При этом настройки всех целей хранятся одновременно:
+переключение target'а меняет destination следующего `+ ai`, но не стирает
+модель, project/system-instruction или ChatGPT effort.
+
+Три target'а делятся на два механических класса:
+- **Gemini Studio** и **Claude** — autoscrape: background кладёт payload в
+  `chrome.storage.local`, открывает вкладку target'а в фоне, content-script
+  на странице сам выбирает модель/проект/инструкцию, вставляет текст и жмёт Run.
+- **ChatGPT** — compose handoff: background читает готовый transcript/comments через
+  `/yt-fetch`, собирает один prompt (`chatgpt_prompt` + текст видео + комментарии),
+  кладёт payload в `chrome.storage.local` под `__sc_chatgpt_compose_job_*` и открывает
+  `chatgpt.com/?sc-compose=<id>#sc-compose=<id>`. `chatgpt-research.js` в этой ветке
+  переиспользует только низкоуровневые шаги выбора модели/effort, paste, ожидания
+  document-loader'а и Send. MCP-badge, watcher ответа, парсер «Источников» и
+  `/research-state` не запускаются.
+
+У ChatGPT target нет события `__sc_aistudio_pasted`: вкладка остаётся открытой после
+submit, потому что результат пересказа нужно читать прямо в ChatGPT. Для YouTube-кнопки
+это означает: `opening`/`done` подтверждают, что ChatGPT-вкладка открыта и prompt
+принят к отправке; финальный текст дальше живёт в обычной истории/вкладке ChatGPT,
+не в истории MCP.
 
 `aistudio-autoscrape.js` — content-script на `aistudio.google.com/prompts/*`.
 Триггер: открытие `prompts/new_chat#sc=<requestId>`.
@@ -555,11 +580,12 @@ Flash-модель денайнута.
 
 ### Fallback Ctrl+Enter
 
-После `runBtn.click()` ждём 800ms и смотрим — появилась ли кнопка `Stop`
-(Gemini в это время уже отвечает). Если нет — диспатчим `KeyboardEvent`
-с `ctrlKey:true` и `metaKey:true` в textarea. Угадан штатный шорткат
-Gemini Studio (Ctrl+Enter / Cmd+Enter), работает напрямую через
-ProseMirror, не зависит от focus/event-bubbling кнопки Run.
+После `runBtn.click()` success проверяется по реальному маркеру `Stop`: если
+Run-click не перевёл composer в streaming-state, fallback диспатчит штатный
+шорткат Gemini Studio (Ctrl+Enter / Cmd+Enter) в textarea. Это работает напрямую
+через ProseMirror и не зависит от focus/event-bubbling кнопки Run. Фиксированная
+пауза сама по себе не считается доказательством submit'а — см.
+`methodology/переносимый-дизайн.md::UI-состояние ждём по маркеру, не по задержке`.
 
 ### Что отбросили
 
@@ -661,16 +687,18 @@ Polling через `chrome.alarms` (period 0.1 min ≈ 6с — минимум ч
 поддерживает Chrome alarms API).
 
 ```js
-trackJob({jobId, videoId, tabId, fromCache, autoAistudio, modelTitle, systemInstruction, ...})
+trackJob({jobId, videoId, tabId, fromCache, autoAistudio, target, modelTitle, systemInstruction, chatgptModel, chatgptEffort, ...})
 ```
 
-- `fromCache:true` → не polls'им, сразу финализируем (открываем aistudio
-  если auto, шлём `state:'done'`).
+- `fromCache:true` → не polls'им, сразу финализируем (открываем выбранный
+  AI-target если auto, шлём `state:'done'`).
+- `target` нормализуется в `aistudio|claude|chatgpt`. Legacy job'ы без target'а
+  считаются `aistudio`, чтобы старые storage-записи не ломали opening.
 - Иначе кладём в storage, поднимаем alarm. На каждый tick `pollTracker`:
   - timeout 30 минут → `state:'error', "таймаут"`, удаляем
   - bridge unreachable → пропускаем тик (попробуем в следующем)
   - status=error / comments_status=error → relay error, удаляем
-  - оба done → если auto: `state:'opening'`, `tabs.create({active:false})`,
+  - оба done → если auto: `state:'opening'`, `openTargetBackground(target)`,
     `state:'done'`. Иначе сразу `state:'done'`. Удаляем.
 
 **Idle-resilience SW.** Service worker в Chrome выгружается через ~30с
@@ -698,18 +726,21 @@ fail silent, при следующем визите старая кнопка у
 провале → `state:'error'` с понятным текстом. Re-entry guard держится: `'sending'`
 выставлен синхронно до await, так что двойного POST нет.
 
-**Idempotency-латч перед открытием AI-вкладки.** Между `openTargetBackground`
-(создаёт вкладку + пишет storage) и финальным `state:'done'` есть 800ms sleep
-(чтобы тост «Открываю…» прожил видимое время). Если SW выгрузят и разбудят
-alarm'ом в этом окне — он перезапустит long-poll, `processSnapshot` снова увидит
-`transcriptDone && commentsDone` и откроет **вторую** вкладку. Флаг
-`aiOpenStarted` в storage (переживает respin SW) делает второй заход no-op'ом.
+**Idempotency-латч перед открытием AI-вкладки.** `aiOpenStarted` ставится в
+storage **до** `openTargetBackground`. Если SW выгрузят и разбудят alarm'ом между
+открытием target'а и финальным `state:'done'`, новый проход `processSnapshot`
+снова увидит `transcriptDone && commentsDone`; без storage-латча он открыл бы
+вторую вкладку. Искусственной задержки ради того, чтобы тост «Открываю…» пожил
+на экране, нет: `opening` — событийный маркер «начали open target», а не
+таймерный loading-state.
 
 **Orphan-storage cleanup при сбое открытия.** `openTargetBackground` пишет
-`__sc_aistudio_job_*` / `__sc_claude_job_*` (payload для autoscrape) и удаляется
-только когда autoscrape реально отработал. Если открытие упало (или вкладку
-закрыли до autoscrape) — запись висела бы в storage.local вечно. На error-пути
-`cleanupOrphanAiJob(videoId)` подчищает осиротевшие записи по `ytVideoId`.
+`__sc_aistudio_job_*` / `__sc_claude_job_*` для autoscrape и
+`__sc_chatgpt_compose_job_*` для ChatGPT compose. Autoscrape-записи удаляются после
+`pasted`, ChatGPT-запись — после успешного submit в обычный чат. Если открытие упало
+или вкладку закрыли до чтения payload'а, запись висела бы в `storage.local` вечно.
+На error-пути `cleanupOrphanAiJob(videoId)` подчищает все три семейства ключей по
+`ytVideoId`.
 
 ### awaiting_ai engine берётся из настройки
 

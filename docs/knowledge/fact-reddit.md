@@ -16,7 +16,7 @@
 
 **С залогиненной сессией** (`reddit_session` или `token_v2`) тот же endpoint отдаёт нормальный JSON (status 200) — авторизованным пользователям бот-фильтр даёт зелёный.
 
-Cookies загружаются через `cli-tools/reddit/reddit_auth.py`: сначала `SC_REDDIT_COOKIE_HEADER` (удобно для тестов/bridge-интеграций), затем browser-cookie loaders (`firefox`, `chrome`, `chromium`, `brave`, `arc`, `edge`, `opera`, `opera_gx`, `vivaldi`, `safari`). В логах можно писать только источник и количество cookies, не значения. Важно: live browser MCP может видеть cookies в текущем профиле, но `browser_cookie3` читает только профили/браузеры, к которым у процесса есть доступ. Если текущий Chrome-профиль не читается, Firefox-сессия или env header остаются самым детерминированным путём.
+Cookies загружаются через `python-workers/reddit/reddit_auth.py`: сначала `SC_REDDIT_COOKIE_HEADER` (удобно для тестов/bridge-интеграций), затем browser-cookie loaders (`firefox`, `chrome`, `chromium`, `brave`, `arc`, `edge`, `opera`, `opera_gx`, `vivaldi`, `safari`). В логах можно писать только источник и количество cookies, не значения. Важно: live browser MCP может видеть cookies в текущем профиле, но `browser_cookie3` читает только профили/браузеры, к которым у процесса есть доступ. Если текущий Chrome-профиль не читается, Firefox-сессия или env header остаются самым детерминированным путём.
 
 ### Что делать если api отвалился
 
@@ -77,7 +77,7 @@ Apify не отдаёт `depth` напрямую, только `parentId` в ф�
 ## 📂 Файлы
 
 ```
-cli-tools/reddit/
+python-workers/reddit/
   reddit_auth.py         — cookie loading: env header → browser_cookie3 loaders
   rd_thread_ndjson.py    — один URL → пост + дерево комментов
   rd_search_ndjson.py    — keyword [+ subreddit] → посты без комментов

@@ -2,6 +2,8 @@ import React, { useEffect, useState } from 'react'
 import { Trash2, ChevronDown, ChevronRight } from 'lucide-react'
 import PlatformLogo from '../components/PlatformLogo'
 
+const LOGIN_COMMAND = 'cd ~/Desktop/sc-desktop && npm run instagram:login'
+
 /**
  * Instagram settings (per-platform settings screen, opened from
  * LibrarySidebar by clicking the «Instagram» group header).
@@ -13,9 +15,8 @@ import PlatformLogo from '../components/PlatformLogo'
  *      Apify token field is shared (only relevant when *either* selector
  *      is set to apify).
  *   2. Расширенное → Cookies-сессии — collapsed by default, only matters
- *      for private profiles you're logged in to.  Login itself is done
- *      via `sc -i --login` in the terminal (Instagram bans programmatic
- *      logins from inside the app).
+ *      for private profiles you're logged in to. Login itself is done by a
+ *      local Playwright helper command in the terminal.
  */
 export default function InstagramSettings() {
   return (
@@ -130,12 +131,18 @@ function BackendBlock() {
             <div className="text-zinc-200" style={{ fontSize: '14px' }}>Apify token</div>
             <div className="text-zinc-500 mt-0.5" style={{ fontSize: '14px' }}>
               {settings.apify_token_set
-                ? <>● ● ● ● ● ● ● ● <span className="text-emerald-400">сохранён</span>{settings.apify_token_legacy && <span className="text-amber-400 ml-2">· из legacy-файла, пересохрани чтобы перенести</span>}</>
+                ? <TokenStatus settings={settings} />
                 : apifyAnywhere
                   ? <span className="text-amber-400">не задан — Apify backend не сможет работать</span>
                   : <span className="text-zinc-600">не нужен — оба селектора на api</span>}
             </div>
           </div>
+          <button
+            onClick={refresh}
+            disabled={busy}
+            className="px-3 py-1 rounded-md text-zinc-300 bg-zinc-900 hover:bg-zinc-800 disabled:opacity-60"
+            style={{ fontSize: '14px' }}
+          >Проверить</button>
           {!editingToken && (
             <button
               onClick={() => { setEditingToken(true); setTokenInput('') }}
@@ -172,6 +179,20 @@ function BackendBlock() {
       </div>
     </Section>
   )
+}
+
+function TokenStatus({ settings }) {
+  const check = settings.apify_token_check || {}
+  const suffix = settings.apify_token_legacy
+    ? <span className="text-amber-400 ml-2">· из legacy-файла, пересохрани чтобы перенести</span>
+    : null
+  if (check.status === 'valid') {
+    return <>● ● ● ● ● ● ● ● <span className="text-emerald-400">проверен</span>{check.username && <span className="text-zinc-500 ml-2">· {check.username}</span>}{suffix}</>
+  }
+  if (check.status === 'invalid' || check.status === 'error') {
+    return <>● ● ● ● ● ● ● ● <span className="text-red-300">не прошёл проверку</span><span className="text-zinc-500 ml-2">· {check.message || check.status}</span>{suffix}</>
+  }
+  return <>● ● ● ● ● ● ● ● <span className="text-zinc-400">сохранён</span>{suffix}</>
 }
 
 function SelectorGroup({ title, subtitle, choices, value, onPick, disabled }) {
@@ -277,7 +298,7 @@ function SessionsInventory() {
   }
 
   function copyLogin() {
-    navigator.clipboard.writeText('sc -i --login')
+    navigator.clipboard.writeText(LOGIN_COMMAND)
     setCopied(true)
     setTimeout(() => setCopied(false), 1600)
   }
@@ -292,15 +313,21 @@ function SessionsInventory() {
           style={{ fontSize: '13px' }}
           title="Скопировать команду"
         >
-          {copied ? 'скопировано' : 'sc -i --login'}
+          {copied ? 'скопировано' : LOGIN_COMMAND}
         </button>
+        <button
+          onClick={refresh}
+          disabled={loading}
+          className="ml-2 px-2 py-0.5 rounded-md bg-zinc-900 text-zinc-300 hover:bg-zinc-800 disabled:opacity-60"
+          style={{ fontSize: '13px' }}
+        >{loading ? 'проверяю…' : 'Проверить'}</button>
       </div>
 
       {err && <ErrorBox text={err} />}
 
       <div className="rounded-md border border-zinc-800 bg-zinc-950 divide-y divide-zinc-900">
         {loading && (
-          <div className="px-4 py-3 text-zinc-500 italic" style={{ fontSize: '14px' }}>Загрузка сессий…</div>
+          <div className="px-4 py-3 text-zinc-500 italic" style={{ fontSize: '14px' }}>Проверка сессий…</div>
         )}
         {!loading && sessions.length === 0 && (
           <div className="px-4 py-4 text-zinc-500 italic" style={{ fontSize: '14px' }}>
@@ -327,11 +354,15 @@ function SessionRow({ session, onDelete }) {
           {session.user_id && <span className="text-zinc-500" style={{ fontSize: '14px' }}>· user_id {session.user_id}</span>}
         </div>
         <div className="text-zinc-500 mt-0.5 flex items-center gap-2" style={{ fontSize: '14px' }}>
-          {session.authorized
-            ? <span className="text-emerald-400">✓ авторизована</span>
-            : <span className="text-amber-400">⚠ не авторизована{session.error ? ` · ${session.error}` : ''}</span>}
+          <SessionStatus session={session} />
           <span className="text-zinc-700">·</span>
           <code className="text-zinc-600 truncate">{session.path?.replace(/^.*\//, '')}</code>
+          {session.age_days != null && (
+            <>
+              <span className="text-zinc-700">·</span>
+              <span className="text-zinc-600">{formatAge(session.age_days)}</span>
+            </>
+          )}
         </div>
       </div>
       <button
@@ -341,6 +372,26 @@ function SessionRow({ session, onDelete }) {
       ><Trash2 size={16} /></button>
     </div>
   )
+}
+
+function SessionStatus({ session }) {
+  const health = session.health || {}
+  if (!session.authorized) {
+    return <span className="text-amber-400">локально нет sessionid{session.error ? ` · ${session.error}` : ''}</span>
+  }
+  if (health.status === 'valid') {
+    return <span className="text-emerald-400">сессия проверена{health.username ? ` · @${health.username}` : ''}</span>
+  }
+  if (health.status === 'invalid' || health.status === 'error') {
+    return <span className="text-red-300">сессия не прошла проверку · {health.message || health.status}</span>
+  }
+  return <span className="text-zinc-400">cookie-файл найден · проверка не выполнялась</span>
+}
+
+function formatAge(days) {
+  if (days < 1) return 'сегодня'
+  if (days < 2) return '1 день назад'
+  return `${Math.round(days)} дн. назад`
 }
 
 // ─── shared bits ───────────────────────────────────────────────────────

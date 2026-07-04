@@ -327,6 +327,16 @@ CS сам себе делает `location.reload()`. URL hash сбрасывае
 
 Без этого fallback'а после crash-restore research висел бы в RAM bridge'а зомби-running'ом до 24-часового GC. Юзер видит «research завершён в браузере» (panel с N sources на вкладке), но bridge не знает.
 
+**Caveat: recovery по tabId обязан учитывать provider.** Живой post-mortem после
+зомби ChatGPT jobs: старая вкладка `tabId=57069372` уже навигировала на
+`perplexity.ai`, Perplexity CS сделал `cs.no_id_try_recover`, а
+`/research-by-tab` вернул старый running ChatGPT job `rkkhjzer…` по тому же tabId.
+Итог — Perplexity-пайплайн начал configuring чужого job'а и записал в него
+`pplx_model_locked`, хотя исходный результат был ChatGPT. Если трогаешь
+`recoverIdByTabId` / `/research-by-tab`, не считай tabId достаточным identity:
+provider из ответа должен совпасть с текущим CS/provider domain, иначе recovery надо
+отклонять.
+
 ### 4. Тихий ext-reload во время research'а
 
 Если расширение перезагрузилось (`chrome.runtime.reload()` — hot-reload в dev, или manual ⟳) пока research активный, CS на странице получает teardown (chrome.* объекты становятся inaccessible), watcher умирает. Новый CS впрыснется только при следующей навигации — если research уже завершился до этого момента, watcher.done не сработает.
@@ -417,6 +427,18 @@ model/config fail, confirm_failed, stopped, flow_err) вызываются **т�
 `log()`, который и потерялся в инциденте: postState-ошибка писалась только через `log()`).
 Промежуточные `stage`-апдейты остаются fire-and-forget — там потеря безвредна.
 
+**Body-limit failure — отдельный класс, ретраи не помогают.** Живой кейс
+`rja1mjv8…` / `rkkhjzer…`: ChatGPT watcher корректно дошёл до
+`gpt.watcher.done {hasAnswer:true}`, но terminal `POST /research-state` содержал
+structured result с большим `sources/source_activity` и bridge отклонял его как
+`request body too large` (`129233 > 65536`, `77152 > 65536`). `postTerminalState`
+честно сделал 5 попыток и ушёл в `gpt.terminal.giveup`, но payload каждый раз был
+тем же — это не сетевой flake. Контракт после фикса: малые управляющие endpoints
+остаются на 64KB, `/research-start`/`/research-create` — 2MB,
+`/research-state`/`/aistudio-state` — 5MB. Не снимай лимит глобально: loopback
+bridge всё равно должен отсекать случайный huge POST; поднимать надо адресно под
+канал, где большие ответы являются нормой.
+
 > **Что пробовали мысленно и почему не то.** Наивный fix — «починить tab-closed fallback,
 > чтобы он ловил и этот случай». Не годится: fallback опирается на членство вкладки в
 > `RESEARCH_TABS` на момент `onRemoved`, а его снимает `stopKeepAlive()` до закрытия —
@@ -462,6 +484,11 @@ POST /research-state      {id, status?, stage?, tabId?, url?, error?, result?}
                           tabId сохраняется (CS шлёт свой tabId в первом postState —
                           раньше был null/хардкод -1 → Tab ID:-1 в Истории).
                           На done/error → persistResearchJob → research_jobs (БД).
+                          body cap 5MB: большие ChatGPT sources/activity — штатный result.
+POST /research-artifact   {id, kind, name, contentType, base64}
+                          body cap 30MB, decoded file cap 25MB; base64 не попадает в result_json.
+POST /aistudio-state      {id, status?, stage?, responseText?, ...}
+                          body cap 5MB: AI Studio result mirror для renderer/history.
 POST /research-log        {id?, tabId?, tag, …}  persistent log в production.log;
                           на tag=sw.tab.onRemoved → failAllByTabId (tab-closed fallback)
 POST /research-stop       {id}  job → error 'Остановлено пользователем' + close tab.

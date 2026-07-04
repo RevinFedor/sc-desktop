@@ -150,6 +150,8 @@ export default function TelegramScopeFields({
   // a forum chat — copy flow keeps the single-topic filter via topicId.
   topicIds, onTopicIdsChange,
   preview = null,
+  mediaEstimate = null,
+  mediaEstimateBusy = false,
   hasDiscussion = null,
   commentsCount = null,
   // Optional overrides for callers whose situation isn't pure fetch/copy.
@@ -231,6 +233,8 @@ export default function TelegramScopeFields({
             // Engine is fetch-only; copy mode just formats existing items.
             engine={showEngine ? engine : null}
             onEngineChange={showEngine ? onEngineChange : null}
+            mediaEstimate={mediaEstimate}
+            estimateBusy={mediaEstimateBusy}
           />
           {isForum && use === 'fetch' && onTopicIdsChange && (
             <TelegramTopicsPopover

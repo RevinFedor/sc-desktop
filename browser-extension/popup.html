@@ -307,13 +307,38 @@
     input:checked + .slider { background-color: var(--accent-color); }
     input:checked + .slider:before { transform: translateX(14px); }
 
-    /* ─────────── Two-column YouTube settings ──────────────────────────
-       Грид из двух карточек: Gemini Studio (left) и Claude (right).
-       На compact-режиме popup (320px) — одна колонка вертикально. */
+    .yt-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .yt-heading .panel-title {
+      margin: 0;
+    }
+    .yt-target-select {
+      flex: 0 0 190px;
+      min-width: 0;
+      background: var(--bg-color);
+      color: var(--text-primary);
+      border: 1px solid var(--border-color);
+      border-radius: 7px;
+      padding: 6px 8px;
+      font-size: 12px;
+      font-family: inherit;
+    }
+    .yt-target-select:focus {
+      outline: 1px solid var(--accent-color);
+      border-color: var(--accent-color);
+    }
+
+    /* ─────────── YouTube summary settings ──────────────────────────
+       Один target за раз: карточка широкая, не две колонки. */
     .yt-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
+      grid-template-columns: 1fr;
+      gap: 8px;
       margin-top: 8px;
     }
     .yt-card {
@@ -331,6 +356,7 @@
       border-color: var(--accent-color);
       background: rgba(102, 126, 234, 0.06);
     }
+    .yt-card[hidden] { display: none; }
     .yt-card h3 {
       font-size: 12px;
       font-weight: 600;
@@ -384,39 +410,22 @@
     .field-row .ta-input {
       margin-top: 0;
     }
-
-    /* Segmented control: target switcher — Gemini ⟷ Claude. */
-    .target-switcher {
-      display: flex;
-      background: var(--bg-color);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 3px;
-      gap: 2px;
-      margin-bottom: 4px;
-    }
-    .target-switcher button {
-      flex: 1;
-      padding: 6px 10px;
-      background: transparent;
-      border: none;
+    .field-note {
       color: var(--text-secondary);
-      font-size: 12px;
-      font-weight: 500;
-      cursor: pointer;
-      border-radius: 6px;
-      transition: background 0.15s, color 0.15s;
+      opacity: 0.75;
     }
-    .target-switcher button:hover:not(.active) { color: var(--text-primary); }
-    .target-switcher button.active {
-      background: var(--accent-color);
-      color: white;
+    .prompt-textarea {
+      min-height: 34px;
+      height: 34px;
+      max-height: 92px;
+      resize: none;
+      overflow: hidden;
+      line-height: 20px;
+      font-family: inherit;
     }
-    .target-hint {
-      font-size: 11px;
-      color: var(--text-secondary);
-      margin-bottom: 6px;
-      padding: 0 2px;
+    .prompt-textarea:focus {
+      height: 92px;
+      overflow-y: auto;
     }
 
     /* Switch row внутри карточки — слева текст, справа toggle. */
@@ -446,7 +455,7 @@
     <div class="content">
       <div id="status" class="status inactive">
         <span class="status-icon">⚠️</span>
-        <span id="statusText">Откройте диалог в Gemini Studio, Perplexity или Claude</span>
+        <span id="statusText">Откройте диалог в Gemini Studio, Perplexity, Claude или ChatGPT</span>
       </div>
 
       <div id="formatHint" style="margin-bottom: 10px; padding: 7px 10px; border-radius: 6px; font-size: 11px; background-color: rgba(102, 126, 234, 0.1); border: 1px solid rgba(102, 126, 234, 0.25); color: var(--accent-color); display: flex; align-items: center; gap: 6px;">
@@ -476,6 +485,7 @@
           <button type="button" id="tabAistudio" role="tab" aria-selected="true" aria-controls="settingsAistudio">Gemini Studio</button>
           <button type="button" id="tabPerplexity" role="tab" aria-selected="false" aria-controls="settingsPerplexity">Perplexity</button>
           <button type="button" id="tabClaude" role="tab" aria-selected="false" aria-controls="settingsClaude">Claude</button>
+          <button type="button" id="tabChatgpt" role="tab" aria-selected="false" aria-controls="settingsChatgpt">ChatGPT</button>
         </div>
 
         <!-- ──────────────── Gemini Studio settings ──────────────── -->
@@ -563,18 +573,46 @@
             </label>
           </div>
         </div>
+
+        <!-- ──────────────── ChatGPT settings ──────────────── -->
+        <div class="export-panel" id="settingsChatgpt" role="tabpanel" aria-labelledby="tabChatgpt" hidden>
+          <div class="setting-row">
+            <span class="row-text" title="Блоки рассуждений ChatGPT, если они есть в DOM ответа">Рассуждения</span>
+            <label class="switch">
+              <input type="checkbox" id="chatgpt_include_reasoning">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <span class="row-text" title="Ссылки из панели «Источники» под ответами ChatGPT">Источники</span>
+            <label class="switch">
+              <input type="checkbox" id="chatgpt_include_sources">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <span class="row-text" title="Шаги поиска и инструментов из правой панели ChatGPT, если она доступна">Активность поиска</span>
+            <label class="switch">
+              <input type="checkbox" id="chatgpt_include_source_activity">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <span class="row-text" title="Сгенерированные картинки и видимые изображения в сообщениях: в markdown попадут ссылки и подписи">Картинки</span>
+            <label class="switch">
+              <input type="checkbox" id="chatgpt_include_images">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
       </div>
 
       <!-- ──────────────── YouTube settings ──────────────── -->
       <div class="settings" id="settingsYoutube">
-        <div class="panel-title" id="titleYoutube"><span class="dot"></span>YouTube</div>
-
-        <!-- Target switcher: куда улетит транскрипт после клика «+ ai» -->
-        <div class="target-switcher" role="tablist" aria-label="Target">
-          <button type="button" id="ytTargetAistudio" role="tab" aria-selected="true">Gemini Studio</button>
-          <button type="button" id="ytTargetClaude"   role="tab" aria-selected="false">Claude</button>
+        <div class="yt-heading">
+          <div class="panel-title" id="titleYoutube"><span class="dot"></span>YouTube пересказ</div>
+          <select id="yt_target" class="yt-target-select" aria-label="Куда отправлять + ai"></select>
         </div>
-        <div class="target-hint" id="ytTargetHint">«+ ai» на YouTube-карточке отправляет в выбранный target. Настройки сохраняются для обоих — переключение target'а не теряет конфигурацию.</div>
 
         <!-- Общий toggle: comments. Применяется к обоим target'ам. -->
         <div class="setting-row">
@@ -593,13 +631,12 @@
             <h3><span class="dot"></span>Gemini Studio</h3>
 
             <div class="field-group">
-              <div class="field-group-title">System instruction</div>
               <div class="field-row">
-                <label title="Название сохранённого пресета. Расширение откроет dropdown и выберет его.">До отправки</label>
+                <label title="Название сохранённого пресета. Расширение откроет dropdown и выберет его.">До отправки <span class="field-note">(system instruction)</span></label>
                 <input id="yt_system_instruction" class="ta-input" type="text" placeholder="пересказ ютуб" spellcheck="false" style="min-height: auto; font-family: inherit;">
               </div>
               <div class="field-row">
-                <label title="Сбрасывает sys-prompt после Run чтобы не висел над следующими вопросами. Пусто = «+ Create new instruction».">После Run</label>
+                <label title="Сбрасывает sys-prompt после Run чтобы не висел над следующими вопросами. Пусто = «+ Create new instruction».">После Run <span class="field-note">(system instruction)</span></label>
                 <input id="yt_post_system_instruction" class="ta-input" type="text" placeholder="пусто = пустая инструкция" spellcheck="false" style="min-height: auto; font-family: inherit;">
               </div>
             </div>
@@ -622,13 +659,12 @@
             <h3><span class="dot"></span>Claude</h3>
 
             <div class="field-group">
-              <div class="field-group-title">Проект</div>
               <div class="field-row">
-                <label title="Имя проекта в claude.ai — будет выбран через «+ → Add to project». Пусто = отправить в обычный чат без проекта.">До отправки</label>
+                <label title="Имя проекта в claude.ai — будет выбран через «+ → Add to project». Пусто = отправить в обычный чат без проекта.">До отправки <span class="field-note">(проект)</span></label>
                 <input id="yt_claude_project" class="ta-input" type="text" placeholder="пересказ ютуб" spellcheck="false" style="min-height: auto; font-family: inherit;">
               </div>
               <div class="field-row">
-                <label title="Проект для дефолтного значения в будущих вкладках. Внутри той же вкладки проект сменить нельзя — Claude фиксирует его при создании чата.">После Run</label>
+                <label title="Проект для дефолтного значения в будущих вкладках. Внутри той же вкладки проект сменить нельзя — Claude фиксирует его при создании чата.">После Run <span class="field-note">(проект)</span></label>
                 <input id="yt_claude_post_project" class="ta-input" type="text" placeholder="пусто = не менять" spellcheck="false" style="min-height: auto; font-family: inherit;">
               </div>
             </div>
@@ -645,6 +681,29 @@
                   <input type="checkbox" id="yt_claude_adaptive_thinking">
                   <span class="slider"></span>
                 </label>
+              </div>
+            </div>
+          </div>
+
+          <!-- ── ChatGPT ── -->
+          <div class="yt-card" id="cardChatgpt" hidden>
+            <h3><span class="dot"></span>ChatGPT</h3>
+
+            <div class="field-group">
+              <div class="field-row">
+                <textarea id="yt_chatgpt_prompt" class="ta-input prompt-textarea" rows="1" spellcheck="false" placeholder="Промпт для пересказа"></textarea>
+              </div>
+            </div>
+
+            <div class="field-group">
+              <div class="field-group-title">Модель</div>
+              <div class="field-row">
+                <label>Для пересказа</label>
+                <select id="yt_chatgpt_model" class="ta-input" style="min-height: auto; font-family: inherit; padding: 6px 8px;"></select>
+              </div>
+              <div class="field-row">
+                <label>Интеллект</label>
+                <select id="yt_chatgpt_effort" class="ta-input" style="min-height: auto; font-family: inherit; padding: 6px 8px;"></select>
               </div>
             </div>
           </div>

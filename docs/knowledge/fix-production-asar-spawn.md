@@ -1,4 +1,9 @@
-# Fix: spawn ENOTDIR в production-сборке (cli-tools внутри app.asar)
+# Fix: spawn ENOTDIR в production-сборке (workers внутри app.asar)
+
+> Исторически этот шрам был про `cli-tools` внутри `app.asar`. Активный
+> runtime теперь `python-workers/` + bundled `.venv`, но класс бага тот же:
+> всё что должен spawn'ить Python не может жить только внутри packed asar.
+> Текущий активный контракт — `fact-python-воркеры.md`.
 
 ## 🚨 Симптом
 
@@ -19,8 +24,9 @@
 
 `electron-builder` упаковывает renderer + main в `app.asar` (tar-like архив).
 `__dirname` внутри main указывает на `Resources/app.asar/electron`.
-`CLI_ROOT = path.resolve(__dirname, '..', 'cli-tools')` указывает на
-`Resources/app.asar/cli-tools`.
+Исторически `CLI_ROOT = path.resolve(__dirname, '..', 'cli-tools')` указывал на
+`Resources/app.asar/cli-tools`. В текущем runtime тот же класс ошибки возникает,
+если `WORKERS_ROOT` резолвится внутрь `Resources/app.asar/python-workers`.
 
 `spawn(VENV_PYTHON, [scriptPath], { cwd: CLI_ROOT })` валится с **`ENOTDIR`**
 потому что **asar — это файл-архив, а не директория**. Node.js fs API
@@ -31,15 +37,17 @@
 
 ## ✅ Решение
 
-`cli-tools` копируется **рядом** с `app.asar`, не внутрь. Это и не нужно —
-в архиве Python всё равно был бы недоступен для venv-интерпретатора как cwd.
+Активные `python-workers` копируются **рядом** с `app.asar`, не внутрь. Это
+и не нужно — в архиве Python всё равно был бы недоступен для venv-интерпретатора
+как cwd. Исторические упоминания `cli-tools` ниже оставлены только как контекст
+старого шрама; новый код должен идти через `python-workers`.
 
 `package.json::build`:
 ```json
 "extraResources": [
   {
-    "from": "cli-tools",
-    "to": "cli-tools",
+    "from": "python-workers",
+    "to": "python-workers",
     "filter": [
       "**/*.py",
       "!**/__pycache__/**",
@@ -51,14 +59,16 @@
 ]
 ```
 
-`extraResources` копирует в `Contents/Resources/cli-tools/` — обычная
-директория, доступная для spawn.
+`extraResources` копирует workers в `Contents/Resources/python-workers/` —
+обычную директорию, доступную для spawn. `.venv` копируется отдельным
+`extraResources` entry; без него production упадёт не `ENOTDIR`, а
+`worker_dependency_missing` / `telethon not installed`.
 
 `electron/job-runner.js`:
 ```js
-const CLI_ROOT = app.isPackaged
-  ? path.join(process.resourcesPath, 'cli-tools')
-  : path.resolve(__dirname, '..', 'cli-tools')
+const WORKERS_ROOT = app.isPackaged
+  ? path.join(process.resourcesPath, 'python-workers')
+  : path.resolve(__dirname, '..', 'python-workers')
 ```
 
 `app.isPackaged` различает dev/prod без явного NODE_ENV.
@@ -68,21 +78,24 @@ const CLI_ROOT = app.isPackaged
 - **`asar: false`** в build config — выключает asar целиком, теряем sign+
   notarize-friendly архив. Большой удар по структуре сборки ради одной
   проблемы.
-- **`asarUnpack` для cli-tools** — копирует папку рядом с asar, но имя
-  получается `app.asar.unpacked/cli-tools/` — менее чистый путь, и `__dirname`
+- **`asarUnpack` для workers** — копирует папку рядом с asar, но имя
+  получается `app.asar.unpacked/python-workers/` — менее чистый путь, и `__dirname`
   всё равно указывает в asar, нужен такой же app.isPackaged-switch.
 - **Переписать `*_ndjson.py` в Node** — прибил бы Telethon-зависимость, но
-  CLI-side тоже на Python и они шарят shared модули. Перепиливать сейчас
-  нет смысла, см. `CLAUDE.md::cli-tools — папка со скриптами`.
+  весь Telegram/runtime-контур уже работает как Python workers. Перепиливать
+  ради packaging-ошибки нет смысла, см. `fact-python-воркеры.md`.
 
 ## ⚠ После фикса проверить
 
 ```bash
-ls "/Applications/SC Desktop.app/Contents/Resources/cli-tools/web/yt_single_ndjson.py"
+ls "/Applications/SC Desktop.app/Contents/Resources/python-workers/web/yt_single_ndjson.py"
+ls "/Applications/SC Desktop.app/Contents/Resources/.venv/bin/python3"
 ```
 
-Должен существовать. Если нет — проверить filter в `extraResources` (могло
-исключить что-то нужное).
+Оба пути должны существовать. Если нет workers — проверить filter в
+`extraResources`; если нет `.venv` — проверить `npm run build:install` /
+`npm run python:setup`. Симптом второго случая в UI: `telethon not installed`
+или `worker_dependency_missing`.
 
 ## 🪤 Другие prod-only path-ловушки (тот же класс багов)
 
@@ -90,7 +103,7 @@ ls "/Applications/SC Desktop.app/Contents/Resources/cli-tools/web/yt_single_ndjs
 в prod указывает в asar — производит ещё минимум три бага**, каждый
 проявляется отдельно по мере того как юзер открывает в prod очередную
 фичу. Все три починены, держим в уме при добавлении новых ресурсов из
-`cli-tools/` или нативных deps:
+`python-workers/` или нативных deps:
 
 ### `vec0.dylib` (sqlite-vec)
 
@@ -123,15 +136,11 @@ db.loadExtension(p)
 
 ### `embedder.js` искал `config.env` через `__dirname/../cli-tools`
 
-Аналогично `cwd` для spawn'ов: `__dirname/../cli-tools` в prod указывает
-в asar, а `cli-tools` живёт в `extraResources` (рядом с asar, не внутри).
-fs.readFile асаровского пути молча возвращает «нет файла», embedder
-бросает `GEMINI_API_KEY not found in env or cli-tools/config.env`.
-
-Симптом: **индексация запускается, мгновенно падает с error**, при том
-что ключ в config.env есть, fetch работает (job-runner уже использует
-`process.resourcesPath`). Решение — зеркальный switch на app.isPackaged
-прямо в embedder'е.
+Этот подпункт теперь исторический: ключ Gemini больше не ищется в
+`config.env`, активный контракт — env или `~/.config/sc/settings.json`
+(см. `fact-python-воркеры.md` и `fact-semantic-search.md::Gemini API key`).
+Сам шрам остаётся как пример того, почему любые ресурсы рядом со скриптами
+нельзя резолвить через `__dirname/..` в production.
 
 ### Sessions исключены из bundle
 
@@ -146,17 +155,16 @@ fs.readFile асаровского пути молча возвращает «н
 завершается через 1 секунду с `Session file 'session.session' not
 found`, fetch / preview / backfill / folder-resolve — все падают.
 
-Решение — общий helper `cli-tools/shared/tg_session_path.py` с приоритетом
+Решение — общий helper `python-workers/shared/tg_session_path.py` с приоритетом
 `[script_dir, ~/Library/Application Support/sc-desktop/sessions/telegram/]`.
 Подробно — `fact-telegram-sessions.md::Где живут session-файлы`. Новые
-sessions через UI (`sc -t settings` → Add) пишутся сразу в user-dir, а
-существующие dev-копии в `cli-tools/telegram/` остаются — dev-flow не
-ломается.
+sessions через UI пишутся сразу в user-dir; старые dev-копии из
+`cli-tools/telegram/` — legacy и не являются active runtime.
 
 > **Что отбросили:** автокопирование sessions из bundle в user-dir при
 > первом запуске prod-app. Сессий **в bundle нет** (выше — фильтр их
 > исключает), копировать нечего. Юзер заново логинится через UI, либо
-> руками копирует `cli-tools/telegram/session.session` в user-dir после
+> руками копирует старый `session.session` в user-dir после
 > чистой установки.
 
 ### PATH в GUI-launched prod (yt-dlp / ffmpeg / brew tools)
@@ -211,21 +219,22 @@ test'у false-pass.
 ### Общий чеклист
 
 При добавлении нового кода в **main process**, который читает что-либо
-из `cli-tools/` через FS (read, spawn, fork, native lib load) или пишет
+из `python-workers/` через FS (read, spawn, fork, native lib load) или пишет
 куда-либо рядом со скриптом:
 
 - ❓ Этот код будет работать в **packed asar**? Если использует `__dirname`
   + `..` — почти наверняка нет.
-- ✅ Read из cli-tools → `app.isPackaged ? path.join(process.resourcesPath, 'cli-tools', ...) : path.resolve(__dirname, '..', 'cli-tools', ...)`.
+- ✅ Read/spawn из workers → `app.isPackaged ? path.join(process.resourcesPath, 'python-workers', ...) : path.resolve(__dirname, '..', 'python-workers', ...)`.
 - ✅ Native .dylib/.so/.node резолвится через `require.resolve` →
   rewrite `app.asar/` → `app.asar.unpacked/`, плюс `asarUnpack` правило.
 - ✅ Write куда-либо рядом со скриптом (sessions, кэш, лог) → менять
   на user-dir (`~/Library/Application Support/sc-desktop/...`),
   либо явный prod-fallback.
-- ⚠ extraResources filter включает только `**/*.py` + `config.env` +
-  явные исключения. Любой новый non-Python ресурс из cli-tools (json,
+- ⚠ extraResources filter включает worker `.py` и отдельный `.venv`.
+  Любой новый non-Python ресурс из `python-workers` (json,
   txt, csv, sqlite-template) — добавляй в filter явно или будет
-  silently отсутствовать в bundle.
+  silently отсутствовать в bundle. Credentials не тащить как `config.env`:
+  активный источник — env / `~/.config/sc/settings.json`.
 - ✅ Вызываешь внешний бинарь по короткому имени (`yt-dlp`, `ffmpeg`,
   `pbcopy`, `afplay`) из Python-subprocess'а — main.js уже augment'ит PATH
   brew/macports путями, ничего делать не надо. Если нужен бинарь из
@@ -234,8 +243,7 @@ test'у false-pass.
 
 ## 🔗 Связанное
 
-- Venv Python захардкожен на `/Users/fedor/Desktop/telethon/venv/bin/python3`
-  (`job-runner.js::VENV_PYTHON`). Переезд на другую машину = указать новый
-  путь или bundling Python (что не сделано).
+- Python runtime выбирается через `SC_DESKTOP_PYTHON` → `.venv/bin/python3` →
+  системные fallback'и; production должен иметь bundled `.venv`.
 - `fact-telegram-sessions.md::Где живут session-файлы` — дев/прод
   fallback и почему bundle не содержит sessions.

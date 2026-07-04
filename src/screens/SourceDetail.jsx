@@ -19,7 +19,7 @@ import YouTubeQuickFetchForm from '../components/YouTubeQuickFetchForm'
 import IndexButton from '../components/IndexButton'
 import ToolbarButton from '../components/ToolbarButton'
 import NewRequestSplitButton from '../components/NewRequestSplitButton'
-import JobProgress from '../components/JobProgress'
+import JobProgress, { cleanErrorMessage } from '../components/JobProgress'
 import { refreshSources } from '../lib/sources'
 import { useJobs } from '../lib/jobs'
 import { useInvalidator } from '../lib/dataBus'
@@ -212,11 +212,21 @@ export default function SourceDetail({ payload }) {
     const src = data?.source
     if (!src || src.platform !== 'telegram' || !window.api?.tgFetch) return
     if (quickBusy) return
+    if (src.tg_session_conflict) {
+      flashQuickToast('Выбери Telegram-аккаунт')
+      return
+    }
+    if (!src.tg_session) {
+      flashQuickToast('Telegram-аккаунт не выбран')
+      return
+    }
     try {
       const content = loadLastUsedContent()
       const engine = loadLastUsedEngine()
       const params = {
         target: '@' + String(src.handle).replace(/^@/, ''),
+        _source_id: sourceId,
+        _tg_session_override: src.tg_session,
         ...buildContentParams(content, engine),
       }
       let since = 0
@@ -480,6 +490,10 @@ export default function SourceDetail({ payload }) {
             <div className="mb-8 rounded-lg border border-zinc-800 bg-zinc-950 p-6">
               <TelegramConfigForm
                 target={'@' + s.handle}
+                sourceId={sourceId}
+                sourceSession={s.tg_session || null}
+                sourceSessionConflict={!!s.tg_session_conflict}
+                notifyOnLaunch
                 onStarted={() => setNewFetchOpen(false)}
               />
             </div>
@@ -591,10 +605,11 @@ export default function SourceDetail({ payload }) {
             </div>
             {data.jobs && data.jobs.length > 0 ? (
               <div className="rounded-md border border-zinc-800 bg-zinc-950 divide-y divide-zinc-800 max-h-80 overflow-auto">
-                {data.jobs.map(j => (
+                {data.jobs.filter(isVisibleHistoryJobRow).map(j => (
                   <JobHistoryRow
                     key={j.id}
                     job={j}
+                    source={s}
                     liveJob={liveByDbId.get(j.id) || null}
                     onDelete={async () => {
                       await window.api.jobsDeleteOne(j.id)
@@ -744,6 +759,15 @@ function SessionBadge({ source, onPinned }) {
   const bound = source.tg_session || null
 
   useEffect(() => {
+    if (!bound || sessions != null || !window.api?.tgListSessions) return
+    let alive = true
+    window.api.tgListSessions()
+      .then(r => { if (alive) setSessions(r?.sessions || []) })
+      .catch(() => { if (alive) setSessions([]) })
+    return () => { alive = false }
+  }, [bound, sessions])
+
+  useEffect(() => {
     if (!open) return
     function onDoc(e) {
       if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false)
@@ -780,6 +804,21 @@ function SessionBadge({ source, onPinned }) {
     return who?.username ? `@${who.username}` : (who?.first_name || sess.name)
   }
 
+  function sessNick(sess) {
+    const who = sess.me || sess.me_cached
+    return who?.username || who?.first_name || sess.name
+  }
+
+  const boundSession = bound && Array.isArray(sessions)
+    ? sessions.find(sess => sess.name === bound)
+    : null
+  const boundDisplay = boundSession
+    ? sessNick(boundSession)
+    : (bound && sessions == null && /^session[_-]?\d+$/i.test(bound) ? 'сессия…' : bound)
+  const boundTitle = boundSession
+    ? `Чат привязан к сессии «${sessLabel(boundSession)}» (${bound}). Клик — сменить.`
+    : `Чат привязан к сессии «${bound}». Клик — сменить.`
+
   return (
     <span className="relative inline-flex" ref={wrapRef}>
       <button
@@ -795,11 +834,11 @@ function SessionBadge({ source, onPinned }) {
         title={conflict
           ? 'Чат запрашивался из разных сессий — выбери, к какой он относится'
           : bound
-            ? `Чат привязан к сессии «${bound}». Клик — сменить.`
+            ? boundTitle
             : 'Сессия не определена (старый чат). Клик — привязать вручную.'}
       >
         {conflict ? <TriangleAlert size={12} /> : <UserRound size={12} />}
-        {conflict ? 'выбери сессию' : (bound || 'сессия?')}
+        {conflict ? 'выбери сессию' : (boundDisplay || 'сессия?')}
       </button>
       {open && (
         <div className="absolute top-full left-0 mt-1 w-60 z-50 rounded-md border border-zinc-700 bg-zinc-900 shadow-xl py-1">
@@ -837,7 +876,15 @@ function SessionBadge({ source, onPinned }) {
   )
 }
 
-function JobHistoryRow({ job, liveJob, onDelete, onCancel }) {
+function isVisibleHistoryJobRow(job) {
+  try {
+    const params = JSON.parse(job?.parameters_json || '{}')
+    if (params?._range_plan_child) return false
+  } catch {}
+  return true
+}
+
+function JobHistoryRow({ job, source, liveJob, onDelete, onCancel }) {
   const [expanded, setExpanded] = useState(false)
   let params = {}
   try { params = JSON.parse(job.parameters_json || '{}') } catch {}
@@ -850,6 +897,10 @@ function JobHistoryRow({ job, liveJob, onDelete, onCancel }) {
   const eff = liveJob ? { ...job, ...liveJob, status: liveJob.status, items_done: liveJob.items_done } : job
   const dur = (eff.finished_at && eff.started_at) ? eff.finished_at - eff.started_at : null
   const { label, count, kindIcon, kindColor } = jobRowLabel(eff, params)
+  const issue = jobHistoryIssue(eff, params, source)
+  const labelTitle = [job.parameters_json, issue.title]
+    .filter(Boolean)
+    .join('\n')
 
   // Batch transcribe expands inline — its details (saved/skipped/cost +
   // per-video file list with Open) live entirely in DB + transcripts/, no
@@ -874,7 +925,18 @@ function JobHistoryRow({ job, liveJob, onDelete, onCancel }) {
         <span className="text-zinc-400 shrink-0 whitespace-nowrap tabular-nums" style={{ fontSize: '14px' }}>
           {dt ? dt.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' }) : '—'}
         </span>
-        <span className={`truncate flex-1 ${kindColor || 'text-zinc-300'}`} title={job.parameters_json}>{label}</span>
+        <span className="min-w-0 flex-1">
+          <span className={`block truncate ${kindColor || 'text-zinc-300'}`} title={labelTitle}>{label}</span>
+          {issue.text && (
+            <span
+              className={`mt-0.5 block truncate ${issue.className}`}
+              style={{ fontSize: '12px' }}
+              title={issue.title}
+            >
+              {issue.text}
+            </span>
+          )}
+        </span>
         <span className="text-zinc-500 shrink-0 tabular-nums" style={{ fontSize: '14px' }}>{count}</span>
         {dur !== null && (
           <span className="text-zinc-600 shrink-0 tabular-nums" style={{ fontSize: '14px' }}>
@@ -917,6 +979,83 @@ function JobHistoryRow({ job, liveJob, onDelete, onCancel }) {
       )}
     </div>
   )
+}
+
+function parseEmbeddedErrorMessage(raw) {
+  const s = String(raw || '')
+  const brace = s.indexOf('{')
+  if (brace < 0) return ''
+  try {
+    const data = JSON.parse(s.slice(brace))
+    return data?.error?.message || data?.message || ''
+  } catch {
+    return ''
+  }
+}
+
+function compactOneLine(s, max = 180) {
+  const line = String(s || '').replace(/\s+/g, ' ').trim()
+  if (line.length <= max) return line
+  return `${line.slice(0, Math.max(0, max - 1))}…`
+}
+
+function jobHistoryErrorText(job) {
+  if (!job?.error) return ''
+  const cleaned = cleanErrorMessage(job.error)
+  const message = parseEmbeddedErrorMessage(cleaned) || cleaned
+  if (!message) return ''
+  if (/GEMINI_API_KEY/i.test(message)) return 'Ключ Gemini не найден'
+  if (/API key expired|API_KEY_INVALID|API key not valid|key expired|key is invalid/i.test(message)) {
+    return 'Ключ Gemini недоступен'
+  }
+  if (/Gemini\s+429|quota|rate limit/i.test(message)) return 'Gemini: превышена квота'
+  if (/telethon.*not installed|not installed.*telethon|No module named ['"]?telethon/i.test(message)) {
+    return 'Telethon не установлен'
+  }
+  return compactOneLine(message)
+}
+
+function isPlainTelegramHistoryFetch(params) {
+  const mode = params?.mode || 'last_n'
+  if (mode !== 'last_n' && mode !== 'all') return false
+  if (params?.date || params?.date_to || params?.url || params?.sinceMessageId) return false
+  if (params?.include_comments) return false
+  if (Array.isArray(params?.topic_ids) && params.topic_ids.length > 0) return false
+  if (Array.isArray(params?._comments_only_post_ids) && params._comments_only_post_ids.length > 0) return false
+  if (Array.isArray(params?._media_only_msg_ids) && params._media_only_msg_ids.length > 0) return false
+  return true
+}
+
+function jobHistoryWarningText(job, params, source) {
+  const warning = job?.warning || params?._warning
+  if (!warning?.message) return ''
+  const itemsDone = Number(job?.items_done || job?.items_total || 0)
+  const sourceItems = Number(source?.items_count || 0)
+  if (warning.code === 'empty_result' && itemsDone === 0 && sourceItems > 0 && isPlainTelegramHistoryFetch(params)) {
+    return 'Telegram вернул 0 сообщений: проверь сессию'
+  }
+  return compactOneLine(warning.message)
+}
+
+function jobHistoryIssue(job, params, source) {
+  const errorText = jobHistoryErrorText(job)
+  if (errorText) {
+    return {
+      text: errorText,
+      title: cleanErrorMessage(job.error),
+      className: 'text-red-400/90',
+    }
+  }
+  const warningText = jobHistoryWarningText(job, params, source)
+  if (!warningText) return { text: '', title: '', className: '' }
+  const warning = job?.warning || params?._warning
+  return {
+    text: warningText,
+    title: warning?.message || warningText,
+    className: warning?.code === 'empty_result' && warningText.includes('проверь сессию')
+      ? 'text-red-400/90'
+      : 'text-amber-400/90',
+  }
 }
 
 /**

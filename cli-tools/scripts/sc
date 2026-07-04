@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+if [[ "${1:-}" == "-i" && ( "${2:-}" == "--login" || "${2:-}" == "login" ) ]]; then
+  shift 2
+  cd "$ROOT"
+  exec npm run instagram:login -- "$@"
+fi
+
+cat >&2 <<'EOF'
+This SC Desktop compatibility shim only supports:
+  sc -i --login
+
+For desktop runtime code, use python-workers/ inside sc-desktop.
+EOF
+exit 2

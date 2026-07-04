@@ -2,17 +2,21 @@
 
 Всё про Instagram-парсинг в desktop. Платформа в Library — `instagram`. Источник — профиль (`source.handle = '<username>'`), элементы — рилсы (`external_id = 'reel:<shortcode>'`) и опционально посты (`'post:<shortcode>'`).
 
-> Подмодуль `cli-tools/docs/knowledge/fact-instagram.md` описывает CLI-сторону (Playwright, Docker). Здесь — про desktop-flow и как этот стек устроен под Electron.
+Здесь — про desktop-flow и как Instagram-стек устроен под Electron через
+`python-workers`. Старые CLI-only материалы, если встретятся в истории, не
+являются точкой входа для desktop-правок.
 
-## 🧭 Три ndjson-скрипта
+## 🧭 Ndjson-скрипты Instagram
 
 | Скрипт | Что делает | Тип job |
 |---|---|---|
-| `cli-tools/instagram/ig_sessions_ndjson.py` | inventory cookies-файлов + delete | one-shot, не job |
-| `cli-tools/instagram/ig_profile_ndjson.py` | username → список reels/posts | `ig_profile_fetch` |
-| `cli-tools/instagram/ig_batch_transcribe_ndjson.py` | список shortcodes → транскрипты | `ig_batch_transcribe` |
+| `python-workers/instagram/ig_login_ndjson.py` | headed-login в Instagram и запись cookies | one-shot, не job |
+| `python-workers/instagram/ig_sessions_ndjson.py` | inventory/health-check cookies-файлов + delete | one-shot, не job |
+| `python-workers/instagram/ig_profile_ndjson.py` | username → список reels/posts | `ig_profile_fetch` |
+| `python-workers/instagram/ig_batch_transcribe_ndjson.py` | список shortcodes → транскрипты | `ig_batch_transcribe` |
 
-Все три используют `IGAPIClient` из `cli-tools/instagram/ig_api_core.py` (CLI-only код, но из spawn'а его импортировать **можно**, если обернуть в `silenced()` — он печатает в stdout с цветными ANSI).
+Скрипты используют worker-side API helpers. Любой helper, который пишет rich/ANSI
+в stdout, должен быть обёрнут `silenced()` — ndjson stdout остаётся чистым.
 
 ---
 
@@ -37,6 +41,7 @@
 - `X-IG-App-ID: 936619743392459` — публичный mobile-app ID, одинаковый у всех пользователей IG-приложения.
 
 Этого достаточно чтобы получить **публичные reels публичных профилей** с полными метаданными **и прямыми `video_url`** (signed CDN, действителен ~5–15 минут).
+Это requests-эмуляция Android-клиента, не Docker/headless-browser: браузер остался только для ручного login/cookies, не для парсинга reels.
 
 **Ограничения:**
 - Приватные профили → endpoint вернёт `login_required`. В UI это error для юзера, не silent skip.
@@ -58,8 +63,8 @@
 
 Что работает — это **повторно** дёрнуть `clips/user/` (тот же endpoint, что использует `ig_profile_ndjson.py`) для конкретного `target_user_id` и пагинировать пока нужный shortcode не появится. У каждого reel в payload уже есть свежий signed `video_url` (минуты-часы TTL).
 
-**Архитектура transcribe-job:**
-1. `ig_batch_transcribe_ndjson.py` принимает обязательный `--user-id <pk>` (passed из source.external_id в job-runner).
+**Архитектура transcribe-job через `--backend api`:**
+1. `ig_batch_transcribe_ndjson.py` принимает обязательный `--user-id <pk>` (passed из `source.external_id` в job-runner). Если job sourceless или у source нет числового Instagram `user_id`, api-путь невозможен: `clips/user/` не умеет резолвить произвольный shortcode без владельца.
 2. Перед первым reel'ом `_get_ig_client()` создаёт singleton `IGAPIClient(skip_session=True)`.
 3. Для каждого shortcode из batch:
     - Сначала смотрим `_cache[user_id].reels[shortcode]` — был ли он уже спарсен в предыдущем page.
@@ -83,21 +88,34 @@ Apify-runs работают так: POST `acts/<actor>/runs?token=...`, полу
 
 **Cancel-проблема:** при cancel job в Electron мы делаем `child.kill('SIGTERM')` — Python-процесс умирает, но **запущенный run на сервере Apify продолжает выполняться** ещё 5-30 секунд и спишет деньги. Мы не зовём `apify abort` API. Это известный недочёт; кост на отменённые runs пока приемлемый ($0.001-0.0026 максимум).
 
-**`apify_token`** — в `~/.config/sc/settings.json::instagram.apify_token`. Legacy plaintext-файл `~/.config/sc/apify_token` (CLI-старый формат) тоже читается через `cfg.get_apify_token()`. При сохранении токена через UI legacy-файл удаляется, чтобы CLI не подхватил устаревшее значение.
+**`apify_token`** — в `~/.config/sc/settings.json::instagram.apify_token`. Legacy plaintext-файл `~/.config/sc/apify_token` (CLI-старый формат) тоже читается через `cfg.get_apify_token()`. При сохранении токена через UI legacy-файл удаляется, чтобы CLI не подхватил устаревшее значение. InstagramSettings проверяет токен сетевым запросом к Apify `users/me`: «сохранён» означает только что секрет лежит на диске, «валиден» показывается только после ответа Apify.
 
 ---
 
 ## 🍪 Cookies для приватных профилей — опциональны
 
-`~/.config/sc/instagram_session.json` (Playwright storage_state) и `~/.config/sc/instagram_api_session.json` (плоский dict) — старый CLI-flow. Если файл есть и `IGAPIClient` создан **без** `skip_session=True`, он подхватит cookies и будет ходить как залогиненный юзер. Это нужно **только** для приватных профилей на которые юзер подписан.
+`~/.config/sc/instagram_session.json` (Playwright storage_state) и `~/.config/sc/instagram_api_session.json` (плоский dict) — два формата одной Instagram-сессии. Если файл есть и `IGAPIClient` создан **без** `skip_session=True`, он подхватит cookies и будет ходить как залогиненный юзер. Это нужно **только** для приватных профилей на которые юзер подписан.
 
-**В UI** управление сессиями скрыто за `Расширенное · Cookies-сессии` в InstagramSettings. Юзер видит файлы и может их удалить, но создание сессии — только через CLI: `sc -i --login`. Программно логиниться не пытаемся — IG банит за автозаполнение форм.
+**Login-flow:** `sc -i --login` (shim в `cli-tools/scripts/sc`) запускает тот же путь что и `npm run instagram:login`: headed Chrome через Playwright, пользователь логинится руками, скрипт ждёт `sessionid` cookie и сохраняет оба файла. Это не «браузерный парсер» и не Docker — только ручной способ получить cookies без автозаполнения Instagram-форм.
 
-`ig_sessions_ndjson.py` — read-only inventory:
-- `list` → emit per-file `{kind:'playwright'|'api', authorized, user_id, error}`
+**В UI** управление сессиями скрыто за `Расширенное · Cookies-сессии` в InstagramSettings. Юзер видит файлы, возраст файла, результат проверки и может удалить сессию. Наличие `sessionid` в JSON больше не считается доказательством авторизации: старая cookie могла протухнуть месяц назад, поэтому Settings вызывает `ig_sessions_ndjson.py list --check`.
+
+`ig_sessions_ndjson.py` — inventory + optional health-check:
+- `list` → emit per-file `{kind:'playwright'|'api', authorized, user_id, error, age_days}`
+- `list --check` → дополнительно делает network-check на `instagram.com/api/v1/accounts/edit/web_form_data/` и возвращает `health.ok`, `health.username` или HTTP/JSON-причину невалидности.
 - `delete --kind <k>` → удалить файл (используется в UI кнопкой 🗑)
 
-Скрипт **не делает** network-запросов — только парсит JSON-файлы на диске. Поэтому быстрый и без deps.
+Файл без network-check — это только inventory («на диске что-то есть»). UI-статусы «сессия проверена» / «не прошла проверку» опираются на `health`, а не на `authorized`.
+
+## 🎬 Одиночный reel из paste-flow
+
+Inline-форма для `https://www.instagram.com/reel/<shortcode>/...` больше не должна показывать CLI-заглушку. Поток такой:
+
+1. Сначала `ig:lookupReel` ищет уже готовый текст: `items.external_id = 'reel:<shortcode>'` для source-attached reels, затем sourceless `ig_batch_transcribe` jobs по `parameters_json.shortcodes` + `file_path`. Cache-hit сразу показывает «Уже есть транскрипт» и копирует combined-файл, без нового Apify run.
+2. Если shortcode уже привязан к локальному Instagram source с числовым `user_id`, можно идти бесплатным `android-api`: transcribe заново пагинирует `clips/user/<user_id>` и берёт свежий `video_url`.
+3. Если юзер вставил **голый reel URL**, а владельца/source в БД нет, бесплатный api-путь невозможен. `clips/user/` требует owner `user_id`; надёжного cookies-free shortcode-resolve в текущем стеке нет. В этом случае UI явно планирует Apify, проверяет валидность токена и пишет почему android-api не подходит.
+
+Это не silent fallback: переключение на платный backend для bare URL видно в форме до запуска. Если Apify token невалиден или не задан, кнопка блокируется с причиной.
 
 ---
 
@@ -143,4 +161,6 @@ Combined.txt пишется **автоматически** при close batch-jo
 - **`graphql/query/?shortcode=<c>`** — отвечает `require_login: true` для анонимных запросов. Workaround нет.
 - **Хранить `video_url` в БД при первом fetch** — signed URL экспирится через 5-15 минут, БД переполнится протухшими URL. Re-fetch перед скачиванием обязателен.
 - **Auto-fallback api → apify при ошибке** — отбросили: тихо тратятся деньги на apify в случаях которые юзер бы сам решил перезагрузкой / переключением. Failure visible — лучше чем quiet retry.
-- **Свой phone+code login flow в UI (как у Telegram)** — IG банит за автозаполнение полей входа. Cookies импортируются из Firefox/Chrome через `browser_cookie3`, не через UI.
+- **Парсинг через Docker/browser** — первый вариант был ближе к «открыть Instagram как страницу и вытащить данные», но Android mobile endpoints оказались быстрее и проще. Браузер не возвращаем в runtime-парсинг; он нужен только для headed login.
+- **Импорт cookies из Yandex/Chrome как основной flow** — browser cookies часто зашифрованы системным keychain и не читаются детерминированно из worker'а. Надёжнее дать пользователю headed-login, сохранить оба app-specific session-файла и потом проверять их network-check'ом.
+- **Свой phone+code login flow в UI (как у Telegram)** — IG банит за автозаполнение полей входа. Логин остаётся ручным в headed Chrome, UI только показывает команду и валидность получившихся cookies.

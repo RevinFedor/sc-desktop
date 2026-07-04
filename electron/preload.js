@@ -37,6 +37,15 @@ contextBridge.exposeInMainWorld('api', {
   tgLoginFinish:       (payload)  => ipcRenderer.invoke('tg:loginFinish', payload),
   tgDeleteSession:     (name)     => ipcRenderer.invoke('tg:deleteSession', name),
 
+  // Telegram Bot API bridge. State snapshots never include the bot token.
+  telegramBotState:   () => ipcRenderer.invoke('telegramBot:state'),
+  telegramBotRestart: () => ipcRenderer.invoke('telegramBot:restart'),
+  onTelegramBotUpdate: (fn) => {
+    const handler = (_evt, state) => fn(state)
+    ipcRenderer.on('telegramBot:update', handler)
+    return () => ipcRenderer.removeListener('telegramBot:update', handler)
+  },
+
   // Instagram settings + session inventory + profile fetch.
   igGetSettings:    ()         => ipcRenderer.invoke('ig:getSettings'),
   igSetBackend:     (payload)  => ipcRenderer.invoke('ig:setBackend', payload),
@@ -45,6 +54,7 @@ contextBridge.exposeInMainWorld('api', {
   igDeleteSession:  (kind)     => ipcRenderer.invoke('ig:deleteSession', kind),
   igOverview:       (payload)  => ipcRenderer.invoke('ig:overview', payload),
   igLookupProfile:  (payload)  => ipcRenderer.invoke('ig:lookupProfile', payload),
+  igLookupReel:     (payload)  => ipcRenderer.invoke('ig:lookupReel', payload),
   igProfileFetch:   (params)   => ipcRenderer.invoke('ig:profileFetch', params),
   igBatchTranscribe:(params)   => ipcRenderer.invoke('ig:batchTranscribe', params),
   igAssembleBatch:  (payload)  => ipcRenderer.invoke('ig:assembleBatchTranscript', payload),
@@ -109,6 +119,7 @@ contextBridge.exposeInMainWorld('api', {
     return () => ipcRenderer.removeListener('aistudio:update', handler)
   },
   jobDetail:      (id)     => ipcRenderer.invoke('jobs:detail', id),
+  jobSetAutoIndexAfterFetch: (payload) => ipcRenderer.invoke('jobs:setAutoIndexAfterFetch', payload),
   cancelJob:      (id)     => ipcRenderer.invoke('jobs:cancel', id),
   copyFile:       (path)   => ipcRenderer.invoke('jobs:copyFile', path),
   copyCombined:   (paths)  => ipcRenderer.invoke('jobs:copyCombined', paths),
@@ -131,6 +142,7 @@ contextBridge.exposeInMainWorld('api', {
   itemsSearch:   (params)   => ipcRenderer.invoke('items:search', params),
   itemsTopics:   (sourceId) => ipcRenderer.invoke('items:topics', sourceId),
   itemsTypeBreakdown: (params) => ipcRenderer.invoke('items:typeBreakdown', params),
+  itemsTelegramMediaEstimate: (scope) => ipcRenderer.invoke('items:telegramMediaEstimate', scope),
   itemsCopyMany:      (payload) => ipcRenderer.invoke('items:copyMany', payload),
   itemsAssembleEstimate: (scope) => ipcRenderer.invoke('items:assembleEstimate', scope),
   itemsAssembleCopy:     (scope) => ipcRenderer.invoke('items:assembleCopy', scope),
@@ -142,6 +154,7 @@ contextBridge.exposeInMainWorld('api', {
   jobsDeleteOne:      (id) => ipcRenderer.invoke('jobs:deleteOne', id),
   jobsClearForSource: (id) => ipcRenderer.invoke('jobs:clearForSource', id),
   sourceMaxExternalId:(id) => ipcRenderer.invoke('sources:maxExternalId', id),
+  diagLog:            (payload) => ipcRenderer.send('diag:rendererEvent', payload),
   sourceGetNotes:     (id) => ipcRenderer.invoke('sources:getNotes', id),
   sourceSetNotes:     (id, notes) => ipcRenderer.invoke('sources:setNotes', { id, notes }),
 

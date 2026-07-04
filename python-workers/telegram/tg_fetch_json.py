@@ -85,7 +85,7 @@ try:
         ReactionEmoji, ReactionCustomEmoji,
     )
 except ImportError:
-    print(json.dumps({"type": "error", "message": "telethon not installed"}), flush=True)
+    print(json.dumps({"type": "error", "message": "telethon not installed", "code": "worker_dependency_missing"}), flush=True)
     sys.exit(2)
 
 # Forum topics moved between Telethon versions:
@@ -711,7 +711,7 @@ async def resolve_title(text, fuzzy=False, limit=50):
         except Exception: pass
         return 4
 
-    needle = _normalize_title(text)
+    needle = _normalize_title(str(text or "").lstrip("@"))
     matches = 0
     scanned = 0
     try:
@@ -721,12 +721,15 @@ async def resolve_title(text, fuzzy=False, limit=50):
                 emit({"type": "resolve_progress", "scanned": scanned})
             t = " ".join((d.name or "").split())
             title_norm = _normalize_title(t)
-            if fuzzy:
-                if not needle or needle not in title_norm:
-                    continue
-            elif title_norm != needle:
-                continue
             ent = d.entity
+            username_norm = _normalize_title(getattr(ent, "username", None))
+            ent_id = getattr(ent, "id", None)
+            id_matches = ent_id is not None and needle in {str(ent_id), f"-100{ent_id}"}
+            if fuzzy:
+                if not needle or (needle not in title_norm and needle not in username_norm and not id_matches):
+                    continue
+            elif title_norm != needle and username_norm != needle and not id_matches:
+                continue
             last_at = None
             if d.date:
                 try: last_at = d.date.isoformat()
@@ -1008,6 +1011,7 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
     # Optional upper-bound on message.date — set by the from_date branch when
     # --date-to is also passed. Filtered in the consume loop below.
     date_to_cutoff = None
+    parsed_from_date = None
     if mode == "last_n":
         kwargs["limit"] = limit
         # Skip-dupes path: caller passes --since-msgid pointing at the
@@ -1043,7 +1047,9 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
         # then date-only "dd.mm.yy" / "dd.mm.yyyy" (assumed 00:00).
         # ISO "yyyy-mm-dd" tolerated too — it's what users paste from anywhere.
         def _parse_user_date(s):
-            for fmt in ("%d.%m.%y %H:%M", "%d.%m.%Y %H:%M",
+            for fmt in ("%d.%m.%y %H:%M:%S", "%d.%m.%Y %H:%M:%S",
+                        "%Y-%m-%d %H:%M:%S",
+                        "%d.%m.%y %H:%M", "%d.%m.%Y %H:%M",
                         "%d.%m.%y",       "%d.%m.%Y",
                         "%Y-%m-%d %H:%M", "%Y-%m-%d"):
                 try:
@@ -1057,6 +1063,7 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
                   "message": f"Bad date {date_str!r}: ожидаю «01.01.26», «01.01.2026» или «01.01.2026 12:00»"})
             await client.disconnect()
             return 2
+        parsed_from_date = parsed
         kwargs["offset_date"] = parsed
         kwargs["reverse"] = True
         if limit:
@@ -1266,6 +1273,7 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
         nonlocal_count = {"v": 0}
 
         async def _consume_iter(iter_kwargs):
+            nonlocal date_min, date_max, total_voice_seconds, total_video_seconds
             async for msg in client.iter_messages(**iter_kwargs):
                 # Upper-bound filter (--date-to). Iteration is reverse=True
                 # (oldest → newest), so once a message is past the cutoff
@@ -1432,7 +1440,17 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
         ent_kind = kind_of(entity)
         uname = getattr(entity, "username", None)
         label = ("@" + uname) if uname else title_of(entity)
-        if since_msgid and since_msgid > 0:
+        if mode == "from_date" and parsed_from_date is not None and parsed_from_date > datetime.now():
+            emit({
+                "type": "warning",
+                "code": "future_date",
+                "message": (
+                    f"Ничего не найдено: дата начала {parsed_from_date.strftime('%d.%m.%Y')} "
+                    f"ещё не наступила (сегодня {datetime.now().strftime('%d.%m.%Y')}). "
+                    f"Диапазон из будущего для {label} всегда вернёт 0 сообщений."
+                ),
+            })
+        elif since_msgid and since_msgid > 0:
             emit({
                 "type": "warning",
                 "code": "no_new_messages",

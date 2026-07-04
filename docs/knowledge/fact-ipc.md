@@ -42,6 +42,17 @@ per-item emit = 5000 IPC frames + 5000 React re-renders. Прогресс-бар
 > ничего не сломано. Throttled emit раз в 250 мс — видимый прогресс без
 > render-storm.
 
+Throttle решает live-progress storm, но не freeze на закрытии job. Если после
+`done` приложение зависает на несколько секунд, ищи не `emit(job)`, а sync
+SQLite work в close-handler (`bulkUpsertItems`, coverage, sidecar write). Для
+Telegram больших чатов guard — chunked DB write с yield между пачками; детали и
+production-симптом `MainLoopGap` — `fact-jobs.md::Chunked close write`.
+
+ETA не является поводом увеличивать частоту IPC. Для Telegram `from_date`
+оценка времени берётся из тех же page-boundary samples и save-chunk callbacks,
+которые уже дают осмысленный прогресс. Если хочется точнее — улучшай sampling
+внутри этих границ, а не возвращай `emit(job)` на каждый item.
+
 ### То же правило для YouTube batch transcribe
 
 Аналогичный контракт: `yt_batch_transcribe_ndjson.py` эмитит per-video события (`item_start`, `subs_racing`, `transcribe_done`, ...), но job-runner вызывает `emit(snapshot)` **только** на агрегатных границах: `saved`, `skipped`, `item_error`, `done`. Иначе на 50 видео получим 250+ rerender'ов для прогресс-панели в picker'е. См. `fact-youtube.md::Batch transcribe`.

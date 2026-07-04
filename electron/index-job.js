@@ -181,7 +181,7 @@ function buildText(row, priors) {
 /**
  * Start indexing. Returns the job id (newly created or already-running).
  */
-function start({ sourceId, limit }) {
+function start({ sourceId, limit, origin = 'unknown' }) {
   const startMs = Date.now()
   if (!sourceId) throw new Error('sourceId required')
   const existing = activeJobs.get(sourceId)
@@ -205,7 +205,7 @@ function start({ sourceId, limit }) {
 
   const selectStartedMs = Date.now()
   const items = selectItems(sourceId, limit || null)
-  console.log(`[IndexJob] start source #${sourceId} limit=${limit || 'full'} selectItems rows=${items.length} took ${Date.now() - selectStartedMs}ms`)
+  console.log(`[IndexJob] start source #${sourceId} origin=${origin} limit=${limit || 'full'} selectItems rows=${items.length} took ${Date.now() - selectStartedMs}ms`)
   if (!items.length) {
     // Nothing to do — return a noop signal so the UI can toast "уже
     // проиндексирован". We don't write a jobs-table row for a no-op (would
@@ -232,7 +232,7 @@ function start({ sourceId, limit }) {
   }
   activeJobs.set(sourceId, job)
   emit(job)
-  console.log(`[IndexJob] start source #${sourceId} live #${job.id} setup took ${Date.now() - startMs}ms`)
+  console.log(`[IndexJob] start source #${sourceId} origin=${origin} live #${job.id} setup took ${Date.now() - startMs}ms`)
 
   // Persist a row in jobs table so it appears in "История парсинга".
   try {
@@ -241,7 +241,7 @@ function start({ sourceId, limit }) {
       source_id: sourceId,
       status: 'running',
       items_total: items.length,
-      params: { limit: limit || null },
+      params: { limit: limit || null, origin },
       started_at: job.started_at,
     })
   } catch (err) {
@@ -263,7 +263,13 @@ function start({ sourceId, limit }) {
       for (let i = 0; i < items.length; i += BATCH_SIZE) {
         if (job.cancelled) throw new Error('cancelled')
         const batch = items.slice(i, i + BATCH_SIZE)
+        const ctxStarted = Date.now()
         const ctxMap = buildContextMap(sourceId, batch)
+        const ctxMs = Date.now() - ctxStarted
+        if (ctxMs >= 100) {
+          console.log(`[IndexJob] #${job.id} slow context batch ${i / BATCH_SIZE + 1}/${Math.ceil(items.length / BATCH_SIZE)} ` +
+            `source #${sourceId} origin=${origin} rows=${batch.length} ctx_ms=${ctxMs}`)
+        }
         const texts = batch.map(r => buildText(r, ctxMap.get(r.id) || []))
         // Pre-flight: does this batch fit under RPM_TARGET in the rolling
         // 60-second window? If not, sleep until the oldest entry expires.
@@ -277,19 +283,33 @@ function start({ sourceId, limit }) {
         }
         const t0 = Date.now()
         const vecs = await embedBatch(texts, 'RETRIEVAL_DOCUMENT')
+        const embedMs = Date.now() - t0
         reqLog.push({ ts: t0, units: batch.length })
         const rows = batch.map((r, k) => ({ item_id: r.id, embedding: vecs[k] }))
+        const bulkStarted = Date.now()
         db.bulkUpsertVectors(rows)
+        const bulkMs = Date.now() - bulkStarted
+        if (bulkMs >= 100) {
+          console.log(`[IndexJob] #${job.id} slow bulkUpsert batch ${i / BATCH_SIZE + 1}/${Math.ceil(items.length / BATCH_SIZE)} ` +
+            `source #${sourceId} origin=${origin} rows=${rows.length} bulk_ms=${bulkMs}`)
+        }
         job.items_done += batch.length
         const ms = Date.now() - t0
         console.log(`[IndexJob] #${job.id} batch ${i / BATCH_SIZE + 1}/${Math.ceil(items.length / BATCH_SIZE)} ` +
-          `(${batch.length} msgs, ${ms}ms, ${unitsInWindow()} RPM in window) → ${job.items_done}/${job.items_total}`)
+          `(${batch.length} msgs, total=${ms}ms embed=${embedMs}ms bulk=${bulkMs}ms ctx=${ctxMs}ms, ${unitsInWindow()} RPM in window) → ${job.items_done}/${job.items_total}`)
         emit(job)
         // Sync DB row so "История парсинга" / JobDetail see the live
         // counter, not a frozen 0/N until the very end. updateJob does a
         // tight WHERE id=?, no measurable cost compared to embedBatch.
         if (job.dbRowId) {
-          try { db.updateJob(job.dbRowId, { items_done: job.items_done }) }
+          try {
+            const updateStarted = Date.now()
+            db.updateJob(job.dbRowId, { items_done: job.items_done })
+            const updateMs = Date.now() - updateStarted
+            if (updateMs >= 100) {
+              console.log(`[IndexJob] #${job.id} slow updateJob source #${sourceId} origin=${origin} update_ms=${updateMs}`)
+            }
+          }
           catch (err) { console.error('[IndexJob] mid-run updateJob failed', err.message) }
         }
       }

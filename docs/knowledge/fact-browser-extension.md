@@ -1,15 +1,15 @@
 # Knowledge: Browser Parser (расширение)
 
-Браузерный канал парсинга в SC Desktop. Лежит в `sc-desktop/browser-extension/` рядом с `cli-tools/`. **Это не часть Electron-приложения** — отдельный MV3-extension Chrome/Yandex, который юзер вручную устанавливает через `browser://extensions` → «Load unpacked». Логи пишутся в `~/Desktop/sc-desktop/browser-extension/logs/exporter-YYYY-MM-DD.log` через Native Messaging Host (отдельный Node-процесс, спавнится браузером).
+Браузерный канал парсинга в SC Desktop. Лежит в `sc-desktop/browser-extension/` рядом с Electron-кодом и `python-workers/`. **Это не часть Electron-приложения** — отдельный MV3-extension Chrome/Yandex, который юзер вручную устанавливает через `browser://extensions` → «Load unpacked». Логи пишутся в `~/Desktop/sc-desktop/browser-extension/logs/exporter-YYYY-MM-DD.log` через Native Messaging Host (отдельный Node-процесс, спавнится браузером).
 
 ## Зачем существует отдельно от CLI
 
-Платформы которые уже покрывает CLI (`cli-tools/youtube/`, `telegram/`, etc.) имеют public API или yt-dlp. Они вне браузера парсятся проще. Этот extension — для **двух классов источников где CLI невозможен**:
+Платформы которые уже покрывают `python-workers/` (`web/`, `telegram/`, etc.) имеют public API или yt-dlp. Они вне браузера парсятся проще. Этот extension — для **двух классов источников где worker-канал невозможен**:
 
-1. **Нет публичного API + cookie-only auth** → AI Studio (Google), Perplexity Computer/Tasks. CLI с anonymous-cookies возвращает 401.
-2. **Anti-bot защита блокирует yt-dlp** → планируется YouTube как fallback. Браузер с реальным юзер-cookie проходит мимо detection.
+1. **Нет публичного API + cookie-only auth** → AI Studio (Google), Perplexity Computer/Tasks, ChatGPT conversation export. CLI с anonymous-cookies возвращает 401.
+2. **Anti-bot защита блокирует yt-dlp / нужен реальный browser-context** → YouTube UI/bridge и browser-only страницы. Браузер с реальным юзер-cookie проходит мимо detection.
 
-То есть — это **четвёртый канал парсинга** наравне с `tg_*_ndjson.py`, `yt_*_ndjson.py`, `ig_*_ndjson.py`. Не подмена CLI, а добор того что CLI не может.
+То есть — это **четвёртый канал парсинга** наравне с `tg_*_ndjson.py`, `yt_*_ndjson.py`, `ig_*_ndjson.py`. Не подмена workers, а добор того что обычный subprocess-канал не может.
 
 ## Что покрыто сейчас (v1.4.0)
 
@@ -35,11 +35,18 @@
   видимые файловые карточки и текстовые preview вложений. Для документов exporter
   сначала использует встроенную кнопку `Copy` в viewer'е Claude, а DOM читает только
   как fallback; бинарники и картинки пока не скачиваются.
+- **ChatGPT** (`/c/<conversation-id>`) — popup export текущей ветки чата. Основной
+  путь не DOM, а same-origin backend API ChatGPT: `current_node` + `mapping`
+  дают текущую ветку целиком, включая reasoning/tool activity и вложения. DOM fallback
+  существует только как аварийный путь: ChatGPT виртуализирует историю, и видимый DOM
+  может содержать малую часть conversation.
 - **YouTube** (`/`, `/results`, `/@channel/videos`, `/watch`) — pill-кнопка
   «забрать в sc-desktop» на каждой видео-карточке + FAB на /watch. Click → POST
-  на bridge sc-desktop'а (см. `fact-yt-extension-bridge.md`). Опциональный
-  автоскрапинг → новая вкладка Gemini Studio в фоне. Прогресс — на самой кнопке
-  (sending/working/opening/done/error), без toast'ов.
+  на bridge sc-desktop'а (см. `fact-yt-extension-bridge.md`). Правая половина
+  `+ ai` отправляет готовый текст в выбранный target: Gemini Studio, Claude или
+  ChatGPT. Gemini/Claude идут через autoscrape-вкладку, ChatGPT — через отдельный
+  `sc-compose` handoff без MCP/research extraction. Прогресс — на самой кнопке и в YT-toast'ах
+  (sending/searching/transcribing/opening/done/pasted/error).
 
 ## Архитектура
 
@@ -49,7 +56,7 @@ NMH-процесс + HTTP-bridge на стороне Electron (для YouTube). 
 браузер вместо main process.
 
 ```
-[content.js / perplexity-content.js / claude-content.js / youtube-content.js / aistudio-autoscrape.js]
+[content.js / perplexity-content.js / claude-content.js / chatgpt-research.js / youtube-content.js / aistudio-autoscrape.js]
    ↓ chrome.runtime.sendMessage   ↘ HTTP fetch
 [background.js (service worker)]   [Electron HTTP bridge :53127]
    ↓ chrome.runtime.connectNative      (только YouTube ↔ sc-desktop;
@@ -66,11 +73,12 @@ NMH-процесс + HTTP-bridge на стороне Electron (для YouTube). 
 | `aistudio-autoscrape.js` | AI Studio автоскрапинг (входящий поток для YouTube). ~210 строк. См. `fact-yt-extension-flow.md::autoscrape`. |
 | `perplexity-content.js` | Perplexity парсинг через REST API. ~370 строк, включает overlay. |
 | `claude-content.js` | Claude chat export через DOM. Читает только колонку текущей переписки, раскрывает status/Show more и file preview-панели, не обходит стрелки edit-history. |
+| `chatgpt-research.js` | Общий ChatGPT automation-layer: research job, YouTube `sc-compose` handoff и popup export текущего `/c/<id>`. Для popup export сначала читает `/backend-api/conversation/<id>`, DOM использует только fallback'ом. |
 | `youtube-content.js` | Pill-кнопка на YouTube-карточках/FAB. ~370 строк. См. `fact-yt-extension-flow.md`. |
 | `logger.js` | Универсальный фасад: `log.info|warn|error|debug|timed|timer|domSnapshot`. Зеркалит в console + шлёт в background. Загружается во все content-script'ы через `manifest.content_scripts[].js`. |
-| `background.js` | Service worker. (а) Релеит логи AI Studio/Perplexity/Claude в NMH через port, буферит последние 500 событий в `chrome.storage.local` как fallback. (б) **YouTube job-tracker:** хранит активные job'ы в `chrome.storage.local`, polls bridge через `chrome.alarms` (period 6с), на готовности открывает Gemini Studio через `chrome.tabs.create({active:false})` и шлёт state-update в YouTube-вкладку. (в) Выполняет main-world click для claude.ai, когда synthetic click не проходит из content-script world. |
-| `popup.html/js` | UI с блоком **Настройка экспорта**: tabs Gemini Studio / Perplexity / Claude + общий switch `Скачивать файл`. YouTube flow живёт отдельным блоком ниже. Активный сайт автоматически открывает свой export-tab. |
-| `settings.js` | Дефолты + sanitize/detect helpers для AI Studio, Perplexity, Claude export, YouTube и общего `__export.downloadFile`. |
+| `background.js` | Service worker. (а) Релеит логи AI Studio/Perplexity/Claude/ChatGPT в NMH через port, буферит последние 500 событий в `chrome.storage.local` как fallback. (б) **YouTube job-tracker:** хранит активные job'ы в `chrome.storage.local`, polls bridge через `chrome.alarms` (period 6с), на готовности открывает выбранный AI-target в фоне и шлёт state-update в YouTube-вкладку. (в) Выполняет main-world click для claude.ai, когда synthetic click не проходит из content-script world. |
+| `popup.html/js` | UI с блоком **Настройка экспорта**: tabs Gemini Studio / Perplexity / Claude / ChatGPT + общий switch `Скачивать файл`. YouTube flow живёт отдельным блоком ниже. Активный сайт автоматически открывает свой export-tab. |
+| `settings.js` | Дефолты + sanitize/detect helpers для AI Studio, Perplexity, Claude/ChatGPT export, YouTube и общего `__export.downloadFile`. |
 | `libs/jszip.min.js` | Локальная копия (CSP запрещает CDN). Используется только AI Studio экспорт. |
 | `nmh/host.js` | Node-процесс. Принимает length-prefixed JSON (4 byte LE + payload), пишет в файл лога. |
 | `nmh/setup.js` | **Идемпотентный установщик.** Генерит RSA-ключ, прописывает публичный ключ в `manifest.json` (фиксирует extension ID), деплоит NMH-манифест в Chrome и Yandex `NativeMessagingHosts/`. |
@@ -163,6 +171,32 @@ Extension ID **зафиксирован навсегда** через `manifest.
 заголовок реально найден внутри текущего scope; если title живёт только в sidebar
 или другой ветке edit-history, exporter быстро оставляет metadata/placeholder и идёт
 дальше, а не ждёт timeout.
+
+## Поток данных (ChatGPT)
+
+1. Popup доступен на `https://chatgpt.com/c/<conversation-id>` и шлёт в
+   `chatgpt-research.js` `{action:'export', settings}` с `__chatgpt` и общим
+   `__export.downloadFile`.
+2. Primary path — API-first: content-script берёт access token из
+   `/api/auth/session`, затем same-origin `fetch('/backend-api/conversation/<id>')`.
+   Это не optional optimization, а защита от потери данных: на живом проверочном чате
+   2026-07-03 DOM показывал 44 видимых turn'а, а backend mapping содержал 235 nodes,
+   current-branch path 227 nodes и 150 значимых записей.
+3. Ветка строится назад от `current_node` через `mapping[parent]`, затем разворачивается
+   в прямой порядок. Экспортируется именно текущая ветка, а не соседние edit-history
+   версии prompt'ов. DOM fallback скроллит видимые сообщения и sources panel, но не
+   должен считаться полным, потому что виртуализация ChatGPT скрывает старые turn'ы.
+4. Markdown различает `user`, финальный `assistant`, reasoning/thinking, tool/code/output
+   activity и attachments. File citations без URL (`source: my_files`) не становятся
+   web-источниками: это вложения/цитаты внутри чата. Web source считается source только
+   когда есть реальный `http(s)` URL.
+5. Пустой API-markdown — не “успех с пустым файлом”: exporter падает на DOM fallback.
+   Cancel проверяется и в API path, потому что большой conversation может долго
+   обходиться без UI-scroll.
+6. Доставка: `downloadFile=false` → сначала `navigator.clipboard.writeText`. На реальном
+   popup-запуске ChatGPT это падало с `Document is not focused`; fallback — временный
+   textarea + `document.execCommand('copy')`. Если браузер заблокировал оба clipboard
+   пути, exporter скачивает `.md` как деградацию вместо красного abort'а.
 
 ## Где лежит финальный текст ответа Perplexity (важная гетча)
 
@@ -317,14 +351,14 @@ grep "turn .*/.*END" logs/exporter-*.log | tail -50
 Хранятся в `chrome.storage.sync`. Меняются live (без кнопки «Save»), без отдельного
 submit/save шага.
 Popup автодетектит сайт через `detectSite(tab.url)`: Gemini Studio / Perplexity /
-Claude открывают соответствующий tab в блоке «Настройка экспорта», YouTube остаётся
-отдельной секцией.
+Claude / ChatGPT открывают соответствующий tab в блоке «Настройка экспорта», YouTube
+остаётся отдельной секцией.
 
 ### Общие export-настройки (под ключом `__export`)
 
 | Ключ | Что значит |
 |---|---|
-| `downloadFile` | Default `false`: текстовый markdown копируется в clipboard. Если `true`, текстовые Gemini/Perplexity/Claude экспорты скачивают `.md`. Gemini ZIP с картинками скачивается всегда, потому что clipboard не несёт assets. |
+| `downloadFile` | Default `false`: текстовый markdown копируется в clipboard. Если `true`, текстовые Gemini/Perplexity/Claude/ChatGPT экспорты скачивают `.md`. Gemini ZIP с картинками скачивается всегда, потому что clipboard не несёт assets. |
 
 ### AI Studio (top-level keys в storage)
 
@@ -355,14 +389,35 @@ Perplexity-настройки **НЕ читаются content-script'ом из s
 
 Claude-настройки, как и Perplexity, отправляются popup'ом inline вместе с `__export`.
 
+### ChatGPT (под ключом `__chatgpt`)
+
+| Ключ | Что значит |
+|---|---|
+| `includeReasoning` | Default `true`: reasoning/thinking summary и внутренние рассуждения ChatGPT, если они есть в API/DOM. |
+| `includeSources` | Default `true`: web URL sources из backend metadata или sources panel. File citations без URL остаются вложениями/цитатами, не web sources. |
+| `includeSourceActivity` | Default `true`: tool/code/output activity, search steps и snippets. Для agentic ответов это часто главный невидимый слой, который DOM-only экспорт терял бы. |
+| `includeImages` | Default `true`: видимые/generated изображения попадают в markdown как ссылки/подписи; assets не скачиваются архивом. |
+
+ChatGPT-настройки, как Claude/Perplexity, отправляются popup'ом inline вместе с
+`__export`. Это важно: активный tab уже содержит cookie/session, а storage-read внутри
+page path не должен быть дополнительным source of truth.
+
 ### YouTube (под ключом `__yt`)
 
 | Ключ | Что значит |
 |---|---|
-| `auto_aistudio` | (bool) После транскрибации открывать Gemini Studio в фоне с готовым промптом |
+| `auto_aistudio` | (bool, legacy name) После транскрибации открывать выбранный AI-target в фоне с готовым текстом |
+| `target` | `aistudio` / `claude` / `chatgpt`: куда уходит правая половина `+ ai` |
 | `with_comments` | (bool) Дополнительно тянуть комменты к видео; склеиваются с транскриптом одним блобом |
 | `system_instruction` | (string) **Имя сохранённого пресета** в Gemini Studio (а не сам текст инструкции). Autoscrape выберет его из `mat-select` dropdown'а; не найден или дубли → throw |
 | `model_title` | (string, default «Gemini 3 Flash Preview») Точное имя model-card'а |
+| `claude_project` / `claude_model` / `claude_post_project` | Claude-target настройки; живут рядом с Gemini-настройками и не стираются при переключении target'а |
+| `chatgpt_prompt` / `chatgpt_model` / `chatgpt_effort` | ChatGPT-target настройки; prompt добавляется перед текстом видео, модель/effort уходят в `sc-compose` handoff |
+
+Настройки target'ов хранятся параллельно. Popup показывает только карточку
+выбранной цели, но переключение селекта не теряет Gemini/Claude/ChatGPT
+конфигурацию — это важно для YouTube-пересказа, где один и тот же `+ ai`
+должен менять destination, а не форму текста.
 
 YouTube-настройки **читаются content-script'ом из storage напрямую** —
 кнопка на карточке должна знать `auto_aistudio` чтобы показать `⬇ sc · AI`
@@ -395,3 +450,6 @@ YouTube-настройки **читаются content-script'ом из storage �
   скачиваются только по явному switch'у или когда у Gemini есть картинки/ZIP.
   Claude export читает текущую ветку, раскрывает status/Show more и документы берёт
   через viewer Copy-first, без скачивания текстовых preview.
+- **1.4.x+** — добавлен ChatGPT popup export текущего `/c/<id>` через backend
+  conversation API + DOM fallback. Отдельно от этого YouTube `+ ai → ChatGPT`
+  использует `sc-compose` handoff и не пишет результат в MCP history.

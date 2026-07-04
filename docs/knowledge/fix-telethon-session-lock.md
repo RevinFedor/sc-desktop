@@ -11,7 +11,7 @@
 
 ## 🔍 Корневая причина
 
-Все три случая используют один файл `cli-tools/telegram/session2.session` —
+Все три случая используют один файл `python-workers/telegram/session2.session` —
 sqlite-БД Telethon с auth_keys. Telethon `SQLiteSession` открывает соединение
 **без `busy_timeout`**, поэтому второй параллельный коннект (preview /
 resolve-title spawn'ятся отдельным Python-процессом) ловит lock мгновенно

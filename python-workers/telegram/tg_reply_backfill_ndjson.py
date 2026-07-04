@@ -59,7 +59,7 @@ try:
         ReactionEmoji, ReactionCustomEmoji,
     )
 except ImportError:
-    print(json.dumps({"type": "error", "message": "telethon not installed"}), flush=True)
+    print(json.dumps({"type": "error", "message": "telethon not installed", "code": "worker_dependency_missing"}), flush=True)
     sys.exit(2)
 
 try:

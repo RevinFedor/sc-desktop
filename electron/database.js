@@ -94,6 +94,9 @@ CREATE TABLE IF NOT EXISTS items (
 
 CREATE INDEX IF NOT EXISTS idx_items_source     ON items(source_id);
 CREATE INDEX IF NOT EXISTS idx_items_published  ON items(published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_items_source_published ON items(source_id, published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_items_source_caption_present ON items(source_id)
+  WHERE caption IS NOT NULL AND length(trim(caption)) > 0;
 CREATE INDEX IF NOT EXISTS idx_items_status     ON items(download_status, transcribe_status);
 CREATE INDEX IF NOT EXISTS idx_items_type       ON items(source_id, type);
 
@@ -491,10 +494,45 @@ function close() {
 
 // ─── Sources ──────────────────────────────────────────────────────────
 
+function cleanMetaPatch(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const out = {}
+  for (const [key, val] of Object.entries(value)) {
+    if (val == null) continue
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      const nested = cleanMetaPatch(val)
+      if (Object.keys(nested).length) out[key] = nested
+    } else {
+      out[key] = val
+    }
+  }
+  return out
+}
+
+function mergeSourceMetaJson(existingJson, patch) {
+  let base = {}
+  try {
+    base = existingJson ? JSON.parse(existingJson) : {}
+    if (!base || typeof base !== 'object' || Array.isArray(base)) base = {}
+  } catch {
+    base = {}
+  }
+  const cleanPatch = cleanMetaPatch(patch)
+  const merged = { ...base }
+  for (const [key, val] of Object.entries(cleanPatch)) {
+    if (val && typeof val === 'object' && !Array.isArray(val)
+      && merged[key] && typeof merged[key] === 'object' && !Array.isArray(merged[key])) {
+      merged[key] = { ...merged[key], ...val }
+    } else {
+      merged[key] = val
+    }
+  }
+  return Object.keys(merged).length ? JSON.stringify(merged) : null
+}
+
 function upsertSource({ platform, handle, display_name, external_id, avatar_url, meta, mark_synced, is_explicit, tg_session }) {
   const db = getDb()
   const now = Math.floor(Date.now() / 1000)
-  const meta_json = meta ? JSON.stringify(meta) : null
   const cleanHandle = String(handle || '').replace(/^@+/, '').trim()
 
   // is_explicit семантика: ставится в 1 callerом ИМЕННО при целенаправленном
@@ -536,22 +574,23 @@ function upsertSource({ platform, handle, display_name, external_id, avatar_url,
     let row = null
     if (extId) {
       row = db.prepare(
-        `SELECT id, handle FROM sources
+        `SELECT id, handle, meta_json FROM sources
           WHERE platform='telegram' AND external_id=? LIMIT 1`).get(extId)
     }
     if (!row) {
       row = db.prepare(
-        `SELECT id, handle FROM sources
+        `SELECT id, handle, meta_json FROM sources
           WHERE platform='telegram' AND handle=? COLLATE NOCASE LIMIT 1`).get(cleanHandle)
     }
     if (!row && /^-?\d+$/.test(cleanHandle)) {
       const alt = cleanHandle.startsWith('-100')
         ? cleanHandle.slice(4) : ('-100' + cleanHandle)
       row = db.prepare(
-        `SELECT id, handle FROM sources
+        `SELECT id, handle, meta_json FROM sources
           WHERE platform='telegram' AND handle=? LIMIT 1`).get(alt)
     }
     if (row) {
+      const meta_json = mergeSourceMetaJson(row.meta_json, meta)
       db.prepare(`
         UPDATE sources SET
           display_name   = COALESCE(?, display_name),
@@ -586,6 +625,11 @@ function upsertSource({ platform, handle, display_name, external_id, avatar_url,
       return row.id
     }
   }
+
+  const existingByHandle = db.prepare(
+    `SELECT id, meta_json FROM sources WHERE platform = ? AND handle = ? LIMIT 1`
+  ).get(platform, cleanHandle)
+  const meta_json = mergeSourceMetaJson(existingByHandle?.meta_json || null, meta)
 
   db.prepare(`
     INSERT INTO sources (platform, handle, display_name, external_id, avatar_url, meta_json, last_synced_at, is_explicit, tg_session)
@@ -628,6 +672,22 @@ function listSources(platform = null) {
   const db = getDb()
   const hasVec = itemsVecAvailable(db)
   const indexedExpr = hasVec ? `COALESCE(iv.semantic_indexed_count, 0)` : `0`
+  const itemStatsJoin = `
+    LEFT JOIN (
+      SELECT source_id,
+             COUNT(*) AS items_count,
+             SUM(CASE WHEN caption IS NOT NULL AND length(trim(caption)) > 0 THEN 1 ELSE 0 END) AS semantic_indexable_count,
+             MAX(published_at) AS last_item_at,
+             SUM(CASE WHEN type='text'     THEN 1 ELSE 0 END) AS text_n,
+             SUM(CASE WHEN type='voice'    THEN 1 ELSE 0 END) AS voice_n,
+             SUM(CASE WHEN type='video'    THEN 1 ELSE 0 END) AS video_n,
+             SUM(CASE WHEN type='photo'    THEN 1 ELSE 0 END) AS photo_n,
+             SUM(CASE WHEN type='audio'    THEN 1 ELSE 0 END) AS audio_n,
+             SUM(CASE WHEN type='document' THEN 1 ELSE 0 END) AS document_n
+        FROM items
+       GROUP BY source_id
+    ) ia ON ia.source_id = s.id
+  `
   const indexedJoin = hasVec ? `
     LEFT JOIN (
       SELECT i.source_id, COUNT(*) AS semantic_indexed_count
@@ -638,19 +698,18 @@ function listSources(platform = null) {
   ` : ''
   const sql = `
     SELECT s.*,
-      (SELECT COUNT(*) FROM items i WHERE i.source_id = s.id) AS items_count,
-      (SELECT COUNT(*) FROM items i
-        WHERE i.source_id = s.id
-          AND i.caption IS NOT NULL AND length(trim(i.caption)) > 0) AS semantic_indexable_count,
+      COALESCE(ia.items_count, 0) AS items_count,
+      COALESCE(ia.semantic_indexable_count, 0) AS semantic_indexable_count,
       ${indexedExpr} AS semantic_indexed_count,
-      (SELECT MAX(published_at) FROM items i WHERE i.source_id = s.id) AS last_item_at,
-      (SELECT SUM(CASE WHEN type='text'     THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS text_n,
-      (SELECT SUM(CASE WHEN type='voice'    THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS voice_n,
-      (SELECT SUM(CASE WHEN type='video'    THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS video_n,
-      (SELECT SUM(CASE WHEN type='photo'    THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS photo_n,
-      (SELECT SUM(CASE WHEN type='audio'    THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS audio_n,
-      (SELECT SUM(CASE WHEN type='document' THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS document_n
+      ia.last_item_at AS last_item_at,
+      COALESCE(ia.text_n, 0) AS text_n,
+      COALESCE(ia.voice_n, 0) AS voice_n,
+      COALESCE(ia.video_n, 0) AS video_n,
+      COALESCE(ia.photo_n, 0) AS photo_n,
+      COALESCE(ia.audio_n, 0) AS audio_n,
+      COALESCE(ia.document_n, 0) AS document_n
     FROM sources s
+    ${itemStatsJoin}
     ${indexedJoin}
     ${platform ? 'WHERE s.platform = ?' : ''}
     ORDER BY s.platform, COALESCE(s.last_synced_at, 0) DESC
@@ -755,6 +814,41 @@ function listTelegramAutoSources() {
       }
     })
     .filter(row => row.tg_auto.pull || row.tg_auto.index)
+}
+
+function semanticIndexCountsForSources(sourceIds) {
+  const db = getDb()
+  const ids = Array.isArray(sourceIds)
+    ? sourceIds.map(Number).filter(Number.isFinite)
+    : []
+  if (!ids.length) return new Map()
+  const placeholders = ids.map(() => '?').join(',')
+  const hasVec = itemsVecAvailable(db)
+  const indexedJoin = hasVec ? `
+    LEFT JOIN (
+      SELECT i.source_id, COUNT(*) AS semantic_indexed_count
+        FROM items_vec v
+        JOIN items i ON i.id = v.item_id
+       GROUP BY i.source_id
+    ) iv ON iv.source_id = s.id
+  ` : ''
+  const indexedExpr = hasVec ? 'COALESCE(iv.semantic_indexed_count, 0)' : '0'
+  const rows = db.prepare(`
+    SELECT s.id,
+      (SELECT COUNT(*)
+         FROM items i
+        WHERE i.source_id = s.id
+          AND i.caption IS NOT NULL
+          AND length(trim(i.caption)) > 0) AS semantic_indexable_count,
+      ${indexedExpr} AS semantic_indexed_count
+    FROM sources s
+    ${indexedJoin}
+    WHERE s.id IN (${placeholders})
+  `).all(...ids)
+  return new Map(rows.map(r => [Number(r.id), {
+    semantic_indexable_count: Number(r.semantic_indexable_count) || 0,
+    semantic_indexed_count: Number(r.semantic_indexed_count) || 0,
+  }]))
 }
 
 function getSource(id) {
@@ -1279,6 +1373,103 @@ function itemTypeBreakdown(source_id, topic_id = null) {
                        THEN 1 ELSE 0 END) AS with_caption
     FROM items WHERE ${where} GROUP BY type ORDER BY count DESC
   `).all(...params)
+}
+
+function telegramMediaEstimate(scope = {}) {
+  const db = getDb()
+  const sourceId = Number(scope.source_id)
+  if (!sourceId) {
+    return { ok: false, error: 'source_id required', total: 0, by_type: {} }
+  }
+
+  const conds = ['source_id = ?']
+  const params = [sourceId]
+
+  const topicIds = Array.isArray(scope.topic_ids)
+    ? scope.topic_ids.map(Number).filter(Number.isFinite)
+    : []
+  if (topicIds.length) {
+    conds.push(`topic_id IN (${topicIds.map(() => '?').join(',')})`)
+    params.push(...topicIds)
+  } else if (scope.topic_id != null) {
+    conds.push('topic_id = ?')
+    params.push(Number(scope.topic_id))
+  }
+
+  if ((scope.mode === 'from_date' || scope.mode === 'date_range') && scope.date_from) {
+    conds.push('published_at >= ?')
+    params.push(Number(scope.date_from))
+  }
+  if (scope.mode === 'date_range' && scope.date_to) {
+    conds.push('published_at <= ?')
+    params.push(Number(scope.date_to))
+  }
+
+  const where = conds.join(' AND ')
+  let sliceSql = `SELECT * FROM items WHERE ${where}`
+  const sliceParams = [...params]
+  if (scope.mode === 'last_n' && Number(scope.limit) > 0) {
+    sliceSql += ` ORDER BY COALESCE(published_at, 0) DESC, CAST(external_id AS INTEGER) DESC LIMIT ?`
+    sliceParams.push(Number(scope.limit))
+  }
+
+  const total = db.prepare(`
+    SELECT COUNT(*) AS count,
+           MIN(published_at) AS date_min,
+           MAX(published_at) AS date_max
+      FROM (${sliceSql})
+  `).get(...sliceParams)
+
+  const rows = db.prepare(`
+    SELECT type,
+           COUNT(*) AS count,
+           SUM(CASE WHEN has_media = 1 THEN 1 ELSE 0 END) AS has_media,
+           SUM(CASE WHEN media_path IS NOT NULL THEN 1 ELSE 0 END) AS downloaded,
+           SUM(CASE WHEN transcribe_status = 'done' THEN 1 ELSE 0 END) AS processed,
+           SUM(CASE WHEN transcript_path IS NOT NULL THEN 1 ELSE 0 END) AS transcribed,
+           SUM(CASE WHEN caption IS NOT NULL AND length(trim(caption)) > 0 THEN 1 ELSE 0 END) AS with_caption,
+           SUM(COALESCE(duration_seconds, 0)) AS duration_seconds,
+           SUM(CASE WHEN duration_seconds IS NOT NULL THEN 1 ELSE 0 END) AS duration_known,
+           SUM(CASE
+                 WHEN type IN ('voice','video','audio') AND duration_seconds IS NULL THEN 1
+                 ELSE 0
+               END) AS duration_missing
+      FROM (${sliceSql})
+     GROUP BY type
+     ORDER BY count DESC
+  `).all(...sliceParams)
+
+  const byType = {}
+  for (const row of rows) {
+    byType[row.type] = {
+      count: Number(row.count || 0),
+      has_media: Number(row.has_media || 0),
+      downloaded: Number(row.downloaded || 0),
+      processed: Number(row.processed || 0),
+      transcribed: Number(row.transcribed || 0),
+      with_caption: Number(row.with_caption || 0),
+      duration_seconds: Number(row.duration_seconds || 0),
+      duration_known: Number(row.duration_known || 0),
+      duration_missing: Number(row.duration_missing || 0),
+    }
+  }
+
+  return {
+    ok: true,
+    source_id: sourceId,
+    scope: {
+      mode: scope.mode || 'all',
+      limit: Number(scope.limit || 0),
+      date_from: scope.date_from || null,
+      date_to: scope.date_to || null,
+      topic_ids: topicIds,
+      basis: 'saved_items',
+    },
+    total: Number(total?.count || 0),
+    date_min: total?.date_min || null,
+    date_max: total?.date_max || null,
+    by_type: byType,
+  }
 }
 
 function socialSourceOverview(source_id) {
@@ -1899,7 +2090,17 @@ function recordCoverage({ source_id, job_id, date_from, date_to, content_type, d
 
 function listCoverage(source_id) {
   const db = getDb()
-  return db.prepare(`SELECT * FROM source_coverage WHERE source_id = ? ORDER BY date_from`)
+  return db.prepare(`
+    SELECT c.*,
+           j.parameters_json AS job_parameters_json,
+           j.status AS job_status,
+           j.started_at AS job_started_at,
+           j.finished_at AS job_finished_at
+      FROM source_coverage c
+      LEFT JOIN jobs j ON j.id = c.job_id
+     WHERE c.source_id = ?
+     ORDER BY c.date_from
+  `)
            .all(source_id)
 }
 
@@ -2435,6 +2636,22 @@ function listFolderSources(folder_id) {
   const db = getDb()
   const hasVec = itemsVecAvailable(db)
   const indexedExpr = hasVec ? `COALESCE(iv.semantic_indexed_count, 0)` : `0`
+  const itemStatsJoin = `
+    LEFT JOIN (
+      SELECT source_id,
+             COUNT(*) AS items_count,
+             SUM(CASE WHEN caption IS NOT NULL AND length(trim(caption)) > 0 THEN 1 ELSE 0 END) AS semantic_indexable_count,
+             MAX(published_at) AS last_item_at,
+             SUM(CASE WHEN type='text'     THEN 1 ELSE 0 END) AS text_n,
+             SUM(CASE WHEN type='voice'    THEN 1 ELSE 0 END) AS voice_n,
+             SUM(CASE WHEN type='video'    THEN 1 ELSE 0 END) AS video_n,
+             SUM(CASE WHEN type='photo'    THEN 1 ELSE 0 END) AS photo_n,
+             SUM(CASE WHEN type='audio'    THEN 1 ELSE 0 END) AS audio_n,
+             SUM(CASE WHEN type='document' THEN 1 ELSE 0 END) AS document_n
+        FROM items
+       GROUP BY source_id
+    ) ia ON ia.source_id = s.id
+  `
   const indexedJoin = hasVec ? `
     LEFT JOIN (
       SELECT i.source_id, COUNT(*) AS semantic_indexed_count
@@ -2445,21 +2662,20 @@ function listFolderSources(folder_id) {
   ` : ''
   return db.prepare(`
     SELECT s.*,
-      (SELECT COUNT(*) FROM items i WHERE i.source_id = s.id) AS items_count,
-      (SELECT COUNT(*) FROM items i
-        WHERE i.source_id = s.id
-          AND i.caption IS NOT NULL AND length(trim(i.caption)) > 0) AS semantic_indexable_count,
+      COALESCE(ia.items_count, 0) AS items_count,
+      COALESCE(ia.semantic_indexable_count, 0) AS semantic_indexable_count,
       ${indexedExpr} AS semantic_indexed_count,
-      (SELECT MAX(published_at) FROM items i WHERE i.source_id = s.id) AS last_item_at,
-      (SELECT SUM(CASE WHEN type='text'     THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS text_n,
-      (SELECT SUM(CASE WHEN type='voice'    THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS voice_n,
-      (SELECT SUM(CASE WHEN type='video'    THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS video_n,
-      (SELECT SUM(CASE WHEN type='photo'    THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS photo_n,
-      (SELECT SUM(CASE WHEN type='audio'    THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS audio_n,
-      (SELECT SUM(CASE WHEN type='document' THEN 1 ELSE 0 END) FROM items WHERE source_id=s.id) AS document_n,
+      ia.last_item_at AS last_item_at,
+      COALESCE(ia.text_n, 0) AS text_n,
+      COALESCE(ia.voice_n, 0) AS voice_n,
+      COALESCE(ia.video_n, 0) AS video_n,
+      COALESCE(ia.photo_n, 0) AS photo_n,
+      COALESCE(ia.audio_n, 0) AS audio_n,
+      COALESCE(ia.document_n, 0) AS document_n,
       fs.added_at AS folder_added_at
     FROM folder_sources fs
     JOIN sources s ON s.id = fs.source_id
+    ${itemStatsJoin}
     ${indexedJoin}
     WHERE fs.folder_id = ?
     -- Свежий пост вверху, пустые/неспарсенные чаты в конец (last_item_at = NULL).
@@ -2560,7 +2776,11 @@ function normalizeResearchHistoryRow(row) {
   const resultSourcesMeta = result?.sources_meta && typeof result.sources_meta === 'object'
     ? result.sources_meta
     : null
+  const sourceActivity = normalizeResearchSourceActivity(result, resultSourcesMeta)
   const sourcesMeta = resultSourcesMeta || legacy.sourcesMeta
+  if (sourcesMeta && sourceActivity.length && !Array.isArray(sourcesMeta.activity_items)) {
+    sourcesMeta.activity_items = sourceActivity
+  }
   const answerText = normalizeResearchAnswerText(result, responseText, legacy.answerText)
   const reasoningText = normalizeResearchReasoningText(result, sourcesMeta)
   const images = normalizeResearchImages(result?.images, 'output')
@@ -2578,10 +2798,34 @@ function normalizeResearchHistoryRow(row) {
     imageCount: images.length,
     sources,
     sourcesMeta,
+    sourceActivity,
     linkCount: sources.length || row.linkCount,
     textKind: result?.text_kind || null,
     isResearch: result?.is_research,
   }
+}
+
+function normalizeResearchSourceActivity(result, sourcesMeta) {
+  const arr = Array.isArray(sourcesMeta?.activity_items)
+    ? sourcesMeta.activity_items
+    : Array.isArray(result?.source_activity)
+      ? result.source_activity
+      : []
+  return arr
+    .map((item) => {
+      const title = typeof item?.title === 'string' ? item.title.trim() : ''
+      const text = typeof item?.text === 'string' ? item.text.trim() : ''
+      const command = typeof item?.command === 'string' ? item.command.trim() : ''
+      const links = Array.isArray(item?.links)
+        ? item.links.map((link) => ({
+          url: typeof link?.url === 'string' ? link.url : '',
+          title: typeof link?.title === 'string' ? link.title : '',
+        })).filter((link) => link.url)
+        : []
+      if (!title && !text && !command && links.length === 0) return null
+      return { title, text, command, links }
+    })
+    .filter(Boolean)
 }
 
 function normalizeResearchSources(result) {
@@ -2734,9 +2978,10 @@ module.exports = {
   upsertSource, setSourceSession, upsertYoutubeChannel, upsertTiktokChannel, listSources, getSource, deleteSource,
   getSourceNotes, setSourceNotes,
   setTelegramAutoForSources, listTelegramAutoSources,
+  semanticIndexCountsForSources,
   // items
   upsertItem, bulkUpsertItems, listItems, listSourceTopics,
-  itemTypeBreakdown, socialSourceOverview, senderBreakdown,
+  itemTypeBreakdown, telegramMediaEstimate, socialSourceOverview, senderBreakdown,
   itemsDateRange,
   assemblyEstimate, assemblyTranscriptPaths, assemblyFetch,
   deleteItem, maxExternalId, getItemsByExternalIds, markItemTranscribed,

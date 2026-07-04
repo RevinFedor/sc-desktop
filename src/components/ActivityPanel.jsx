@@ -76,6 +76,8 @@ export function isActiveRequestJob(job) {
 }
 
 export function isVisibleRequestJob(job) {
+  if (job?.params?._history_suppressed) return false
+  if (job?.params?._range_plan_child) return false
   return !job?.params?._folder_umbrella_id
 }
 

@@ -6,7 +6,7 @@
 
 Schema живёт в **двух местах**:
 - `electron/database.js` — JS-сторона (`SCHEMA` константа)
-- `~/Desktop/sc-desktop/cli-tools/shared/library_db.py` — Python-сторона (`SCHEMA_V1` константа)
+- `~/Desktop/sc-desktop/python-workers/shared/library_db.py` — Python-сторона (`SCHEMA_V1` константа)
 
 **Обе должны совпадать.** При добавлении колонки/таблицы — менять обе. Пока миграций не введено, используем idempotent `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE … ADD COLUMN` блоки в `try/catch` для backwards-compat при upgrade dev DB.
 
@@ -223,9 +223,9 @@ metadata-only вызовы без сессии не стирают привяз�
 
 **Dual-source mirror.** Та же mirror-обязанность, что и для основной схемы:
 изменение в `electron/database.js::SCHEMA` требует копии в
-`cli-tools/shared/library_db.py::SCHEMA_V1`. CLI сам с папками не работает,
-но открывает ту же `library.db` — без зеркала ALTER упадёт при первом open()
-с CLI-стороны.
+`python-workers/shared/library_db.py::SCHEMA_V1`. Workers сами с папками не работают,
+но открывают ту же `library.db` — без зеркала ALTER упадёт при первом open()
+с Python-стороны.
 
 ### `busy_timeout` для конкурирующих writers
 
@@ -242,7 +242,9 @@ Telethon session-файлы имеют ту же проблему — фикс �
 
 ## 🪜 Coverage depth ladder
 
-`source_coverage` — таблица коротких записей вида «для source X в диапазоне Y…Z был purge для типа T на глубине D». Несколько записей на один источник нормально, UI агрегирует.
+`source_coverage` — таблица коротких записей вида «для source X в диапазоне
+Y…Z был просмотрен тип T на глубине D». Несколько записей на один источник
+нормально, UI агрегирует.
 
 ```
 metadata     — есть строка в items, но media_path NULL (файл не качали)
@@ -253,6 +255,21 @@ transcribed  — transcript_path указан (есть текст)
 Ladder монотонный: depth повышается, никогда не понижается. Когда юзер делает «Дотянуть фото» (TODO) — apply UPDATE на existing items, не INSERT новых, и добавляет новую coverage-запись с depth=`media`.
 
 **Зачем ladder** (а не bool «есть/нет файла»): чтобы UI всегда знал что **сейчас доступно** vs что **было запрошено**. Это даёт детерминированность по принципу методологии — юзер видит «28 фото метаданные, файлы не загружены», и UI может предложить «Дотянуть» точечно по такому source без перетягивания всего.
+
+Для Telegram `from_date` coverage — это **requested interval**, а не min/max
+фактически найденных сообщений. Если job просмотрел 20.02.2022→сейчас и первые
+реальные сообщения начались только в июле, пустой февраль-июль всё равно покрыт:
+повторный запуск не должен ходить туда снова. Поэтому close-handler пишет
+`date_from/date_to` из параметров запроса (`params.date/date_to` или время
+старта/закрытия), а не из `job.date_min/date_max`, и добавляет нулевые строки
+для выбранных бесплатных типов (`text`, `poll` при `process_polls=true`) даже
+когда конкретного типа в диапазоне не нашлось.
+
+Старые строки до этого правила могут начинаться с первого найденного сообщения.
+Planner компенсирует это read-time: `listCoverage()` отдаёт рядом
+`jobs.parameters_json/status`, а `fact-fetch-strategies.md::Coverage planner`
+расширяет successful source-wide `from_date` до `params.date`. Не мигрировать
+старые rows вручную: их достаточно корректно интерпретировать при планировании.
 
 ### YouTube exception: depth `media` пропускается
 
@@ -267,6 +284,13 @@ Ladder монотонный: depth повышается, никогда не п�
 - `media_path = null` если файл не скачивался (skip-список из CONTENT_TYPES в форме)
 
 UI код полагается на этот invariant в `SourceDetail.jsx::TypeRow` для пометки `файлы не скачаны (N)` и в `ChatView.jsx::MessageRow` для `⚠ Только метаданные ({type})`.
+
+Metadata-only строка может уже знать длительность. Для Telegram voice/video/audio
+длительность часто лежит в атрибутах сообщения и пишется в `duration_seconds`
+даже когда файл не скачивался. Это намеренно: после text-only прохода UI может
+локально оценить будущую AI-нагрузку («8 видео · 4:01») без повторного Telegram
+walk и без загрузки бинарников. Не стирать `duration_seconds` при повторном
+metadata-upsert'е только потому что `media_path` остаётся NULL.
 
 **Антипаттерн:** удалить строку item потому что «не скачали файл — нечего хранить». Тогда UI потеряет информацию что именно было пропущено.
 
@@ -332,6 +356,12 @@ username — не трогаем.
   требует миграции схемы ради пары bool'ов.
 
 Всегда **read-modify-write** при апдейте (`getSourceNotes` → ... → `setSourceNotes`), чтобы не затирать другие ключи. См. `db.setSourceNotes` как образец.
+Это правило критично для `tg_auto`: обычный `upsertSource` от entity-event'а
+при fetch'е приносит свежие `kind`/`username`, но не знает про auto-режимы.
+Если такой patch перезаписывает весь `meta_json`, бейджи `auto-pull` /
+`auto-index` пропадают после успешного парсинга, хотя настройка должна жить
+дальше. Поэтому source meta мержится key-wise; вложенный `tg_auto` не удаляется
+отсутствующим полем в новом patch.
 
 ## 🪶 FTS5 contentless mode
 
@@ -358,7 +388,7 @@ item'а, чей caption уже в индексе (молча не обновля
 (`sql NOT LIKE '%contentless_delete%'`) и пересобирает один раз: DROP +
 CREATE с флагом + reindex (caption из `items`, transcript из файла
 `transcript_path`, как в `markItemTranscribed`). На реальной БД ~253k строк
-≈ 2.4 сек на первом старте. Зеркальная правка в `cli-tools/shared/library_db.py`
+≈ 2.4 сек на первом старте. Зеркальная правка в `python-workers/shared/library_db.py`
 (Python-сторона открывает ту же `items_fts`; там же чинили лишнюю колонку
 `title` в INSERT — её нет в реальной таблице, INSERT падал
 `no column named title`).

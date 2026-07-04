@@ -1,8 +1,14 @@
-// SC Browser Parser — research через chatgpt.com.
+// SC Browser Parser — automation через chatgpt.com.
 //
-// Триггер: вкладка открыта на chatgpt.com/?sc-research=<requestId> (query;
-// дублируется в #hash на случай если SPA срежет query до document_idle).
-// requestId — в bridge'е, забираем GET /research-job.
+// Два entrypoint'а используют один низкоуровневый compose-layer:
+//   • ?sc-research=<requestId> — MCP/research job: submit → watcher →
+//     extract answer/images/sources → POST /research-state.
+//   • ?sc-compose=<requestId> — одноразовый handoff для YouTube +AI:
+//     submit prompt и оставить обычный ChatGPT-чат без MCP-badge/sources.
+//
+// requestId для research живёт в bridge'е (GET /research-job). requestId
+// для compose живёт в chrome.storage.local (__sc_chatgpt_compose_job_*).
+// query дублируется в #hash на случай если SPA срежет query до document_idle.
 //
 // Flow:
 //   1. Дождаться #prompt-textarea (ProseMirror contenteditable).
@@ -57,6 +63,8 @@
     } catch {}
   };
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  let popupExportRunning = false;
+  let popupExportCancel = false;
 
   // SW-driven watchdog: chrome.alarms каждые 30с шлёт {__sc_research_poke},
   // listener форсирует tick в throttled/hidden вкладке. См. fact-deep-research.md.
@@ -73,6 +81,21 @@
         sendResponse({ ok: true });
         return false;
       }
+      if (req && req.action === 'getStatus') {
+        sendResponse({ isExporting: popupExportRunning });
+        return false;
+      }
+      if (req && req.action === 'cancel') {
+        popupExportCancel = true;
+        sendResponse({ success: true });
+        return false;
+      }
+      if (req && req.action === 'export') {
+        runChatGPTPopupExport(req.settings || {})
+          .then(result => sendResponse(result || { success: true }))
+          .catch(error => sendResponse({ success: false, message: error?.message || String(error) }));
+        return true;
+      }
       return undefined;
     });
   } catch (e) {
@@ -83,6 +106,8 @@
   // pushState'ит на /c/<uuid> без query — persistence через window.name
   // (формат sc-research:<id>:<startTsMs>), как у perplexity.
   const WINDOW_NAME_PREFIX = 'sc-research:';
+  const COMPOSE_WINDOW_NAME_PREFIX = 'sc-compose:';
+  const COMPOSE_JOB_PREFIX = '__sc_chatgpt_compose_job_';
   let researchStartTs = null;
   function getRequestId() {
     const u = new URL(location.href);
@@ -113,6 +138,50 @@
       }
     } catch (_) {}
     return null;
+  }
+  function getComposeId() {
+    const u = new URL(location.href);
+    const fromHash = (u.hash || '').match(/sc-compose=([\w-]+)/);
+    if (fromHash) {
+      try { window.name = COMPOSE_WINDOW_NAME_PREFIX + fromHash[1] + ':' + Date.now(); } catch (_) {}
+      return fromHash[1];
+    }
+    const fromQuery = u.searchParams.get('sc-compose');
+    if (fromQuery) {
+      try { window.name = COMPOSE_WINDOW_NAME_PREFIX + fromQuery + ':' + Date.now(); } catch (_) {}
+      return fromQuery;
+    }
+    try {
+      const wn = String(window.name || '');
+      if (wn.startsWith(COMPOSE_WINDOW_NAME_PREFIX)) {
+        const id = wn.slice(COMPOSE_WINDOW_NAME_PREFIX.length).split(':')[0];
+        if (id) {
+          log('compose.id_from_window_name', { id });
+          return id;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  async function fetchComposeJob(id) {
+    const key = COMPOSE_JOB_PREFIX + id;
+    const got = await new Promise(resolve => {
+      chrome.storage.local.get(key, resolve);
+    });
+    const job = got?.[key];
+    if (!job || typeof job.prompt !== 'string' || !job.prompt.trim()) {
+      throw new Error('compose_job_missing_or_empty: ' + id);
+    }
+    return job;
+  }
+
+  async function removeComposeJob(id) {
+    try {
+      await new Promise(resolve => {
+        chrome.storage.local.remove(COMPOSE_JOB_PREFIX + id, resolve);
+      });
+    } catch (_) {}
   }
 
   // bfetch: page→bridge с SW-fallback (см. scBridgeFetch в research-badge.js).
@@ -272,6 +341,898 @@
   }
   function nodeText(el) {
     return (el?.textContent || '').trim().replace(/\s+/g, ' ');
+  }
+
+  // ── Popup export: текущий ChatGPT-чат → markdown ─────────────────────
+  const CHATGPT_EXPORT_OVERLAY_ID = 'sc-chatgpt-export-overlay';
+  const CHATGPT_EXPORT_DEFAULTS = Object.freeze({
+    includeReasoning: true,
+    includeSources: true,
+    includeSourceActivity: true,
+    includeImages: true,
+    __export: { downloadFile: false },
+  });
+
+  function normalizeChatGPTExportSettings(raw = {}) {
+    const cb = (v, fb) => typeof v === 'boolean' ? v : fb;
+    return {
+      includeReasoning: cb(raw.includeReasoning, CHATGPT_EXPORT_DEFAULTS.includeReasoning),
+      includeSources: cb(raw.includeSources, CHATGPT_EXPORT_DEFAULTS.includeSources),
+      includeSourceActivity: cb(raw.includeSourceActivity, CHATGPT_EXPORT_DEFAULTS.includeSourceActivity),
+      includeImages: cb(raw.includeImages, CHATGPT_EXPORT_DEFAULTS.includeImages),
+      __export: {
+        downloadFile: cb(raw.__export?.downloadFile, CHATGPT_EXPORT_DEFAULTS.__export.downloadFile),
+      },
+    };
+  }
+
+  function assertPopupExportNotCancelled() {
+    if (popupExportCancel) throw new Error('Экспорт отменён');
+  }
+
+  function escapeHtml(value) {
+    return String(value || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
+  function safeFilenamePart(value, fallback = 'chatgpt-chat') {
+    return String(value || fallback)
+      .replace(/[\uE000-\uF8FF]/g, '')
+      .replace(/[\\/:*?"<>|\s]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 70) || fallback;
+  }
+
+  async function copyTextToClipboard(text) {
+    let primaryError = null;
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch (error) {
+        primaryError = error;
+        log('popup_export.clipboard_writeText_failed', {
+          err: error?.message || String(error),
+          focused: document.hasFocus(),
+          visibility: document.visibilityState,
+        });
+      }
+    }
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+    document.body.appendChild(ta);
+    ta.focus({ preventScroll: true });
+    ta.select();
+    try {
+      const ok = document.execCommand('copy');
+      if (ok) return true;
+      throw new Error(primaryError?.message || 'document.execCommand(copy) returned false');
+    } finally {
+      ta.remove();
+    }
+  }
+
+  async function deliverMarkdown(markdown, filename, wantsFile) {
+    if (wantsFile) {
+      downloadMarkdownFile(markdown, filename);
+      return 'download';
+    }
+    try {
+      await copyTextToClipboard(markdown);
+      return 'clipboard';
+    } catch (error) {
+      log('popup_export.clipboard_all_failed_download_fallback', {
+        err: error?.message || String(error),
+        focused: document.hasFocus(),
+        visibility: document.visibilityState,
+      });
+      downloadMarkdownFile(markdown, filename);
+      return 'download-fallback';
+    }
+  }
+
+  function downloadMarkdownFile(markdown, filename) {
+    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+      a.remove();
+    }, 1000);
+  }
+
+  function showChatGPTExportOverlay() {
+    document.getElementById(CHATGPT_EXPORT_OVERLAY_ID)?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = CHATGPT_EXPORT_OVERLAY_ID;
+    overlay.dataset.state = 'progress';
+    overlay.style.cssText = `
+      position: fixed; inset: 0; z-index: 2147483600;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(0,0,0,0.62); color: #e9ecef;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    `;
+    const card = document.createElement('div');
+    card.style.cssText = `
+      width: min(420px, calc(100vw - 40px)); padding: 22px;
+      border-radius: 10px; border: 1px solid #343a40; background: #1f2024;
+      box-shadow: 0 18px 60px rgba(0,0,0,.35); text-align: left;
+    `;
+    card.innerHTML = `
+      <div style="font-size:13px;font-weight:700;color:#69db7c;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;">ChatGPT export</div>
+      <div id="${CHATGPT_EXPORT_OVERLAY_ID}-status" style="font-size:16px;font-weight:650;margin-bottom:8px;">Готовлю экспорт...</div>
+      <div id="${CHATGPT_EXPORT_OVERLAY_ID}-progress" style="font-size:13px;color:#adb5bd;line-height:1.45;">Сканирую сообщения</div>
+      <button type="button" id="${CHATGPT_EXPORT_OVERLAY_ID}-cancel" style="
+        margin-top:18px;background:#343a40;color:#e9ecef;border:1px solid #495057;
+        border-radius:7px;padding:8px 14px;font-size:13px;cursor:pointer;">Остановить</button>
+    `;
+    overlay.addEventListener('wheel', e => e.preventDefault(), { passive: false });
+    overlay.addEventListener('click', e => {
+      if (e.target === overlay && (overlay.dataset.state === 'success' || overlay.dataset.state === 'error')) {
+        hideChatGPTExportOverlay();
+      }
+    });
+    card.addEventListener('click', e => e.stopPropagation());
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    document.getElementById(`${CHATGPT_EXPORT_OVERLAY_ID}-cancel`).onclick = () => { popupExportCancel = true; };
+  }
+
+  function updateChatGPTExportOverlay(status, progress) {
+    const s = document.getElementById(`${CHATGPT_EXPORT_OVERLAY_ID}-status`);
+    const p = document.getElementById(`${CHATGPT_EXPORT_OVERLAY_ID}-progress`);
+    if (s && status) s.textContent = status;
+    if (p && progress) p.textContent = progress;
+  }
+
+  function hideChatGPTExportOverlay() {
+    const overlay = document.getElementById(CHATGPT_EXPORT_OVERLAY_ID);
+    if (!overlay) return;
+    overlay.style.opacity = '0';
+    overlay.style.transition = 'opacity .2s ease';
+    setTimeout(() => overlay.remove(), 220);
+  }
+
+  function showChatGPTExportTerminal(kind, message) {
+    const overlay = document.getElementById(CHATGPT_EXPORT_OVERLAY_ID);
+    if (!overlay) return;
+    overlay.dataset.state = kind;
+    const ok = kind === 'success';
+    const card = overlay.firstElementChild;
+    if (!card) return;
+    card.innerHTML = `
+      <div style="font-size:13px;font-weight:700;color:${ok ? '#69db7c' : '#ff8787'};text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;">
+        ${ok ? 'Готово' : 'Экспорт прерван'}
+      </div>
+      <p style="margin:0 0 18px;color:#e9ecef;font-size:13px;line-height:1.5;white-space:pre-wrap;">${escapeHtml(message)}</p>
+      <button type="button" id="${CHATGPT_EXPORT_OVERLAY_ID}-close" style="
+        background:${ok ? '#2b8a3e' : '#c92a2a'};color:white;border:none;
+        border-radius:7px;padding:8px 16px;font-size:13px;cursor:pointer;">Закрыть</button>
+    `;
+    document.getElementById(`${CHATGPT_EXPORT_OVERLAY_ID}-close`).onclick = hideChatGPTExportOverlay;
+  }
+
+  function chatgptConversationTurns() {
+    const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"]'))
+      .filter(t => t.querySelector('[data-message-author-role]'));
+    if (turns.length) return turns;
+    return Array.from(document.querySelectorAll('[data-message-author-role]'));
+  }
+
+  function roleLabel(role) {
+    if (role === 'user') return 'User';
+    if (role === 'assistant') return 'ChatGPT';
+    if (role === 'tool') return 'Tool';
+    return role || 'Message';
+  }
+
+  function markdownEscapeInline(value) {
+    return String(value || '').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
+  }
+
+  function normalizeMarkdownText(value) {
+    return String(value || '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function markdownFromDom(root) {
+    if (!root) return '';
+    const ignoredSelector = [
+      'button',
+      'svg',
+      'style',
+      'script',
+      '[data-testid*="copy"]',
+      '[data-testid*="feedback"]',
+      '[aria-label*="Copy" i]',
+      '[aria-label*="Копировать" i]',
+    ].join(',');
+    const clone = root.cloneNode(true);
+    clone.querySelectorAll(ignoredSelector).forEach(n => n.remove());
+    return normalizeMarkdownText(markdownNode(clone, {}));
+  }
+
+  function markdownNode(node, ctx) {
+    if (!node) return '';
+    if (node.nodeType === Node.TEXT_NODE) {
+      const raw = node.nodeValue || '';
+      return ctx?.pre ? raw : raw.replace(/\s+/g, ' ');
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return '';
+    const el = node;
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'br') return '\n';
+    if (tag === 'pre') {
+      const code = el.querySelector('code');
+      const cls = code?.className || '';
+      const lang = (String(cls).match(/language-([a-z0-9_-]+)/i) || [])[1] || '';
+      const text = (code || el).textContent || '';
+      return `\n\n\`\`\`${lang}\n${text.replace(/\n+$/g, '')}\n\`\`\`\n\n`;
+    }
+    if (tag === 'code') {
+      if (el.closest('pre')) return el.textContent || '';
+      return '`' + String(el.textContent || '').replace(/`/g, '\\`') + '`';
+    }
+    if (/^h[1-6]$/.test(tag)) {
+      const level = Number(tag.slice(1));
+      return `\n\n${'#'.repeat(level)} ${childrenMarkdown(el, ctx).trim()}\n\n`;
+    }
+    if (tag === 'strong' || tag === 'b') return `**${childrenMarkdown(el, ctx).trim()}**`;
+    if (tag === 'em' || tag === 'i') return `_${childrenMarkdown(el, ctx).trim()}_`;
+    if (tag === 'a') {
+      const href = el.getAttribute('href') || '';
+      const text = childrenMarkdown(el, ctx).trim() || href;
+      if (!href) return text;
+      return `[${markdownEscapeInline(text)}](${href})`;
+    }
+    if (tag === 'blockquote') {
+      const body = childrenMarkdown(el, ctx).trim().split('\n').map(line => `> ${line}`).join('\n');
+      return `\n\n${body}\n\n`;
+    }
+    if (tag === 'ul' || tag === 'ol') {
+      const items = Array.from(el.children).filter(ch => ch.tagName?.toLowerCase() === 'li');
+      const lines = items.map((li, idx) => {
+        const marker = tag === 'ol' ? `${idx + 1}.` : '-';
+        return `${marker} ${childrenMarkdown(li, ctx).trim().replace(/\n+/g, '\n  ')}`;
+      });
+      return `\n\n${lines.join('\n')}\n\n`;
+    }
+    if (tag === 'table') {
+      const rows = Array.from(el.querySelectorAll('tr')).map(tr =>
+        Array.from(tr.children).map(td => normalizeMarkdownText(td.textContent).replace(/\|/g, '\\|'))
+      ).filter(r => r.length);
+      if (!rows.length) return '';
+      const head = rows[0];
+      const sep = head.map(() => '---');
+      return `\n\n| ${head.join(' | ')} |\n| ${sep.join(' | ')} |\n` +
+        rows.slice(1).map(r => `| ${r.join(' | ')} |`).join('\n') + '\n\n';
+    }
+    if (tag === 'p' || tag === 'div' || tag === 'section' || tag === 'article') {
+      const text = childrenMarkdown(el, ctx).trim();
+      return text ? `\n\n${text}\n\n` : '';
+    }
+    return childrenMarkdown(el, ctx);
+  }
+
+  function childrenMarkdown(el, ctx) {
+    return Array.from(el.childNodes).map(n => markdownNode(n, ctx)).join('');
+  }
+
+  function extractMessageRoot(turn) {
+    return turn.querySelector?.('[data-message-author-role]') || turn;
+  }
+
+  function extractMessageTextMarkdown(messageEl, role) {
+    if (!messageEl) return '';
+    if (role === 'assistant') {
+      const mds = Array.from(messageEl.querySelectorAll('.markdown'))
+        .filter(m => !m.classList.contains('result-thinking'));
+      const md = mds[mds.length - 1];
+      if (md) return markdownFromDom(md);
+    }
+    const textContainers = Array.from(messageEl.querySelectorAll('.whitespace-pre-wrap, .prose, .markdown'))
+      .filter(el => !el.classList.contains('result-thinking'));
+    if (textContainers.length) return markdownFromDom(textContainers[textContainers.length - 1]);
+    return normalizeMarkdownText(messageEl.textContent || '');
+  }
+
+  function extractReasoningMarkdownForMessage(messageEl) {
+    if (!messageEl) return '';
+    const mds = Array.from(messageEl.querySelectorAll('.markdown.result-thinking, .result-thinking.markdown, .result-thinking'));
+    const md = mds[mds.length - 1];
+    return md ? markdownFromDom(md) : '';
+  }
+
+  function extractImagesForExportTurn(turn) {
+    const scope = extractMessageRoot(turn);
+    const imgs = Array.from(scope.querySelectorAll('img[src]'));
+    const seen = new Set();
+    const out = [];
+    for (const img of imgs) {
+      const src = img.currentSrc || img.src || img.getAttribute('src') || '';
+      if (!src) continue;
+      const likelyContent =
+        src.includes('/backend-api/estuary/content') ||
+        /^blob:|^data:image\//i.test(src) ||
+        (img.naturalWidth >= 48 && img.naturalHeight >= 48);
+      if (!likelyContent) continue;
+      const key = `${src}|${img.alt || ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        src,
+        alt: img.alt || 'ChatGPT image',
+        width: img.naturalWidth || null,
+        height: img.naturalHeight || null,
+      });
+    }
+    return out;
+  }
+
+  function renderImagesMarkdown(images) {
+    if (!images.length) return '';
+    let md = `\n\n### Картинки\n\n`;
+    for (const img of images) {
+      const size = img.width && img.height ? ` (${img.width}x${img.height})` : '';
+      md += `- ![${markdownEscapeInline(img.alt || 'ChatGPT image')}](${img.src})${size}\n`;
+    }
+    return md;
+  }
+
+  function findSourcesChipInTurn(turn) {
+    const chips = Array.from(turn.querySelectorAll('button[aria-label]'))
+      .filter(b => /^(Источники|Sources)$/i.test(b.getAttribute('aria-label') || ''));
+    return chips.find(isVisible) || chips[chips.length - 1] || null;
+  }
+
+  async function extractSourcesForExportTurn(turn, turnIndex) {
+    const out = { links: [], activity_items: [], activity: null, thinking: [], chip_present: false, panel_opened: false };
+    const chip = findSourcesChipInTurn(turn);
+    if (!chip) return out;
+    out.chip_present = true;
+    try { turn.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+    await sleep(150);
+    try { chip.click(); } catch (_) { nativeMouseClick(chip); }
+    let panel;
+    try {
+      panel = await waitFor(() => findSourcesPanel(), `ChatGPT sources panel for turn ${turnIndex}`, 8000, 250);
+    } catch (_) {
+      log('popup_export.sources_panel_timeout', { turnIndex });
+      return out;
+    }
+    out.panel_opened = true;
+    await sleep(500);
+
+    const seen = new Set();
+    const seenActivity = new Set();
+    const collect = () => {
+      for (const a of panel.querySelectorAll('a[href]')) {
+        const link = sourceLinkFromAnchor(a);
+        if (!link || seen.has(link.url)) continue;
+        seen.add(link.url);
+        out.links.push(link);
+      }
+      collectActivityItems(panel, out.activity_items, seenActivity);
+    };
+    collect();
+    const scroller = [panel, ...panel.querySelectorAll('*')]
+      .find(el => el.scrollHeight > el.clientHeight + 40) || panel;
+    let idle = 0;
+    for (let step = 0; step < 20 && idle < 2; step++) {
+      assertPopupExportNotCancelled();
+      const before = out.links.length + out.activity_items.length;
+      scroller.scrollTop = scroller.scrollTop + Math.max(300, scroller.clientHeight || 300);
+      await sleep(300);
+      collect();
+      const after = out.links.length + out.activity_items.length;
+      idle = after === before ? idle + 1 : 0;
+      if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 10 && after === before) break;
+    }
+    const txt = panel.textContent || '';
+    out.thinking = txt.match(/(?:Думал[а]? на протяжении|Thought for)\s+[^\n]{1,30}/g) || [];
+    const actM = txt.match(/(?:Активность|Activity)\s*·?\s*(.{1,60})/);
+    if (actM) out.activity = cleanActivity(actM[1]);
+    try {
+      const closeBtn = Array.from(panel.querySelectorAll('button'))
+        .find(b => /^(Закрыть|Close)$/i.test(b.getAttribute('aria-label') || ''));
+      closeBtn?.click();
+    } catch (_) {}
+    log('popup_export.sources_done', { turnIndex, links: out.links.length, activity_items: out.activity_items.length });
+    return out;
+  }
+
+  function renderSourcesMarkdown(src, settings) {
+    let md = '';
+    if (settings.includeSources && src.links.length) {
+      md += `\n\n### Источники\n\n`;
+      src.links.forEach((l, idx) => {
+        md += `${idx + 1}. ${l.title || l.url} — ${l.url}\n`;
+      });
+      if (src.activity) md += `\n_Активность: ${src.activity}_\n`;
+    }
+    if (settings.includeSourceActivity && src.activity_items.length) {
+      md += `\n\n### Активность поиска\n\n`;
+      for (const item of src.activity_items) {
+        md += `- ${item.title || 'Шаг'}\n`;
+        if (Array.isArray(item.links) && item.links.length) {
+          for (const l of item.links) md += `  - ${l.title || l.url}: ${l.url}\n`;
+        }
+        if (item.command) md += `\n  \`\`\`text\n${item.command}\n  \`\`\`\n`;
+        else if (item.text && item.text !== item.title) md += `  ${item.text}\n`;
+      }
+    }
+    return md;
+  }
+
+  function buildChatGPTExportHeader(turnCount, stats) {
+    const title = (document.title || 'ChatGPT').replace(/\s*[-–]\s*ChatGPT\s*$/i, '').trim() || 'ChatGPT chat';
+    const exportedAt = new Date().toISOString();
+    let md = `# ${title}\n\n`;
+    md += `> **Сводка экспорта ChatGPT**  \n`;
+    md += `> Сообщений: ${turnCount}; User: ${stats.user}; ChatGPT: ${stats.assistant}  \n`;
+    md += `> Источников: ${stats.sources}; activity-шагов: ${stats.activity}; картинок: ${stats.images}  \n`;
+    md += `> URL: ${location.href}  \n`;
+    md += `> Экспортировано: ${exportedAt}\n\n---\n\n`;
+    return md;
+  }
+
+  function chatgptConversationIdFromLocation() {
+    try {
+      const parts = location.pathname.split('/').filter(Boolean);
+      const cIdx = parts.indexOf('c');
+      if (cIdx >= 0 && parts[cIdx + 1]) return parts[cIdx + 1];
+      const last = parts[parts.length - 1] || '';
+      return /^[0-9a-f-]{16,}$/i.test(last) ? last : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  async function fetchChatGPTConversationJson() {
+    const conversationId = chatgptConversationIdFromLocation();
+    if (!conversationId) return null;
+    const sessionRes = await fetch('/api/auth/session', { credentials: 'include' });
+    if (!sessionRes.ok) throw new Error('ChatGPT session fetch failed: HTTP ' + sessionRes.status);
+    const session = await sessionRes.json();
+    const accessToken = session?.accessToken;
+    if (!accessToken) throw new Error('ChatGPT session has no access token');
+    const res = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+      credentials: 'include',
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`ChatGPT conversation API failed: HTTP ${res.status} ${text.slice(0, 120)}`);
+    }
+    const data = await res.json();
+    if (!data?.mapping || !data?.current_node) throw new Error('ChatGPT conversation API returned no mapping/current_node');
+    return data;
+  }
+
+  function chatgptCurrentPathNodes(data) {
+    const mapping = data?.mapping || {};
+    const out = [];
+    const seen = new Set();
+    let cur = data?.current_node;
+    while (cur && mapping[cur] && !seen.has(cur)) {
+      seen.add(cur);
+      out.push(mapping[cur]);
+      cur = mapping[cur].parent;
+    }
+    return out.reverse();
+  }
+
+  function apiMessageRole(node) {
+    return node?.message?.author?.role || '';
+  }
+
+  function apiMessageContentType(node) {
+    return node?.message?.content?.content_type || '';
+  }
+
+  function isHiddenApiMessage(node) {
+    return !!node?.message?.metadata?.is_visually_hidden_from_conversation;
+  }
+
+  function apiPartsText(parts) {
+    if (!Array.isArray(parts)) return '';
+    return parts.map(part => {
+      if (typeof part === 'string') return part;
+      if (!part || typeof part !== 'object') return '';
+      if (typeof part.text === 'string') return part.text;
+      if (typeof part.content === 'string') return part.content;
+      if (typeof part.name === 'string' && typeof part.url === 'string') return `${part.name}: ${part.url}`;
+      return '';
+    }).filter(Boolean).join('\n\n');
+  }
+
+  function compactJsonSnippet(value, max = 2400) {
+    try {
+      return JSON.stringify(value, null, 2).slice(0, max);
+    } catch (_) {
+      return String(value || '').slice(0, max);
+    }
+  }
+
+  function apiMessageText(node) {
+    const msg = node?.message || {};
+    const content = msg.content || {};
+    const type = content.content_type || '';
+    if (type === 'text' || type === 'multimodal_text') return normalizeMarkdownText(apiPartsText(content.parts));
+    if (type === 'code') {
+      const lang = content.language || content.response_format_name || '';
+      return `\`\`\`${lang}\n${String(content.text || '').replace(/\n+$/g, '')}\n\`\`\``;
+    }
+    if (type === 'execution_output') {
+      const text = content.text || msg.metadata?.aggregate_result?.final_expression_output || '';
+      return normalizeMarkdownText(String(text || ''));
+    }
+    if (type === 'reasoning_recap') {
+      if (typeof content.content === 'string') return normalizeMarkdownText(content.content);
+      return normalizeMarkdownText(compactJsonSnippet(content.content || ''));
+    }
+    if (type === 'thoughts') return normalizeMarkdownText(apiThoughtsText(content.thoughts));
+    if (type === 'model_editable_context') {
+      const bits = [];
+      if (content.repository) bits.push(`Repository: ${content.repository}`);
+      if (content.repo_summary) bits.push(String(content.repo_summary));
+      if (content.model_set_context) bits.push(String(content.model_set_context));
+      return normalizeMarkdownText(bits.join('\n\n'));
+    }
+    return '';
+  }
+
+  function apiThoughtsText(thoughts) {
+    if (!thoughts || typeof thoughts !== 'object') return '';
+    const out = [];
+    for (const item of Object.values(thoughts)) {
+      if (typeof item === 'string') out.push(item);
+      else if (item && typeof item === 'object') {
+        if (typeof item.summary === 'string') out.push(item.summary);
+        if (typeof item.content === 'string') out.push(item.content);
+        if (typeof item.text === 'string') out.push(item.text);
+        if (Array.isArray(item.parts)) out.push(apiPartsText(item.parts));
+      }
+    }
+    return out.filter(Boolean).join('\n\n');
+  }
+
+  function apiAttachmentsMarkdown(node) {
+    const attachments = node?.message?.metadata?.attachments;
+    if (!Array.isArray(attachments) || !attachments.length) return '';
+    let md = `\n\n### Вложения\n\n`;
+    for (const a of attachments) {
+      const name = a.name || a.file_name || a.title || a.id || 'attachment';
+      const mime = a.mime_type || a.content_type || a.file_mime_type || '';
+      const url = a.url || a.download_url || a.file_url || '';
+      md += `- ${name}${mime ? ` (${mime})` : ''}${url ? ` — ${url}` : ''}\n`;
+    }
+    return md;
+  }
+
+  function apiAttachmentCount(node) {
+    const attachments = node?.message?.metadata?.attachments;
+    return Array.isArray(attachments) ? attachments.length : 0;
+  }
+
+  function collectLinksDeep(value, out, seen, depth = 0) {
+    if (!value || depth > 6 || out.length >= 200) return;
+    if (Array.isArray(value)) {
+      for (const item of value) collectLinksDeep(item, out, seen, depth + 1);
+      return;
+    }
+    if (typeof value !== 'object') return;
+    const url = value.url || value.href || value.link_url || value.source_url || value.uri;
+    if (typeof url === 'string' && /^https?:\/\//i.test(url) && !seen.has(url)) {
+      seen.add(url);
+      out.push({
+        url,
+        title: compactText(value.title || value.name || value.text || value.snippet || url).slice(0, 300),
+      });
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (/token|email|authorization|session/i.test(key)) continue;
+      collectLinksDeep(child, out, seen, depth + 1);
+    }
+  }
+
+  function apiLinksFromMessage(node) {
+    const msg = node?.message || {};
+    const md = msg.metadata || {};
+    const out = [];
+    const seen = new Set();
+    collectLinksDeep(md.citations, out, seen);
+    collectLinksDeep(md.content_references, out, seen);
+    collectLinksDeep(md.search_result_groups, out, seen);
+    collectLinksDeep(md.story_events, out, seen);
+    return out;
+  }
+
+  function apiActivityFromMessage(node) {
+    const msg = node?.message || {};
+    const role = msg.author?.role || '';
+    const type = msg.content?.content_type || '';
+    const text = apiMessageText(node);
+    if (type === 'code') {
+      return { title: `Code${msg.content?.language ? `: ${msg.content.language}` : ''}`, command: text };
+    }
+    if (type === 'execution_output') {
+      return { title: 'Execution output', text: text || compactJsonSnippet(msg.metadata?.aggregate_result || '') };
+    }
+    if (role === 'tool') {
+      const title = msg.metadata?.command ? `Tool: ${compactText(msg.metadata.command).slice(0, 120)}` : `Tool: ${type || 'activity'}`;
+      return { title, text: text || compactJsonSnippet(msg.content || '') };
+    }
+    if (type === 'model_editable_context') {
+      const title = msg.content?.repository ? `Context: ${msg.content.repository}` : 'Context update';
+      return { title, text: text || compactJsonSnippet(msg.content || '') };
+    }
+    return null;
+  }
+
+  function renderApiSourcesMarkdown(links) {
+    if (!links.length) return '';
+    let md = `\n\n### Источники\n\n`;
+    links.forEach((l, idx) => { md += `${idx + 1}. ${l.title || l.url} — ${l.url}\n`; });
+    return md;
+  }
+
+  function renderApiActivityMarkdown(items) {
+    if (!items.length) return '';
+    let md = `\n\n### Активность поиска\n\n`;
+    const codeBlock = (value) => {
+      const body = String(value || '').replace(/^```[^\n]*\n?|\n?```$/g, '');
+      const runs = body.match(/`{3,}/g) || [];
+      const maxRun = runs.reduce((max, run) => Math.max(max, run.length), 2);
+      const fence = '`'.repeat(Math.max(3, maxRun + 1));
+      return `\n  ${fence}text\n${body}\n  ${fence}\n`;
+    };
+    for (const item of items) {
+      md += `- ${item.title || 'Шаг'}\n`;
+      if (item.command) {
+        md += codeBlock(item.command);
+      } else if (item.text) {
+        const text = String(item.text);
+        md += (text.includes('\n') || text.length > 300)
+          ? codeBlock(text)
+          : `  ${text}\n`;
+      }
+    }
+    return md;
+  }
+
+  function buildChatGPTApiMarkdown(data, settings, stats) {
+    const nodes = chatgptCurrentPathNodes(data)
+      .filter(node => node?.message && apiMessageRole(node) !== 'system' && !isHiddenApiMessage(node));
+    const turns = [];
+    let current = null;
+
+    for (const node of nodes) {
+      assertPopupExportNotCancelled();
+      const role = apiMessageRole(node);
+      const type = apiMessageContentType(node);
+      const msg = node.message;
+      if (role === 'user') {
+        current = { user: node, assistant: [], reasoning: [], sources: [], activity: [] };
+        turns.push(current);
+        continue;
+      }
+      if (!current) {
+        current = { user: null, assistant: [], reasoning: [], sources: [], activity: [] };
+        turns.push(current);
+      }
+      if (role === 'assistant') {
+        if (type === 'reasoning_recap' || type === 'thoughts' || msg.metadata?.is_thinking_preamble_message) {
+          const text = apiMessageText(node);
+          if (text) current.reasoning.push(text);
+        } else if (type === 'text' && (msg.channel === 'final' || msg.end_turn === true)) {
+          const text = apiMessageText(node);
+          if (text) current.assistant.push(text);
+        } else if (type === 'code' || type === 'model_editable_context') {
+          const item = apiActivityFromMessage(node);
+          if (item) current.activity.push(item);
+        }
+        const links = apiLinksFromMessage(node);
+        if (links.length) current.sources.push(...links);
+      } else if (role === 'tool') {
+        const item = apiActivityFromMessage(node);
+        if (item) current.activity.push(item);
+      }
+    }
+
+    const dedupeLinks = (links) => {
+      const seen = new Set();
+      const out = [];
+      for (const link of links) {
+        if (!link?.url || seen.has(link.url)) continue;
+        seen.add(link.url);
+        out.push(link);
+      }
+      return out;
+    };
+
+    const parts = [];
+    for (const turn of turns) {
+      assertPopupExportNotCancelled();
+      const userText = turn.user ? apiMessageText(turn.user) : '';
+      const userAttachments = turn.user ? apiAttachmentsMarkdown(turn.user) : '';
+      const userAttachmentCount = turn.user ? apiAttachmentCount(turn.user) : 0;
+      const assistantText = turn.assistant.join('\n\n---\n\n').trim();
+      const links = dedupeLinks(turn.sources);
+
+      if (userText || userAttachments) {
+        stats.user++;
+        if (settings.includeImages) stats.images += userAttachmentCount;
+        parts.push(`## User\n\n${userText || '_[Пустое сообщение]_'}${settings.includeImages ? userAttachments : ''}`.trim() + '\n');
+      }
+      if (assistantText || turn.reasoning.length || links.length || turn.activity.length) {
+        stats.assistant++;
+        let md = `## ChatGPT\n\n${assistantText || '_[Финальный текст не найден в API-записи.]_'}\n`;
+        if (settings.includeReasoning && turn.reasoning.length) {
+          md += `\n\n### Рассуждения ChatGPT\n\n${turn.reasoning.join('\n\n---\n\n')}\n`;
+        }
+        if (settings.includeSources && links.length) {
+          stats.sources += links.length;
+          md += renderApiSourcesMarkdown(links);
+        }
+        if (settings.includeSourceActivity && turn.activity.length) {
+          stats.activity += turn.activity.length;
+          md += renderApiActivityMarkdown(turn.activity);
+        }
+        parts.push(md.trim() + '\n');
+      }
+    }
+
+    const title = data.title || document.title || 'ChatGPT chat';
+    const exportedAt = new Date().toISOString();
+    let markdown = `# ${title}\n\n`;
+    markdown += `> **Сводка экспорта ChatGPT**  \n`;
+    markdown += `> Источник: ChatGPT backend API  \n`;
+    markdown += `> User-сообщений: ${stats.user}; ответов ChatGPT: ${stats.assistant}  \n`;
+    markdown += `> Источников: ${stats.sources}; activity-шагов: ${stats.activity}; картинок/вложений: ${stats.images}  \n`;
+    markdown += `> URL: ${location.href}  \n`;
+    markdown += `> Экспортировано: ${exportedAt}\n\n---\n\n`;
+    return { markdown: markdown + parts.join('\n---\n\n') + '\n', turnCount: parts.length, source: 'api' };
+  }
+
+  async function runChatGPTPopupExport(rawSettings) {
+    if (popupExportRunning) {
+      if (!document.getElementById(CHATGPT_EXPORT_OVERLAY_ID)) showChatGPTExportOverlay();
+      return { success: false, message: 'Экспорт уже запущен' };
+    }
+    popupExportRunning = true;
+    popupExportCancel = false;
+    const settings = normalizeChatGPTExportSettings(rawSettings || {});
+    const started = performance.now();
+    const stats = { user: 0, assistant: 0, sources: 0, activity: 0, images: 0 };
+    const parts = [];
+
+    showChatGPTExportOverlay();
+    try {
+      assertPopupExportNotCancelled();
+      updateChatGPTExportOverlay('Запрашиваю историю ChatGPT...', 'Шаг 1/3: полный JSON диалога');
+      let apiBuilt = null;
+      try {
+        const apiData = await fetchChatGPTConversationJson();
+        assertPopupExportNotCancelled();
+        if (apiData) apiBuilt = buildChatGPTApiMarkdown(apiData, settings, stats);
+      } catch (apiError) {
+        log('popup_export.api_fallback', { err: apiError?.message || String(apiError) });
+      }
+
+      if (apiBuilt?.markdown && apiBuilt.turnCount > 0) {
+        assertPopupExportNotCancelled();
+        updateChatGPTExportOverlay('Собираю markdown...', 'Шаг 3/3: упаковка');
+        const filename = `chatgpt-${safeFilenamePart(document.title || 'chat')}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.md`;
+        const delivery = await deliverMarkdown(apiBuilt.markdown, filename, settings.__export.downloadFile);
+        const elapsed = ((performance.now() - started) / 1000).toFixed(1);
+        log('popup_export.done', {
+          source: apiBuilt.source,
+          turns: apiBuilt.turnCount,
+          delivery,
+          sources: stats.sources,
+          activity: stats.activity,
+          images: stats.images,
+          elapsed,
+        });
+        showChatGPTExportTerminal('success',
+          `Записей: ${apiBuilt.turnCount}; источников: ${stats.sources}; activity-шагов: ${stats.activity}\n` +
+          (delivery === 'clipboard'
+            ? 'Markdown скопирован в буфер обмена'
+            : delivery === 'download-fallback'
+              ? `Буфер обмена был недоступен, скачан файл: ${filename}`
+          : `Файл: ${filename}`));
+        return { success: true, message: 'Экспорт ChatGPT завершён' };
+      }
+      if (apiBuilt?.markdown) {
+        log('popup_export.api_empty_fallback', { turns: apiBuilt.turnCount });
+      }
+
+      updateChatGPTExportOverlay('Сканирую сообщения ChatGPT...', 'Шаг 1/3: DOM fallback');
+      await waitFor(() => document.querySelector('[data-message-author-role]'), 'ChatGPT messages', 8000, 200);
+      const turns = chatgptConversationTurns();
+      if (!turns.length) throw new Error('Сообщения ChatGPT не найдены на странице');
+
+      for (let i = 0; i < turns.length; i++) {
+        assertPopupExportNotCancelled();
+        const turn = turns[i];
+        const messageEl = extractMessageRoot(turn);
+        const role = messageEl?.getAttribute?.('data-message-author-role') || 'message';
+        if (role === 'user') stats.user++;
+        if (role === 'assistant') stats.assistant++;
+        try { turn.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+        updateChatGPTExportOverlay('Извлекаю сообщения...', `Шаг 2/3: ${i + 1}/${turns.length} (${roleLabel(role)})`);
+        await sleep(80);
+
+        let md = `## ${roleLabel(role)}\n\n`;
+        const text = extractMessageTextMarkdown(messageEl, role);
+        const images = settings.includeImages ? extractImagesForExportTurn(turn) : [];
+        if (text) md += `${text}\n`;
+        if (settings.includeReasoning && role === 'assistant') {
+          const reasoning = extractReasoningMarkdownForMessage(messageEl);
+          if (reasoning) md += `\n\n### Рассуждения ChatGPT\n\n${reasoning}\n`;
+        }
+        if (images.length) {
+          stats.images += images.length;
+          md += renderImagesMarkdown(images);
+        }
+        if (role === 'assistant' && (settings.includeSources || settings.includeSourceActivity)) {
+          updateChatGPTExportOverlay('Читаю источники ChatGPT...', `Шаг 2/3: ${i + 1}/${turns.length}`);
+          const src = await extractSourcesForExportTurn(turn, i + 1);
+          stats.sources += src.links.length;
+          stats.activity += src.activity_items.length;
+          md += renderSourcesMarkdown(src, settings);
+        }
+        if (!text && !images.length) {
+          md += '_[Сообщение найдено, но текст или изображение не извлечены из DOM.]_\n';
+        }
+        parts.push(md.trim() + '\n');
+      }
+
+      updateChatGPTExportOverlay('Собираю markdown...', 'Шаг 3/3: упаковка');
+      const body = parts.join('\n---\n\n');
+      const markdown = buildChatGPTExportHeader(turns.length, stats) + body + '\n';
+      const filename = `chatgpt-${safeFilenamePart(document.title || 'chat')}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.md`;
+      const delivery = await deliverMarkdown(markdown, filename, settings.__export.downloadFile);
+      const elapsed = ((performance.now() - started) / 1000).toFixed(1);
+      log('popup_export.done', {
+        turns: turns.length,
+        delivery,
+        sources: stats.sources,
+        activity: stats.activity,
+        images: stats.images,
+        elapsed,
+      });
+      showChatGPTExportTerminal('success',
+        `Сообщений: ${turns.length}; источников: ${stats.sources}; картинок: ${stats.images}\n` +
+        (delivery === 'clipboard'
+          ? 'Markdown скопирован в буфер обмена'
+          : delivery === 'download-fallback'
+            ? `Буфер обмена был недоступен, скачан файл: ${filename}`
+            : `Файл: ${filename}`));
+      return { success: true, message: 'Экспорт ChatGPT завершён' };
+    } catch (e) {
+      const msg = e?.message || String(e);
+      log('popup_export.failed', { err: msg });
+      showChatGPTExportTerminal('error', msg);
+      return { success: false, message: msg };
+    } finally {
+      popupExportRunning = false;
+      popupExportCancel = false;
+    }
   }
 
   // ── Реестр уровней интеллекта (effort). ЕДИНОЕ место. ──────────────
@@ -558,6 +1519,145 @@
     ed.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
   }
 
+  function isDisabled(el) {
+    if (!el) return true;
+    return !!el.disabled
+      || el.hasAttribute('disabled')
+      || el.getAttribute('aria-disabled') === 'true'
+      || el.closest('[aria-disabled="true"]');
+  }
+
+  function composerBusySnapshot() {
+    const root = composerRoot();
+    const ed = findComposer();
+    const send = findSendBtn();
+    const busySelectors = [
+      '[role="progressbar"]',
+      '[aria-busy="true"]',
+      '[data-testid*="loading" i]',
+      '[data-testid*="loader" i]',
+      '[data-testid*="progress" i]',
+      '[class*="animate-spin"]',
+      '[class*="spinner"]',
+      '[class*="loading"]',
+      'svg[aria-label*="loading" i]',
+      'svg[aria-label*="загруз" i]',
+    ].join(',');
+    const busyNodes = Array.from(root.querySelectorAll(busySelectors)).filter(isVisible);
+    const rootText = compactText(root.textContent).slice(0, 500);
+    const busyText = /(?:uploading|loading|processing|attaching|загруз|обработ|прикреп|подождите|please wait)/i.test(rootText);
+    const composerDisabled = isDisabled(ed)
+      || ed?.getAttribute('contenteditable') === 'false'
+      || ed?.getAttribute('aria-disabled') === 'true';
+    const sendVisible = !!send && isVisible(send);
+    const sendDisabled = !sendVisible || isDisabled(send);
+    return {
+      ready: sendVisible && !sendDisabled && !composerDisabled && busyNodes.length === 0 && !busyText,
+      sendVisible,
+      sendDisabled,
+      composerDisabled,
+      busyCount: busyNodes.length,
+      busyText,
+      textHead: rootText.slice(0, 160),
+    };
+  }
+
+  function waitComposerReadyAfterPaste(id, timeoutMs = 120000) {
+    const t0 = performance.now();
+    return new Promise((resolve, reject) => {
+      let done = false;
+      let rafPending = false;
+      let verifyingReady = false;
+      let lastSig = '';
+      const observer = new MutationObserver(scheduleCheck);
+      const timer = setTimeout(() => {
+        const snap = composerBusySnapshot();
+        finish(null, new Error('chatgpt_composer_not_ready_after_paste: ' + JSON.stringify({
+          sendVisible: snap.sendVisible,
+          sendDisabled: snap.sendDisabled,
+          composerDisabled: snap.composerDisabled,
+          busyCount: snap.busyCount,
+          busyText: snap.busyText,
+        })));
+      }, timeoutMs);
+
+      function cleanup() {
+        observer.disconnect();
+        document.removeEventListener('input', scheduleCheck, true);
+        document.removeEventListener('change', scheduleCheck, true);
+        clearTimeout(timer);
+      }
+      function finish(value, error) {
+        if (done) return;
+        done = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve(value);
+      }
+      function emitWaitLog(snap) {
+        const sig = [
+          snap.sendVisible ? 1 : 0,
+          snap.sendDisabled ? 1 : 0,
+          snap.composerDisabled ? 1 : 0,
+          snap.busyCount,
+          snap.busyText ? 1 : 0,
+        ].join('|');
+        if (sig === lastSig) return;
+        lastSig = sig;
+        const data = {
+          waitedMs: Math.round(performance.now() - t0),
+          sendVisible: snap.sendVisible,
+          sendDisabled: snap.sendDisabled,
+          composerDisabled: snap.composerDisabled,
+          busyCount: snap.busyCount,
+          busyText: snap.busyText,
+        };
+        log('composer.wait_after_paste', data);
+        bridgeLog('gpt.composer.wait_after_paste', data, id, null);
+      }
+      function verifyReadyNextFrame(firstSnap) {
+        if (verifyingReady) return;
+        verifyingReady = true;
+        requestAnimationFrame(() => {
+          verifyingReady = false;
+          const snap = composerBusySnapshot();
+          if (!snap.ready) {
+            emitWaitLog(snap);
+            return;
+          }
+          log('composer.ready_after_paste', { waitedMs: Math.round(performance.now() - t0) });
+          bridgeLog('gpt.composer.ready_after_paste', { waitedMs: Math.round(performance.now() - t0) }, id, null);
+          finish(firstSnap);
+        });
+      }
+      function checkNow() {
+        if (done) return;
+        const snap = composerBusySnapshot();
+        if (snap.ready) verifyReadyNextFrame(snap);
+        else emitWaitLog(snap);
+      }
+      function scheduleCheck() {
+        if (done || rafPending) return;
+        rafPending = true;
+        requestAnimationFrame(() => {
+          rafPending = false;
+          checkNow();
+        });
+      }
+
+      observer.observe(document.body || document.documentElement, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ['disabled', 'aria-disabled', 'aria-busy', 'data-testid', 'class', 'contenteditable'],
+      });
+      document.addEventListener('input', scheduleCheck, true);
+      document.addEventListener('change', scheduleCheck, true);
+      scheduleCheck();
+    });
+  }
+
   function bytesFromBase64(base64) {
     const bin = atob(base64 || '');
     const out = new Uint8Array(bin.length);
@@ -640,15 +1740,94 @@
   async function clickSend() {
     // Send-button рендерится только когда композер непустой (вместо него в
     // idle — кнопка голосового режима). Появление = paste принят.
-    const btn = await waitFor(() => findSendBtn(), 'send button (composer non-empty)', 10000);
+    const btn = await waitEnabledSendButton();
     btn.click();
-    await sleep(1000);
-    // Успех: stop появился ИЛИ send исчез (началась генерация).
-    if (findStopBtn() || !findSendBtn()) return;
+    if (await waitSubmitAccepted()) return;
     // Fallback: полный pointer-chain.
     const again = findSendBtn();
-    if (again) { nativeMouseClick(again); await sleep(800); }
-    if (!findStopBtn() && findSendBtn()) throw new Error('chatgpt_submit_failed: send click had no effect');
+    if (again) nativeMouseClick(again);
+    if (await waitSubmitAccepted()) return;
+    throw new Error('chatgpt_submit_failed: send click had no effect');
+  }
+
+  function waitEnabledSendButton(timeoutMs = 120000) {
+    return new Promise((resolve, reject) => {
+      let done = false;
+      let rafPending = false;
+      const observer = new MutationObserver(scheduleCheck);
+      const timer = setTimeout(() => finish(null, new Error('timeout: enabled send button (composer non-empty)')), timeoutMs);
+      function cleanup() {
+        observer.disconnect();
+        clearTimeout(timer);
+      }
+      function finish(value, error) {
+        if (done) return;
+        done = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve(value);
+      }
+      function checkNow() {
+        if (done) return;
+        const b = findSendBtn();
+        if (b && isVisible(b) && !isDisabled(b)) finish(b);
+      }
+      function scheduleCheck() {
+        if (done || rafPending) return;
+        rafPending = true;
+        requestAnimationFrame(() => {
+          rafPending = false;
+          checkNow();
+        });
+      }
+      observer.observe(document.body || document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['disabled', 'aria-disabled', 'data-testid', 'class'],
+      });
+      scheduleCheck();
+    });
+  }
+
+  function waitSubmitAccepted(timeoutMs = 120000) {
+    return new Promise(resolve => {
+      let done = false;
+      let rafPending = false;
+      const observer = new MutationObserver(scheduleCheck);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      function cleanup() {
+        observer.disconnect();
+        clearTimeout(timer);
+      }
+      function finish(value) {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve(value);
+      }
+      function checkNow() {
+        if (done) return;
+        // Успех: stop появился ИЛИ send исчез/стал неактивным (началась генерация).
+        const send = findSendBtn();
+        if (findStopBtn() || !send || !isVisible(send) || isDisabled(send)) finish(true);
+      }
+      function scheduleCheck() {
+        if (done || rafPending) return;
+        rafPending = true;
+        requestAnimationFrame(() => {
+          rafPending = false;
+          checkNow();
+        });
+      }
+      observer.observe(document.body || document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['disabled', 'aria-disabled', 'data-testid', 'class'],
+      });
+      scheduleCheck();
+    });
   }
 
   // ── Extract: последний assistant-ответ ──────────────────────────────
@@ -812,7 +1991,8 @@
 
   // ── Источники (правая панель «Детали рассуждения») ──────────────────
   // Чип «Источники» в action-bar последнего ответа → клик → справа панель:
-  //   Активность · 2m 20s / «Думал на протяжении X» / Источники · N / ссылки.
+  //   Активность · 2m 20s / «Думал на протяжении X» / Источники · N / ссылки
+  //   + activity/tool steps (GitHub fetches, bash/python command snippets).
   // Парсим ВСЕГДА; в text включается только при options.sources (см. main).
   function findSourcesChip() {
     const chips = Array.from(document.querySelectorAll('button[aria-label]'))
@@ -824,7 +2004,7 @@
       .find(s => /рассужден|reasoning/i.test(s.getAttribute('aria-label') || '') && s.offsetParent);
   }
   async function extractSources() {
-    const out = { links: [], activity: null, thinking: [], chip_present: false, panel_opened: false };
+    const out = { links: [], activity_items: [], activity: null, thinking: [], chip_present: false, panel_opened: false };
     const chip = findSourcesChip();
     if (!chip) { log('sources.no_chip'); return out; }
     out.chip_present = true;
@@ -839,11 +2019,14 @@
     out.panel_opened = true;
     await sleep(700); // даём ссылкам дорендериться
     const seen = new Set();
+    const seenActivity = new Set();
     const collect = () => {
       for (const a of panel.querySelectorAll('a[href]')) {
         const href = a.href || '';
         if (!/^https?:/i.test(href)) continue;
-        if (/chatgpt\.com|openai\.com/i.test(href)) continue; // внутренняя навигация
+        let host = '';
+        try { host = new URL(href).hostname.toLowerCase(); } catch (_) {}
+        if (host === 'chatgpt.com' || host.endsWith('.chatgpt.com') || host === 'chat.openai.com') continue; // внутренняя навигация
         if (seen.has(href)) continue;
         seen.add(href);
         out.links.push({
@@ -852,6 +2035,7 @@
           title: (a.textContent || '').trim().replace(/\s*\n+\s*/g, ' — ').slice(0, 300),
         });
       }
+      collectActivityItems(panel, out.activity_items, seenActivity);
     };
     collect();
     // Список источников виртуализирован/подгружается при скролле: панель
@@ -869,7 +2053,7 @@
       idle = out.links.length === before ? idle + 1 : 0;
       if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 10 && out.links.length === before) break;
     }
-    log('sources.scroll_done', { links: out.links.length });
+    log('sources.scroll_done', { links: out.links.length, activity_items: out.activity_items.length });
     const txt = panel.textContent || '';
     out.thinking = txt.match(/(?:Думал[а]? на протяжении|Thought for)\s+[^\n]{1,30}/g) || [];
     // textContent склеивает блоки без \n — нежадный матч + жёсткий cap, иначе
@@ -882,8 +2066,79 @@
         .find(b => /^(Закрыть|Close)$/i.test(b.getAttribute('aria-label') || ''));
       closeBtn?.click();
     } catch (_) {}
-    log('sources.extracted', { links: out.links.length, thinking: out.thinking.length, activity: out.activity });
+    log('sources.extracted', { links: out.links.length, activity_items: out.activity_items.length, thinking: out.thinking.length, activity: out.activity });
     return out;
+  }
+
+  function collectActivityItems(panel, outItems, seen) {
+    const titleNodes = Array.from(panel.querySelectorAll('div.text-token-text-primary'));
+    for (const titleEl of titleNodes) {
+      const title = compactText(titleEl.textContent).slice(0, 220);
+      if (!title || /^(Думал[а]? на протяжении|Thought for)\b/i.test(title)) continue;
+      const block = titleEl.closest('.relative.flex.w-full.items-start.gap-2.overflow-clip') ||
+        titleEl.closest('[class*="overflow-clip"]') ||
+        titleEl.parentElement;
+      if (!block || !panel.contains(block)) continue;
+      const blockText = compactText(block.textContent).slice(0, 2400);
+      if (!blockText) continue;
+      const codeTexts = uniqueStrings(Array.from(block.querySelectorAll('pre code, pre, code'))
+        .map(el => cleanCodeText(el.textContent))
+        .filter(Boolean));
+      const command = pickCommandText(codeTexts);
+      if (isCodeLanguageTitle(title) && command) continue;
+      const links = Array.from(block.querySelectorAll('a[href]'))
+        .map(a => sourceLinkFromAnchor(a))
+        .filter(Boolean)
+        .slice(0, 8);
+      const sig = [title, command || '', links.map(l => l.url).join('|'), blockText.slice(0, 160)].join('\n');
+      if (seen.has(sig)) continue;
+      seen.add(sig);
+      const item = { title };
+      if (links.length) item.links = links;
+      if (command) item.command = command.slice(0, 4000);
+      if (blockText && blockText !== title) item.text = blockText;
+      outItems.push(item);
+      if (outItems.length >= 120) return;
+    }
+  }
+
+  function sourceLinkFromAnchor(a) {
+    const href = a?.href || '';
+    if (!/^https?:/i.test(href)) return null;
+    let host = '';
+    try { host = new URL(href).hostname.toLowerCase(); } catch (_) {}
+    if (host === 'chatgpt.com' || host.endsWith('.chatgpt.com') || host === 'chat.openai.com') return null;
+    return {
+      url: href,
+      title: compactText(a.textContent).slice(0, 300),
+    };
+  }
+
+  function compactText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function cleanCodeText(value) {
+    return compactText(value).replace(/^(?:Python|JavaScript|TypeScript|Bash|Shell|JSON)\s+(?=(?:bash|python|node|npm|pnpm|curl|git|rg|sed|cat|sqlite3|jq)\b)/i, '');
+  }
+
+  function uniqueStrings(values) {
+    const out = [];
+    const seen = new Set();
+    for (const value of values) {
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      out.push(value);
+    }
+    return out;
+  }
+
+  function pickCommandText(values) {
+    return values.find(v => /^(?:bash|python|node|npm|pnpm|curl|git|rg|sed|cat|sqlite3|jq)\b/i.test(v)) || values[0] || '';
+  }
+
+  function isCodeLanguageTitle(value) {
+    return /^(?:Python|JavaScript|TypeScript|Bash|Shell|JSON|Text|Markdown)$/i.test(String(value || '').trim());
   }
 
   function cleanActivity(value) {
@@ -1023,6 +2278,56 @@
     try { chrome.runtime.sendMessage({ __sc_close_self_tab: true, reason }); } catch {}
   }
 
+  async function detachFocusEmulation(tabId) {
+    return await new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage({ __sc_debugger_detach: true, tabId: tabId ?? undefined }, r => {
+          if (chrome.runtime.lastError) {
+            log('compose.debugger_detach_fail', { err: chrome.runtime.lastError.message });
+            resolve(false);
+            return;
+          }
+          log('compose.debugger_detach', r || {});
+          resolve(!!r?.ok);
+        });
+      } catch (e) {
+        log('compose.debugger_detach_throw', { err: e?.message || String(e) });
+        resolve(false);
+      }
+    });
+  }
+
+  async function runComposeHandoff(id, myTabId) {
+    log('compose.start', { id, tabId: myTabId });
+    const stopKeepAlive = startKeepAlivePort();
+    let submitted = false;
+    try {
+      const job = await fetchComposeJob(id);
+      const effortKey = resolveEffort(job.effort);
+      const modelKey = resolveModel(job.model);
+      await waitFor(() => findComposer(), 'composer (#prompt-textarea — логин?)', 20000);
+      const okModel = await ensureModelSelected(modelKey);
+      if (!okModel) throw new Error(`chatgpt_model_select_failed: не удалось выбрать модель ${modelDisplay(modelKey)}`);
+      await ensureEffortSelected(effortKey);
+      pasteIntoComposer(job.prompt);
+      await waitComposerReadyAfterPaste(null);
+      await clickSend();
+      submitted = true;
+      await removeComposeJob(id);
+      log('compose.submitted', {
+        id,
+        model: modelKey,
+        effort: effortKey,
+        promptLen: job.prompt.length,
+      });
+    } catch (e) {
+      log('compose.flow_err', { id, err: e?.message || String(e) });
+    } finally {
+      stopKeepAlive();
+      if (submitted) await detachFocusEmulation(myTabId);
+    }
+  }
+
   async function main() {
     const myTabId = await getMyTabId();
     const bootInfo = {
@@ -1032,6 +2337,12 @@
     };
     log('cs.boot', bootInfo);
     bridgeLog('cs.boot', bootInfo, null, myTabId);
+
+    const composeId = getComposeId();
+    if (composeId) {
+      await runComposeHandoff(composeId, myTabId);
+      return;
+    }
 
     let id = getRequestId();
     let recovered = false;
@@ -1067,6 +2378,7 @@
     const effortKey = resolveEffort(job.options?.effort);
     const modelKey = resolveModel(job.options?.model);
     const wantSourcesInText = !!job.options?.sources;
+    const keepTabAfterDone = job.options?.keepTab === true || job.options?.autoClose === false;
     const attachmentMetas = Array.isArray(job.attachments) ? job.attachments : [];
 
     // MCP-плашка (общий research-badge.js) — юзер видит «вкладка под job'ом».
@@ -1115,7 +2427,7 @@
         }
         await postState(id, { stage: 'submitting' });
         pasteIntoComposer(job.prompt);
-        await sleep(800);
+        await waitComposerReadyAfterPaste(id);
         await clickSend();
         await postState(id, { stage: 'running' });
       } else {
@@ -1175,7 +2487,7 @@
           const isShort = outText.length > 0 && outText.length < 800;
           const endsWithQuestion = /\?\s*$/.test(outText);
           const isClarifying = isShort && endsWithQuestion;
-          log('watcher.final', { textLen: outText.length, images: persistedImages.length, links: src.links.length, thinking: thinkingLine });
+          log('watcher.final', { textLen: outText.length, images: persistedImages.length, links: src.links.length, activity_items: src.activity_items.length, thinking: thinkingLine });
           const confirmed = await postTerminalState(id, {
             status: 'done', stage: 'done',
             url: final.url, title: final.title,
@@ -1193,8 +2505,10 @@
               is_research: src.links.length > 0,
               is_clarifying: isClarifying,
               sources: src.links,
+              source_activity: src.activity_items,
               sources_meta: {
                 activity: src.activity,
+                activity_items: src.activity_items,
                 thinking: src.thinking,
                 thinking_last: thinkingLine,
                 thinking_text: thinkingText || null,
@@ -1215,7 +2529,11 @@
           // вручную) — лучше «лишняя вкладка», чем зомби-running.
           if (confirmed) {
             stopKeepAlive();
-            closeSelfTab('research_done');
+            if (keepTabAfterDone) {
+              log('done.keep_tab_open');
+            } else {
+              closeSelfTab('research_done');
+            }
           } else {
             log('done.unconfirmed_keep_tab_open');
           }

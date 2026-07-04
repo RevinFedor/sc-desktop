@@ -1,16 +1,10 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react'
 import { BarChart3, X } from 'lucide-react'
 import { startTelegramFetch, resolveTelegramTitle, watchJob, cancelJob } from '../lib/jobs'
+import { useInvalidator } from '../lib/dataBus'
 import PlatformLogo from './PlatformLogo'
 import TelegramScopeFields, { defaultRange, presetDaysOf } from './TelegramScopeFields'
 import { CONTENT_TYPES, defaultContent } from './TelegramTypesPopover'
-
-// db-type → human label for the backfill notice. Keys mirror items.type
-// values written by tg_fetch_json (so 'document' / 'poll', not 'docs').
-const TG_LABEL = {
-  text: 'текстов', voice: 'голосовых', video: 'видео', photo: 'фото',
-  poll: 'опросов', document: 'документов',
-}
 
 // Single localStorage key holds last-used range mode, content types, and
 // engine for the form. Stored as one JSON blob so adding a new persisted
@@ -75,6 +69,166 @@ function writeLastUsed({ range, content, engine }) {
   } catch {}
 }
 
+function parseTelegramDateInput(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const m = raw.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})(?:\s+(\d{1,2}):(\d{2}))?$/)
+    || raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/)
+  if (!m) return null
+
+  let year, month, day, hour, minute
+  if (m[0].includes('.')) {
+    day = Number(m[1])
+    month = Number(m[2])
+    year = Number(m[3])
+    if (year < 100) year = year <= 68 ? 2000 + year : 1900 + year
+    hour = Number(m[4] || 0)
+    minute = Number(m[5] || 0)
+  } else {
+    year = Number(m[1])
+    month = Number(m[2])
+    day = Number(m[3])
+    hour = Number(m[4] || 0)
+    minute = Number(m[5] || 0)
+  }
+
+  const d = new Date(year, month - 1, day, hour, minute, 0, 0)
+  if (
+    d.getFullYear() !== year ||
+    d.getMonth() !== month - 1 ||
+    d.getDate() !== day ||
+    d.getHours() !== hour ||
+    d.getMinutes() !== minute
+  ) return null
+  return d
+}
+
+function formatDateRu(date) {
+  const pad = n => String(n).padStart(2, '0')
+  return `${pad(date.getDate())}.${pad(date.getMonth() + 1)}.${date.getFullYear()}`
+}
+
+function rangeIssue(range) {
+  if (range.mode !== 'date_range') return null
+  const fromRaw = String(range.fromDate || '').trim()
+  if (!fromRaw) return null
+  const from = parseTelegramDateInput(fromRaw)
+  if (!from) {
+    return `Не понимаю дату «${fromRaw}». Формат: 01.12.2026 или 01.12.2026 12:00.`
+  }
+  const now = new Date()
+  if (from.getTime() > now.getTime()) {
+    return `Дата начала ${formatDateRu(from)} ещё не наступила. Сегодня ${formatDateRu(now)}; с такой границей Telegram вернёт 0 сообщений.`
+  }
+  const toRaw = String(range.toDate || '').trim()
+  if (toRaw && !parseTelegramDateInput(toRaw)) {
+    return `Не понимаю дату «${toRaw}». Формат: 01.12.2026 или 01.12.2026 12:00.`
+  }
+  return null
+}
+
+function resolveNeedleForTarget(target, kind) {
+  const raw = String(target || '').trim()
+  if (!raw) return ''
+  if (kind === 'title') return raw
+  try {
+    const u = new URL(raw)
+    if (/^(t\.me|telegram\.me)$/i.test(u.hostname)) {
+      const parts = u.pathname.split('/').filter(Boolean)
+      if (parts[0] === 'c' && parts[1]) return `-100${parts[1]}`
+      if (parts[0]) return parts[0]
+    }
+  } catch {}
+  return raw.replace(/^@+/, '')
+}
+
+function unixFromTelegramDateInput(value) {
+  const d = parseTelegramDateInput(value)
+  return d ? Math.floor(d.getTime() / 1000) : null
+}
+
+function buildLocalMediaEstimateScope(sourceId, range, topicIds) {
+  if (!sourceId) return null
+  const scope = { source_id: Number(sourceId), mode: range.mode || 'all' }
+  if (topicIds && topicIds.size > 0) {
+    scope.topic_ids = Array.from(topicIds).map(Number).filter(Number.isFinite)
+  }
+  const presetDays = presetDaysOf(range.mode)
+  if (range.mode === 'last_n') {
+    const n = Number(range.lastN)
+    if (!Number.isFinite(n) || n <= 0) return null
+    scope.mode = 'last_n'
+    scope.limit = n
+    return scope
+  }
+  if (range.mode === 'all') {
+    scope.mode = 'all'
+    return scope
+  }
+  if (range.mode === 'date_range') {
+    const from = unixFromTelegramDateInput(range.fromDate)
+    if (!from) return null
+    scope.mode = 'date_range'
+    scope.date_from = from
+    const to = unixFromTelegramDateInput(range.toDate)
+    if (to) scope.date_to = to
+    return scope
+  }
+  if (presetDays != null) {
+    scope.mode = 'from_date'
+    scope.date_from = Math.floor((Date.now() - presetDays * 86400 * 1000) / 1000)
+    return scope
+  }
+  return null
+}
+
+function estimateType(estimate, type) {
+  return estimate?.by_type?.[type] || {
+    count: 0,
+    processed: 0,
+    duration_seconds: 0,
+  }
+}
+
+function compactCount(n) {
+  return Number(n || 0).toLocaleString('ru-RU')
+}
+
+function mediaEstimateSummary(estimate, content, redoProcessed) {
+  if (!estimate?.ok) return null
+  const rows = []
+  const selectedTypes = []
+  function add(type, label, withDuration = false) {
+    const row = estimateType(estimate, type)
+    selectedTypes.push(row)
+    if (!row.count) return
+    const dur = withDuration && row.duration_seconds > 0
+      ? ` · ${fmtDuration(row.duration_seconds)}`
+      : ''
+    rows.push(`${compactCount(row.count)} ${label}${dur}`)
+  }
+  if (content.voice) {
+    add('voice', 'голосовых', true)
+    add('audio', 'аудио', true)
+  }
+  if (content.video) add('video', 'видео', true)
+  if (content.photo) add('photo', 'фото')
+  if (content.docs) add('document', 'документов')
+
+  const pickedAny = content.voice || content.video || content.photo || content.docs
+  if (!pickedAny) return null
+  const total = selectedTypes.reduce((sum, row) => sum + Number(row.count || 0), 0)
+  const processed = selectedTypes.reduce((sum, row) => sum + Number(row.processed || 0), 0)
+  const toRun = redoProcessed ? total : Math.max(0, total - processed)
+  return {
+    total,
+    processed,
+    toRun,
+    bits: rows,
+    empty: total === 0,
+  }
+}
+
 /**
  * Headless form (no header, no back button, no footer-bar). Renders inline
  * inside whatever container the caller provides.
@@ -91,20 +245,29 @@ function writeLastUsed({ range, content, engine }) {
  *                    pick the rest of the form behaves identically.
  *   onStarted(id)  — called after job is enqueued
  */
-export default function TelegramConfigForm({ target, kind, onStarted }) {
+export default function TelegramConfigForm({
+  target,
+  kind,
+  onStarted,
+  sourceId = null,
+  sourceSession = null,
+  sourceSessionConflict = false,
+  notifyOnLaunch = false,
+}) {
   // Title-resolve state (only used when kind === 'title').
   // 'pending' before mount-effect kicks off; 'resolving' during subprocess;
   // 'picker' when 2+ matches; 'error' for 0/no-session/etc; 'ready' once we
   // have a chosen chat (or kind !== 'title' from the start).
-  const isTitle = kind === 'title'
-  const [resolveStage, setResolveStage] = useState(isTitle ? 'pending' : 'ready')
+  const needsAccountResolve = !sourceId
+  const resolveNeedle = useMemo(() => resolveNeedleForTarget(target, kind), [target, kind])
+  const [resolveStage, setResolveStage] = useState(needsAccountResolve ? 'pending' : 'ready')
   const [resolveErr, setResolveErr] = useState(null)
   const [resolveScanned, setResolveScanned] = useState(0)  // live "просмотрено N…" counter
   const [matches, setMatches] = useState([])
   const [chosen, setChosen] = useState(null)        // {chat_id, title, kind, members, last_message_at, username}
 
   useEffect(() => {
-    if (!isTitle) return
+    if (!needsAccountResolve) return
     let alive = true
     setResolveStage('resolving'); setResolveErr(null); setMatches([]); setChosen(null); setResolveScanned(0)
     // Subscribe to scan progress while invoke is in flight. Telethon's
@@ -116,7 +279,7 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
     })
     ;(async () => {
       try {
-        const r = await resolveTelegramTitle(target)
+        const r = await resolveTelegramTitle(resolveNeedle)
         if (!alive) return
         if (r.error === 'no_session') {
           setResolveErr('Нет активной Telegram-сессии — открой настройки и войди.')
@@ -124,7 +287,7 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
           return
         }
         if (!r.matches || r.matches.length === 0) {
-          setResolveErr(`Не нашёл чат с названием «${target}». Зайди в чат в Telegram, чтобы он попал в список диалогов сессии, потом попробуй снова.`)
+          setResolveErr(`Не нашёл «${target}» ни в одном Telegram-аккаунте. Открой этот чат в Telegram нужного аккаунта и попробуй снова.`)
           setResolveStage('error')
           return
         }
@@ -142,7 +305,7 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
       }
     })()
     return () => { alive = false; off && off() }
-  }, [isTitle, target])
+  }, [needsAccountResolve, target, resolveNeedle])
 
   // Scope state — owned here, fed into <TelegramScopeFields>.
   //
@@ -175,6 +338,7 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
   //  false — no linked group; checkbox disabled with «У канала нет обсуждений» hint
   const [hasDiscussion, setHasDiscussion] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+  const [launchedJobId, setLaunchedJobId] = useState(null)
   const [err, setErr] = useState(null)
   // «Ничего не найдено» — set when a launched fetch finishes with 0 items and
   // a non-fatal warning (empty chat / dialog / filters). Keeps the form on the
@@ -198,13 +362,13 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
   // as --since-msgid when the «пропускать дубли» toggle is on.
   const [sourceRow, setSourceRow] = useState(null)
   const [maxExternalId, setMaxExternalId] = useState(0)
-  // Per-type breakdown for the existing source: used to detect "this type
-  // has saved rows but their bodies are empty" — common after we extended
-  // the classifier (e.g. polls). When the user picks such a type and
-  // skipDupes is on, the fetch would return 0 new items even though the
-  // bodies need backfill. We force-disable skipDupes in that case and
-  // flash a hint right next to the toggle.
+  // Per-type breakdown for the existing source: used only as an internal
+  // guard for skipDupes. If the selected type has metadata-only rows, a
+  // last_n fetch must revisit the saved window instead of asking Telegram
+  // only for messages newer than the saved tip.
   const [typeBreakdown, setTypeBreakdown] = useState([])
+  const effectiveSourceId = sourceId || sourceRow?.id || null
+  const itemsEstimateVer = useInvalidator(effectiveSourceId ? `items:${effectiveSourceId}` : '__tg_media_estimate:none')
 
   // Persist last-used range mode + content types + engine on every change.
   // Runs synchronously after the relevant state commits, no debounce — write
@@ -223,14 +387,20 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
     const externalId = chosen ? String(chosen.chat_id) : null
     ;(async () => {
       try {
-        const sources = await window.api.sourcesList?.()
-        if (!alive || !Array.isArray(sources)) return
-        const s = sources.find(s =>
-          s.platform === 'telegram' && (
-            (handle && s.handle === handle) ||
-            (externalId && s.external_id === externalId)
+        let s = null
+        if (sourceId && window.api.sourceGet) {
+          s = await window.api.sourceGet(sourceId)
+        } else {
+          const sources = await window.api.sourcesList?.()
+          if (!alive || !Array.isArray(sources)) return
+          s = sources.find(s =>
+            s.platform === 'telegram' && (
+              (handle && s.handle === handle) ||
+              (externalId && s.external_id === externalId)
+            )
           )
-        )
+        }
+        if (!alive) return
         if (s) setSourceRow(s)
         if (s && s.has_discussion != null) setHasDiscussion(!!s.has_discussion)
         // If we have a sourceId, pull the topic list. itemsTopics returns
@@ -253,9 +423,9 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
             if (alive) setMaxExternalId(Number(m) || 0)
           } catch {}
         }
-        // Per-type counts (with `with_caption`) — drives the «у вас есть N
-        // опросов без тела» hint and the auto-disable of skipDupes when
-        // the user picks types whose bodies are missing.
+        // Per-type counts (with `with_caption`) — internal guard for
+        // auto-disabling skipDupes when the selected saved window needs a
+        // re-walk.
         if (s && s.id && window.api.itemsTypeBreakdown) {
           try {
             const rows = await window.api.itemsTypeBreakdown({ source_id: s.id })
@@ -265,7 +435,7 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
       } catch {}
     })()
     return () => { alive = false }
-  }, [target, chosen?.chat_id])
+  }, [target, chosen?.chat_id, sourceId])
 
   // Reset topic selection if the user switches between candidate chats —
   // ids belong to the previous chat and would silently no-op against the
@@ -283,7 +453,63 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
   const previewWatchOff = useRef(null)
   useEffect(() => () => { if (previewWatchOff.current) previewWatchOff.current() }, [])
 
+  const [localMediaEstimate, setLocalMediaEstimate] = useState(null)
+  const [localMediaEstimateBusy, setLocalMediaEstimateBusy] = useState(false)
+  const localEstimateScope = useMemo(
+    () => buildLocalMediaEstimateScope(effectiveSourceId, range, topicIds),
+    [
+      effectiveSourceId,
+      range.mode, range.lastN, range.fromDate, range.toDate,
+      topicIds,
+    ],
+  )
+  const localEstimateSig = useMemo(
+    () => localEstimateScope ? JSON.stringify(localEstimateScope) : '',
+    [localEstimateScope],
+  )
+
+  useEffect(() => {
+    if (!localEstimateScope || !window.api?.itemsTelegramMediaEstimate) {
+      setLocalMediaEstimate(null)
+      setLocalMediaEstimateBusy(false)
+      return
+    }
+    let alive = true
+    setLocalMediaEstimateBusy(true)
+    const timer = setTimeout(async () => {
+      const started = Date.now()
+      try {
+        const result = await window.api.itemsTelegramMediaEstimate(localEstimateScope)
+        const rest = Math.max(0, 250 - (Date.now() - started))
+        if (rest) await new Promise(resolve => setTimeout(resolve, rest))
+        if (!alive) return
+        setLocalMediaEstimate(result?.ok ? result : null)
+      } catch {
+        if (alive) setLocalMediaEstimate(null)
+      } finally {
+        if (alive) setLocalMediaEstimateBusy(false)
+      }
+    }, 200)
+    return () => {
+      alive = false
+      clearTimeout(timer)
+    }
+  }, [localEstimateSig, itemsEstimateVer])
+
+  const rangeValidationIssue = useMemo(() => rangeIssue(range), [
+    range.mode, range.fromDate, range.toDate,
+  ])
+  const effectiveSourceSession = sourceSession || sourceRow?.tg_session || null
+  const sourceSessionIssue = sourceId
+    ? (sourceSessionConflict || sourceRow?.tg_session_conflict
+        ? 'У этого чата конфликт Telegram-аккаунтов. Выбери аккаунт в строке чата выше и запусти запрос снова.'
+        : (!effectiveSourceSession
+            ? 'У этого чата не выбран Telegram-аккаунт. Выбери аккаунт в строке чата выше и запусти запрос снова.'
+            : null))
+    : null
   const canStart = (() => {
+    if (sourceSessionIssue) return false
+    if (rangeValidationIssue) return false
     if (range.mode === 'last_n')     return Number(range.lastN) > 0
     // Unified date_range: first date is required, second is optional
     // (empty → «до конца», fetch goes from `fromDate` forward to «now»).
@@ -323,11 +549,12 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
   // pre-analysis the moment the user touches anything.
   const fetchSig = useMemo(() => JSON.stringify({
     target,
+    session: chosen?.tg_session || effectiveSourceSession || null,
     mode: range.mode,
     lastN: range.lastN,
     fromDate: range.fromDate, toDate: range.toDate,
     url1: range.url1, url2: range.url2,
-  }), [target, range])
+  }), [target, chosen?.tg_session, effectiveSourceSession, range])
   const previewStale = preview && previewSig !== fetchSig
   // Dismiss a stale «ничего не найдено» the moment the user changes the scope
   // (different target / range) — they're about to try something else, the old
@@ -339,6 +566,9 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
     // the stable identifier even if the chat gets renamed later.
     const tgt = chosen ? String(chosen.chat_id) : String(target).replace(/^@/, '')
     const params = { target: tgt }
+    if (sourceId) params._source_id = Number(sourceId)
+    const sessionOverride = chosen?.tg_session || effectiveSourceSession
+    if (sessionOverride) params._tg_session_override = sessionOverride
     const presetDays = presetDaysOf(range.mode)
     if (range.mode === 'last_n') {
       params.mode = 'last_n'
@@ -417,10 +647,12 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
   }
 
   async function go() {
-    if (!canStart || submitting) return
+    if (!canStart || submitting || launchedJobId) return
     setSubmitting(true); setErr(null); setEmptyNotice(null)
     try {
       const id = await startTelegramFetch(buildFetchParams())
+      if (id == null) throw new Error('Электрон-IPC недоступен')
+      setLaunchedJobId(id)
       // Watch the launched job to its terminal state. On a normal (non-empty)
       // fetch we hand off to the parent's onStarted (which clears the input so
       // the user can paste the next link). On an empty result we DON'T clear —
@@ -433,7 +665,9 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
         if (!snap) return
         const terminal = snap.status === 'done' || snap.status === 'error' || snap.status === 'cancelled'
         if (!terminal) return
+        setLaunchedJobId(null)
         if (launchWatchOff.current) { launchWatchOff.current(); launchWatchOff.current = null }
+        if (notifyOnLaunch) return
         const empty = (snap.items_done || 0) === 0 && (snap.items_total || 0) === 0
         if (snap.status === 'done' && empty && snap.warning?.message) {
           // Stay on Home, show the notice; skip the parent's input-clear.
@@ -442,9 +676,11 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
           onStarted && onStarted(id)
         }
       })
+      if (notifyOnLaunch) onStarted && onStarted(id)
     } catch (e) {
       console.error(e)
       setErr(String(e && e.message || e))
+      setLaunchedJobId(null)
     } finally {
       setSubmitting(false)
     }
@@ -492,7 +728,7 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
     cancelJob(previewJobId)
   }
 
-  if (isTitle && resolveStage !== 'ready') {
+  if (needsAccountResolve && resolveStage !== 'ready') {
     return (
       <TitleResolvePanel
         text={target}
@@ -528,6 +764,8 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
         topicId={null} onTopicIdChange={() => {}}
         topicIds={topicIds} onTopicIdsChange={setTopicIds}
         preview={preview && !previewStale ? preview : null}
+        mediaEstimate={localMediaEstimate}
+        mediaEstimateBusy={localMediaEstimateBusy}
         hasDiscussion={hasDiscussion}
       >
         <PreAnalysisButton
@@ -540,18 +778,12 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
         />
       </TelegramScopeFields>
 
-      {/* Backfill notice: at least one picked type has rows in the DB
-          with empty caption — internal skipDupes would skip exactly the rows
-          we want to refetch. The runner detects this and silently disables
-          its min_id windowing for last_n mode; surface the explanation here
-          so «0 new messages» symptom doesn't surprise the user. */}
-      {needsBackfill && range.mode === 'last_n' && (
-        <div className="rounded-md border border-amber-700/40 bg-amber-950/20 px-3 py-2 text-amber-200"
-             style={{ fontSize: '14px' }}>
-          ⚠ В БД есть {backfillTypes.map(t => `${t.missing.toLocaleString('ru-RU')} ${TG_LABEL[t.id] || t.id}`).join(', ')} без тела —
-          мы перепарсим этот кусок чата чтобы достать недостающие поля.
-        </div>
-      )}
+      <LocalMediaEstimateLine
+        estimate={localMediaEstimate}
+        busy={localMediaEstimateBusy}
+        content={content}
+        redoProcessed={!!range.redoProcessed}
+      />
 
       {/* Inline preview / "Весь чат" warning under the form. Lives in the
           wrapper because it's a fetch-only artefact. */}
@@ -560,6 +792,20 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
       )}
 
       {err && <div className="text-red-400" style={{ fontSize: '14px' }}>{err}</div>}
+
+      {sourceSessionIssue && (
+        <div className="rounded-md border border-amber-700/40 bg-amber-950/20 px-3 py-2 text-amber-200"
+             style={{ fontSize: '14px' }}>
+          {sourceSessionIssue}
+        </div>
+      )}
+
+      {rangeValidationIssue && (
+        <div className="rounded-md border border-amber-700/40 bg-amber-950/20 px-3 py-2 text-amber-200"
+             style={{ fontSize: '14px' }}>
+          {rangeValidationIssue}
+        </div>
+      )}
 
       {/* «Ничего не найдено» — inline echo of an empty fetch, on Home itself.
           Neutral amber (not red): nothing failed, the chat was just empty. */}
@@ -606,14 +852,14 @@ export default function TelegramConfigForm({ target, kind, onStarted }) {
         </button>
         <button
           onClick={go}
-          disabled={!canStart || submitting}
+          disabled={!canStart || submitting || !!launchedJobId}
           className={`px-5 py-2 rounded-md font-medium ${
-            canStart && !submitting
+            canStart && !submitting && !launchedJobId
               ? 'bg-zinc-100 text-zinc-900 hover:bg-white'
               : 'bg-zinc-800 text-zinc-600 cursor-not-allowed'
           }`}
         >
-          {submitting ? 'Запуск…' : 'Начать парсинг'}
+          {submitting ? 'Запуск…' : launchedJobId ? 'В работе…' : 'Начать парсинг'}
         </button>
       </div>
     </div>
@@ -649,6 +895,36 @@ function PreAnalysisButton({ canStart, previewBusy, canCancel, hasPreview, onRun
         <span>{previewBusy ? 'Анализ…' : (hasPreview ? 'Обновить' : 'Анализ')}</span>
       </button>
     </>
+  )
+}
+
+function LocalMediaEstimateLine({ estimate, busy, content, redoProcessed }) {
+  const pickedAny = content.voice || content.video || content.photo || content.docs
+  if (!pickedAny) return null
+  if (busy) {
+    return (
+      <div className="mt-1.5 flex items-center gap-2 text-zinc-500" style={{ fontSize: '13px' }}>
+        <span className="inline-block w-3.5 h-3.5 rounded-full border-2 border-zinc-700 border-t-zinc-300 animate-spin" />
+        <span>считаю медиа по сохранённым сообщениям</span>
+      </div>
+    )
+  }
+  const summary = mediaEstimateSummary(estimate, content, redoProcessed)
+  if (!summary) return null
+  if (summary.empty) {
+    return (
+      <div className="mt-1.5 text-zinc-500" style={{ fontSize: '13px' }}>
+        По сохранённому диапазону: выбранных медиа нет.
+      </div>
+    )
+  }
+  const runText = redoProcessed
+    ? `парсить заново: к запуску ${compactCount(summary.toRun)}`
+    : `уже обработано ${compactCount(summary.processed)} · к запуску ${compactCount(summary.toRun)}`
+  return (
+    <div className="mt-1.5 text-zinc-400 tabular-nums" style={{ fontSize: '13px' }}>
+      По сохранённому диапазону: {summary.bits.join(', ')} · {runText}
+    </div>
   )
 }
 
@@ -745,13 +1021,13 @@ function TitleResolvePanel({ text, stage, error, scanned, matches, onPick }) {
         <PlatformLogo platform="telegram" size={16} />
         <div className="font-medium text-zinc-200 truncate">«{text}»</div>
         <span className="text-zinc-500" style={{ fontSize: '14px' }}>
-          · нашёл {matches.length} чатов с таким названием — выбери нужный
+          · нашёл {matches.length} совпадений — выбери Telegram-аккаунт
         </span>
       </div>
       <div className="rounded-md border border-zinc-800 divide-y divide-zinc-800 overflow-hidden">
         {matches.map(m => (
           <button
-            key={m.chat_id}
+            key={`${m.tg_session || 'session'}:${m.chat_id}`}
             onClick={() => onPick(m)}
             className="w-full text-left px-4 py-3 hover:bg-zinc-900 flex items-center gap-3"
           >
@@ -759,6 +1035,7 @@ function TitleResolvePanel({ text, stage, error, scanned, matches, onPick }) {
               <div className="text-zinc-200 truncate">{m.title}</div>
               <div className="text-zinc-500 truncate" style={{ fontSize: '14px' }}>
                 {[
+                  m.session_label || m.tg_session,
                   m.kind,
                   m.username ? '@' + m.username : null,
                   m.members != null ? `${m.members.toLocaleString('ru-RU')} участников` : null,
@@ -784,6 +1061,7 @@ function ChosenChatHeader({ chat, canChange, onChange }) {
         <div className="text-zinc-200 truncate">{chat.title}</div>
         <div className="text-zinc-500 truncate" style={{ fontSize: '14px' }}>
           {[
+            chat.session_label || chat.tg_session,
             chat.kind,
             chat.username ? '@' + chat.username : null,
             chat.members != null ? `${chat.members.toLocaleString('ru-RU')} участников` : null,

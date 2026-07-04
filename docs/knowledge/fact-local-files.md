@@ -42,7 +42,7 @@ Engine selector виден всегда — юзер может переключ
 безусловно — даже если юзер выбрал `engine=assemblyai` и Gemini ни разу не дёрнется.
 Симптом в проде: «выбрал AssemblyAI, нажал Транскрибировать — ошибка про GEMINI_API_KEY».
 
-**Лечение в `cli-tools/web/local_transcribe_ndjson.py`** (узкое, не трогает shared
+**Лечение в `python-workers/web/local_transcribe_ndjson.py`** (узкое, не трогает shared
 gemini_utils):
 
 ```python
@@ -52,8 +52,7 @@ if args.engine == "assemblyai" and not os.environ.get("GEMINI_API_KEY"):
 
 Placeholder проходит constructor-check, на путь к API не попадает потому что для
 assembly он не нужен. Альтернатива (правка `GeminiClient.__init__` чтоб ключ был
-optional) — рискованнее, она ломает контракт shared-модуля который используют CLI-скрипты
-из `cli-tools/`.
+optional) — рискованнее, она ломает контракт shared-модуля который используют worker-скрипты.
 
 ## ⏱ Progress на длинных файлах (AAI polling)
 
@@ -111,7 +110,7 @@ job-list, не дублировать локальный store. Mount → ище
 
 - `src/lib/detect.js` — добавлен `LOCAL_AUDIO_VIDEO_EXT_RE` и `'local-file'` kind
 - `src/components/LocalFileTranscribeForm.jsx` — inline форма
-- `cli-tools/web/local_transcribe_ndjson.py` — Python wrapper над `gemini_utils.transcribe_audio`
+- `python-workers/web/local_transcribe_ndjson.py` — Python wrapper над `gemini_utils.transcribe_audio`
   (он сам делает ffmpeg `-vn` для видео → mp3, ничего особого мы не делаем)
 - `electron/job-runner.js::startLocalTranscribe` — type `local_transcribe`, transcripts
   в `LIB_ROOT/transcripts/local/`, `source_id = NULL`

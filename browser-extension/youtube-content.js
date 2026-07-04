@@ -176,12 +176,16 @@
   // Маркер меняется в зависимости от toggle «Автоскрапинг нейронки»:
   //   off → "sc"      (только скачать в sc-desktop)
   //   on  → "sc · AI" (скачать + дальше Gemini Studio)
+  function ytTargetLabel(target) {
+    return (typeof YOUTUBE_TARGET_LABELS === 'object' && YOUTUBE_TARGET_LABELS?.[target])
+      || (target === 'chatgpt' ? 'ChatGPT' : target === 'claude' ? 'Claude' : 'Gemini Studio');
+  }
   function buttonLabel(autoAistudio) {
     return autoAistudio ? '⬇ sc · AI' : '⬇ sc';
   }
   function buttonTitle(autoAistudio) {
     return autoAistudio
-      ? 'Забрать в sc-desktop и автоматически открыть Gemini Studio'
+      ? 'Забрать в sc-desktop и автоматически открыть AI'
       : 'Забрать в sc-desktop (только субтитры)';
   }
 
@@ -215,7 +219,7 @@
   // Активные (sending/searching/transcribing/opening) на возврате
   // остаются — это идущая работа, юзер хочет её видеть.
 
-  /** @type {Map<string, {state: string, engine?: string, error?: string, title?: string, autoAistudio?: boolean, expiresAt?: number}>} */
+  /** @type {Map<string, {state: string, engine?: string, error?: string, title?: string, target?: string, autoAistudio?: boolean, expiresAt?: number}>} */
   const videoStateMap = new Map();
   const stateTimers = new Map(); // videoId → timeoutId
 
@@ -241,12 +245,13 @@
     } else {
       const auto = opts.autoAistudio != null ? opts.autoAistudio : prev.autoAistudio;
       const title = opts.title != null ? opts.title : prev.title;
+      const target = opts.target != null ? opts.target : prev.target;
       // engine приходит из background.js на стадии 'transcribing'; на
       // 'searching' bridge ещё не знает какой engine (subs могут найтись
       // и AI вообще не понадобится). Сохраняем prev.engine чтобы при
       // переходе searching→transcribing не потерять уже известный engine.
       const engine = opts.engine != null ? opts.engine : prev.engine;
-      videoStateMap.set(videoId, { state, engine, error: opts.error, title, autoAistudio: auto });
+      videoStateMap.set(videoId, { state, engine, error: opts.error, title, target, autoAistudio: auto });
       // Авто-удаление done/error/pasted через TTL.
       const t = stateTimers.get(videoId);
       if (t) clearTimeout(t);
@@ -285,6 +290,7 @@
     paintPill(pill, state, {
       error: entry?.error,
       engine: entry?.engine,
+      target: entry?.target,
       autoAistudio: entry?.autoAistudio != null ? entry.autoAistudio : ytSettings.auto_aistudio,
     });
   }
@@ -310,7 +316,7 @@
     // state'ах ставим overlay-label на весь pill, idle — восстанавливаем
     // обе половинки.
     if (btn.dataset.scYtSplitFab === '1') {
-      paintSplitPill(btn, uiState, isActiveState, opts.engine);
+      paintSplitPill(btn, uiState, isActiveState, opts);
       return;
     }
 
@@ -336,8 +342,8 @@
         title = 'sc-desktop обрабатывает видео';
         break;
       case 'opening':
-        label = '🤖 Gemini Studio…';
-        title = 'Открываю Gemini Studio в фоне';
+        label = '🤖 ' + ytTargetLabel(opts.target || ytSettings.target) + '…';
+        title = 'Открываю ' + ytTargetLabel(opts.target || ytSettings.target) + ' в фоне';
         break;
       case 'idle':
       default:
@@ -354,7 +360,8 @@
   // Для split-pill (sc-yt-fab в dock'е): на активных state'ах рисуем
   // один overlay-label поверх обеих половинок, на idle — восстанавливаем
   // copy | ai. Активный state блокирует обе кнопки внутри.
-  function paintSplitPill(wrap, uiState, isActive, engine) {
+  function paintSplitPill(wrap, uiState, isActive, opts = {}) {
+    const engine = opts.engine;
     const overlay = wrap.querySelector(':scope > .sc-split-overlay');
     const halves = wrap.querySelectorAll(':scope > button[data-sc-half]');
     const divider = wrap.querySelector(':scope > div:not(.sc-split-overlay)');
@@ -371,7 +378,7 @@
           break;
         }
         case 'working':      label = '⏳ Транскрипция…';   title = 'sc-desktop обрабатывает видео'; break;
-        case 'opening':      label = '🤖 Gemini Studio…';  title = 'Открываю Gemini Studio в фоне'; break;
+        case 'opening':      label = '🤖 ' + ytTargetLabel(opts.target || ytSettings.target) + '…'; title = 'Открываю ' + ytTargetLabel(opts.target || ytSettings.target) + ' в фоне'; break;
         default:             label = uiState;              title = uiState;
       }
       // Скрываем половины, показываем overlay-метку.
@@ -686,7 +693,7 @@
     // AI-половина: тот же background что у copy. Hover-фон такой же,
     // как у copy — единый стиль, только divider визуально разделяет
     // зоны клика.
-    const right = mkHalf(aiIcon, 'ai', 'Скопировать + открыть Gemini Studio',
+    const right = mkHalf(aiIcon, 'ai', 'Скопировать + открыть выбранный AI',
       () => { const u = resolveUrl(); if (u) handleClick(u, wrap, true, false); },
       { role: 'ai' });
 
@@ -736,7 +743,7 @@
       { role: 'copy-comments' });
     const cmtDivider = document.createElement('div');
     cmtDivider.style.cssText = 'width: 1px; align-self: stretch; background: rgba(102, 126, 234, 0.35);';
-    const cmtAi = mkHalf('', '+ субтитры + ai', 'Скопировать с комментариями + открыть Gemini Studio',
+    const cmtAi = mkHalf('', '+ субтитры + ai', 'Скопировать с комментариями + открыть выбранный AI',
       () => {
         const u = resolveUrl();
         dbg('cmd.click.ai-comments', { url: u, vid: wrap.dataset.videoId });
@@ -1064,10 +1071,11 @@
       return;
     }
     const titleSnapshot = pickCardTitleForVideo(videoId, btn) || pageVideoTitle();
-    setVideoState(videoId, 'sending', { title: titleSnapshot });
+    const initialTarget = ytSettings.target || 'aistudio';
+    setVideoState(videoId, 'sending', { title: titleSnapshot, target: initialTarget });
     try {
       if (!await pingBridge()) {
-        setVideoState(videoId, 'error', { error: 'sc-desktop не запущен', title: titleSnapshot });
+        setVideoState(videoId, 'error', { error: 'sc-desktop не запущен', title: titleSnapshot, target: initialTarget });
         return;
       }
       const sent = await sendVideo(url, withCommentsOverride);
@@ -1110,7 +1118,7 @@
               // trackJob.engine → POST /yt-resume-ai. Без этого resume всегда
               // шёл gemini'ем, игнорируя настройку.
               engine: settings.engine || 'gemini',
-              // Target dispatch: 'aistudio' (Gemini) или 'claude'.
+              // Target dispatch: 'aistudio' (Gemini), 'claude' или 'chatgpt'.
               target: chosenTarget,
               // Gemini-side
               modelTitle: settings.model_title || 'Gemini 3 Flash Preview',
@@ -1122,6 +1130,10 @@
               claudeProject: settings.claude_project || '',
               claudePostProject: settings.claude_post_project || '',
               claudeAdaptiveThinking: settings.claude_adaptive_thinking !== false,
+              // ChatGPT-side
+              chatgptPrompt: settings.chatgpt_prompt || '',
+              chatgptModel: settings.chatgpt_model || '5.5',
+              chatgptEffort: settings.chatgpt_effort || 'xhigh',
             },
           }, (resp) => {
             const lerr = chrome.runtime.lastError;
@@ -1139,14 +1151,15 @@
         setVideoState(videoId, 'error', {
           error: 'трекер недоступен — перезапустите расширение' + (trackResp.error ? ': ' + trackResp.error : ''),
           title: titleSnapshot,
+          target: chosenTarget,
         });
         return;
       }
 
-      setVideoState(videoId, 'working', { title: titleSnapshot, autoAistudio });
+      setVideoState(videoId, 'working', { title: titleSnapshot, autoAistudio, target: chosenTarget });
     } catch (e) {
       console.warn('[SC-YT] send failed', e);
-      setVideoState(videoId, 'error', { error: e.message || String(e), title: titleSnapshot });
+      setVideoState(videoId, 'error', { error: e.message || String(e), title: titleSnapshot, target: initialTarget });
     }
   }
 
@@ -1426,6 +1439,7 @@
             paintPill(existing, entry?.state || 'idle', {
               error: entry?.error,
               engine: entry?.engine,
+              target: entry?.target,
               autoAistudio: entry?.autoAistudio != null ? entry.autoAistudio : ytSettings.auto_aistudio,
             });
             refreshed++;
@@ -1525,6 +1539,7 @@
           paintPill(existing, entry?.state || 'idle', {
             error: entry?.error,
             engine: entry?.engine,
+            target: entry?.target,
             autoAistudio: entry?.autoAistudio != null ? entry.autoAistudio : ytSettings.auto_aistudio,
           });
           refreshed++;
@@ -1588,6 +1603,7 @@
       paintPill(btn, entry?.state || 'idle', {
         error: entry?.error,
         engine: entry?.engine,
+        target: entry?.target,
         autoAistudio: entry?.autoAistudio != null ? entry.autoAistudio : ytSettings.auto_aistudio,
       });
     }
@@ -2033,6 +2049,7 @@
     paintPill(fab, entry?.state || 'idle', {
       error: entry?.error,
       engine: entry?.engine,
+      target: entry?.target,
       autoAistudio: entry?.autoAistudio != null ? entry.autoAistudio : ytSettings.auto_aistudio,
     });
   }
@@ -2270,7 +2287,7 @@
       // на скрытой вкладке смысла не имеют — они быстро устаревают.
       const persistOnHidden = (req.state === 'pasted' || req.state === 'done');
       if (document.visibilityState !== 'visible' && !persistOnHidden) return;
-      setVideoState(vid, req.state, { engine: req.engine, error: req.error, title: req.title });
+      setVideoState(vid, req.state, { engine: req.engine, error: req.error, title: req.title, target: req.target });
     });
 
     // На возврат на вкладку — выкидываем «протухшие» done/error из

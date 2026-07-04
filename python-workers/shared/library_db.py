@@ -85,7 +85,11 @@ CREATE TABLE IF NOT EXISTS items (
 
 CREATE INDEX IF NOT EXISTS idx_items_source     ON items(source_id);
 CREATE INDEX IF NOT EXISTS idx_items_published  ON items(published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_items_source_published ON items(source_id, published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_items_source_caption_present ON items(source_id)
+  WHERE caption IS NOT NULL AND length(trim(caption)) > 0;
 CREATE INDEX IF NOT EXISTS idx_items_status     ON items(download_status, transcribe_status);
+CREATE INDEX IF NOT EXISTS idx_items_type       ON items(source_id, type);
 
 CREATE TABLE IF NOT EXISTS jobs (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,

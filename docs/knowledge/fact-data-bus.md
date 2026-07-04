@@ -51,6 +51,12 @@ ChatView reset'ил пагинацию каждые 100мс, picker не дав�
 - progressing (`running`/`awaiting_ai`) — **только `'jobs:<id>'`**, и троттлим
   до раз в 750мс на jobId. Sidebar и items list deliberately стоят пока fetch
   идёт — там ничего не изменилось до close.
+- child-job внутри umbrella (`params._folder_umbrella_id`) **не бьёт `'sources'`
+  даже на terminal**. На `tg_catchup`/`tg_folder_fetch` таких детей десятки:
+  каждый child-terminal раньше вызывал глобальный `sources:list`, и скролл
+  лагал не от самого fetch/index, а от refresh storm вокруг него. Child всё ещё
+  бьёт `source:<id>` / `items:<id>` / `jobs:<id>` для открытой страницы
+  конкретного чата; umbrella row в конце один раз бьёт `'sources'`.
 
 Окно 750мс — компромисс: глаз не успеет прочитать счётчик чаще, а DB-round-trips
 сжимаются до ~70 за 50-секундный fetch против 50 без троттла.

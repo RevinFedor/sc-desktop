@@ -30,6 +30,68 @@ export function defaultContent() {
   return Object.fromEntries(CONTENT_TYPES.map(c => [c.id, c.default]))
 }
 
+function fmtInt(n) {
+  return Number(n || 0).toLocaleString('ru-RU')
+}
+
+function fmtDuration(seconds) {
+  const s = Math.round(Number(seconds || 0))
+  if (!s) return ''
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+  return `${m}:${String(sec).padStart(2, '0')}`
+}
+
+function previewCountFor(id, preview) {
+  const counts = preview?.type_counts
+  if (!counts) return null
+  if (id === 'text') return (counts.text || 0) + (counts.poll || 0)
+  if (id === 'docs') return counts.document ?? null
+  return counts[id] ?? null
+}
+
+function estimateFor(id, estimate) {
+  const by = estimate?.by_type || {}
+  if (!by || !estimate?.ok) return null
+  const zero = { count: 0, duration_seconds: 0 }
+  if (id === 'text') {
+    const text = by.text || {}
+    const poll = by.poll || {}
+    return { count: (text.count || 0) + (poll.count || 0), duration_seconds: 0 }
+  }
+  if (id === 'docs') return by.document || zero
+  return by[id] || zero
+}
+
+function TypeEstimateBadge({ id, preview, estimate, busy }) {
+  if (busy) {
+    return (
+      <span
+        className="inline-block w-3.5 h-3.5 rounded-full border-2 border-zinc-700 border-t-zinc-300 animate-spin shrink-0"
+        title="Считаю по сохранённым сообщениям"
+      />
+    )
+  }
+
+  const local = estimateFor(id, estimate)
+  const previewCount = previewCountFor(id, preview)
+  const count = local ? local.count : previewCount
+  if (count == null) return null
+  const duration = local?.duration_seconds || 0
+  const durationText = duration > 0 ? fmtDuration(duration) : ''
+  return (
+    <span
+      style={{ fontSize: '13px' }}
+      className="text-zinc-400 shrink-0 tabular-nums whitespace-nowrap"
+      title={local ? 'По уже сохранённым сообщениям в выбранном диапазоне' : undefined}
+    >
+      {fmtInt(count)}{durationText ? ` · ${durationText}` : ''}
+    </span>
+  )
+}
+
 /**
  * Compact multi-select for Telegram content types. One-line button shows
  * what's picked; click opens a popover with checkboxes.
@@ -56,6 +118,8 @@ export function TelegramTypesPopover({
   content, onChange, preview = null, hasDiscussion = null,
   showComments = true,
   engine = null, onEngineChange = null,
+  mediaEstimate = null,
+  estimateBusy = false,
 }) {
   const showEngineRow = !!onEngineChange
     && (content.voice || content.video)
@@ -139,7 +203,7 @@ export function TelegramTypesPopover({
             ? `Выбрано всё · ${totalCount}`
             : `Выбрано ${onCount} из ${totalCount}`
         return (
-        <div className="absolute z-50 mt-1 left-0 w-[320px] rounded-md border border-zinc-700 bg-zinc-900 shadow-2xl py-1">
+        <div className="absolute z-50 mt-1 left-0 w-[420px] rounded-md border border-zinc-700 bg-zinc-900 shadow-2xl py-1">
           <div
             role="button"
             tabIndex={0}
@@ -166,7 +230,6 @@ export function TelegramTypesPopover({
           </div>
           {visibleTypes.map(c => {
             const isOn = !!content[c.id]
-            const cnt = preview?.type_counts?.[c.id]
             const disabled = c.isComments && hasDiscussion === false
             const hint = disabled ? 'У канала нет обсуждений' : c.processor
             // Whole-row click handler: toggle the same way the Checkbox
@@ -216,27 +279,31 @@ export function TelegramTypesPopover({
                     voice nor video is on (engine has nothing to drive yet)
                     to avoid premature noise. Same engine governs video too,
                     that's why we show this row even with video-only on. */}
-                {c.id === 'voice' && showEngineRow && (
-                  <div
-                    className="shrink-0 ml-1 w-[140px]"
-                    onClick={e => e.stopPropagation()}
-                    onKeyDown={e => e.stopPropagation()}
-                  >
-                    <Select
-                      value={engine || 'assemblyai'}
-                      onChange={onEngineChange}
-                      options={ENGINES}
-                      compact
-                      hideHint
+                <div className="ml-auto flex items-center gap-2 shrink-0">
+                  {c.id === 'voice' && showEngineRow && (
+                    <div
+                      className="shrink-0 w-[128px]"
+                      onClick={e => e.stopPropagation()}
+                      onKeyDown={e => e.stopPropagation()}
+                    >
+                      <Select
+                        value={engine || 'assemblyai'}
+                        onChange={onEngineChange}
+                        options={ENGINES}
+                        compact
+                        hideHint
+                      />
+                    </div>
+                  )}
+                  {!c.isComments && (
+                    <TypeEstimateBadge
+                      id={c.id}
+                      preview={preview}
+                      estimate={mediaEstimate}
+                      busy={estimateBusy && isOn}
                     />
-                  </div>
-                )}
-                {c.id !== 'voice' && cnt != null && (
-                  <span style={{ fontSize: '13px' }} className="text-zinc-400 shrink-0 tabular-nums">{cnt}</span>
-                )}
-                {c.id === 'voice' && !showEngineRow && cnt != null && (
-                  <span style={{ fontSize: '13px' }} className="text-zinc-400 shrink-0 tabular-nums">{cnt}</span>
-                )}
+                  )}
+                </div>
               </div>
             )
           })}

@@ -8,7 +8,7 @@
 
 ## Причина
 
-`fetch_meta()` в `cli-tools/web/yt_single_ndjson.py` (общий helper, его же
+`fetch_meta()` в `python-workers/web/yt_single_ndjson.py` (общий helper, его же
 импортит `yt_batch_transcribe_ndjson.py`) — один `yt-dlp --dump-json` запрос
 метадаты. Первый холодный вызов после клика **изредка** флакает: YouTube-side
 rate-limit, секундный лок `cookies.sqlite` Firefox'а когда два yt-dlp процесса

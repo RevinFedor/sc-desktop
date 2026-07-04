@@ -10,9 +10,9 @@
 
 | Скрипт | Что делает | Тип job |
 |---|---|---|
-| `cli-tools/web/tk_single_ndjson.py`     | URL → AI-транскрипт | `tk_transcribe` (sourceless) |
-| `cli-tools/web/tk_channel_ndjson.py`    | URL канала → список видео (yt-dlp flat-playlist) | `tk_channel_fetch` (с source_id) |
-| `cli-tools/web/tk_batch_transcribe_ndjson.py` | N video_ids → batch транскрипция | `tk_batch_transcribe` (с source_id) |
+| `python-workers/web/tk_single_ndjson.py`     | URL → AI-транскрипт | `tk_transcribe` (sourceless) |
+| `python-workers/web/tk_channel_ndjson.py`    | URL канала → список видео (yt-dlp flat-playlist) | `tk_channel_fetch` (с source_id) |
+| `python-workers/web/tk_batch_transcribe_ndjson.py` | N video_ids → batch транскрипция | `tk_batch_transcribe` (с source_id) |
 
 Скрипты лежат в `web/` рядом с YouTube — категориально это та же «web» платформа, оба тащат через yt-dlp + Gemini.
 

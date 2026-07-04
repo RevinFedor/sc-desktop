@@ -38,13 +38,18 @@ export function wireJobInvalidation() {
 
     if (terminal) {
       lastProgressBump.delete(j.id)
-      const keys = ['sources']
+      // Child tg_fetch jobs inside tg_catchup/tg_folder_fetch can finish dozens
+      // of times in one batch. Refreshing the global sources list on each child
+      // is a main-process DB storm; the umbrella job will bump `sources` once at
+      // the end. Keep source-specific keys for the currently open SourceDetail.
+      const insideUmbrella = !!j.params?._folder_umbrella_id
+      const keys = insideUmbrella ? [] : ['sources']
       if (j.source_id) {
         keys.push(`source:${j.source_id}`, `items:${j.source_id}`, `jobs:${j.source_id}`)
       }
       // Folder-umbrella close → refresh folders list (last_fetched_at moved).
       if (j.type === 'tg_folder_fetch') keys.push('folders')
-      invalidateMany(keys)
+      if (keys.length) invalidateMany(keys)
       return
     }
 

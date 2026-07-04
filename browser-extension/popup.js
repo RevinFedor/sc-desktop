@@ -1,10 +1,10 @@
 // SC Browser Parser — Popup
 //
 // Раньше popup показывал только панель активного сайта. Теперь настройки
-// экспорта собраны в tabs (Gemini Studio / Perplexity / Claude), а YouTube
+// экспорта собраны в tabs (Gemini Studio / Perplexity / Claude / ChatGPT), а YouTube
 // flow живёт отдельным блоком ниже. Активный сайт подсвечивается.
 // Кнопка «Экспортировать» работает только когда вкладка — AI Studio,
-// Perplexity или Claude (для них нужно указать tab куда слать сообщение). YouTube
+// Perplexity, Claude или ChatGPT (для них нужно указать tab куда слать сообщение). YouTube
 // настройки применяются content-script'ом youtube.js на каждой YouTube
 // странице независимо от того, открыт ли popup.
 
@@ -48,11 +48,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     aistudio:   document.getElementById('tabAistudio'),
     perplexity: document.getElementById('tabPerplexity'),
     claude:     document.getElementById('tabClaude'),
+    chatgpt:    document.getElementById('tabChatgpt'),
   };
   const exportPanels = {
     aistudio:   document.getElementById('settingsAistudio'),
     perplexity: document.getElementById('settingsPerplexity'),
     claude:     document.getElementById('settingsClaude'),
+    chatgpt:    document.getElementById('settingsChatgpt'),
   };
   let currentExportTab = 'aistudio';
 
@@ -83,6 +85,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     includeReattachedFiles: document.getElementById('claude_include_reattached'),
   };
 
+  // ── ChatGPT export settings inputs ────────────────────────────────────
+  const chatgptInputs = {
+    includeReasoning:      document.getElementById('chatgpt_include_reasoning'),
+    includeSources:        document.getElementById('chatgpt_include_sources'),
+    includeSourceActivity: document.getElementById('chatgpt_include_source_activity'),
+    includeImages:         document.getElementById('chatgpt_include_images'),
+  };
+
   // ── YouTube settings inputs ────────────────────────────────────────────
   // auto_aistudio убран из popup'а: теперь управление copy / copy+AI идёт
   // через split-button на самой YouTube-карточке (см. youtube-content.js
@@ -99,17 +109,25 @@ document.addEventListener('DOMContentLoaded', async () => {
     claude_post_project:         document.getElementById('yt_claude_post_project'),
     claude_model:                document.getElementById('yt_claude_model'),
     claude_adaptive_thinking:    document.getElementById('yt_claude_adaptive_thinking'),
+    // ChatGPT-side
+    chatgpt_prompt:              document.getElementById('yt_chatgpt_prompt'),
+    chatgpt_model:               document.getElementById('yt_chatgpt_model'),
+    chatgpt_effort:              document.getElementById('yt_chatgpt_effort'),
   };
-  // Target switcher (Gemini ⟷ Claude) + cards для подсветки активного
-  const ytTargetBtns = {
-    aistudio: document.getElementById('ytTargetAistudio'),
-    claude:   document.getElementById('ytTargetClaude'),
-  };
+  const ytTargetSelect = document.getElementById('yt_target');
   const ytCards = {
     aistudio: document.getElementById('cardAistudio'),
     claude:   document.getElementById('cardClaude'),
+    chatgpt:  document.getElementById('cardChatgpt'),
   };
   let currentTarget = 'aistudio'; // active target (Gemini по умолчанию)
+
+  for (const target of YOUTUBE_TARGETS) {
+    const opt = document.createElement('option');
+    opt.value = target;
+    opt.textContent = YOUTUBE_TARGET_LABELS[target] || target;
+    ytTargetSelect.appendChild(opt);
+  }
 
   // Заполняем Gemini select'ы. Список — единая константа из settings.js.
   for (const m of YOUTUBE_AVAILABLE_MODELS) {
@@ -134,20 +152,33 @@ document.addEventListener('DOMContentLoaded', async () => {
     opt.value = m; opt.textContent = m;
     ytInputs.claude_model.appendChild(opt);
   }
+  for (const m of CHATGPT_AVAILABLE_MODELS) {
+    const opt = document.createElement('option');
+    opt.value = m.id; opt.textContent = m.label;
+    ytInputs.chatgpt_model.appendChild(opt);
+  }
+  for (const e of CHATGPT_AVAILABLE_EFFORTS) {
+    const opt = document.createElement('option');
+    opt.value = e.id; opt.textContent = e.label;
+    ytInputs.chatgpt_effort.appendChild(opt);
+  }
 
   function applyTargetUi(target) {
-    currentTarget = target === 'claude' ? 'claude' : 'aistudio';
-    ytTargetBtns.aistudio.classList.toggle('active', currentTarget === 'aistudio');
-    ytTargetBtns.claude.classList.toggle('active',   currentTarget === 'claude');
-    ytTargetBtns.aistudio.setAttribute('aria-selected', String(currentTarget === 'aistudio'));
-    ytTargetBtns.claude.setAttribute('aria-selected',   String(currentTarget === 'claude'));
-    ytCards.aistudio.classList.toggle('active', currentTarget === 'aistudio');
-    ytCards.claude.classList.toggle('active',   currentTarget === 'claude');
+    currentTarget = YOUTUBE_TARGETS.includes(target) ? target : 'aistudio';
+    ytTargetSelect.value = currentTarget;
+    for (const [id, card] of Object.entries(ytCards)) {
+      const active = id === currentTarget;
+      card.hidden = !active;
+      card.classList.toggle('active', active);
+    }
   }
-  ytTargetBtns.aistudio.addEventListener('click', () => { applyTargetUi('aistudio'); persistYoutube(); });
-  ytTargetBtns.claude.addEventListener('click',   () => { applyTargetUi('claude');   persistYoutube(); });
+  ytTargetSelect.addEventListener('change', () => {
+    applyTargetUi(ytTargetSelect.value);
+    persistYoutube();
+    updateFormatHint();
+  });
 
-  let currentSite = null; // 'aistudio' | 'perplexity' | 'youtube' | null
+  let currentSite = null; // 'aistudio' | 'perplexity' | 'claude' | 'chatgpt' | 'youtube' | null
   let currentTab = null;
 
   function storageSetSync(payload) {
@@ -155,7 +186,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function applyExportTab(tab) {
-    currentExportTab = ['aistudio', 'perplexity', 'claude'].includes(tab) ? tab : 'aistudio';
+    currentExportTab = ['aistudio', 'perplexity', 'claude', 'chatgpt'].includes(tab) ? tab : 'aistudio';
     for (const [id, btn] of Object.entries(exportTabs)) {
       const active = id === currentExportTab;
       btn.classList.toggle('active', active);
@@ -170,6 +201,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   exportTabs.aistudio.addEventListener('click', () => applyExportTab('aistudio'));
   exportTabs.perplexity.addEventListener('click', () => applyExportTab('perplexity'));
   exportTabs.claude.addEventListener('click', () => applyExportTab('claude'));
+  exportTabs.chatgpt.addEventListener('click', () => applyExportTab('chatgpt'));
 
   function readAistudioSettings() {
     const s = {};
@@ -191,6 +223,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       includeReattachedFiles: !!claudeInputs.includeReattachedFiles.checked,
     };
   }
+  function readChatGPTSettings() {
+    const s = {};
+    for (const [k, el] of Object.entries(chatgptInputs)) s[k] = !!el.checked;
+    return s;
+  }
   function readYoutubeSettings() {
     return {
       auto_aistudio:            false, // legacy
@@ -206,12 +243,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       claude_post_project:      String(ytInputs.claude_post_project.value || ''),
       claude_model:             String(ytInputs.claude_model.value || ''),
       claude_adaptive_thinking: !!ytInputs.claude_adaptive_thinking.checked,
+      // ChatGPT-side
+      chatgpt_prompt:           String(ytInputs.chatgpt_prompt.value || ''),
+      chatgpt_model:            String(ytInputs.chatgpt_model.value || ''),
+      chatgpt_effort:           String(ytInputs.chatgpt_effort.value || ''),
     };
   }
 
   // Format hint depends on site & settings
   function updateFormatHint() {
-    const hintSite = (currentSite === 'aistudio' || currentSite === 'perplexity' || currentSite === 'claude')
+    const hintSite = (currentSite === 'aistudio' || currentSite === 'perplexity' || currentSite === 'claude' || currentSite === 'chatgpt')
       ? currentSite
       : (currentSite || currentExportTab);
     const exportSettings = readExportSettings();
@@ -239,6 +280,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       formatText.textContent = readClaudeSettings().includeReattachedFiles
         ? `${delivery}: markdown с текстом диалога и файловыми preview`
         : `${delivery}: markdown без файловых карточек Claude`;
+    } else if (hintSite === 'chatgpt') {
+      formatIcon.textContent = exportSettings.downloadFile ? '📄' : '⧉';
+      const delivery = exportSettings.downloadFile ? 'Скачается' : 'Скопируется';
+      const s = readChatGPTSettings();
+      const extras = [
+        s.includeSources ? 'источниками' : '',
+        s.includeReasoning ? 'рассуждениями' : '',
+        s.includeImages ? 'картинками-ссылками' : '',
+      ].filter(Boolean).join(', ');
+      formatText.textContent = extras
+        ? `${delivery}: markdown с ${extras}`
+        : `${delivery}: только текст диалога ChatGPT`;
     } else if (hintSite === 'youtube') {
       formatIcon.textContent = '⬇';
       formatText.textContent = 'Split-кнопка: copy / ai на карточке плеера';
@@ -305,6 +358,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       updateFormatHint();
     });
   }
+  for (const el of Object.values(chatgptInputs)) {
+    el.addEventListener('change', () => {
+      chrome.storage.sync.set({
+        __chatgpt: sanitizeChatGPTExportSettings(readChatGPTSettings()),
+      });
+      updateFormatHint();
+    });
+  }
   // Live-save YouTube settings — input для textarea, change для switch'ей.
   // Debounce ввода в textarea на 300ms чтоб не спамить storage на каждый
   // символ (chrome.storage.sync лимитит на ~120 операций/мин).
@@ -324,6 +385,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   ytInputs.claude_post_project.addEventListener('input', () => { persistYoutube(); });
   ytInputs.claude_model.addEventListener('change', () => { persistYoutube(); });
   ytInputs.claude_adaptive_thinking.addEventListener('change', () => { persistYoutube(); });
+  ytInputs.chatgpt_prompt.addEventListener('input', () => { persistYoutube(); });
+  ytInputs.chatgpt_model.addEventListener('change', () => { persistYoutube(); });
+  ytInputs.chatgpt_effort.addEventListener('change', () => { persistYoutube(); });
 
   function loadSettings() {
     chrome.storage.sync.get({
@@ -331,6 +395,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       __export: EXPORT_DEFAULT_SETTINGS,
       __pplx: PERPLEXITY_DEFAULT_SETTINGS,
       __claude: CLAUDE_EXPORT_DEFAULT_SETTINGS,
+      __chatgpt: CHATGPT_EXPORT_DEFAULT_SETTINGS,
       __yt:   YOUTUBE_DEFAULT_SETTINGS,
     }, (raw) => {
       const e = sanitizeExportSettings(raw.__export || {});
@@ -346,6 +411,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       const c = sanitizeClaudeExportSettings(raw.__claude || {});
       claudeInputs.includeReattachedFiles.checked = c.includeReattachedFiles;
 
+      const g = sanitizeChatGPTExportSettings(raw.__chatgpt || {});
+      for (const [k, el] of Object.entries(chatgptInputs)) el.checked = !!g[k];
+
       const y = sanitizeYoutubeSettings(raw.__yt || {});
       ytInputs.with_comments.checked              = y.with_comments;
       ytInputs.system_instruction.value           = y.system_instruction;
@@ -356,6 +424,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       ytInputs.claude_post_project.value          = y.claude_post_project;
       ytInputs.claude_model.value                 = y.claude_model;
       ytInputs.claude_adaptive_thinking.checked   = y.claude_adaptive_thinking;
+      ytInputs.chatgpt_prompt.value               = y.chatgpt_prompt;
+      ytInputs.chatgpt_model.value                = y.chatgpt_model;
+      ytInputs.chatgpt_effort.value               = y.chatgpt_effort;
       applyTargetUi(y.target);
       applyExportTab(currentExportTab);
 
@@ -408,12 +479,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     exportTabs.aistudio.classList.toggle('site-active', site === 'aistudio');
     exportTabs.perplexity.classList.toggle('site-active', site === 'perplexity');
     exportTabs.claude.classList.toggle('site-active', site === 'claude');
-    if (site === 'aistudio' || site === 'perplexity' || site === 'claude') {
+    exportTabs.chatgpt.classList.toggle('site-active', site === 'chatgpt');
+    if (site === 'aistudio' || site === 'perplexity' || site === 'claude' || site === 'chatgpt') {
       applyExportTab(site);
     }
     if (site === 'aistudio')        appTitle.textContent = 'Gemini Studio Exporter';
     else if (site === 'perplexity') appTitle.textContent = 'Perplexity Exporter';
     else if (site === 'claude')     appTitle.textContent = 'Claude Exporter';
+    else if (site === 'chatgpt')    appTitle.textContent = 'ChatGPT Exporter';
     else if (site === 'youtube')    appTitle.textContent = 'YouTube → sc-desktop';
     else                            appTitle.textContent = 'SC Browser Parser';
     updateFormatHint();
@@ -434,7 +507,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       applySite(site);
 
       if (!site) {
-        updateStatus(false, 'Открой YouTube, Gemini Studio, Perplexity или Claude', 'error');
+        updateStatus(false, 'Открой YouTube, Gemini Studio, Perplexity, Claude или ChatGPT', 'error');
         exportBtn.disabled = true;
         return;
       }
@@ -457,7 +530,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             ? 'Экспорт идёт (Gemini Studio)...'
             : site === 'perplexity'
               ? 'Экспорт идёт (Perplexity)...'
-              : 'Экспорт идёт (Claude)...';
+              : site === 'claude'
+                ? 'Экспорт идёт (Claude)...'
+                : 'Экспорт идёт (ChatGPT)...';
           updateStatus(true, runningLabel, 'exporting');
           setLoading(true, true);
         } else {
@@ -465,7 +540,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             ? 'Подключено к Gemini Studio'
             : site === 'perplexity'
               ? 'Подключено к Perplexity'
-              : 'Подключено к Claude';
+              : site === 'claude'
+                ? 'Подключено к Claude'
+                : 'Подключено к ChatGPT';
           updateStatus(true, readyLabel, 'ready');
           setLoading(false);
         }
@@ -475,7 +552,9 @@ document.addEventListener('DOMContentLoaded', async () => {
           ? 'Gemini Studio (обнови страницу если экспорт не запустится)'
           : site === 'perplexity'
             ? 'Perplexity (обнови страницу если экспорт не запустится)'
-            : 'Claude (обнови страницу если экспорт не запустится)';
+            : site === 'claude'
+              ? 'Claude (обнови страницу если экспорт не запустится)'
+              : 'ChatGPT (обнови страницу если экспорт не запустится)';
         updateStatus(true, hintLabel, 'ready');
         setLoading(false);
       }
@@ -492,7 +571,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (!tab) throw new Error('Активная вкладка не найдена');
       const site = detectSite(tab.url);
       if (!site || site === 'youtube') {
-        showMessage('error', '✗ Экспортировать через popup можно только Gemini Studio / Perplexity / Claude');
+        showMessage('error', '✗ Экспортировать через popup можно только Gemini Studio / Perplexity / Claude / ChatGPT');
         return;
       }
 
@@ -514,7 +593,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         ? { ...readPerplexitySettings(), __export: readExportSettings() }
         : site === 'claude'
           ? { ...readClaudeSettings(), __export: readExportSettings() }
-          : undefined;
+          : site === 'chatgpt'
+            ? { ...readChatGPTSettings(), __export: readExportSettings() }
+            : undefined;
 
       try {
         await chrome.tabs.sendMessage(tab.id, { action: 'export', settings });

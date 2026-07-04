@@ -24,7 +24,10 @@ const WORKERS_ROOT = electronApp?.isPackaged
   : path.resolve(__dirname, '..', 'python-workers')
 
 function resolveWorkerPython() {
-  if (process.env.SC_DESKTOP_PYTHON) return process.env.SC_DESKTOP_PYTHON
+  if (process.env.SC_DESKTOP_PYTHON) {
+    if (fs.existsSync(process.env.SC_DESKTOP_PYTHON)) return process.env.SC_DESKTOP_PYTHON
+    console.warn(`[Jobs] SC_DESKTOP_PYTHON ignored, file not found: ${process.env.SC_DESKTOP_PYTHON}`)
+  }
   const candidates = electronApp?.isPackaged
     ? [
         path.join(process.resourcesPath, 'python', 'bin', 'python3'),
@@ -48,6 +51,7 @@ function resolveWorkerPython() {
 }
 
 const WORKER_PYTHON = resolveWorkerPython()
+console.log(`[Jobs] worker runtime python=${WORKER_PYTHON} root=${WORKERS_ROOT}`)
 
 // Library root holds saved job results (and later: media + transcripts).
 // Honour SC_DESKTOP_DIR env var (with MEDIA_INBOX_DIR as legacy fallback)
@@ -144,6 +148,586 @@ function activeTgSession() {
   } catch { return null }
 }
 
+function isPlainTelegramHistoryFetch(params = {}) {
+  const mode = params.mode || 'last_n'
+  if (mode !== 'last_n' && mode !== 'all') return false
+  if (params.date || params.date_to || params.url || params.sinceMessageId) return false
+  if (params.include_comments) return false
+  if (Array.isArray(params.topic_ids) && params.topic_ids.length > 0) return false
+  if (Array.isArray(params._comments_only_post_ids) && params._comments_only_post_ids.length > 0) return false
+  if (Array.isArray(params._media_only_msg_ids) && params._media_only_msg_ids.length > 0) return false
+  return true
+}
+
+function maybePromoteSuspiciousEmptyTelegramFetch(job) {
+  if (job?.type !== 'tg_fetch') return false
+  if (job.status !== 'done' || job.error || !job.source_id) return false
+  if (!isPlainTelegramHistoryFetch(job.params || {})) return false
+  const got = Array.isArray(job.items)
+    ? job.items.length
+    : Number(job.items_done || job.items_total || 0)
+  if (got > 0) return false
+  const warningCode = job.warning?.code || null
+  if (warningCode && warningCode !== 'empty_result') return false
+
+  let existingItems = 0
+  try {
+    existingItems = Number(db.getSource(job.source_id)?.items_count || 0)
+  } catch (err) {
+    console.error('[Jobs] empty-known-chat source lookup failed', err)
+    return false
+  }
+  if (existingItems <= 0) return false
+
+  const message = [
+    `Telegram вернул 0 сообщений, хотя в этом чате уже сохранено ${existingItems}.`,
+    'Это похоже на неправильную или устаревшую сессию Telegram либо сбой resolve диалога.',
+    'Проверь привязанную сессию и запусти fetch заново.',
+  ].join(' ')
+  job.status = 'error'
+  job.error = message
+  job.warning = { code: 'empty_known_chat', message }
+  job.params = {
+    ...(job.params || {}),
+    _warning: job.warning,
+    _empty_known_chat: {
+      existing_items: existingItems,
+      tg_session: job.tg_session || null,
+    },
+  }
+  console.warn(`[Jobs] tg_fetch #${job.id} promoted empty result to error source #${job.source_id} existing_items=${existingItems} session=${job.tg_session || '-'}`)
+  return true
+}
+
+function isAutoEmptyCatchUpFetch(job) {
+  if (job?.type !== 'tg_fetch') return false
+  if (job.status !== 'done' || job.error) return false
+  const params = job.params || {}
+  if (params._auto_catchup !== true) return false
+  const got = Array.isArray(job.items)
+    ? job.items.length
+    : Number(job.items_done || job.items_total || 0)
+  return got <= 0
+}
+
+function suppressJobHistoryRow(job, reason) {
+  if (!job?.dbRowId) {
+    if (job) job.params = { ...(job.params || {}), _history_suppressed: true }
+    console.log(`[Jobs] ${reason} no history row for #${job?.id || '-'}`)
+    return true
+  }
+  const rowId = job.dbRowId
+  try {
+    db.deleteJob(rowId)
+    job.dbRowId = null
+    job.params = { ...(job.params || {}), _history_suppressed: true }
+    console.log(`[Jobs] ${reason} suppressed history row #${rowId} for #${job.id}`)
+    return true
+  } catch (err) {
+    console.error(`[Jobs] ${reason} suppress history row #${rowId} failed`, err)
+    return false
+  }
+}
+
+function telegramSourceForFetchParams(params = {}) {
+  try {
+    const sourceId = params._source_id || params.source_id || params.source_id_hint || null
+    if (sourceId) {
+      const s = db.getSource(Number(sourceId))
+      return s && s.platform === 'telegram' ? s : null
+    }
+  } catch {}
+  try {
+    return db.findTelegramSourceByTarget(params.target) || null
+  } catch {
+    return null
+  }
+}
+
+function telegramSessionForFetchParams(params = {}) {
+  const explicit = params._tg_session_override || params.tg_session || params.session || null
+  if (explicit && typeof explicit === 'string' && explicit.trim()) return explicit.trim()
+
+  const src = telegramSourceForFetchParams(params)
+  if (src && src.tg_session_conflict) {
+    throw new Error('У этого Telegram-чата конфликт аккаунтов — выбери аккаунт в строке чата и запусти снова.')
+  }
+  if (src && !src.tg_session) {
+    throw new Error('У этого Telegram-чата не выбран аккаунт — выбери аккаунт в строке чата и запусти снова.')
+  }
+  if (src && src.tg_session) return src.tg_session
+
+  return activeTgSession()
+}
+
+const TG_TERMINAL_STATUSES = new Set(['done', 'error', 'cancelled', 'interrupted'])
+
+function isTerminalStatus(status) {
+  return TG_TERMINAL_STATUSES.has(status)
+}
+
+function parseTelegramUserDateToSec(raw, { endOfDay = false } = {}) {
+  if (raw == null) return null
+  const s = String(raw).trim()
+  if (!s) return null
+  let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/)
+  if (m) {
+    let year = Number(m[3])
+    if (year < 100) year += 2000
+    const hasTime = m[4] != null
+    const hh = hasTime ? Number(m[4]) : (endOfDay ? 23 : 0)
+    const mm = hasTime ? Number(m[5]) : (endOfDay ? 59 : 0)
+    const ss = hasTime ? Number(m[6] || 0) : (endOfDay ? 59 : 0)
+    const d = new Date(year, Number(m[2]) - 1, Number(m[1]), hh, mm, ss)
+    const ts = Math.floor(d.getTime() / 1000)
+    return Number.isFinite(ts) ? ts : null
+  }
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/)
+  if (m) {
+    const hasTime = m[4] != null
+    const hh = hasTime ? Number(m[4]) : (endOfDay ? 23 : 0)
+    const mm = hasTime ? Number(m[5]) : (endOfDay ? 59 : 0)
+    const ss = hasTime ? Number(m[6] || 0) : (endOfDay ? 59 : 0)
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), hh, mm, ss)
+    const ts = Math.floor(d.getTime() / 1000)
+    return Number.isFinite(ts) ? ts : null
+  }
+  return null
+}
+
+function formatTelegramUserDateTime(ts) {
+  const d = new Date(Number(ts) * 1000)
+  const pad = n => String(n).padStart(2, '0')
+  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+function clampInterval(interval, request) {
+  const start = Math.max(Number(interval.start), Number(request.start))
+  const end = Math.min(Number(interval.end), Number(request.end))
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null
+  return { start, end }
+}
+
+function mergeIntervals(intervals) {
+  const sorted = (intervals || [])
+    .filter(i => Number.isFinite(Number(i.start)) && Number.isFinite(Number(i.end)) && Number(i.end) >= Number(i.start))
+    .map(i => ({ start: Number(i.start), end: Number(i.end) }))
+    .sort((a, b) => a.start - b.start)
+  const out = []
+  for (const i of sorted) {
+    const last = out[out.length - 1]
+    if (last && i.start <= last.end + 1) {
+      if (i.end > last.end) last.end = i.end
+    } else {
+      out.push({ ...i })
+    }
+  }
+  return out
+}
+
+function intersectIntervalSets(a, b) {
+  const aa = mergeIntervals(a)
+  const bb = mergeIntervals(b)
+  const out = []
+  let i = 0, j = 0
+  while (i < aa.length && j < bb.length) {
+    const start = Math.max(aa[i].start, bb[j].start)
+    const end = Math.min(aa[i].end, bb[j].end)
+    if (end >= start) out.push({ start, end })
+    if (aa[i].end < bb[j].end) i++
+    else j++
+  }
+  return mergeIntervals(out)
+}
+
+function subtractCoveredIntervals(request, covered) {
+  const req = { start: Number(request.start), end: Number(request.end) }
+  if (!Number.isFinite(req.start) || !Number.isFinite(req.end) || req.end < req.start) return []
+  const cov = mergeIntervals(covered)
+    .map(i => clampInterval(i, req))
+    .filter(Boolean)
+  const missing = []
+  let cur = req.start
+  for (const c of cov) {
+    if (c.start > cur) missing.push({ start: cur, end: c.start - 1 })
+    cur = Math.max(cur, c.end + 1)
+    if (cur > req.end) break
+  }
+  if (cur <= req.end) missing.push({ start: cur, end: req.end })
+  return missing
+}
+
+function intervalSame(a, b) {
+  return Number(a?.start) === Number(b?.start) && Number(a?.end) === Number(b?.end)
+}
+
+function telegramRequestedDateRange(params = {}) {
+  if ((params.mode || '') !== 'from_date' || !params.date) return null
+  const start = parseTelegramUserDateToSec(params.date)
+  if (!Number.isFinite(start)) return null
+  const end = params.date_to
+    ? parseTelegramUserDateToSec(params.date_to, { endOfDay: true })
+    : Math.floor(Date.now() / 1000)
+  if (!Number.isFinite(end) || end < start) return null
+  return { start, end }
+}
+
+function hasUnsafeTelegramBackfillNeed(sourceId, params = {}) {
+  if (!sourceId) return false
+  try {
+    const rows = db.itemTypeBreakdown(sourceId) || []
+    const byType = new Map(rows.map(r => [r.type, r]))
+    const bodyTypes = ['text']
+    if (params.process_polls) bodyTypes.push('poll')
+    for (const t of bodyTypes) {
+      const row = byType.get(t)
+      if (!row) continue
+      if (Number(row.with_caption || 0) < Number(row.count || 0)) return true
+    }
+  } catch (err) {
+    console.error('[Jobs] coverage planner backfill check failed', err)
+    return true
+  }
+  return false
+}
+
+function telegramCoveragePlannerAllowed(params = {}) {
+  if (params._range_plan_child || params._coverage_planner_disabled) return false
+  if ((params.mode || '') !== 'from_date') return false
+  if (!params.date) return false
+  if (params.redo_processed) return false
+  if (params.include_comments) return false
+  if (Array.isArray(params._comments_only_post_ids) && params._comments_only_post_ids.length > 0) return false
+  if (Array.isArray(params._media_only_msg_ids) && params._media_only_msg_ids.length > 0) return false
+  if (Array.isArray(params.topic_ids) && params.topic_ids.length > 0) return false
+  if (params.process_voice || params.process_photo || params.process_docs) return false
+  return true
+}
+
+function isSourceWideTelegramCoverageParams(params = {}) {
+  if (!params || typeof params !== 'object') return true
+  if (params._range_plan_parent) return false
+  if (params.mode === 'single' || params.mode === 'media_only') return false
+  if (Array.isArray(params._comments_only_post_ids) && params._comments_only_post_ids.length > 0) return false
+  if (Array.isArray(params._media_only_msg_ids) && params._media_only_msg_ids.length > 0) return false
+  if (Array.isArray(params.topic_ids) && params.topic_ids.length > 0) return false
+  return true
+}
+
+function parseParamsJsonSafe(raw) {
+  if (!raw) return null
+  try {
+    const v = JSON.parse(raw)
+    return v && typeof v === 'object' ? v : null
+  } catch {
+    return null
+  }
+}
+
+function coverageRowUsableForPlanner(row) {
+  const params = parseParamsJsonSafe(row?.job_parameters_json)
+  if (!params) return true
+  return isSourceWideTelegramCoverageParams(params)
+}
+
+function coverageIntervalForPlannerRow(row, request) {
+  let start = Number(row?.date_from)
+  let end = Number(row?.date_to)
+  const params = parseParamsJsonSafe(row?.job_parameters_json)
+  if (params && row?.job_status === 'done'
+      && isSourceWideTelegramCoverageParams(params)
+      && params.mode === 'from_date'
+      && params.date) {
+    const requestedStart = parseTelegramUserDateToSec(params.date)
+    if (Number.isFinite(requestedStart)) start = requestedStart
+    const requestedEnd = params.date_to
+      ? parseTelegramUserDateToSec(params.date_to, { endOfDay: true })
+      : Number(row.job_finished_at || row.job_started_at || row.date_to)
+    if (Number.isFinite(requestedEnd)) end = requestedEnd
+  }
+  return clampInterval({ start, end }, request)
+}
+
+function telegramCoverageTypesForParams(params = {}, typeBreakdown = {}) {
+  const types = new Set(Object.keys(typeBreakdown || {}).filter(Boolean))
+  if (isSourceWideTelegramCoverageParams(params)) {
+    const mode = params.mode || 'last_n'
+    if (mode === 'from_date' || mode === 'last_n' || mode === 'all') {
+      types.add('text')
+      if (params.process_polls) types.add('poll')
+    }
+  }
+  return Array.from(types)
+}
+
+function telegramRequiredCoverageTypes(params = {}) {
+  const types = ['text']
+  if (params.process_polls) types.push('poll')
+  return types
+}
+
+function coverageIntervalsForTypes(sourceId, requiredTypes, requestRange) {
+  let rows = []
+  try { rows = db.listCoverage(sourceId) || [] }
+  catch (err) {
+    console.error('[Jobs] coverage planner listCoverage failed', err)
+    return []
+  }
+  const request = { start: requestRange.start, end: requestRange.end }
+  const byType = new Map()
+  for (const t of requiredTypes) byType.set(t, [])
+  for (const r of rows) {
+    if (!coverageRowUsableForPlanner(r)) continue
+    if (!byType.has(r.content_type)) continue
+    if (r.depth && r.depth !== 'metadata' && r.depth !== 'media' && r.depth !== 'transcribed') continue
+    if (!r.date_from || !r.date_to) continue
+    const clipped = coverageIntervalForPlannerRow(r, request)
+    if (clipped) byType.get(r.content_type).push(clipped)
+  }
+  let covered = null
+  for (const t of requiredTypes) {
+    const intervals = mergeIntervals(byType.get(t) || [])
+    if (!intervals.length) return []
+    covered = covered == null ? intervals : intersectIntervalSets(covered, intervals)
+    if (!covered.length) return []
+  }
+  return mergeIntervals(covered || [])
+}
+
+function summarizeRangePlan(original, covered, missing, reason = 'coverage') {
+  return {
+    reason,
+    original,
+    covered,
+    intervals: missing,
+    intervals_total: missing.length,
+  }
+}
+
+function prepareTelegramCoveragePlan(params = {}) {
+  if (!telegramCoveragePlannerAllowed(params)) return null
+  const source = telegramSourceForFetchParams(params)
+  if (!source?.id) return null
+  const request = telegramRequestedDateRange(params)
+  if (!request) return null
+  if (hasUnsafeTelegramBackfillNeed(source.id, params)) {
+    console.log(`[Jobs] coverage planner skip source #${source.id}: body backfill needed`)
+    return null
+  }
+  const requiredTypes = telegramRequiredCoverageTypes(params)
+  const covered = coverageIntervalsForTypes(source.id, requiredTypes, request)
+  if (!covered.length) return null
+  const missing = subtractCoveredIntervals(request, covered)
+  const plan = summarizeRangePlan(request, covered, missing)
+  if (missing.length === 0) {
+    return { kind: 'noop', source, plan }
+  }
+  if (missing.length === 1) {
+    if (intervalSame(missing[0], request)) return null
+    const nextParams = {
+      ...params,
+      mode: 'from_date',
+      date: formatTelegramUserDateTime(missing[0].start),
+      date_to: formatTelegramUserDateTime(missing[0].end),
+      _range_plan: plan,
+    }
+    console.log(`[Jobs] coverage planner source #${source.id}: clipped from_date ${formatTelegramUserDateTime(request.start)}..${formatTelegramUserDateTime(request.end)} → ${nextParams.date}..${nextParams.date_to}`)
+    return { kind: 'single', source, plan, params: nextParams }
+  }
+  console.log(`[Jobs] coverage planner source #${source.id}: split ${missing.length} gaps from ${formatTelegramUserDateTime(request.start)}..${formatTelegramUserDateTime(request.end)}`)
+  return { kind: 'multi', source, plan }
+}
+
+function buildTelegramDateProgress(params = {}, interval = null, intervalIndex = 0, intervalTotal = 1) {
+  const range = interval || telegramRequestedDateRange(params)
+  if (!range) return null
+  return {
+    kind: 'date_range',
+    direction: 'forward',
+    request_from: range.start,
+    request_to: range.end,
+    current_at: range.start,
+    interval_index: intervalIndex,
+    interval_total: intervalTotal,
+  }
+}
+
+const TELEGRAM_ETA_SAMPLE_WINDOW = 10
+const TELEGRAM_ETA_MIN_SAMPLE_MS = 250
+
+function clampNonNegative(n) {
+  const v = Number(n)
+  return Number.isFinite(v) ? Math.max(0, v) : 0
+}
+
+function pushTelegramEtaSample(job, sample) {
+  if (!job) return
+  if (!job._tgEta) job._tgEta = { samples: [], last: null }
+  job._tgEta.samples.push(sample)
+  if (job._tgEta.samples.length > TELEGRAM_ETA_SAMPLE_WINDOW) {
+    job._tgEta.samples.splice(0, job._tgEta.samples.length - TELEGRAM_ETA_SAMPLE_WINDOW)
+  }
+}
+
+function updateTelegramEtaFromSamples(job) {
+  const progress = job?.tg_progress
+  const samples = job?._tgEta?.samples || []
+  if (!progress || samples.length === 0) return
+
+  const wallSec = samples.reduce((acc, s) => acc + clampNonNegative(s.wall_ms) / 1000, 0)
+  if (wallSec <= 0) return
+
+  const currentAt = Number(progress.current_at || 0)
+  const requestTo = Number(progress.request_to || 0)
+  const rangeDone = samples.reduce((acc, s) => acc + clampNonNegative(s.range_sec), 0)
+  const remainingRange = (currentAt && requestTo)
+    ? Math.max(0, requestTo - currentAt)
+    : null
+
+  if (remainingRange != null && remainingRange > 0 && rangeDone > 0) {
+    const rangePerSec = rangeDone / wallSec
+    if (rangePerSec > 0) {
+      progress.eta_sec = Math.ceil(remainingRange / rangePerSec)
+      progress.eta_basis = 'date'
+      progress.eta_samples = samples.length
+      return
+    }
+  }
+
+  const total = Number(job.items_total || 0)
+  const done = Number(job.items_done || 0)
+  const itemDone = samples.reduce((acc, s) => acc + clampNonNegative(s.items), 0)
+  if (total > done && itemDone > 0) {
+    const itemsPerSec = itemDone / wallSec
+    if (itemsPerSec > 0) {
+      progress.eta_sec = Math.ceil((total - done) / itemsPerSec)
+      progress.eta_basis = 'items'
+      progress.eta_samples = samples.length
+      return
+    }
+  }
+
+  delete progress.eta_sec
+  delete progress.eta_basis
+  progress.eta_samples = samples.length
+}
+
+function markTelegramEtaPoint(job, { force = false } = {}) {
+  const progress = job?.tg_progress
+  if (!progress) return
+  const now = Date.now()
+  const currentAt = Number(progress.current_at || 0)
+  const itemsDone = Number(job.items_done || 0)
+  if (!job._tgEta) job._tgEta = { samples: [], last: null }
+  const prev = job._tgEta.last
+  job._tgEta.last = { at_ms: now, current_at: currentAt, items_done: itemsDone }
+  if (!prev) return
+
+  const wallMs = now - Number(prev.at_ms || 0)
+  const rangeSec = currentAt && prev.current_at
+    ? Math.max(0, currentAt - Number(prev.current_at || 0))
+    : 0
+  const items = Math.max(0, itemsDone - Number(prev.items_done || 0))
+  if ((force || wallMs >= TELEGRAM_ETA_MIN_SAMPLE_MS) && (rangeSec > 0 || items > 0)) {
+    pushTelegramEtaSample(job, { wall_ms: wallMs, range_sec: rangeSec, items })
+  }
+  updateTelegramEtaFromSamples(job)
+}
+
+function updateTelegramSavingProgress(job, { done, total, chunkRows, ms } = {}) {
+  const progress = job?.tg_progress
+  if (!progress) return
+  const savingDone = clampNonNegative(done)
+  const savingTotal = clampNonNegative(total)
+  progress.saving_done = savingDone
+  progress.saving_total = savingTotal
+  if (progress.request_to) progress.current_at = Number(progress.request_to)
+
+  if (!job._tgSavingEta) job._tgSavingEta = { samples: [] }
+  const rows = clampNonNegative(chunkRows)
+  const wallMs = clampNonNegative(ms)
+  if (rows > 0 && wallMs > 0) {
+    job._tgSavingEta.samples.push({ rows, wall_ms: wallMs })
+    if (job._tgSavingEta.samples.length > TELEGRAM_ETA_SAMPLE_WINDOW) {
+      job._tgSavingEta.samples.splice(0, job._tgSavingEta.samples.length - TELEGRAM_ETA_SAMPLE_WINDOW)
+    }
+  }
+
+  const samples = job._tgSavingEta.samples
+  const sampleRows = samples.reduce((acc, s) => acc + clampNonNegative(s.rows), 0)
+  const sampleWallSec = samples.reduce((acc, s) => acc + clampNonNegative(s.wall_ms) / 1000, 0)
+  const remainingRows = Math.max(0, savingTotal - savingDone)
+  if (remainingRows > 0 && sampleRows > 0 && sampleWallSec > 0) {
+    const rowsPerSec = sampleRows / sampleWallSec
+    progress.eta_sec = Math.ceil(remainingRows / rowsPerSec)
+    progress.eta_basis = 'saving'
+    progress.eta_samples = samples.length
+  } else if (savingTotal > 0 && savingDone >= savingTotal) {
+    progress.eta_sec = 0
+    progress.eta_basis = 'saving'
+    progress.eta_samples = samples.length
+  }
+}
+
+function finishTelegramProgress(job) {
+  const progress = job?.tg_progress
+  if (!progress) return
+  if (job.status === 'done' && progress.request_to) {
+    progress.current_at = Number(progress.request_to)
+    progress.eta_sec = 0
+    progress.eta_basis = progress.saving_total ? 'saving' : (progress.eta_basis || 'date')
+  }
+}
+
+function publicTelegramProgress(progress) {
+  if (!progress) return null
+  const out = {
+    kind: progress.kind || 'date_range',
+    direction: progress.direction || 'forward',
+    request_from: progress.request_from || null,
+    request_to: progress.request_to || null,
+    current_at: progress.current_at || null,
+    interval_index: progress.interval_index || 0,
+    interval_total: progress.interval_total || 1,
+    saving_done: progress.saving_done || 0,
+    saving_total: progress.saving_total || 0,
+  }
+  if (progress.eta_sec != null && Number.isFinite(Number(progress.eta_sec))) {
+    out.eta_sec = Math.max(0, Math.ceil(Number(progress.eta_sec)))
+  }
+  if (progress.eta_basis) out.eta_basis = progress.eta_basis
+  if (progress.eta_samples != null) out.eta_samples = Number(progress.eta_samples) || 0
+  if (out.current_at && out.request_to) {
+    out.remaining_sec = Math.max(0, Number(out.request_to) - Number(out.current_at))
+  } else if (out.request_from && out.request_to) {
+    out.remaining_sec = Math.max(0, Number(out.request_to) - Number(out.request_from))
+  }
+  if (out.current_at && out.request_from && out.request_to) {
+    const total = Math.max(1, Number(out.request_to) - Number(out.request_from))
+    const done = Math.max(0, Math.min(total, Number(out.current_at) - Number(out.request_from)))
+    out.progress_pct = Math.round((done / total) * 100)
+  }
+  return out
+}
+
+function persistTelegramProgressParams(job) {
+  const progress = publicTelegramProgress(job?.tg_progress)
+  if (!progress) return job?.params || null
+  job.params = { ...(job.params || {}), _tg_progress: progress }
+  return job.params
+}
+
+function updateTelegramDateProgress(job, item) {
+  if (!job?.tg_progress || !item?.date) return
+  const ts = Math.floor(new Date(item.date).getTime() / 1000)
+  if (!Number.isFinite(ts)) return
+  const from = Number(job.tg_progress.request_from || 0)
+  const to = Number(job.tg_progress.request_to || 0)
+  job.tg_progress.current_at = from && to
+    ? Math.max(from, Math.min(to, ts))
+    : ts
+}
+
 // On startup, flip any zombie 'running' batch rows to 'interrupted' so
 // JobDetail can show a "Продолжить" button. yt_batch and ig_batch are the
 // only flows where a hard-kill could leave orphan rows; tg_fetch persists
@@ -212,10 +796,16 @@ function snapshot(j) {
     // Machine token for structural error handling (e.g. "session_unauthorized"
     // → global toast). null for the vast majority of jobs.
     error_code: j.error_code || null,
+    // Telegram account snapshot used by this job. Renderer mostly ignores it,
+    // but background schedulers need it to pause/resume session-scoped auto work.
+    tg_session: j.tg_session || null,
     // Non-fatal diagnostic for an otherwise-mute outcome: {message, code}.
     // Set by tg_fetch's empty-result path (personal account has no feed, 0 new
     // messages, filters excluded all). Rendered amber, doesn't block `done`.
     warning: j.warning || null,
+    tg_progress: publicTelegramProgress(j.tg_progress)
+                 || j.params?._tg_progress
+                 || null,
     started_at: j.started_at || null,
     finished_at: j.finished_at || null,
     entity_title: j.entity_title || null,
@@ -378,6 +968,28 @@ function listJobs() {
   } catch (err) {
     console.error('[Jobs] historic yt_batch query failed', err)
   }
+  let historicIgBatch = []
+  try {
+    const rows = db.listSourcelessJobs({ type: 'ig_batch_transcribe', limit: 150 })
+    historicIgBatch = rows
+      .filter(row => {
+        let p = null
+        try { p = row.parameters_json ? JSON.parse(row.parameters_json) : null } catch {}
+        const rowCodes = Array.isArray(p?.shortcodes) ? p.shortcodes.join(',') : ''
+        return !live.some(j => {
+          if (j.type !== 'ig_batch_transcribe') return false
+          const liveCodes = Array.isArray(j.params?.shortcodes) ? j.params.shortcodes.join(',') : ''
+          return (
+            (row.file_path && j.file_path && row.file_path === j.file_path) ||
+            (p?.target && j.target && p.target === j.target) ||
+            (rowCodes && liveCodes && rowCodes === liveCodes)
+          )
+        })
+      })
+      .map(rowToHistoricSnapshot)
+  } catch (err) {
+    console.error('[Jobs] historic ig_batch query failed', err)
+  }
   // YouTube comments — single-paste artifacts; show in Recent regardless of
   // whether they're now bound to a source via the new single-flow.
   let historicYtComments = []
@@ -403,7 +1015,7 @@ function listJobs() {
   } catch (err) {
     console.error('[Jobs] historic yt_batch_comments query failed', err)
   }
-  return [...live, ...historic, ...historicLocal, ...historicTgSingle, ...historicYtBatch, ...historicYtComments, ...historicYtBatchComments]
+  return [...live, ...historic, ...historicLocal, ...historicTgSingle, ...historicYtBatch, ...historicIgBatch, ...historicYtComments, ...historicYtBatchComments]
     .sort((a, b) => (b.started_at || 0) - (a.started_at || 0))
 }
 
@@ -545,18 +1157,428 @@ function rowToTgSingleSnapshot(row) {
 function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn) }
 function subscribeEvents(fn) { eventListeners.add(fn); return () => eventListeners.delete(fn) }
 
+function markJobClosed(job) {
+  if (!job) return
+  job._closed = true
+  if (typeof job._resolveClose === 'function') {
+    try { job._resolveClose(snapshot(job)) } catch {}
+    job._resolveClose = null
+  }
+}
+
+function findLiveJobByIdOrDbId(id) {
+  const numericId = Number(id)
+  const requestedId = Number.isFinite(numericId) ? numericId : id
+  let j = jobs.get(requestedId)
+  if (!j) {
+    for (const candidate of jobs.values()) {
+      if (candidate.dbRowId === requestedId) {
+        j = candidate
+        break
+      }
+    }
+  }
+  return j || null
+}
+
+function startAutoIndexAfterTelegramFetch(job) {
+  if (!job || job.type !== 'tg_fetch') return null
+  if (job.status !== 'done' || job.params?._auto_index_after_fetch !== true) return null
+  if (job.params?._auto_index_after_fetch_started
+      || job.params?._auto_index_after_fetch_noop) return null
+
+  const nextParams = { ...(job.params || {}) }
+  if (!job.source_id) {
+    nextParams._auto_index_after_fetch_error = 'source_id missing after Telegram fetch'
+    job.params = nextParams
+    if (job.dbRowId) {
+      try { db.updateJob(job.dbRowId, { params: job.params }) } catch {}
+    }
+    return { ok: false, error: nextParams._auto_index_after_fetch_error }
+  }
+
+  try {
+    const indexJob = require('./index-job')
+    const result = indexJob.start({
+      sourceId: Number(job.source_id),
+      limit: null,
+      origin: 'tg-fetch-auto-rag',
+    })
+    if (result && typeof result === 'object' && result.noop) {
+      nextParams._auto_index_after_fetch_noop = {
+        reason: result.reason || 'already-indexed',
+        at: Math.floor(Date.now() / 1000),
+      }
+      delete nextParams._auto_index_after_fetch_error
+      console.log(`[Jobs] tg_fetch #${job.id} auto RAG noop source #${job.source_id}: ${nextParams._auto_index_after_fetch_noop.reason}`)
+      job.params = nextParams
+      if (job.dbRowId) db.updateJob(job.dbRowId, { params: job.params })
+      return { ok: true, noop: true, reason: nextParams._auto_index_after_fetch_noop.reason }
+    }
+
+    nextParams._auto_index_after_fetch_started = {
+      job_id: result,
+      at: Math.floor(Date.now() / 1000),
+    }
+    delete nextParams._auto_index_after_fetch_error
+    console.log(`[Jobs] tg_fetch #${job.id} auto RAG started tg_index #${result} source #${job.source_id}`)
+    job.params = nextParams
+    if (job.dbRowId) db.updateJob(job.dbRowId, { params: job.params })
+    return { ok: true, jobId: result }
+  } catch (err) {
+    const message = String(err && err.message || err)
+    nextParams._auto_index_after_fetch_error = message
+    job.params = nextParams
+    if (job.dbRowId) {
+      try { db.updateJob(job.dbRowId, { params: job.params }) } catch {}
+    }
+    console.error(`[Jobs] tg_fetch #${job.id} auto RAG failed`, err)
+    return { ok: false, error: message }
+  }
+}
+
+function patchAutoIndexParams(params, enabled) {
+  const next = { ...(params || {}), _auto_index_after_fetch: enabled === true }
+  if (enabled === true) {
+    delete next._auto_index_after_fetch_error
+  } else if (!next._auto_index_after_fetch_started && !next._auto_index_after_fetch_noop) {
+    delete next._auto_index_after_fetch_error
+  }
+  return next
+}
+
+function setAutoIndexAfterFetch(id, enabled) {
+  const on = enabled === true
+  const live = findLiveJobByIdOrDbId(id)
+  if (live) {
+    if (live.type !== 'tg_fetch') return { ok: false, error: 'auto RAG is only available for Telegram parsing jobs' }
+    if (live.params?.mode === 'single' || live.params?.mode === 'media_only') {
+      return { ok: false, error: 'auto RAG needs a saved Telegram chat source' }
+    }
+    live.params = patchAutoIndexParams(live.params, on)
+    if (live.dbRowId) {
+      try { db.updateJob(live.dbRowId, { params: live.params }) } catch {}
+    }
+    const auto = on ? startAutoIndexAfterTelegramFetch(live) : null
+    emit(live)
+    return { ok: true, enabled: on, auto, job: snapshot(live) }
+  }
+
+  const rowId = Number(id)
+  if (!Number.isFinite(rowId)) return { ok: false, error: 'job not found' }
+  try {
+    const row = db.getDb().prepare('SELECT * FROM jobs WHERE id = ?').get(rowId)
+    if (!row) return { ok: false, error: 'job not found' }
+    if (row.type !== 'tg_fetch') return { ok: false, error: 'auto RAG is only available for Telegram parsing jobs' }
+    let params = null
+    try { params = row.parameters_json ? JSON.parse(row.parameters_json) : null } catch {}
+    if (params?.mode === 'single' || params?.mode === 'media_only') {
+      return { ok: false, error: 'auto RAG needs a saved Telegram chat source' }
+    }
+    const pseudoJob = {
+      id: row.id,
+      dbRowId: row.id,
+      type: row.type,
+      status: row.status,
+      source_id: row.source_id || null,
+      params: patchAutoIndexParams(params, on),
+    }
+    db.updateJob(row.id, { params: pseudoJob.params })
+    const auto = on ? startAutoIndexAfterTelegramFetch(pseudoJob) : null
+    const job = getJobDetail(row.id)
+    return { ok: true, enabled: on, auto, job }
+  } catch (err) {
+    return { ok: false, error: String(err && err.message || err) }
+  }
+}
+
+function startTelegramNoopFetch(params, planInfo) {
+  const id = nextId++
+  const source = planInfo?.source || telegramSourceForFetchParams(params) || null
+  const now = Math.floor(Date.now() / 1000)
+  const plan = planInfo?.plan || null
+  const warning = {
+    code: 'already_covered',
+    message: 'Этот диапазон уже покрыт сохранённым парсингом — новый Telegram-запрос не запускался.',
+  }
+  const job = {
+    id,
+    type: 'tg_fetch',
+    target: params.target,
+    status: 'done',
+    items_done: 0,
+    items_total: 0,
+    started_at: now,
+    finished_at: now,
+    source_id: source?.id || params._source_id || null,
+    entity_title: source?.display_name || null,
+    entity_kind: source?.meta?.kind || null,
+    params: {
+      ...params,
+      _range_plan: plan,
+      _warning: warning,
+    },
+    warning,
+    type_breakdown: {},
+    tg_progress: plan?.original ? buildTelegramDateProgress(params, plan.original) : null,
+  }
+  finishTelegramProgress(job)
+  job.params = persistTelegramProgressParams(job)
+  try {
+    if (job.source_id) {
+      job.dbRowId = db.recordJob({
+        type: job.type, source_id: job.source_id, status: job.status,
+        items_total: 0, items_done: 0,
+        params: job.params, started_at: job.started_at,
+        finished_at: job.finished_at,
+        file_path: null,
+      })
+    }
+  } catch (err) {
+    console.error('[Jobs] coverage planner noop recordJob failed', err)
+  }
+  jobs.set(id, job)
+  console.log(`[Jobs] coverage planner noop #${id} source #${job.source_id || '-'} db #${job.dbRowId || '-'} fully covered`)
+  emit(job)
+  setImmediate(() => emit(job))
+  markJobClosed(job)
+  return id
+}
+
+function mergeTypeBreakdownInto(target, src) {
+  if (!target || !src) return
+  for (const [k, v] of Object.entries(src)) {
+    target[k] = (target[k] || 0) + Number(v || 0)
+  }
+}
+
+function waitForJobClose(jobId) {
+  const j = jobs.get(jobId)
+  if (!j) return Promise.resolve(null)
+  if (j._closed) return Promise.resolve(snapshot(j))
+  if (j._closePromise) return j._closePromise
+  if (isTerminalStatus(j.status)) return Promise.resolve(snapshot(j))
+  return new Promise(resolve => {
+    const off = subscribe(snap => {
+      if (!snap || snap.id !== jobId) return
+      if (!isTerminalStatus(snap.status)) return
+      off()
+      resolve(snap)
+    })
+  })
+}
+
+function startTelegramRangePlan(params, planInfo) {
+  const id = nextId++
+  const source = planInfo.source || telegramSourceForFetchParams(params) || null
+  const intervals = Array.isArray(planInfo.plan?.intervals) ? planInfo.plan.intervals : []
+  const now = Math.floor(Date.now() / 1000)
+  const job = {
+    id,
+    type: 'tg_fetch',
+    target: params.target,
+    status: 'running',
+    items_done: 0,
+    items_total: null,
+    started_at: now,
+    source_id: source?.id || params._source_id || null,
+    entity_title: source?.display_name || null,
+    entity_kind: source?.meta?.kind || null,
+    params: {
+      ...params,
+      _range_plan_parent: true,
+      _range_plan: planInfo.plan,
+    },
+    type_breakdown: {},
+    tg_progress: intervals[0] ? buildTelegramDateProgress(params, intervals[0], 0, intervals.length) : null,
+  }
+  if (job.tg_progress) markTelegramEtaPoint(job)
+  job._closePromise = new Promise(resolve => { job._resolveClose = resolve })
+  job.cancel = () => {
+    job._cancelRequested = true
+    if (job._activeChildId) {
+      try { cancelJob(job._activeChildId) } catch {}
+    }
+  }
+  try {
+    if (job.source_id) {
+      job.dbRowId = db.recordJob({
+        type: job.type, source_id: job.source_id, status: 'running',
+        items_total: null, items_done: 0,
+        params: persistTelegramProgressParams(job),
+        started_at: job.started_at,
+      })
+    }
+  } catch (err) {
+    console.error('[Jobs] coverage planner parent recordJob failed', err)
+  }
+  jobs.set(id, job)
+  console.log(`[Jobs] coverage planner parent #${id} source #${job.source_id || '-'} db #${job.dbRowId || '-'} intervals=${intervals.length}`)
+  emit(job)
+
+  ;(async () => {
+    let failed = null
+    for (let i = 0; i < intervals.length; i++) {
+      if (job._cancelRequested || job.status === 'cancelled') break
+      const interval = intervals[i]
+      job.tg_progress = buildTelegramDateProgress(params, interval, i, intervals.length)
+      job._tgEta = null
+      if (job.tg_progress) markTelegramEtaPoint(job)
+      job.params = persistTelegramProgressParams(job)
+      if (job.dbRowId) {
+        try { db.updateJob(job.dbRowId, { params: job.params, items_done: job.items_done }) } catch {}
+      }
+      emit(job)
+
+      const childParams = {
+        ...params,
+        mode: 'from_date',
+        date: formatTelegramUserDateTime(interval.start),
+        date_to: formatTelegramUserDateTime(interval.end),
+        _source_id: job.source_id || params._source_id || null,
+        _range_plan_child: true,
+        _range_plan_parent_id: id,
+        _range_plan_parent_db_id: job.dbRowId || null,
+        _range_plan_interval_index: i,
+        _range_plan_interval_total: intervals.length,
+      }
+      let childId = null
+      try {
+        const doneBeforeInterval = Number(job.items_done || 0)
+        childId = startTelegramFetch(childParams)
+        job._activeChildId = childId
+        console.log(`[Jobs] coverage planner parent #${id} interval ${i + 1}/${intervals.length} child #${childId} ${childParams.date}..${childParams.date_to}`)
+        const offChildProgress = subscribe(snap => {
+          if (!snap || snap.id !== childId) return
+          job.items_done = doneBeforeInterval + Number(snap.items_done || 0)
+          job.items_total = job.items_done || null
+          if (snap.tg_progress) {
+            job.tg_progress = {
+              ...snap.tg_progress,
+              interval_index: i,
+              interval_total: intervals.length,
+            }
+          }
+          job.params = persistTelegramProgressParams(job)
+          const nowMs = Date.now()
+          if (job.dbRowId && (!job._lastParentProgressDbSync || nowMs - job._lastParentProgressDbSync > 750)) {
+            job._lastParentProgressDbSync = nowMs
+            try { db.updateJob(job.dbRowId, { items_done: job.items_done, params: job.params }) }
+            catch (err) { console.error('[Jobs] coverage planner parent progress update failed', err) }
+          }
+          emit(job)
+        })
+        const snap = await waitForJobClose(childId)
+        try { offChildProgress() } catch {}
+        job._activeChildId = null
+        if (!snap) continue
+        job.items_done = doneBeforeInterval + Number(snap.items_done || 0)
+        job.items_total = job.items_done
+        mergeTypeBreakdownInto(job.type_breakdown, snap.type_breakdown || {})
+        if (snap.status === 'error') {
+          failed = snap.error || 'child fetch failed'
+          break
+        }
+        if (snap.status === 'cancelled') {
+          job._cancelRequested = true
+          break
+        }
+      } catch (err) {
+        failed = String(err?.message || err)
+        job._activeChildId = null
+        break
+      }
+    }
+
+    job.finished_at = Math.floor(Date.now() / 1000)
+    if (job._cancelRequested) {
+      job.status = 'cancelled'
+    } else if (failed) {
+      job.status = 'error'
+      job.error = failed
+    } else {
+      job.status = 'done'
+    }
+    finishTelegramProgress(job)
+    try {
+      const nextParams = { ...(job.params || {}) }
+      if (job.type_breakdown && Object.keys(job.type_breakdown).length) nextParams._type_breakdown = job.type_breakdown
+      if (job.tg_progress) nextParams._tg_progress = publicTelegramProgress(job.tg_progress)
+      job.params = nextParams
+      if (job.dbRowId) {
+        db.updateJob(job.dbRowId, {
+          status: job.status,
+          items_total: job.items_done,
+          items_done: job.items_done,
+          error: job.error || null,
+          finished_at: job.finished_at,
+          params: job.params,
+        })
+      }
+    } catch (err) {
+      console.error('[Jobs] coverage planner parent final update failed', err)
+    }
+    console.log(`[Jobs] coverage planner parent #${id} end status=${job.status} items=${job.items_done} intervals=${intervals.length}${job.error ? ' error=' + job.error : ''}`)
+    emit(job)
+    markJobClosed(job)
+  })().catch(err => {
+    job.status = 'error'
+    job.error = String(err?.message || err)
+    job.finished_at = Math.floor(Date.now() / 1000)
+    console.error('[Jobs] coverage planner parent failed', err)
+    emit(job)
+    markJobClosed(job)
+  })
+
+  return id
+}
+
+async function bulkUpsertItemsYielding(rows, { jobId = '-', sourceId = '-', chunkSize = 1000, onProgress = null } = {}) {
+  if (!Array.isArray(rows) || rows.length === 0) return 0
+  if (rows.length <= chunkSize) {
+    const t0 = Date.now()
+    db.bulkUpsertItems(rows)
+    if (typeof onProgress === 'function') {
+      onProgress({ done: rows.length, total: rows.length, chunkRows: rows.length, ms: Date.now() - t0 })
+    }
+    return rows.length
+  }
+  let done = 0
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize)
+    const t0 = Date.now()
+    db.bulkUpsertItems(chunk)
+    done += chunk.length
+    const ms = Date.now() - t0
+    if (ms > 250) {
+      console.log(`[Jobs] close #${jobId} bulkUpsertItems chunk source #${sourceId} rows=${chunk.length} done=${done}/${rows.length} took ${ms}ms`)
+    }
+    if (typeof onProgress === 'function') {
+      onProgress({ done, total: rows.length, chunkRows: chunk.length, ms })
+    }
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  return done
+}
+
 /**
  * Start a Telegram fetch via tg_fetch_json.py.
  * params: { target, mode, limit?, date?, url? }
  */
 function startTelegramFetch(params) {
+  params = { ...(params || {}) }
+  const coveragePlan = prepareTelegramCoveragePlan(params)
+  if (coveragePlan?.kind === 'noop') return startTelegramNoopFetch(params, coveragePlan)
+  if (coveragePlan?.kind === 'multi') return startTelegramRangePlan(params, coveragePlan)
+  if (coveragePlan?.kind === 'single' && coveragePlan.params) params = coveragePlan.params
+
   const startStartedMs = Date.now()
   const id = nextId++
   // Снимок активной сессии ДО построения args: он же уходит Python'у явным
   // --session (иначе Python перечитал бы settings.json сам — окно гонки, в
   // котором переключение сессии в UI ретаргетит уже-спавнящийся fetch, и
   // job.tg_session разошёлся бы с реально использованной сессией).
-  const tgSession = params._tg_session_override || activeTgSession()
+  const tgSession = telegramSessionForFetchParams(params)
   const args = [
     path.join(WORKERS_ROOT, 'telegram', 'tg_fetch_json.py'),
     params.target,
@@ -613,6 +1635,22 @@ function startTelegramFetch(params) {
   // the same tg_media_results stash → appendItemTranscript path as batch fetch.
   const isMediaOnly = Array.isArray(params._media_only_msg_ids)
                       && params._media_only_msg_ids.length > 0
+  const isSingle = params.mode === 'single'
+  const knownSourceIdRaw = params._source_id || params.source_id || params.source_id_hint || null
+  const knownSourceId = !isSingle && knownSourceIdRaw != null
+    ? Number(knownSourceIdRaw)
+    : null
+  if (knownSourceId && Number.isFinite(knownSourceId) && knownSourceId > 0) {
+    if (!params._range_plan_child) {
+      for (const existing of jobs.values()) {
+        if (existing?.type !== 'tg_fetch') continue
+        if (Number(existing.source_id) !== Number(knownSourceId)) continue
+        if (existing.status !== 'running' && existing.status !== 'awaiting_ai') continue
+        console.warn(`[Jobs] tg_fetch duplicate source #${knownSourceId} → reuse live #${existing.id} db #${existing.dbRowId || '-'}`)
+        return existing.id
+      }
+    }
+  }
   if (isMediaOnly) {
     args.push('--media-only-msg-ids', params._media_only_msg_ids.join(','))
   }
@@ -631,7 +1669,7 @@ function startTelegramFetch(params) {
   //     items row for output). Skipping would emit empty .txt.
   //   • _comments_only_post_ids — comments-catch-up: doesn't process media,
   //     only walks discussion threads; skip is no-op but cheap to omit.
-  const isEphemeral = params.mode === 'single'
+  const isEphemeral = isSingle
                        || (Array.isArray(params._comments_only_post_ids)
                            && params._comments_only_post_ids.length > 0)
                        // media-only: the user explicitly asked to (re)process
@@ -668,6 +1706,9 @@ function startTelegramFetch(params) {
     `mode=${params.mode}`,
     `limit=${params.limit || 'none'}`,
   ]
+  if (knownSourceId && Number.isFinite(knownSourceId) && knownSourceId > 0) {
+    startBits.push(`source=${knownSourceId}`)
+  }
   if (params.sinceMessageId) startBits.push(`since=${params.sinceMessageId}`)
   if (Array.isArray(params.topic_ids) && params.topic_ids.length > 0) {
     startBits.push(`topics=${params.topic_ids.join(',')}`)
@@ -690,6 +1731,7 @@ function startTelegramFetch(params) {
   })
   console.log(`[Jobs] tg_fetch #${id} spawned pid=${child.pid || '-'} spawn_ms=${Date.now() - spawnStartedMs} setup_ms=${Date.now() - startStartedMs}`)
 
+  const requestedDateRange = telegramRequestedDateRange(params)
   const job = {
     id,
     type: 'tg_fetch',
@@ -706,24 +1748,32 @@ function startTelegramFetch(params) {
     _startStartedMs: startStartedMs,
     _skipFilePath: skipFilePath,  // tmp file with already-processed external_ids;
                                   // removed in close handler.
+    tg_requested_range: requestedDateRange,
+    tg_progress: buildTelegramDateProgress(
+      params,
+      requestedDateRange,
+      Number(params._range_plan_interval_index || 0),
+      Number(params._range_plan_interval_total || 1),
+    ),
   }
-  // Media-only re-processing operates on an EXISTING source whose id the
-  // renderer already knows — there's no `entity` event to discover it (Python
-  // jumps straight to process_media → done). Seed source_id now so (a) the
-  // close-handler's appendItemTranscript replay runs (it's guarded by
-  // job.source_id) and (b) we can write a pending History row below. Mirrors
-  // the «pending row on spawn» pattern used by tg_reply_backfill, which is
-  // likewise entity-event-less. See fact-jobs.md::Pending row.
-  if (isMediaOnly && params._source_id) {
-    job.source_id = Number(params._source_id)
+  job._closePromise = new Promise(resolve => { job._resolveClose = resolve })
+  if (job.tg_progress) job.params = persistTelegramProgressParams(job)
+  if (job.tg_progress) markTelegramEtaPoint(job)
+  // SourceDetail fetches already know their source_id before Python resolves
+  // the Telegram entity. Seed it now and insert the running History row before
+  // the potentially slow resolve pass; otherwise the page can look idle for
+  // 20+ seconds and repeated clicks create duplicate live jobs.
+  if (knownSourceId && Number.isFinite(knownSourceId) && knownSourceId > 0) {
+    job.source_id = knownSourceId
     try {
       job.dbRowId = db.recordJob({
         type: job.type, source_id: job.source_id, status: 'running',
         items_total: null, items_done: 0,
         params: job.params, started_at: job.started_at,
       })
+      console.log(`[Jobs] tg_fetch #${id} recordJob seeded row #${job.dbRowId} source #${job.source_id}`)
     } catch (err) {
-      console.error('[Jobs] recordJob (media_only pending) failed', err)
+      console.error('[Jobs] recordJob (seeded pending) failed', err)
     }
   }
   jobs.set(id, job)
@@ -743,7 +1793,7 @@ function startTelegramFetch(params) {
     stderrTail = (stderrTail + chunk.toString()).slice(-2000)
   })
 
-  child.on('close', code => {
+  child.on('close', async code => {
     const closeStartedMs = Date.now()
     if (job.status === 'running') {
       if (code === 0) {
@@ -757,10 +1807,20 @@ function startTelegramFetch(params) {
     const dur = job.finished_at - job.started_at
     const closeItemCount = Array.isArray(job.items) ? job.items.length : 0
     console.log(`[Jobs] close #${id} begin status=${job.status} code=${code} items=${closeItemCount} db #${job.dbRowId || '-'} source #${job.source_id || '-'}`)
+    if (maybePromoteSuspiciousEmptyTelegramFetch(job)) emit(job)
 
     // Clean up the skip-processed JSON file (best-effort; missing file ok).
     if (job._skipFilePath) {
       try { fs.unlinkSync(job._skipFilePath) } catch {}
+    }
+
+    if (isAutoEmptyCatchUpFetch(job)
+        && suppressJobHistoryRow(job, 'auto empty catchup')) {
+      delete job.items
+      console.log(`[Jobs] end #${id} status=${job.status} items=${job.items_done} duration=${dur}s history=suppressed close_ms=${Date.now() - closeStartedMs}`)
+      emit(job)
+      markJobClosed(job)
+      return
     }
 
     // 1. Persist all items into SQLite (idempotent UPSERT — re-fetches don't dup).
@@ -797,7 +1857,15 @@ function startTelegramFetch(params) {
         }))
         console.log(`[Jobs] close #${id} prepared item rows rows=${rows.length} took ${Date.now() - prepareRowsStartedMs}ms`)
         const dbStartedMs = Date.now()
-        db.bulkUpsertItems(rows)
+        await bulkUpsertItemsYielding(rows, {
+          jobId: id,
+          sourceId: job.source_id,
+          onProgress: info => {
+            updateTelegramSavingProgress(job, info)
+            job.params = persistTelegramProgressParams(job)
+            emit(job)
+          },
+        })
         console.log(`[Jobs] close #${id} bulkUpsertItems rows=${rows.length} source #${job.source_id} took ${Date.now() - dbStartedMs}ms`)
       }
 
@@ -837,23 +1905,31 @@ function startTelegramFetch(params) {
     // 2. Per-type coverage records (the jobs row itself is finalised AFTER
     //    file save below so file_path can be persisted in the same UPDATE).
     try {
+      const coverageTypes = telegramCoverageTypesForParams(job.params || {}, job.type_breakdown || {})
+      const useRequestedDateRange = job.tg_requested_range
+        && isSourceWideTelegramCoverageParams(job.params || {})
+        && (job.params?.mode || '') === 'from_date'
+      const coverageDateFrom = useRequestedDateRange ? job.tg_requested_range.start : job.date_min
+      const coverageDateTo = useRequestedDateRange ? job.tg_requested_range.end : job.date_max
       if (job.source_id && job.status === 'done' && job.dbRowId
-          && Object.keys(job.type_breakdown).length) {
+          && coverageTypes.length
+          && Number.isFinite(Number(coverageDateFrom))
+          && Number.isFinite(Number(coverageDateTo))) {
         const coverageStartedMs = Date.now()
-        for (const [contentType, count] of Object.entries(job.type_breakdown)) {
+        for (const contentType of coverageTypes) {
           db.recordCoverage({
             source_id:    job.source_id,
             job_id:       job.dbRowId,
-            date_from:    job.date_min,
-            date_to:      job.date_max,
+            date_from:    Number(coverageDateFrom),
+            date_to:      Number(coverageDateTo),
             content_type: contentType,
             // metadata for now — depth bumps to 'media' / 'transcribed' as we
             // download files / transcribe in later jobs.
             depth: 'metadata',
-            items_count: count,
+            items_count: Number(job.type_breakdown?.[contentType] || 0),
           })
         }
-        console.log(`[Jobs] close #${id} coverage types=${Object.keys(job.type_breakdown).length} took ${Date.now() - coverageStartedMs}ms`)
+        console.log(`[Jobs] close #${id} coverage types=${coverageTypes.length} range=${coverageDateFrom}..${coverageDateTo} requested=${useRequestedDateRange ? 1 : 0} took ${Date.now() - coverageStartedMs}ms`)
       }
     } catch (err) {
       console.error('[Jobs] coverage write failed', err)
@@ -980,6 +2056,8 @@ function startTelegramFetch(params) {
         // Persist the empty-result warning so a historic JobDetail (rebuilt
         // from the DB row after restart) still explains why 0 items landed.
         if (job.warning) next._warning = job.warning
+        finishTelegramProgress(job)
+        if (job.tg_progress) next._tg_progress = publicTelegramProgress(job.tg_progress)
         job.params = next
       } catch (err) {
         console.error('[Jobs] media_phase persist failed', err)
@@ -1025,11 +2103,14 @@ function startTelegramFetch(params) {
       console.error('[Jobs] updateJob (final) failed', err)
     }
 
+    startAutoIndexAfterTelegramFetch(job)
+
     // Free memory.
     delete job.items
 
     console.log(`[Jobs] end #${id} status=${job.status} items=${job.items_done} duration=${dur}s close_ms=${Date.now() - closeStartedMs}ms${job.error ? ' error=' + job.error : ''}`)
     emit(job)
+    markJobClosed(job)
   })
 
   return id
@@ -1057,7 +2138,7 @@ function startTelegramCommentsCatchUp(params) {
     include_comments:          true,
     comments_limit:            params.comments_limit || 0,
     _comments_only_post_ids:   params.post_ids,      // forwarded below
-    source_id_hint:            params.source_id || null,
+    _source_id:                params.source_id || null,
   })
 }
 
@@ -1312,6 +2393,7 @@ function handleEvent(job, evt) {
       job.items_done = (job.items_done || 0) + 1
       job.items.push(evt.data)
       job.tg_current_item = evt.data
+      updateTelegramDateProgress(job, evt.data)
       const t = (evt.data && evt.data.type) || 'other'
       job.type_breakdown[t] = (job.type_breakdown[t] || 0) + 1
 
@@ -1348,6 +2430,7 @@ function handleEvent(job, evt) {
     case 'page':
       job.items_done = evt.loaded
       job.items_total = evt.limit || null
+      if (job.tg_progress) markTelegramEtaPoint(job, { force: true })
       // Page boundary always emits — guaranteed update even if the throttle
       // skipped the last few items.
       job._lastProgressEmit = Date.now()
@@ -1357,7 +2440,11 @@ function handleEvent(job, evt) {
       // counter. Page is every 100 items — single UPDATE is negligible.
       // Same fix made for tg_index in index-job.js.
       if (job.dbRowId) {
-        try { db.updateJob(job.dbRowId, { items_done: job.items_done }) }
+        try {
+          const patch = { items_done: job.items_done }
+          if (job.tg_progress) patch.params = persistTelegramProgressParams(job)
+          db.updateJob(job.dbRowId, patch)
+        }
         catch (err) { console.error('[Jobs] tg_fetch mid-run updateJob failed', err) }
       }
       break
@@ -1402,6 +2489,7 @@ function handleEvent(job, evt) {
       job.items_done = evt.items_total
       job.tg_current_item = null
       job.finished_at = Math.floor(Date.now() / 1000)
+      if (job.tg_progress) persistTelegramProgressParams(job)
       // Comments pass summary — surface in JobDetail.
       if (evt.comments_collected != null) {
         job.tg_comments = {
@@ -1415,8 +2503,8 @@ function handleEvent(job, evt) {
     case 'warning':
       // Non-fatal diagnostic — job still finishes `done`. Currently the only
       // emitter is tg_fetch_json's empty-result path («ничего не найдено»: 0
-      // new messages, empty chat/dialog, or filters excluded everything).
-      // Carries a machine `code` (no_new_messages | empty_result) so the
+      // new messages, empty chat/dialog, future date, or filters excluded everything).
+      // Carries a machine `code` (no_new_messages | empty_result | future_date) so the
       // renderer can branch structurally without matching the Russian text.
       // Surfaced in amber, beside (not instead of) job.error.
       job.warning = { message: evt.message, code: evt.code || null }
@@ -1668,6 +2756,7 @@ function rowToHistoricSnapshot(row) {
     // Empty-result diagnostic stuffed into params on close — recover it so the
     // historic JobDetail still explains a 0-item fetch after Electron restart.
     warning:      params?._warning || null,
+    tg_progress:  params?._tg_progress || null,
     started_at:   row.started_at || null,
     finished_at:  row.finished_at || null,
     entity_title: params?.title || null,
@@ -1770,6 +2859,16 @@ function cancelJob(id) {
     return false
   }
   console.log(`[Jobs] cancel id=${id} matched live #${j.id} db #${j.dbRowId || '-'} type=${j.type} source #${j.source_id || '-'}`)
+  if (typeof j.cancel === 'function') {
+    try { j.cancel() } catch (err) { console.error('[Jobs] custom cancel failed', err) }
+    j.status = 'cancelled'
+    j.finished_at = Math.floor(Date.now() / 1000)
+    if (j.dbRowId) {
+      try { db.updateJob(j.dbRowId, { status: 'cancelled', finished_at: j.finished_at, items_done: j.items_done || 0, params: j.params || null }) } catch {}
+    }
+    emit(j)
+    return true
+  }
   if (j.child && !j.child.killed) {
     j.child.kill('SIGTERM')
     j.status = 'cancelled'
@@ -1914,10 +3013,13 @@ function runTelegramResolveFolder({ name, filterId, all }) {
  * Returns the new job id immediately. Activity panel subscribes via
  * onJobUpdate and renders progress N/M папок with current title.
  */
-function startTelegramFolderRefresh() {
+function startTelegramFolderRefresh(options = {}) {
   const id = nextId++
   // Снимок до спавна, он же — явный --session (см. startTelegramFetch).
-  const tgSession = activeTgSession()
+  const override = options?._tg_session_override || options?.session || null
+  const tgSession = (typeof override === 'string' && override.trim())
+    ? override.trim()
+    : activeTgSession()
   const args = [path.join(WORKERS_ROOT, 'telegram', 'tg_resolve_folder_ndjson.py'), '--all']
   if (tgSession) args.push('--session', tgSession)
 
@@ -2298,6 +3400,33 @@ function startTelegramReplyBackfill(params) {
   return id
 }
 
+function isFatalTelegramChildError(snap) {
+  const code = snap?.error_code || null
+  if (code === 'session_unauthorized') return true
+  if (code === 'worker_dependency_missing') return true
+  const msg = String(snap?.error || '')
+  return /telethon (not installed|import failed)/i.test(msg)
+}
+
+function finalizeTelegramUmbrellaStatus(job) {
+  const rows = Array.isArray(job?.tg_folder?.per_chat) ? job.tg_folder.per_chat : []
+  const failed = rows.filter(row => row.status === 'error')
+  const cancelled = rows.filter(row => row.status === 'cancelled')
+  if (failed.length) {
+    const first = failed.find(row => row.error) || failed[0]
+    job.status = 'error'
+    job.error = `${failed.length}/${job.tg_folder.total_chats} чатов завершились ошибкой${first?.error ? `: ${first.error}` : ''}`
+    return
+  }
+  if (cancelled.length) {
+    job.status = 'cancelled'
+    job.error = null
+    return
+  }
+  job.status = 'done'
+  job.error = null
+}
+
 /**
  * Folder batch fetch — sequential, never parallel.
  *
@@ -2323,7 +3452,7 @@ function startTelegramFolderFetch(params) {
   // Один снимок сессии на ВЕСЬ зонтик. Дети спавнятся последовательно
   // минутами — без этого переключение сессии в UI посреди прогона
   // раскидало бы чаты одной папки по двум аккаунтам.
-  const tgSession = activeTgSession()
+  const tgSession = params.tg_session || activeTgSession()
 
   const job = {
     id,
@@ -2423,9 +3552,14 @@ function startTelegramFolderFetch(params) {
             })
             // Bubble a structural error code (e.g. session_unauthorized) up to
             // the umbrella. The session is shared, so a deauth fails every
-            // child identically — surface it once so the renderer fires a
-            // single global toast instead of N.
+            // child identically — surface it once and stop the remaining
+            // children instead of spawning N doomed subprocesses.
             if (snap.error_code && !job.error_code) job.error_code = snap.error_code
+            if (isFatalTelegramChildError(snap)) {
+              job.status = 'error'
+              job.error = snap.error || 'Telegram child job failed'
+              job.finished_at = Math.floor(Date.now() / 1000)
+            }
             job.tg_folder.total_items += snap.items_done || 0
             job.tg_folder.done_chats   = i + 1
             job.items_done             = i + 1
@@ -2439,7 +3573,7 @@ function startTelegramFolderFetch(params) {
 
     // Whole batch done.
     if (job.status === 'running') {
-      job.status = 'done'
+      finalizeTelegramUmbrellaStatus(job)
       job.finished_at = Math.floor(Date.now() / 1000)
     }
     job.tg_folder.current_target = null
@@ -2514,6 +3648,9 @@ function startTelegramCatchUp(params) {
   const sinces  = Array.isArray(params.per_source_since)
     ? params.per_source_since.slice()
     : []
+  const sourceIds = Array.isArray(params.source_ids)
+    ? params.source_ids.slice()
+    : []
   if (!targets.length) {
     throw new Error('startTelegramCatchUp: targets required')
   }
@@ -2558,6 +3695,7 @@ function startTelegramCatchUp(params) {
       if (job.status !== 'running') break
       const target = targets[i]
       const since  = Number(sinces[i]) || 0
+      const sourceId = Number(sourceIds[i]) || null
       job.tg_folder.current_idx = i
       job.tg_folder.current_target = target
       emit(job)
@@ -2581,6 +3719,12 @@ function startTelegramCatchUp(params) {
           include_comments:  wantsComments,
           _folder_umbrella_id: id,
           _tg_session_override: tgSession,
+        }
+        if (sourceId && Number.isFinite(sourceId) && sourceId > 0) {
+          fetchParams._source_id = sourceId
+        }
+        if (params.auto === true) {
+          fetchParams._auto_catchup = true
         }
         if (since > 0) {
           // Cached tip known: ask Telethon for strictly newer messages, no
@@ -2620,9 +3764,14 @@ function startTelegramCatchUp(params) {
             })
             // Bubble a structural error code (e.g. session_unauthorized) up to
             // the umbrella. The session is shared, so a deauth fails every
-            // child identically — surface it once so the renderer fires a
-            // single global toast instead of N.
+            // child identically — surface it once and stop the remaining
+            // children instead of spawning N doomed subprocesses.
             if (snap.error_code && !job.error_code) job.error_code = snap.error_code
+            if (isFatalTelegramChildError(snap)) {
+              job.status = 'error'
+              job.error = snap.error || 'Telegram child job failed'
+              job.finished_at = Math.floor(Date.now() / 1000)
+            }
             job.tg_folder.total_items += snap.items_done || 0
             job.tg_folder.done_chats   = i + 1
             job.items_done             = i + 1
@@ -2635,26 +3784,34 @@ function startTelegramCatchUp(params) {
     }
 
     if (job.status === 'running') {
-      job.status = 'done'
+      finalizeTelegramUmbrellaStatus(job)
       job.finished_at = Math.floor(Date.now() / 1000)
     }
     job.tg_folder.current_target = null
     job.tg_folder.child_job_id   = null
 
-    try {
-      db.recordJob({
-        type:        job.type,
-        source_id:   null,
-        status:      job.status,
-        items_total: job.tg_folder.total_chats,
-        items_done:  job.tg_folder.done_chats,
-        params:      { ...job.params, _summary: job.tg_folder },
-        error:       job.error || null,
-        started_at:  job.started_at,
-        finished_at: job.finished_at,
-      })
-    } catch (err) {
-      console.error('[Jobs] tg_catchup recordJob failed', err)
+    const suppressAutoNoopHistory = params.auto === true
+      && job.status === 'done'
+      && Number(job.tg_folder.total_items || 0) <= 0
+    if (suppressAutoNoopHistory) {
+      job.params = { ...(job.params || {}), _history_suppressed: true }
+      console.log(`[Jobs] tg_catchup #${id} auto no-op: history row suppressed`)
+    } else {
+      try {
+        db.recordJob({
+          type:        job.type,
+          source_id:   null,
+          status:      job.status,
+          items_total: job.tg_folder.total_chats,
+          items_done:  job.tg_folder.done_chats,
+          params:      { ...job.params, _summary: job.tg_folder },
+          error:       job.error || null,
+          started_at:  job.started_at,
+          finished_at: job.finished_at,
+        })
+      } catch (err) {
+        console.error('[Jobs] tg_catchup recordJob failed', err)
+      }
     }
 
     console.log(`[Jobs] end tg_catchup #${id} status=${job.status} done=${job.tg_folder.done_chats}/${job.tg_folder.total_chats} items=${job.tg_folder.total_items}`)
@@ -2682,7 +3839,7 @@ function startTelegramCatchUp(params) {
  */
 function startTelegramPreview(params) {
   const id = nextId++
-  const tgSession = activeTgSession()   // снимок → --session (см. startTelegramFetch)
+  const tgSession = telegramSessionForFetchParams(params)   // снимок → --session (см. startTelegramFetch)
   const args = [
     path.join(WORKERS_ROOT, 'telegram', 'tg_fetch_json.py'),
     params.target,
@@ -4877,7 +6034,7 @@ function startInstagramBatchTranscribe(params) {
   const job = {
     id,
     type: 'ig_batch_transcribe',
-    target: params.source_id ? `source:${params.source_id}` : `batch:${params.shortcodes.length}`,
+    target: params.target || (params.source_id ? `source:${params.source_id}` : `batch:${params.shortcodes.length}`),
     status: 'running',
     items_done: 0,
     items_total: params.shortcodes.length,
@@ -5233,6 +6390,7 @@ function handleRedditEvent(job, evt) {
 // `close`. The UI decides which event types it cares about.
 
 const TG_SESSIONS_SCRIPT = path.join(WORKERS_ROOT, 'telegram', 'tg_sessions_ndjson.py')
+const TG_SEND_SAVED_SCRIPT = path.join(WORKERS_ROOT, 'telegram', 'tg_send_saved_ndjson.py')
 const IG_SESSIONS_SCRIPT = path.join(WORKERS_ROOT, 'instagram', 'ig_sessions_ndjson.py')
 
 function runOneShotNdjson(scriptPath, argv) {
@@ -5263,6 +6421,32 @@ function runOneShotNdjson(scriptPath, argv) {
 
 function runTgSessionsCommand(argv) {
   return runOneShotNdjson(TG_SESSIONS_SCRIPT, argv)
+}
+
+async function sendTelegramSavedMessage({ text = '', images = [], files = [], session = null, silent = false } = {}) {
+  const message = String(text == null ? '' : text)
+  const argv = ['--text', message]
+  for (const image of images || []) argv.push('--image', String(image))
+  for (const file of files || []) argv.push('--file', String(file))
+  if (session) argv.push('--session', String(session))
+  if (silent) argv.push('--silent')
+
+  console.log(`[Jobs] tg_send_saved session=${session || activeTgSession() || '-'} chars=${message.length} images=${(images || []).length} files=${(files || []).length}`)
+  const events = await runOneShotNdjson(TG_SEND_SAVED_SCRIPT, argv)
+  const sent = events.filter(e => e.type === 'sent')
+  const done = events.find(e => e.type === 'done') || null
+  const errors = events.filter(e => e.type === 'error')
+  if (errors.length && sent.length === 0) {
+    throw new Error(errors[0].message || 'Telegram saved message send failed')
+  }
+  return {
+    ok: errors.length === 0,
+    target: 'saved_messages',
+    session: done?.session || sent[0]?.session || session || null,
+    sent,
+    done,
+    errors,
+  }
 }
 
 function runIgSessionsCommand(argv) {
@@ -5550,6 +6734,7 @@ module.exports = {
   startTiktokChannelFetch,
   startTiktokBatchTranscribe,
   runTgSessionsCommand,
+  sendTelegramSavedMessage,
   runIgSessionsCommand,
   startInstagramProfileFetch,
   startInstagramBatchTranscribe,
@@ -5559,6 +6744,7 @@ module.exports = {
   runYoutubeSearch,
   resumeYoutubeBatch,
   cancelJob,
+  setAutoIndexAfterFetch,
   listJobs,
   getJobDetail,
   subscribe,

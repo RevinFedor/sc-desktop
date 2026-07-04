@@ -296,6 +296,134 @@ const TOOLS = [
     },
   },
   {
+    name: 'telegram_list_folders',
+    description:
+      'List Telegram dialog folders already synced into SC Desktop. Folders are ' +
+      'session-scoped pointers to normal Telegram sources, not separate message ' +
+      'stores. Defaults to the active Telegram session; pass session/profile or ' +
+      'all_sessions=true when investigating another account.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Optional case-insensitive substring filter on folder title.',
+        },
+        session: {
+          type: 'string',
+          description:
+            'Optional Telegram session/account. Accepts a session file name or ' +
+            'an account alias from telegram_list_sessions.',
+        },
+        profile: { type: 'string', description: 'Alias for session.' },
+        all_sessions: {
+          type: 'boolean',
+          default: false,
+          description:
+            'When true, list folders from every session instead of active/session scope.',
+        },
+        include_sources: {
+          type: 'boolean',
+          default: false,
+          description: 'Include a compact source list for each folder.',
+        },
+        source_limit: {
+          type: 'integer',
+          default: 50,
+          minimum: 1,
+          maximum: 500,
+          description: 'Max sources per folder when include_sources=true.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'telegram_refresh_folders',
+    description:
+      'Start a Telegram DialogFilter refresh job for the active session or an ' +
+      'explicit session/profile. This syncs the latest Telegram folders into ' +
+      'SC Desktop so telegram_list_folders/telegram_folder_state can inspect them.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session: {
+          type: 'string',
+          description:
+            'Optional Telegram session/account. Accepts a session file name or ' +
+            'an account alias from telegram_list_sessions.',
+        },
+        profile: { type: 'string', description: 'Alias for session.' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'telegram_folder_state',
+    description:
+      'Return one Telegram folder and its member chats from local SC Desktop ' +
+      'state. Resolve by folder_id, Telegram filter_id, or title substring. ' +
+      'Use this to inspect a folder like "Social" before choosing chats to fetch, ' +
+      'index, or search.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        folder_id: { type: 'integer', description: 'Numeric SC Desktop folders.id.' },
+        filter_id: { type: 'integer', description: 'Telegram DialogFilter.id.' },
+        title: { type: 'string', description: 'Folder title or substring.' },
+        name: { type: 'string', description: 'Alias for title.' },
+        session: {
+          type: 'string',
+          description:
+            'Optional Telegram session/account. Accepts a session file name or ' +
+            'an account alias from telegram_list_sessions.',
+        },
+        profile: { type: 'string', description: 'Alias for session.' },
+        all_sessions: { type: 'boolean', default: false },
+        source_limit: { type: 'integer', default: 200, minimum: 1, maximum: 1000 },
+        source_offset: { type: 'integer', default: 0, minimum: 0 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'telegram_search_chats',
+    description:
+      'Search local SC Desktop Telegram chats by title, handle, or username. ' +
+      'Can be scoped to a session/profile or to one Telegram folder. This is ' +
+      'local metadata search; use telegram_resolve_chat for a live Telegram ' +
+      'dialog scan when the chat is not in library.db.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Case-insensitive title/handle/username substring.' },
+        session: {
+          type: 'string',
+          description:
+            'Optional Telegram session/account. Accepts a session file name or ' +
+            'an account alias from telegram_list_sessions.',
+        },
+        profile: { type: 'string', description: 'Alias for session.' },
+        all_sessions: { type: 'boolean', default: false },
+        folder_id: { type: 'integer', description: 'Optional folder scope.' },
+        folder: { type: 'string', description: 'Optional folder title/substring scope.' },
+        indexed_only: {
+          type: 'boolean',
+          default: false,
+          description: 'Only return chats with at least one semantic vector.',
+        },
+        explicit_only: {
+          type: 'boolean',
+          default: false,
+          description: 'Hide folder-only/materialised sources.',
+        },
+        limit: { type: 'integer', default: 50, minimum: 1, maximum: 500 },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'telegram_resolve_chat',
     description:
       'Ask the active Telegram session to resolve a pasted chat title/handle ' +
@@ -564,6 +692,60 @@ const TOOLS = [
       'List Telegram session files known to SC Desktop and whether each is ' +
       'authorized. Read-only inventory; login/revoke remains in the app UI.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'telegram_send_saved_message',
+    description:
+      'Send text and/or local attachments to Telegram Saved Messages / Избранное. ' +
+      'This tool intentionally has no chat/target argument and cannot send to ' +
+      'other chats. Images are sent as photos; files are sent as documents. ' +
+      'For long text, split it into multiple calls; one Telegram text message ' +
+      'is limited to 4096 characters.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: {
+          type: 'string',
+          maxLength: 4096,
+          description:
+            'Optional plain text to send exactly as-is. Markdown/HTML parsing is disabled. ' +
+            'When attachments are also present, text is sent as a separate message first.',
+        },
+        images: {
+          type: 'array',
+          maxItems: 50,
+          description:
+            'Local image file paths to send as Telegram photos, e.g. PNG/JPEG/WebP.',
+          items: { type: 'string' },
+        },
+        files: {
+          type: 'array',
+          maxItems: 50,
+          description:
+            'Local file paths to send as Telegram documents. Use this for PDFs, ZIPs, ' +
+            'or images that should be preserved as files instead of photos.',
+          items: { type: 'string' },
+        },
+        session: {
+          type: 'string',
+          description:
+            'Optional Telegram session/account. Accepts a session name or an ' +
+            'account alias from telegram_list_sessions (username/phone, e.g. f9922).',
+        },
+        profile: { type: 'string', description: 'Alias for session.' },
+        silent: {
+          type: 'boolean',
+          default: false,
+          description: 'Send without notification when Telegram supports it.',
+        },
+      },
+      anyOf: [
+        { required: ['text'] },
+        { required: ['images'] },
+        { required: ['files'] },
+      ],
+      additionalProperties: false,
+    },
   },
 
   // ========== REDDIT ==========
@@ -1291,6 +1473,22 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         content: [{ type: 'text', text: JSON.stringify(sourceState(source.id, jobs_limit), null, 2) }],
       }
     }
+    if (name === 'telegram_list_folders') {
+      const out = await listTelegramFoldersTool(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'telegram_refresh_folders') {
+      const out = await telegramRefreshFoldersTool(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'telegram_folder_state') {
+      const out = await telegramFolderStateTool(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'telegram_search_chats') {
+      const out = await telegramSearchChatsTool(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
     if (name === 'telegram_resolve_chat') {
       const { text } = args
       if (!text || !String(text).trim()) throw new Error('text is required')
@@ -1355,6 +1553,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     if (name === 'telegram_list_sessions') {
       const out = await listTelegramSessions()
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'telegram_send_saved_message') {
+      const out = await telegramSendSavedMessageTool(args)
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
 
@@ -1515,6 +1717,13 @@ function parseMaybeJson(raw, fallback = null) {
   try { return JSON.parse(raw) } catch { return fallback }
 }
 
+function normaliseText(value) {
+  return String(value == null ? '' : value)
+    .normalize('NFKC')
+    .trim()
+    .toLowerCase()
+}
+
 function sourceRef(source) {
   if (!source) return null
   return {
@@ -1586,6 +1795,202 @@ function sourceSummary(row, { includeBreakdown = true } = {}) {
   return out
 }
 
+function telegramSourceKind(meta) {
+  return meta.kind || meta.entity_kind || meta.dialog_kind || null
+}
+
+function telegramSourceAuto(meta) {
+  const raw = (meta.tg_auto && typeof meta.tg_auto === 'object') ? meta.tg_auto : {}
+  return {
+    pull: !!raw.pull || !!raw.index,
+    index: !!raw.index,
+    types: Array.isArray(raw.types) ? raw.types.map(String).filter(Boolean) : [],
+    engine: raw.engine || null,
+  }
+}
+
+function compactTelegramSource(row) {
+  const meta = parseMaybeJson(row.meta_json, {}) || {}
+  const sourceId = Number(row.id)
+  const itemsTotal = Number(row.items_count ?? row.items_total ?? 0)
+  const indexable = Number(row.semantic_indexable_count ?? 0)
+  const indexed = Number(row.semantic_indexed_count ?? row.items_indexed ?? 0)
+  return {
+    source_id: sourceId,
+    handle: row.handle,
+    title: row.display_name || row.handle,
+    external_id: row.external_id || null,
+    username: meta.username || meta.user_name || null,
+    kind: telegramSourceKind(meta),
+    tg_session: row.tg_session || null,
+    tg_session_conflict: !!row.tg_session_conflict,
+    is_explicit: !!row.is_explicit,
+    items_total: itemsTotal,
+    items_indexable: indexable,
+    items_indexed: indexed,
+    index_missing: Math.max(0, indexable - indexed),
+    last_item_at: row.last_item_at || row.max_at || null,
+    last_synced_at: row.last_synced_at || null,
+    type_counts: {
+      text: Number(row.text_n || 0),
+      voice: Number(row.voice_n || 0),
+      video: Number(row.video_n || 0),
+      photo: Number(row.photo_n || 0),
+      audio: Number(row.audio_n || 0),
+      document: Number(row.document_n || 0),
+    },
+    auto: telegramSourceAuto(meta),
+  }
+}
+
+function formatTelegramFolder(row) {
+  return {
+    folder_id: Number(row.id),
+    filter_id: row.tg_filter_id == null ? null : Number(row.tg_filter_id),
+    title: row.title || 'Без названия',
+    tg_session: row.tg_session || null,
+    default_period_days: row.default_period_days == null ? null : Number(row.default_period_days),
+    default_types: parseMaybeJson(row.default_types_json, []),
+    sources_count: Number(row.sources_count || 0),
+    last_fetched_at: row.last_fetched_at || null,
+    added_at: row.added_at || null,
+    updated_at: row.updated_at || null,
+  }
+}
+
+function telegramSessionMatches(row, session) {
+  if (!session) return true
+  return !row.tg_session || row.tg_session === session
+}
+
+async function telegramFolderScope(args = {}) {
+  if (args.all_sessions === true) return { all_sessions: true, session: null }
+  const hasOverride = args.session || args.profile || args.account || args.tg_session
+  const session = hasOverride ? await resolveTelegramSessionName(args) : activeTelegramSessionName()
+  return { all_sessions: false, session: session || null }
+}
+
+function folderRowsForScope(scope) {
+  return db.listFolders(scope?.all_sessions ? null : scope?.session || null)
+}
+
+async function listTelegramFoldersTool(args = {}) {
+  const scope = await telegramFolderScope(args)
+  const query = normaliseText(args.query)
+  const includeSources = args.include_sources === true
+  const sourceLimit = Math.min(500, coercePositiveInt(args.source_limit, 50))
+  const rows = folderRowsForScope(scope)
+    .filter(row => !query || normaliseText(row.title).includes(query))
+  const folders = rows.map(row => {
+    const folder = formatTelegramFolder(row)
+    if (includeSources) {
+      const sources = db.listFolderSources(row.id)
+        .filter(src => scope.all_sessions || telegramSessionMatches(src, scope.session))
+      folder.sources = sources
+        .slice(0, sourceLimit)
+        .map(compactTelegramSource)
+      folder.sources_returned = folder.sources.length
+      folder.sources_total = sources.length
+      folder.sources_truncated = Math.max(0, sources.length - folder.sources.length)
+    }
+    return folder
+  })
+  return {
+    scope: {
+      all_sessions: !!scope.all_sessions,
+      tg_session: scope.session,
+      active_session: activeTelegramSessionName(),
+    },
+    query: args.query || null,
+    returned: folders.length,
+    folders,
+  }
+}
+
+async function telegramRefreshFoldersTool(args = {}) {
+  const hasOverride = args.session || args.profile || args.account || args.tg_session
+  const session = hasOverride ? await resolveTelegramSessionName(args) : activeTelegramSessionName()
+  const id = jobRunner().startTelegramFolderRefresh(
+    session ? { _tg_session_override: session } : {},
+  )
+  return {
+    ok: true,
+    job_id: id,
+    tg_session: session || null,
+    job: jobRunner().getJobDetail(id) || null,
+    next: 'Poll telegram_job_status with this job_id, then call telegram_list_folders or telegram_folder_state.',
+  }
+}
+
+function resolveTelegramFolderLocal(args = {}, scope = { all_sessions: true, session: null }) {
+  const folderId = args.folder_id != null ? Number(args.folder_id) : null
+  const filterId = args.filter_id != null ? Number(args.filter_id) : null
+  const title = args.title != null ? args.title : args.name
+  let rows = folderRowsForScope(scope)
+
+  if (folderId != null && Number.isFinite(folderId)) {
+    rows = rows.filter(row => Number(row.id) === folderId)
+  }
+  if (filterId != null && Number.isFinite(filterId)) {
+    rows = rows.filter(row => Number(row.tg_filter_id) === filterId)
+  }
+  if (title != null && String(title).trim()) {
+    const q = normaliseText(title)
+    const exact = rows.filter(row => normaliseText(row.title) === q)
+    rows = exact.length ? exact : rows.filter(row => normaliseText(row.title).includes(q))
+  }
+  rows = rows.filter(row => scope.all_sessions || telegramSessionMatches(row, scope.session))
+
+  if (!rows.length) {
+    return {
+      error: 'folder_not_found',
+      hint: 'Pass folder_id from telegram_list_folders, filter_id, or a title/name substring.',
+      candidates: folderRowsForScope(scope).slice(0, 20).map(formatTelegramFolder),
+    }
+  }
+  if (rows.length > 1 && folderId == null) {
+    return {
+      error: 'ambiguous_folder',
+      hint: 'Pass folder_id to disambiguate. Telegram filter_id is only unique inside one session.',
+      candidates: rows.slice(0, 20).map(formatTelegramFolder),
+    }
+  }
+  return { folder: rows[0] }
+}
+
+async function telegramFolderStateTool(args = {}) {
+  const scope = await telegramFolderScope(args)
+  const resolved = resolveTelegramFolderLocal(args, scope)
+  if (resolved.error) {
+    return {
+      scope: {
+        all_sessions: !!scope.all_sessions,
+        tg_session: scope.session,
+        active_session: activeTelegramSessionName(),
+      },
+      ...resolved,
+    }
+  }
+  const limit = Math.min(1000, coercePositiveInt(args.source_limit, 200))
+  const offset = Math.max(0, Number(args.source_offset || 0))
+  const rows = db.listFolderSources(resolved.folder.id)
+    .filter(src => scope.all_sessions || telegramSessionMatches(src, scope.session))
+  const sources = rows.slice(offset, offset + limit).map(compactTelegramSource)
+  return {
+    scope: {
+      all_sessions: !!scope.all_sessions,
+      tg_session: scope.session,
+      active_session: activeTelegramSessionName(),
+    },
+    folder: formatTelegramFolder(resolved.folder),
+    sources_offset: offset,
+    sources_returned: sources.length,
+    sources_total: rows.length,
+    has_more: offset + sources.length < rows.length,
+    sources,
+  }
+}
+
 function listTelegramSources({ indexed_only = false, explicit_only = false, limit = 200 } = {}) {
   const h = db.getDb()
   const where = [`s.platform = 'telegram'`]
@@ -1639,6 +2044,84 @@ function sourceState(sourceId, jobsLimit = 10) {
     index: indexJob().statusForSource(sourceId),
     coverage,
     recent_jobs: recentJobs,
+  }
+}
+
+async function telegramSearchChatsTool(args = {}) {
+  const query = normaliseText(args.query)
+  if (!query) throw new Error('query is required')
+
+  const scope = await telegramFolderScope(args)
+  let folder = null
+  let rows
+  if (args.folder_id != null || args.folder != null) {
+    const resolved = resolveTelegramFolderLocal(
+      { ...args, folder_id: args.folder_id, title: args.folder },
+      scope,
+    )
+    if (resolved.error) {
+      return {
+        scope: {
+          all_sessions: !!scope.all_sessions,
+          tg_session: scope.session,
+          active_session: activeTelegramSessionName(),
+        },
+        ...resolved,
+      }
+    }
+    folder = formatTelegramFolder(resolved.folder)
+    rows = db.listFolderSources(resolved.folder.id)
+  } else {
+    rows = db.listSources('telegram')
+  }
+
+  const limit = Math.min(500, coercePositiveInt(args.limit, 50))
+  const sources = rows
+    .filter(row => scope.all_sessions || telegramSessionMatches(row, scope.session))
+    .filter(row => args.explicit_only !== true || !!row.is_explicit)
+    .filter(row => {
+      const indexed = Number(row.semantic_indexed_count ?? row.items_indexed ?? 0)
+      return args.indexed_only !== true || indexed > 0
+    })
+    .map(row => {
+      const meta = parseMaybeJson(row.meta_json, {}) || {}
+      const haystack = [
+        row.handle,
+        row.display_name,
+        row.external_id,
+        meta.username,
+        meta.user_name,
+        meta.title,
+      ].map(normaliseText).filter(Boolean).join('\n')
+      return { row, haystack }
+    })
+    .filter(entry => entry.haystack.includes(query))
+    .map(entry => compactTelegramSource(entry.row))
+    .sort((a, b) => {
+      const ai = Number(a.items_indexed || 0)
+      const bi = Number(b.items_indexed || 0)
+      if (bi !== ai) return bi - ai
+      const at = Number(a.items_total || 0)
+      const bt = Number(b.items_total || 0)
+      if (bt !== at) return bt - at
+      return String(a.title || '').localeCompare(String(b.title || ''), 'ru')
+    })
+    .slice(0, limit)
+
+  return {
+    scope: {
+      all_sessions: !!scope.all_sessions,
+      tg_session: scope.session,
+      active_session: activeTelegramSessionName(),
+    },
+    query: args.query,
+    folder,
+    filters: {
+      indexed_only: args.indexed_only === true,
+      explicit_only: args.explicit_only === true,
+    },
+    returned: sources.length,
+    sources,
   }
 }
 
@@ -1956,6 +2439,37 @@ async function listTelegramSessions() {
     sessions: events.filter(e => e.type === 'session'),
     done: events.find(e => e.type === 'done') || null,
     errors: events.filter(e => e.type === 'error'),
+  }
+}
+
+async function telegramSendSavedMessageTool(args = {}) {
+  const text = String(args.text == null ? '' : args.text)
+  const images = Array.isArray(args.images)
+    ? args.images.map(v => String(v || '').trim()).filter(Boolean)
+    : []
+  const files = Array.isArray(args.files)
+    ? args.files.map(v => String(v || '').trim()).filter(Boolean)
+    : []
+  if (!text.trim() && images.length === 0 && files.length === 0) {
+    throw new Error('text, images, or files are required')
+  }
+  const textToSend = text.trim() ? text : ''
+  if (textToSend.length > 4096) {
+    throw new Error(`Telegram message is too long: ${textToSend.length} characters, maximum is 4096`)
+  }
+  if (images.length > 50) throw new Error('Too many images: maximum is 50')
+  if (files.length > 50) throw new Error('Too many files: maximum is 50')
+  const session = await resolveTelegramSessionName(args)
+  const out = await jobRunner().sendTelegramSavedMessage({
+    text: textToSend,
+    images,
+    files,
+    session: session || null,
+    silent: args.silent === true,
+  })
+  return {
+    ...out,
+    active_session: activeTelegramSessionName(),
   }
 }
 

@@ -21,6 +21,8 @@
 // notifies the exact key only — for "broad" invalidations call multiple
 // invalidate() at the writer site.
 
+import { noteDataBusInvalidation } from './perfDiagnostics'
+
 const subs = new Map()        // key -> Set<callback>
 const counters = new Map()    // key -> int (bumped on invalidate)
 
@@ -37,6 +39,7 @@ export function subscribe(key, fn) {
 export function invalidate(key) {
   counters.set(key, (counters.get(key) || 0) + 1)
   const s = subs.get(key)
+  noteDataBusInvalidation(key, s?.size || 0)
   if (!s) return
   for (const fn of s) {
     try { fn() } catch (err) { console.error('[dataBus] sub threw', err) }

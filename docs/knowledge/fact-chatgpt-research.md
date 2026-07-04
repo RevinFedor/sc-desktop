@@ -1,9 +1,17 @@
-# Knowledge: ChatGPT-провайдер research (chatgpt.com)
+# Knowledge: ChatGPT automation (research + compose + export)
 
-Четвёртый research-провайдер поверх общего канала `fact-deep-research.md` (тот же
-`/research-start` → CS → `/research-state`, тот же watcher-паттерн, keepalive, recovery
-через window.name/tabId). Здесь — только chatgpt-специфика: параметры, шрамы фоновой
-вкладки, парсинг «Источников». CS — `browser-extension/chatgpt-research.js`.
+`browser-extension/chatgpt-research.js` содержит общий низкоуровневый compose-layer
+для chatgpt.com и три разных entrypoint'а. Research-провайдер поверх общего канала
+`fact-deep-research.md` идёт как `/research-start` → CS → `/research-state`: watcher
+ответа, keepalive, recovery через window.name/tabId, парсинг «Источников» и сохранение
+результата в bridge. YouTube `+ ai → ChatGPT` идёт через `?sc-compose=<id>`:
+background кладёт prompt/model/effort в `chrome.storage.local`
+`__sc_chatgpt_compose_job_*`, CS выбирает модель/effort, вставляет текст, ждёт готовности
+document-loader'а и нажимает Send. В compose-ветке **нет MCP-badge, нет парсинга правой
+панели «Источники», нет `/research-state` и нет записи в историю MCP** — результат
+остаётся обычным ChatGPT-чатом для пользователя. Третий вход — popup export на
+`/c/<conversation-id>`: расширение собирает текущую ветку чата в markdown и доставляет
+её в clipboard/файл; это не research job и не compose handoff.
 
 ## Параметры job'а
 
@@ -23,10 +31,12 @@
   `false`; pill остаётся «Очень высокий», и запрос уходит не в Pro. Поэтому verify обязан
   проверять оба уровня. «Очень высокий» = xhigh из Codex CLI; Pro-режимы — эксклюзив
   тарифа Pro, в CLI недоступны, но для нашего асинхронного канала идеальны (мы поллим).
-- **`options.sources`** (default false) — включать ли блок источников в `result.text`.
-  Источники **парсятся всегда** и лежат в `result.sources[{url,title}]` +
-  `result.sources_meta` (activity, thinking-тайминги) — флаг управляет только текстовой
-  презентацией, не сбором. Принцип — `methodology/переносимый-дизайн.md::Сбор данных ≠ выдача`.
+- **`options.sources`** (default false, только research-ветка) — включать ли блок источников в `result.text`.
+  Источники **парсятся всегда** и лежат в `result.sources[{url,title}]`; activity/tool
+  steps из правой панели ChatGPT лежат в `result.source_activity[]` и дублируются в
+  `result.sources_meta.activity_items[]` вместе с `activity`/thinking-таймингами. Флаг
+  управляет только текстовой презентацией, не сбором. Принцип —
+  `methodology/переносимый-дизайн.md::Сбор данных ≠ выдача`.
 - **`attachments` / `files`** — локальные изображения для upload в composer. Поддержано
   только для `provider:"chatgpt"`: bridge валидирует MIME/размер, копирует файл в
   `LIB_ROOT/research-artifacts/<jobId>/input/`, а CS забирает bytes через
@@ -38,6 +48,10 @@
   `?sc-research=<id>#sc-research=<id>` и открывает тот же conversation вместо нового
   чата. Это контракт для follow-up запросов вроде «у того изображения внеси такой-то
   комментарий»: повторный job должен попасть в тот же чат, а не создавать новый контекст.
+- **`options.keepTab` / `options.autoClose === false`** — не закрывать вкладку после
+  подтверждённого terminal done в research-ветке. YouTube `+ ai → ChatGPT` больше не
+  использует этот флаг: для него вкладка остаётся открытой по природе `sc-compose`
+  handoff'а, потому что CS после Send не извлекает ответ и не делает terminal teardown.
 
 Выбор и модели и уровня — verify-and-retry: после клика меню переоткрывается и читается
 `aria-checked` только у видимых menu-нóд (ChatGPT оставляет stale-ноды от закрытых меню;
@@ -51,6 +65,33 @@ submit-verify. Провал **уровня** (effort) — non-fatal, лог `gpt
 
 **Модель врёт о своей версии в тексте ответа** (живой тест: выбрана 5.4, ответ «я —
 GPT-5.3»). Источник истины — bridge-лог `gpt.model.selected` + verify по меню, не текст.
+
+## Popup export текущего чата
+
+Popup export запускается только когда активная вкладка уже на `chatgpt.com/c/<id>`.
+Главный контракт — **API-first, DOM fallback**. Через `/api/auth/session` берётся
+access token текущей страницы, потом `fetch('/backend-api/conversation/<id>')` возвращает
+`mapping` и `current_node`. Ветка строится от `current_node` к корню по `parent`, затем
+разворачивается в пользовательский порядок. Это защищает от виртуализации: в проверочном
+чате 2026-07-03 visible DOM давал 44 turn'а, а API — 235 nodes / 227 nodes в current path /
+150 значимых записей. Поэтому DOM-only exporter выглядел бы рабочим на коротких чатах и
+молча терял бы большую часть длинного диалога.
+
+API-path собирает user messages, final assistant messages, reasoning/thinking, tool/code
+activity и вложения. File citations вида `source: my_files` без URL не считаются web
+sources: это пользовательские/ChatGPT-файлы внутри conversation, в markdown они остаются
+как вложения или цитаты. Web source появляется только когда есть реальный `http(s)` URL.
+DOM fallback остаётся нужен для случаев, когда backend API недоступен или формат поменялся:
+он скроллит видимые сообщения и может открыть right-side sources panel, но не должен быть
+единственным источником истины на длинных чатах.
+
+Доставка результата повторяет общий принцип browser-extension: текстовый markdown сначала
+идёт в clipboard, файл — только по `downloadFile=true`. Особый шрам ChatGPT popup export:
+`navigator.clipboard.writeText` может падать с `Document is not focused`, потому что popup
+инициирует экспорт, а документ страницы уже не в фокусе. Поэтому после `writeText` обязан
+быть DOM fallback через временный textarea + `document.execCommand('copy')`; если оба пути
+заблокированы, exporter скачивает `.md` как последнюю деградацию, а не завершает экспорт
+красной ошибкой.
 
 ## Шрам: hidden tab не рендерит стрим ответа (render-freeze)
 
@@ -126,16 +167,33 @@ LNA-диалог больше не фатален ни в одной форме.
 
 ## Парсинг «Источников» (правая панель)
 
+Research-ветка всегда парсит правую панель как часть terminal result. Popup export тоже
+может собрать sources/activity, но сначала через backend conversation API; DOM/right-panel
+парсинг для него — fallback. Compose/handoff для YouTube не трогает эту панель: если после
+`+ ai → ChatGPT` справа открылась «Детали рассуждения/Источники» или появился бейдж
+`MCP · CHATGPT`, значит YouTube снова ошибочно пошёл через high-level research-пайплайн,
+а не через reusable compose-layer.
+
 Чип `button[aria-label="Источники"]` в action-bar ответа → клик → справа
 `section[aria-label="Детали рассуждения"]`: активность (`Активность · 2m 20s`),
-thinking-блоки («Думал на протяжении X» — RU/EN), заголовок «Источники · N», ссылки.
+thinking-блоки («Думал на протяжении X» — RU/EN), заголовок «Источники · N», ссылки,
+а у agentic ChatGPT ещё activity/tool steps: «Получение исходного кода с GitHub»,
+«Тестирование загрузки данных с GitHub», `bash -lc ...`, Python snippets, output/error.
 
 - **Список виртуализирован**: панель показывала «Источники · 47», в DOM было 8 `<a>`.
   Сбор — скроллим scrollable-контейнер панели шагами, собирая новые ссылки на каждом
-  шаге; стоп — два шага без новых или дно.
+  шаге; на тех же шагах собираем activity items, потому что они тоже могут быть ниже
+  первого viewport'а. Стоп — два шага без новых ссылок или дно.
 - `textContent` панели склеивает блоки **без `\n`** — regex activity с жадным хвостом
   заглатывал весь протокол (1000+ симв); нужен нежадный матч с жёстким cap длины.
-- Ссылки фильтруются от внутренней навигации (`chatgpt.com|openai.com`), дедуп по href.
+- Activity/tool steps не равны URL-источникам. Пример живого DOM: шаг
+  `Тестирование загрузки данных с GitHub` содержит `pre/code` с командой
+  `bash -lc python3 ... urllib.request ... raw.githubusercontent.com ...` и stdout/stderr
+  под тем же блоком. Это сохраняется как
+  `{title, links?, command?, text?}` в `result.source_activity[]`.
+- Ссылки фильтруются от внутренней навигации только по `chatgpt.com`/subdomains и
+  `chat.openai.com`; **не** фильтровать весь `openai.com`, иначе реальные источники
+  `developers.openai.com` пропадают. Дедуп по href.
 - Панель закрывается после сбора (кнопка «Закрыть») — она перекрывает чат.
 - `is_research` = есть ли собранные web-ссылки (аналог research-маркера других провайдеров).
 
@@ -150,12 +208,36 @@ Paste — ClipboardEvent + DataTransfer в ProseMirror `#prompt-textarea` (ка�
 Perplexity, execCommand из isolated world игнорируется). Если stop не появился за 120с —
 терминальная ошибка `chatgpt_submit_failed` (paste в пустоту / логин-волл).
 
+**Длинная вставка может стать document-loader'ом.** На реальном YouTube-пересказе
+длинный prompt после paste не сразу становится обычным текстом в composer: ChatGPT
+показывает карточку вроде «Вставленный текст» и на время загрузки выключает input/Send.
+Клик по Send раньше этого момента даёт внешний симптом «ничего не отправилось»:
+composer ещё disabled, а job потом ждёт stop-button до submit timeout.
+
+Нельзя лечить это `sleep(800)` или другим guessed delay: размер текста, аккаунт и
+состояние ChatGPT меняют длительность loader'а. После paste нужно ждать реальные
+маркеры готовности composer'а: Send видим и enabled, editor не disabled/contenteditable=false,
+нет `aria-busy`, progressbar/loader/spinner и текстовых признаков uploading/loading.
+В реализации это `MutationObserver` + `requestAnimationFrame`; `setTimeout` остаётся
+только аварийным ceiling'ом, который должен завершить job ошибкой с диагностикой, а
+не «подождать на всякий случай».
+
 **Done-сигнал ≠ результат сохранён.** Живой кейс `ryccfz` был именно chatgpt-job:
 `watcher.done` сработал, ответ готов в браузере, но финальный `status=done` не долетел
 до bridge и job завис `running` на 10+ часов. Поэтому done-хендлер пишет финал через
 `postTerminalState` (подтверждение + ретрай) и закрывает вкладку **только** после
 подтверждения. Механика и почему гонка с tab-closed fallback не спасала —
 `fact-deep-research.md::Терминальный статус подтверждается перед teardown'ом`.
+
+Вторая форма того же симптома — **terminal POST слишком большой**, а не потерянный:
+`rja1mjv8…` и `rkkhjzer…` дошли до `gpt.watcher.done {hasAnswer:true}`, но
+`/research-state` отклонял финальный JSON как `request body too large`
+(`129233 > 65536`, `77152 > 65536`). Причина — ChatGPT agentic/research result
+несёт не только `answer_text`, но и `sources`, `source_activity`, code/output snippets
+из правой панели. Ретраи `postTerminalState` в таком случае не лечат — payload
+детерминированно больше лимита. Bridge лимит для `/research-state` поднят адресно
+до 5MB; не переносить большие sources/activity в `/research-log` и не обрезать их
+ради прохождения 64KB, иначе история MCP снова потеряет структурированный result.
 
 URL вкладки: `chatgpt.com/?sc-research=<id>#sc-research=<id>` — query + дубль в hash
 (SPA срезает query при pushState на `/c/<uuid>`; hash страхует ре-инжект CS до того как
@@ -180,6 +262,11 @@ Generated image не хранится в `result_json` как base64. CS ска�
 attachments: история хранит локальный артефакт, а не ссылку ChatGPT CDN, которая может
 истечь или стать недоступной без сессии.
 
+Лимит картинок живёт на `/research-artifact`, не на `/research-state`: JSON/base64
+transport до 30MB, decoded-файл до 25MB. Поэтому image-flow не является аргументом
+поднимать state-limit бесконечно или класть base64 в `result.images[]`; state несёт
+только descriptors.
+
 `result.text_kind = "image"` и `result.is_image = true` ставятся если есть хотя бы одна
 сохранённая картинка. `answer_text` при этом может быть пустым — это нормальный image-only
 ответ, а не ошибка extract'а. UI обязан показывать `result.images`, а не считать пустой
@@ -188,6 +275,7 @@ attachments: история хранит локальный артефакт, а
 ## Связано
 
 - `fact-deep-research.md` — общий канал, recovery, чеклист добавления провайдера
+- `fact-browser-extension.md::Поток данных (ChatGPT)` — popup export текущего `/c/<id>`
 - `fact-research-ui.md` — форма ручного запуска (таб ChatGPT: Модель/Интеллект/Источники)
 - `fact-asset-protocol.md` — `sc-asset://research-artifacts/...` для input/output картинок
 - `fact-aistudio-mcp.md::studio-ready` — первоисточник focus-pulse эскалации

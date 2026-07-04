@@ -163,6 +163,14 @@ export async function startInstagramProfileFetch(params) {
   if (!window.api?.igProfileFetch) return null
   return await window.api.igProfileFetch(params)
 }
+export async function lookupInstagramReel(payload) {
+  if (!window.api?.igLookupReel) return null
+  return await window.api.igLookupReel(payload)
+}
+export async function startInstagramBatchTranscribe(params) {
+  if (!window.api?.igBatchTranscribe) return null
+  return await window.api.igBatchTranscribe(params)
+}
 export async function getInstagramSettings() {
   if (!window.api?.igGetSettings) {
     return { metadata_backend: 'api', transcribe_backend: 'api', apify_token_set: false }

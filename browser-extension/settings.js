@@ -60,6 +60,16 @@ function isClaudeChatUrl(maybeUrl) {
   }
 }
 
+function isChatGPTUrl(maybeUrl) {
+  try {
+    const parsed = new URL(maybeUrl);
+    if (parsed.protocol !== 'https:') return false;
+    return parsed.hostname === 'chatgpt.com' || parsed.hostname === 'www.chatgpt.com';
+  } catch (error) {
+    return false;
+  }
+}
+
 function isYouTubeUrl(maybeUrl) {
   try {
     const parsed = new URL(maybeUrl);
@@ -76,6 +86,7 @@ function detectSite(maybeUrl) {
   if (isAIStudioUrl(maybeUrl)) return 'aistudio';
   if (isPerplexityUrl(maybeUrl)) return 'perplexity';
   if (isClaudeChatUrl(maybeUrl)) return 'claude';
+  if (isChatGPTUrl(maybeUrl)) return 'chatgpt';
   if (isYouTubeUrl(maybeUrl))   return 'youtube';
   return null;
 }
@@ -108,6 +119,23 @@ function sanitizeClaudeExportSettings(raw = {}) {
   return s;
 }
 
+const CHATGPT_EXPORT_DEFAULT_SETTINGS = Object.freeze({
+  includeReasoning: true,
+  includeSources: true,
+  includeSourceActivity: true,
+  includeImages: true,
+});
+
+function sanitizeChatGPTExportSettings(raw = {}) {
+  const s = { ...CHATGPT_EXPORT_DEFAULT_SETTINGS };
+  const cb = (v, fb) => typeof v === 'boolean' ? v : fb;
+  s.includeReasoning = cb(raw.includeReasoning, s.includeReasoning);
+  s.includeSources = cb(raw.includeSources, s.includeSources);
+  s.includeSourceActivity = cb(raw.includeSourceActivity, s.includeSourceActivity);
+  s.includeImages = cb(raw.includeImages, s.includeImages);
+  return s;
+}
+
 // YouTube settings — управляют «забрать видео в sc-desktop» flow.
 // auto_aistudio = после готовности транскрипта открывать AI Studio в новой
 // вкладке, выбирать модель, проставлять system instruction и paste'ить текст.
@@ -131,11 +159,34 @@ const CLAUDE_AVAILABLE_MODELS = Object.freeze([
   'Haiku 4.5',
 ]);
 
+const CHATGPT_AVAILABLE_MODELS = Object.freeze([
+  { id: '5.5', label: 'GPT-5.5' },
+  { id: '5.4', label: 'GPT-5.4' },
+  { id: '5.3', label: 'GPT-5.3' },
+  { id: '5.2', label: 'GPT-5.2' },
+  { id: '4.5', label: 'GPT-4.5' },
+  { id: 'o3', label: 'o3' },
+]);
+
+const CHATGPT_AVAILABLE_EFFORTS = Object.freeze([
+  { id: 'xhigh', label: 'Очень высокий' },
+  { id: 'high', label: 'High' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'instant', label: 'Instant' },
+  { id: 'pro', label: 'Pro стандартный' },
+  { id: 'pro-extended', label: 'Pro расширенный' },
+]);
+
 // Куда отправляется транскрипт после клика «+ ai» на YouTube-карточке.
-// Один target за раз — выбор Gemini или Claude. Раздельные настройки
-// (sys-prompt, проект, модель) каждого target'а живут параллельно в
+// Один target за раз — выбор Gemini, Claude или ChatGPT. Раздельные настройки
+// (sys-prompt, проект, prompt, модель) каждого target'а живут параллельно в
 // storage, чтобы переключение target'а не теряло прошлую конфигурацию.
-const YOUTUBE_TARGETS = Object.freeze(['aistudio', 'claude']);
+const YOUTUBE_TARGETS = Object.freeze(['aistudio', 'claude', 'chatgpt']);
+const YOUTUBE_TARGET_LABELS = Object.freeze({
+  aistudio: 'Gemini Studio',
+  claude: 'Claude',
+  chatgpt: 'ChatGPT',
+});
 
 const YOUTUBE_ENGINES = Object.freeze(['gemini', 'assemblyai']);
 
@@ -146,7 +197,7 @@ const YOUTUBE_DEFAULT_SETTINGS = Object.freeze({
   // gemini (дёшево, быстро) | assemblyai (длинные файлы 1-10ч). Прокидывается
   // в __sc_track_job → trackJob.engine → POST /yt-resume-ai. Дефолт gemini.
   engine: 'gemini',
-  // Куда отправлять: `aistudio` (Gemini Studio) или `claude` (claude.ai).
+  // Куда отправлять: `aistudio` (Gemini Studio), `claude` или `chatgpt`.
   target: 'aistudio',
   // ── Gemini-side настройки ─────────────────────────────────────────
   system_instruction: '',
@@ -171,6 +222,12 @@ const YOUTUBE_DEFAULT_SETTINGS = Object.freeze({
   claude_model: 'Opus 4.7',
   // Adaptive thinking — checkbox в модель-меню. По умолчанию ON.
   claude_adaptive_thinking: true,
+  // ── ChatGPT-side настройки ───────────────────────────────────────
+  // Prompt складывается перед текстом транскрипта и отправляется через
+  // sc-compose handoff. Модель/effort зеркалят chatgpt-research.js.
+  chatgpt_prompt: 'перескажи кратко',
+  chatgpt_model: '5.5',
+  chatgpt_effort: 'xhigh',
 });
 
 function sanitizeYoutubeSettings(raw = {}) {
@@ -211,5 +268,14 @@ function sanitizeYoutubeSettings(raw = {}) {
     s.claude_model = raw.claude_model;
   }
   s.claude_adaptive_thinking = cb(raw.claude_adaptive_thinking, s.claude_adaptive_thinking);
+  if (typeof raw.chatgpt_prompt === 'string') {
+    s.chatgpt_prompt = raw.chatgpt_prompt.slice(0, 4000);
+  }
+  if (typeof raw.chatgpt_model === 'string' && CHATGPT_AVAILABLE_MODELS.some(m => m.id === raw.chatgpt_model)) {
+    s.chatgpt_model = raw.chatgpt_model;
+  }
+  if (typeof raw.chatgpt_effort === 'string' && CHATGPT_AVAILABLE_EFFORTS.some(e => e.id === raw.chatgpt_effort)) {
+    s.chatgpt_effort = raw.chatgpt_effort;
+  }
   return s;
 }

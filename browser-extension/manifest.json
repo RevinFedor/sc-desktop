@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "SC Browser Parser",
   "version": "1.4.0",
-  "description": "SC Browser Parser — экспорт диалогов с Gemini Studio, Perplexity и Claude, плюс кнопка «забрать в sc-desktop» на карточках YouTube. Браузерный канал парсинга sc-desktop.",
+  "description": "SC Browser Parser — экспорт диалогов с Gemini Studio, Perplexity, Claude и ChatGPT, плюс кнопка «забрать в sc-desktop» на карточках YouTube. Браузерный канал парсинга sc-desktop.",
   "permissions": [
     "activeTab",
     "tabs",
@@ -46,7 +46,7 @@
     "service_worker": "background.js"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'self' http://127.0.0.1:53127 http://localhost:53127 ws://127.0.0.1:53129 ws://localhost:53129 ws://localhost:3457"
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'self' https://www.ozon.ru https://*.ozon.ru http://127.0.0.1:53127 http://localhost:53127 ws://127.0.0.1:53129 ws://localhost:53129 ws://localhost:3457"
   },
   "content_scripts": [
     {

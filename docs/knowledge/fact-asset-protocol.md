@@ -36,6 +36,14 @@ Research artifacts хранятся в `LIB_ROOT`, а не рядом с исх�
 и рестарт приложения, но renderer всё равно должен грузить картинку как обычный `<img>`.
 `sc-asset://research-artifacts/...` даёт это без `file://` и без отключения webSecurity.
 
+Transport-граница важна: входные ChatGPT attachments bridge сначала копирует в
+`research-artifacts/<jobId>/input/`, а CS потом забирает их через
+`GET /research-attachment`. Сгенерированные картинки идут base64 только временно через
+`POST /research-artifact` (JSON body cap 30MB, decoded file cap 25MB), сразу
+сохраняются файлом и возвращаются как descriptor. `/research-state` не должен возить
+image base64 — там остаются только paths/metadata, иначе один image-flow снова пробьёт
+state/result лимит и не попадёт в историю.
+
 Twitter/X media использует тот же принцип, но с другим lifecycle: search/thread
 сохраняют только признаки и URL, а бинарники качаются отдельным `twitter_media_fetch`,
 когда текст поста указывает на визуальный контекст. Локальный файл кладётся в

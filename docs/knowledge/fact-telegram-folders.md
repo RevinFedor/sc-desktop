@@ -87,6 +87,19 @@ Telegram sources, поэтому отдельная миграция не нуж
 приложения, дальше каждые 30 минут, пока приложение открыто. Механика
 самого запуска — `fact-fetch-strategies.md::Auto-pull / auto-index`.
 
+### MCP доступ к папкам
+
+MCP-тулы зеркалят ту же session-scoped модель, что и UI: отдельного
+«агентского» хранилища папок нет. `telegram_list_folders` и
+`telegram_folder_state` читают материализованные `folders`/`folder_sources` и
+возвращают sources из той же `library.db`; `telegram_refresh_folders` запускает
+настоящий refresh через Telethon для выбранной session; `telegram_search_chats`
+фильтрует уже сохранённые sources по папке/запросу без нового fetch.
+
+`session`/`profile` override в MCP — область одного вызова. Агент может
+посмотреть папку другого аккаунта или `all_sessions`, но это не переключает
+активную сессию в UI и не меняет куда пойдёт следующий ручной парсинг.
+
 ### Auto-кнопки в строке списка
 
 `auto-pull`, `auto-index` и `Types` живут в header-строке списка рядом с

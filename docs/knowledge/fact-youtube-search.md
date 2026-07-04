@@ -11,7 +11,7 @@
 
 ## 🔍 Что принимает yt-dlp
 
-Скрипт `cli-tools/web/yt_search_ndjson.py` имеет **два режима** в зависимости от формы
+Скрипт `python-workers/web/yt_search_ndjson.py` имеет **два режима** в зависимости от формы
 ввода:
 
 | Вход | yt-dlp получает | Что юзер контролирует |
@@ -173,7 +173,7 @@ Channel-flow (`YouTubeChannelForm`) тоже использует `YouTubeBatchP
 
 ## 🗂 Files
 
-- `cli-tools/web/yt_search_ndjson.py` — wrapper над yt-dlp
+- `python-workers/web/yt_search_ndjson.py` — wrapper над yt-dlp
 - `electron/job-runner.js::runYoutubeSearch` — async one-shot (через `runOneShotNdjson`)
 - `electron/job-runner.js::startYoutubeBatchTranscribe` — close-handler пишет
   `params.video_files` если `is_search`

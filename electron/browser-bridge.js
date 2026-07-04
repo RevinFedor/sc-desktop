@@ -45,6 +45,15 @@ const path = require('node:path')
 const os = require('node:os')
 const crypto = require('node:crypto')
 const researchState = require('./research-state')
+
+const BODY_LIMITS = {
+  default: 64 * 1024,
+  researchStart: 2 * 1024 * 1024,
+  researchState: 5 * 1024 * 1024,
+  researchArtifactJson: 30 * 1024 * 1024,
+  researchArtifactFile: 25 * 1024 * 1024,
+}
+
 // История research persist'ится в library.db (research_jobs). Терминальные
 // (done/error) джобы пишем туда, чтобы История MCP переживала рестарт.
 let _db = null
@@ -218,14 +227,16 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body))
 }
 
-async function readBody(req, maxBytes = 64 * 1024) {
+async function readBody(req, maxBytes = BODY_LIMITS.default) {
   return new Promise((resolve, reject) => {
     let data = ''
+    let received = 0
     req.setEncoding('utf-8')
     req.on('data', chunk => {
+      received += Buffer.byteLength(chunk, 'utf8')
       data += chunk
-      if (data.length > maxBytes) {
-        const err = new Error(`request body too large (${data.length} > ${maxBytes})`)
+      if (received > maxBytes) {
+        const err = new Error(`request body too large (${received} > ${maxBytes})`)
         err.code = 'BODY_TOO_LARGE'
         req.destroy(err)
       }
@@ -360,7 +371,7 @@ function saveResearchArtifact({ libRoot, id, name, contentType, base64 }) {
   if (!base64 || typeof base64 !== 'string') throw new Error('missing artifact base64')
   const bytes = Buffer.from(base64, 'base64')
   if (!bytes.length) throw new Error('empty artifact')
-  if (bytes.length > 25 * 1024 * 1024) throw new Error(`artifact too large (${bytes.length} bytes)`)
+  if (bytes.length > BODY_LIMITS.researchArtifactFile) throw new Error(`artifact too large (${bytes.length} bytes)`)
   const safeId = safeFileName(id, 'research')
   const ext = IMAGE_MIME_EXT[String(contentType || '').toLowerCase()]
     || path.extname(name || '').toLowerCase()
@@ -729,7 +740,7 @@ function startServer({ jobRunner }) {
       // MCP-сессии (юзер всё равно перезапустит deep_research_start).
 
       if (req.method === 'POST' && url.pathname === '/research-create') {
-        const body = await readBody(req)
+        const body = await readBody(req, BODY_LIMITS.researchStart)
         const provider = body.provider === 'perplexity' ? 'perplexity' : 'claude'
         const prompt = typeof body.prompt === 'string' ? body.prompt : ''
         if (!prompt.trim()) return sendJson(res, 400, { error: 'empty prompt' })
@@ -743,7 +754,7 @@ function startServer({ jobRunner }) {
       // + ранее-MCP-only mcp_open_research_tab в один HTTP вызов так чтобы
       // юзер мог дёргать всё curl'ом без MCP-tools.
       if (req.method === 'POST' && url.pathname === '/research-start') {
-        const body = await readBody(req)
+        const body = await readBody(req, BODY_LIMITS.researchStart)
         const prompt = typeof body.prompt === 'string' ? body.prompt : ''
         if (!prompt.trim()) return sendJson(res, 400, { error: 'empty prompt' })
 
@@ -883,7 +894,7 @@ function startServer({ jobRunner }) {
       // В result потом кладётся только file_path + metadata; сам base64 в
       // research-state/БД не попадает.
       if (req.method === 'POST' && url.pathname === '/research-artifact') {
-        const body = await readBody(req, 30 * 1024 * 1024)
+        const body = await readBody(req, BODY_LIMITS.researchArtifactJson)
         const id = body.id
         if (!id) return sendJson(res, 400, { error: 'missing id' })
         const job = researchState.get(id)
@@ -964,7 +975,7 @@ function startServer({ jobRunner }) {
       // воссоздаём stub job чтобы дать CS возможность дотащить research
       // до финала. Требуется body.provider — без него job не восстановить.
       if (req.method === 'POST' && url.pathname === '/research-state') {
-        const body = await readBody(req)
+        const body = await readBody(req, BODY_LIMITS.researchState)
         const id = body.id
         if (!id) return sendJson(res, 400, { error: 'missing id' })
         let cur = researchState.get(id)
@@ -1117,7 +1128,7 @@ function startServer({ jobRunner }) {
       //     stage, elapsedSec, promptHead, responseTextLen?, linkCount?,
       //     createdAt, updatedAt, error?, lastTag }
       if (req.method === 'POST' && url.pathname === '/aistudio-state') {
-        const body = await readBody(req)
+        const body = await readBody(req, BODY_LIMITS.researchState)
         const id = body.id
         if (!id || id === '-') return sendJson(res, 400, { error: 'missing id' })
         const now = Date.now()

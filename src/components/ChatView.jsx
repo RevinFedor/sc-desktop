@@ -252,15 +252,25 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
     // empty '@' target that Python would reject. handle is NOT NULL in the DB,
     // so this always yields a value.
     let h = handle
+    let sess = sourceSession
+    let conflict = sourceSessionConflict
     if (!h && window.api?.sourceGet) {
       try {
         const src = await window.api.sourceGet(sourceId)
         h = src?.handle || null
+        sess = src?.tg_session || null
+        conflict = !!src?.tg_session_conflict
         if (h) setHandle(h)
+        if (sess) setSourceSession(sess)
+        setSourceSessionConflict(conflict)
       } catch {}
     }
     if (!h) {
       console.warn('[ChatView] runTranscribe: no source handle yet')
+      return
+    }
+    if (conflict || !sess) {
+      console.warn('[ChatView] runTranscribe: source telegram session not pinned')
       return
     }
     const flags = { process_voice: false, process_photo: false, process_docs: false }
@@ -281,6 +291,7 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
         target: '@' + String(h).replace(/^@/, ''),
         mode: 'media_only',
         _source_id: sourceId,
+        _tg_session_override: sess,
         _media_only_msg_ids: msgIds,
         transcribe_engine: bulkEngine,
         ...flags,
@@ -315,11 +326,17 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
   // first time we launch (SourceDetail passes platform but not handle). We
   // resolve it from window.api.sourceGet once.
   const [handle, setHandle] = useState(null)
+  const [sourceSession, setSourceSession] = useState(null)
+  const [sourceSessionConflict, setSourceSessionConflict] = useState(false)
   useEffect(() => {
     if (!canProcess || !sourceId || !window.api?.sourceGet) return
     let alive = true
     window.api.sourceGet(sourceId).then(s => {
-      if (alive && s) setHandle(s.handle || null)
+      if (alive && s) {
+        setHandle(s.handle || null)
+        setSourceSession(s.tg_session || null)
+        setSourceSessionConflict(!!s.tg_session_conflict)
+      }
     }).catch(() => {})
     return () => { alive = false }
   }, [sourceId, canProcess])

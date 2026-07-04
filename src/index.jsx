@@ -2,6 +2,9 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App.jsx'
 import './styles/main.css'
+import { installPerfDiagnostics } from './lib/perfDiagnostics'
+
+installPerfDiagnostics()
 
 // === code-inspector: Claude/Cursor-friendly clipboard formatter ===
 // On Shift+Opt+click the plugin emits `code-inspector:trackCode` with

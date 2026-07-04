@@ -62,7 +62,8 @@ try:
     )
 except ImportError as ex:
     print(json.dumps({"type": "error",
-                      "message": f"telethon import failed: {ex}"}), flush=True)
+                      "message": f"telethon import failed: {ex}",
+                      "code": "worker_dependency_missing"}), flush=True)
     sys.exit(2)
 
 

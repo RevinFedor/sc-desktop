@@ -63,7 +63,8 @@ export default function AistudioJobScreen({ payload }) {
     ? job.sources
     : legacyParts.sources
   const sourcesMeta = mergeSourcesMeta(job.sourcesMeta, legacyParts.sourcesMeta)
-  const sourcesText = formatSourcesText(sources, sourcesMeta)
+  const sourceActivityCount = sourceActivityItems(sourcesMeta, job).length
+  const sourcesText = formatSourcesText(sources, sourcesMeta, job)
   const inputImages = normalizeJobImages(job.inputImages)
   const outputImages = normalizeJobImages(job.images)
   const chatTurns = buildChatTurns(jobs, job)
@@ -166,7 +167,9 @@ export default function AistudioJobScreen({ payload }) {
 
       {sourcesText && (
         <CollapsibleText
-          label={`Источники (${sources.length.toLocaleString('ru-RU')})`}
+          label={sourceActivityCount
+            ? `Источники (${sources.length.toLocaleString('ru-RU')} · ${sourceActivityCount.toLocaleString('ru-RU')} шагов)`
+            : `Источники (${sources.length.toLocaleString('ru-RU')})`}
           text={sourcesText}
           pre
           textClassName="text-zinc-200 whitespace-pre-wrap text-sm"
@@ -503,16 +506,72 @@ function mergeSourcesMeta(primary, fallback) {
   return { ...b, ...a }
 }
 
-function formatSourcesText(sources, meta) {
-  if (!Array.isArray(sources) || sources.length === 0) return ''
-  const lines = sources.map((source, i) => {
-    const title = source?.title || source?.url || ''
-    const url = source?.url || ''
-    return `${i + 1}. ${title}${title && url ? ' - ' : ''}${url}`
-  })
+function formatSourcesText(sources, meta, job) {
+  const safeSources = Array.isArray(sources) ? sources : []
+  const activityItems = sourceActivityItems(meta, job)
+  if (safeSources.length === 0 && activityItems.length === 0 && !meta?.activity) return ''
+  const lines = []
+  if (safeSources.length) {
+    lines.push('Ссылки:')
+    safeSources.forEach((source, i) => {
+      const title = source?.title || source?.url || ''
+      const url = source?.url || ''
+      lines.push(`${i + 1}. ${title}${title && url ? ' - ' : ''}${url}`)
+    })
+  }
   const activity = cleanActivity(meta?.activity)
   if (activity) lines.push(`Активность: ${activity}`)
+  if (activityItems.length) {
+    if (lines.length) lines.push('')
+    lines.push('Шаги активности:')
+    activityItems.forEach((item, i) => {
+      const title = item.title || item.text || item.command || `Шаг ${i + 1}`
+      const detail = activityDetail(item, title)
+      lines.push(`${i + 1}. ${title}`)
+      if (item.links?.length) {
+        item.links.forEach((link) => {
+          lines.push(`   source: ${(link.title || link.url)}${link.title && link.url ? ' - ' : ''}${link.url}`)
+        })
+      }
+      if (item.command) lines.push(`   command: ${item.command}`)
+      if (detail) lines.push(`   detail: ${detail}`)
+    })
+  }
   return lines.join('\n')
+}
+
+function activityDetail(item, title) {
+  let detail = typeof item?.text === 'string' ? item.text.trim() : ''
+  if (!detail || detail === title) return ''
+  if (title && detail.startsWith(title)) detail = detail.slice(title.length).trim()
+  if (item?.command) detail = detail.replace(item.command, '').trim()
+  detail = detail.replace(/^(?:Python|JavaScript|TypeScript|Bash|Shell|JSON|Text|Markdown)\s*/i, '').trim()
+  return detail && detail !== title ? detail : ''
+}
+
+function sourceActivityItems(meta, job) {
+  const arr = Array.isArray(meta?.activity_items)
+    ? meta.activity_items
+    : Array.isArray(meta?.activityItems)
+      ? meta.activityItems
+      : Array.isArray(job?.sourceActivity)
+        ? job.sourceActivity
+        : []
+  return arr
+    .map((item) => ({
+      title: typeof item?.title === 'string' ? item.title.trim() : '',
+      text: typeof item?.text === 'string' ? item.text.trim() : '',
+      command: typeof item?.command === 'string' ? item.command.trim() : '',
+      links: Array.isArray(item?.links)
+        ? item.links
+          .map((link) => ({
+            url: typeof link?.url === 'string' ? link.url : '',
+            title: typeof link?.title === 'string' ? link.title : '',
+          }))
+          .filter((link) => link.url)
+        : [],
+    }))
+    .filter((item) => item.title || item.text || item.command || item.links.length)
 }
 
 function cleanActivity(value) {

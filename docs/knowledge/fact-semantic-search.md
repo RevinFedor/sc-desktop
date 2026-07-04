@@ -196,6 +196,18 @@ Telegram tools:
   Telegram sources, включая fetched-but-not-indexed. Не путать с
   `list_telegram_chats`, который намеренно показывает только уже индексируемые
   чаты для vec-поиска.
+- `telegram_list_folders` — локальный inventory Telegram-папок из `folders`
+  для активной или явно выбранной сессии; с `all_sessions` показывает срез по
+  всем аккаунтам, но не меняет active session.
+- `telegram_refresh_folders` — стартует настоящий `tg_folder_refresh` job для
+  выбранной сессии. Это не read-only call: он ходит в Telethon dialogs и
+  материализует `folders`/`folder_sources`, как UI refresh.
+- `telegram_folder_state(folder_id/title, session/profile)` — состояние папки:
+  sources, counts, auto flags и привязка к session. Используется когда агенту
+  нужно понять что лежит в папке вроде `😑events`, не кликая UI.
+- `telegram_search_chats(query, folder, session/profile, all_sessions)` —
+  fuzzy-поиск по уже сохранённым Telegram sources. Это быстрый library lookup,
+  не live Telethon resolve и не fetch.
 - `telegram_resolve_chat(text, session/profile, fuzzy)` — live scan по dialogs
   выбранной сессии, когда чата ещё нет в БД.
 - `telegram_fetch` / `telegram_preview_fetch` / `telegram_index` — тот же
@@ -210,6 +222,11 @@ Telegram tools:
   цепочка (ancestors + descendants) через `parent_external_id`. Хорош для
   **разнесённых по времени тредов** где neighbors не поможет. Подробно
   ниже в секции «🧵 Reply-граф».
+
+`session`/`profile` override у Telegram tools — per-call scope. Он нужен
+агенту для приватных диалогов и папок конкретного аккаунта, но не должен
+ретаргетить следующий ручной fetch пользователя; active session меняется
+только UI-настройкой/логином.
 
 **Агентный flow для отсутствующего Telegram-чата.** Если пользователь просит
 *«по профилю f9922 найди последнее сообщение Геннадия сегодня»*, а чата ещё нет
@@ -362,10 +379,9 @@ gt_list_background_palette / gt_get_line_backgrounds / gt_set_line_backgrounds
 из чата нужно явно различать.
 
 **Промпт для Claude-агента** (опционально): для Telegram — этот файл-промпт
-рядом в `docs/meta/поиск-по-rag.prompt.md`. Для заметок аналогичный
-short-промпт у gt-editor (`docs/meta/поиск-по-rag-notes.prompt.md`, ещё
-не написан на момент создания этой секции). Без них Claude делает один
-`gt_search` и отвечает, без wide-search волны.
+рядом в `docs/meta/поиск-по-rag.prompt.md`. Для заметок — общий prompt в
+`/Users/fedor/Global-Templates/🧩 Code-Patterns/документация/rag/поиск-по-rag-gt.prompt.md`.
+Без них Claude делает один `gt_search` и отвечает, без wide-search волны.
 
 ## 🧵 Reply-граф (`telegram_reply_thread`)
 
@@ -468,9 +484,36 @@ No-op теперь также означает **не запускать `tg_rep
 а backend логирует `[tg:index] source #... noop reason=already-indexed
 total_ms=...`. Шрам с lag/root-cause и SQL timings — `fix-лаг-индексации.md`.
 
+### JobDetail toggle `Google RAG`
+
+На странице `tg_fetch` есть per-job toggle `Google RAG`: он означает «после
+успешного завершения этого конкретного парсинга запустить semantic index».
+Флаг хранится в `jobs.parameters_json` как `_auto_index_after_fetch`, потому что
+это не source-level настройка и не folder `auto-index`: пользователь мог
+захотеть RAG именно после тяжёлого backfill job, не меняя фоновые правила чата.
+
+Автозапуск стоит после финального close-path `tg_fetch`: items уже записаны в
+SQLite, `jobs` row уже обновлена, и только затем вызывается `indexJob.start({
+origin:'tg-fetch-auto-rag' })`. Если toggle включают на уже завершённой job,
+тот же старт выполняется сразу. Результат фиксируется рядом в params:
+`_auto_index_after_fetch_started`, `_auto_index_after_fetch_noop` или
+`_auto_index_after_fetch_error`, чтобы JobDetail после remount не показывал
+ложно «можно включить заново».
+
+Этот путь не проходит через IPC `tg:index` и не обязан запускать hidden
+`tg_reply_backfill`: он следует сразу за свежим `tg_fetch`, где reply/reactions
+уже приходят из Telethon. Если нужен maintenance-backfill исторических строк,
+это остаётся задачей ручного `tg:index`/reply-backfill path, а не post-close
+автозапуска.
+
 ## 🔑 Gemini API key
 
-Embedder читает ключ через тот же `cli-tools/config.env` что и
-`shared/gemini_utils.py` (CLI-сторона). Один ключ на всё. Если когда-то
-переедем на shared `~/.config/sc/settings.json` — менять в обоих местах
-синхронно (Python loader не знает про JSON-конфиг).
+Embedder и Python workers читают ключ из env или общего
+`~/.config/sc/settings.json` (`api_keys.GEMINI_API_KEY` /
+`api.gemini_api_key`). Это сознательно заменило старый `config.env`-контракт:
+production-бандл не должен зависеть от файла рядом со скриптами, а ключи
+должны обновляться одним способом для Node embedder'а и `python-workers`.
+
+Симптом неправильного источника ключа: в dev «починили» `config.env`, но
+production history продолжает писать `Ключ Gemini недоступен`. Проверять надо
+env процесса или settings.json, не `Contents/Resources/python-workers`.

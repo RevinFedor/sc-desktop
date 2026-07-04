@@ -65,6 +65,8 @@ const PROVIDER_TITLES = {
   perplexity: 'perplexity-parser',
   chatgpt: 'chatgpt-parser',
   yandex: 'yandex-maps',
+  avito: 'avito-parser',
+  ozon: 'ozon-parser',
 };
 
 function providerFromUrl(url) {
@@ -76,6 +78,8 @@ function providerFromUrl(url) {
     if (h === 'www.perplexity.ai' || h === 'perplexity.ai') return 'perplexity';
     if (h === 'chatgpt.com' || h === 'www.chatgpt.com') return 'chatgpt';
     if (h === 'yandex.ru' || h.endsWith('.yandex.ru')) return 'yandex';
+    if (h === 'avito.ru' || h === 'www.avito.ru') return 'avito';
+    if (h === 'ozon.ru' || h === 'www.ozon.ru') return 'ozon';
   } catch {}
   return null;
 }
@@ -1120,8 +1124,8 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 
   // ── YouTube job tracker: youtube-content.js шлёт сюда ID job'а сразу
   // после успешного POST /yt-add. Мы кладём его в storage и поднимаем
-  // alarm. Когда bridge скажет done — фаер chrome.notifications + опц.
-  // открываем Gemini Studio в фоне.
+  // alarm. Когда bridge скажет done — опционально открываем выбранный AI-target
+  // в фоне.
   if (req && req.__sc_track_job === true && req.job) {
     // (Удалён misleading diag.storage_session: читал __sc_ext_mtime из
     //  storage.session, куда он НИКОГДА не пишется — hot-reload mtime живёт
@@ -1448,6 +1452,17 @@ function newRequestId() {
   return 'sc' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
+function normalizeYoutubeAiTarget(target) {
+  if (target === 'claude' || target === 'chatgpt') return target;
+  return 'aistudio';
+}
+
+function youtubeAiTargetLabel(target) {
+  if (target === 'chatgpt') return 'ChatGPT';
+  if (target === 'claude') return 'Claude';
+  return 'Gemini Studio';
+}
+
 // Открывает claude.ai в новой вкладке В ФОНЕ. Контракт payload'а:
 //   { cachedFilePath, cachedCommentsFilePath, model, project, postProject,
 //     adaptiveThinking, ytTabId, ytVideoId, ytTitle }
@@ -1491,11 +1506,104 @@ async function openClaudeBackground(payload) {
   return requestId;
 }
 
+async function fetchYoutubeArtifactText(filePath) {
+  if (!filePath) return '';
+  const u = new URL(SC_BRIDGE + '/yt-fetch');
+  u.searchParams.set('path', filePath);
+  const r = await fetch(u.toString());
+  if (!r.ok) {
+    let err = null;
+    try { err = await r.json(); } catch {}
+    throw new Error(err?.error || ('yt-fetch http ' + r.status));
+  }
+  const data = await r.json();
+  return String(data?.text || '');
+}
+
+function buildChatgptYoutubePrompt(payload, transcriptText, commentsText) {
+  const instruction = String(payload.prompt || '').trim();
+  const parts = [];
+  if (instruction) parts.push(instruction);
+  if (transcriptText && transcriptText.trim()) {
+    parts.push('Текст YouTube-видео:\n\n' + transcriptText.trim());
+  }
+  if (commentsText && commentsText.trim()) {
+    parts.push('Комментарии к видео:\n\n' + commentsText.trim());
+  }
+  const prompt = parts.join('\n\n---\n\n').trim();
+  if (!prompt) throw new Error('ChatGPT prompt is empty: no transcript text');
+  return prompt;
+}
+
+const CHATGPT_COMPOSE_JOB_PREFIX = '__sc_chatgpt_compose_job_';
+
+async function createTabAsync(opts) {
+  return await new Promise((resolve, reject) => {
+    chrome.tabs.create(opts, tab => {
+      const err = chrome.runtime.lastError;
+      if (err) reject(new Error(err.message));
+      else resolve(tab);
+    });
+  });
+}
+
+// YouTube → ChatGPT это не MCP/research job. Здесь нужен только reusable
+// compose-layer: открыть ChatGPT, выбрать модель/effort, вставить длинный
+// текст и нажать Send. Ответ остаётся в обычном ChatGPT-чате; sources/parser/
+// MCP-badge не запускаются.
+async function openChatgptBackground(payload) {
+  const transcriptText = await fetchYoutubeArtifactText(payload.cachedFilePath);
+  const commentsText = payload.cachedCommentsFilePath
+    ? await fetchYoutubeArtifactText(payload.cachedCommentsFilePath)
+    : '';
+  const prompt = buildChatgptYoutubePrompt(payload, transcriptText, commentsText);
+  const requestId = newRequestId();
+  const job = {
+    requestId,
+    prompt,
+    model: payload.model || '5.5',
+    effort: payload.effort || 'xhigh',
+    ytTabId: payload.ytTabId ?? null,
+    ytVideoId: payload.ytVideoId || null,
+    ytTitle: payload.ytTitle || null,
+    ts: Date.now(),
+  };
+  scBgDbg('openChatgpt.enter', {
+    requestId,
+    model: job.model,
+    effort: job.effort,
+    promptLen: prompt.length,
+    hasComments: !!commentsText,
+  });
+  await new Promise(resolve => {
+    chrome.storage.local.set({ [CHATGPT_COMPOSE_JOB_PREFIX + requestId]: job }, resolve);
+  });
+  const tab = await createTabAsync({
+    url: 'https://chatgpt.com/?sc-compose=' + encodeURIComponent(requestId) + '#sc-compose=' + encodeURIComponent(requestId),
+    active: false,
+  });
+  if (tab?.id != null) {
+    attachFocusEmulation(tab.id).catch(e => {
+      scBgDbg('openChatgpt.debugger_attach_fail', { requestId, tabId: tab.id, err: e?.message || String(e) });
+    });
+  }
+  scBgDbg('openChatgpt.started', { requestId, tabId: tab?.id ?? null });
+  return requestId;
+}
+
 // Универсальный диспетчер по target. Принимает «общий» payload (cached*,
 // ytTab*) и job-record (где target+специфичные поля каждого target'а
 // уже разложены). Если target неизвестен — fallback на aistudio чтобы
 // legacy job'ы (без поля target) продолжали работать.
 async function openTargetBackground(target, common, job) {
+  if (target === 'chatgpt') {
+    return openChatgptBackground({
+      ...common,
+      prompt: job.chatgptPrompt,
+      model: job.chatgptModel,
+      effort: job.chatgptEffort,
+    });
+  }
   if (target === 'claude') {
     return openClaudeBackground({
       ...common,
@@ -1645,16 +1753,18 @@ async function trackJob(job) {
   //   modelTitle, postModelTitle, systemInstruction, postSystemInstruction,
   //   // Claude-side:
   //   claudeModel, claudeProject, claudePostProject, claudeAdaptiveThinking,
+  //   // ChatGPT-side:
+  //   chatgptPrompt, chatgptModel, chatgptEffort,
   // }
   const map = await loadTracker();
-  const target = job.target === 'claude' ? 'claude' : 'aistudio';
+  const target = normalizeYoutubeAiTarget(job.target);
   scBgDbg('trackJob.enter', { jobId: job.jobId, videoId: job.videoId, fromCache: !!job.fromCache, autoAistudio: !!job.autoAistudio, target });
 
   // fromCache=true → транскрипт уже на диске, поллить нечего. Сразу финал.
   if (job.fromCache) {
     scBgDbg('trackJob.fromCache', { autoAistudio: !!job.autoAistudio, target });
     if (job.autoAistudio) {
-      sendBtnState(job.tabId, { videoId: job.videoId, state: 'opening' });
+      sendBtnState(job.tabId, { videoId: job.videoId, state: 'opening', target });
       try {
         const requestId = await openTargetBackground(target, {
           cachedFilePath: job.cachedFilePath,
@@ -1664,15 +1774,13 @@ async function trackJob(job) {
         scBgDbg('trackJob.openTarget.OK', { target, requestId });
       } catch (e) {
         scBgDbg('trackJob.openTarget.THREW', { target, err: e?.message || String(e) });
-        sendBtnState(job.tabId, { videoId: job.videoId, state: 'error', error: 'open ' + target + ' failed: ' + (e?.message || e) });
+        sendBtnState(job.tabId, { videoId: job.videoId, state: 'error', target, error: 'open ' + youtubeAiTargetLabel(target) + ' failed: ' + (e?.message || e) });
         return;
       }
-      // Дать UI время отрендерить «🤖 Открываю…».
-      await new Promise(res => setTimeout(res, 800));
     } else {
       scBgDbg('trackJob.SKIP_OPEN', { reason: 'autoAistudio=false' });
     }
-    sendBtnState(job.tabId, { videoId: job.videoId, state: 'done' });
+    sendBtnState(job.tabId, { videoId: job.videoId, state: 'done', target });
     return;
   }
 
@@ -1698,6 +1806,10 @@ async function trackJob(job) {
     claudeProject: job.claudeProject || '',
     claudePostProject: job.claudePostProject || '',
     claudeAdaptiveThinking: job.claudeAdaptiveThinking !== false,
+    // ChatGPT-side
+    chatgptPrompt: job.chatgptPrompt || '',
+    chatgptModel: job.chatgptModel || '5.5',
+    chatgptEffort: job.chatgptEffort || 'xhigh',
     engine: job.engine || 'gemini',   // для /yt-resume-ai при awaiting_ai
     resumeRequested: false,
     resumeAttempts: 0,
@@ -1708,7 +1820,7 @@ async function trackJob(job) {
   // Сразу подаём «searching» — bridge принял, sc-desktop сейчас гонит
   // yt-dlp+youtube-transcript-api. Real-time события приходят через
   // long-poll (см. startLongPoll), latency ~0 на смену state'а.
-  sendBtnState(job.tabId, { videoId: job.videoId, state: 'searching' });
+  sendBtnState(job.tabId, { videoId: job.videoId, state: 'searching', target });
 
   startLongPoll(job.jobId).catch(() => {});
   // Alarm оставляем как safety-net: если SW убьют посреди long-poll'а,
@@ -1739,6 +1851,7 @@ async function startLongPoll(jobId) {
       if (Date.now() - job.startedAt > TRACKER_TTL_MS) {
         sendBtnState(job.tabId, {
           videoId: job.videoId, state: 'error',
+          target: job.target,
           error: 'таймаут (>30 минут без ответа)',
         });
         const m = await loadTracker(); delete m[String(jobId)]; await saveTracker(m);
@@ -1784,6 +1897,7 @@ async function processSnapshot(jobId, st) {
   if (st.status === 'error' || st.comments_status === 'error') {
     sendBtnState(job.tabId, {
       videoId: job.videoId, state: 'error',
+      target: job.target,
       error: st.error || st.comments_error || 'unknown',
     });
     delete map[key]; await saveTracker(map);
@@ -1823,6 +1937,7 @@ async function processSnapshot(jobId, st) {
       if (job.resumeAttempts >= MAX_RESUME_ATTEMPTS) {
         sendBtnState(job.tabId, {
           videoId: job.videoId, state: 'error',
+          target: job.target,
           error: 'не удалось запустить AI-транскрипцию (sc-desktop недоступен)',
         });
         delete map[key]; await saveTracker(map);
@@ -1841,6 +1956,7 @@ async function processSnapshot(jobId, st) {
         videoId: job.videoId,
         state: stageEvent.state,
         engine: stageEvent.engine || null,
+        target: job.target,
       });
       job.lastSentState = stageEvent.state;
       map[key] = job;
@@ -1851,17 +1967,16 @@ async function processSnapshot(jobId, st) {
   if (transcriptDone && commentsDone) {
     if (job.autoAistudio) {
       // Idempotency-латч ПЕРЕД открытием вкладки. Между open'ом и финальным
-      // 'done' есть 800ms sleep; если SW выгрузят и разбудят alarm'ом, он
+      // 'done' SW может быть выгружен и разбужен alarm'ом; тогда он
       // перезапустит long-poll → processSnapshot снова увидит (transcriptDone
-      // && commentsDone) и откроет ВТОРУЮ вкладку AI Studio. Флаг aiOpenStarted
-      // в storage (переживает respin SW) делает второй заход no-op'ом: вкладка
-      // уже открыта, ждём только финальный 'done'.
+      // && commentsDone) и открыл бы ВТОРУЮ вкладку AI. Флаг aiOpenStarted
+      // в storage (переживает respin SW) делает второй заход no-op'ом.
       if (!job.aiOpenStarted) {
         job.aiOpenStarted = true;
         map[key] = job;
         await saveTracker(map);
 
-        sendBtnState(job.tabId, { videoId: job.videoId, state: 'opening' });
+        sendBtnState(job.tabId, { videoId: job.videoId, state: 'opening', target: job.target });
         try {
           await openTargetBackground(job.target || 'aistudio', {
             cachedFilePath: st.file_path,
@@ -1869,8 +1984,8 @@ async function processSnapshot(jobId, st) {
             ytTabId: job.tabId, ytVideoId: job.videoId, ytTitle: job.title,
           }, job);
         } catch (e) {
-          const label = (job.target === 'claude') ? 'Claude' : 'Gemini Studio';
-          sendBtnState(job.tabId, { videoId: job.videoId, state: 'error', error: 'open ' + label + ' failed' });
+          const label = youtubeAiTargetLabel(job.target);
+          sendBtnState(job.tabId, { videoId: job.videoId, state: 'error', target: job.target, error: 'open ' + label + ' failed' });
           // openTargetBackground упал — снимаем латч и удаляем job. storage-
           // запись __sc_aistudio_job_/__sc_claude_job_ пишется ВНУТРИ open'а
           // после tabs.create, так что при throw до неё орфана нет; если же
@@ -1879,15 +1994,9 @@ async function processSnapshot(jobId, st) {
           delete map[key]; await saveTracker(map);
           return true;
         }
-        // openAistudioBackground выполняется за миллисекунды (chrome.tabs.create
-        // + storage.set), и сразу после неё мы шлём 'done' — content-script
-        // успевает отрисовать «🤖 Открываю Gemini Studio…» только на ~50мс,
-        // юзер этого не видит. Задержка даёт тосту прожить ≥700мс перед
-        // переходом в '✓ Готово'. На total-time это никак не влияет.
-        await new Promise(res => setTimeout(res, 800));
       }
     }
-    sendBtnState(job.tabId, { videoId: job.videoId, state: 'done' });
+    sendBtnState(job.tabId, { videoId: job.videoId, state: 'done', target: job.target });
     delete map[key]; await saveTracker(map);
     return true;
   }
@@ -1904,7 +2013,7 @@ async function cleanupOrphanAiJob(videoId) {
   try {
     const all = await chrome.storage.local.get(null);
     const stale = Object.keys(all).filter(k =>
-      (k.startsWith('__sc_aistudio_job_') || k.startsWith('__sc_claude_job_')) &&
+      (k.startsWith('__sc_aistudio_job_') || k.startsWith('__sc_claude_job_') || k.startsWith(CHATGPT_COMPOSE_JOB_PREFIX)) &&
       all[k] && all[k].ytVideoId === videoId
     );
     if (stale.length) await chrome.storage.local.remove(stale);

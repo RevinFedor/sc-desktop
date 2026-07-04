@@ -67,7 +67,7 @@ USER_SESSION_DIR.mkdir(parents=True, exist_ok=True)
 try:
     from telethon import TelegramClient, errors
 except ImportError:
-    sys.stdout.write(json.dumps({"type": "error", "message": "telethon not installed"}) + "\n")
+    sys.stdout.write(json.dumps({"type": "error", "message": "telethon not installed", "code": "worker_dependency_missing"}) + "\n")
     sys.stdout.flush()
     sys.exit(1)
 

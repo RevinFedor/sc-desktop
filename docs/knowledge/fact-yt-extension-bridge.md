@@ -3,7 +3,7 @@
 `electron/browser-bridge.js` — loopback HTTP-сервер на `127.0.0.1:53127`,
 который Electron поднимает рядом с UI. Через него browser-extension
 (SC Browser Parser) кладёт YouTube-видео в Library, дёргает кэш, читает
-готовые транскрипты для Gemini Studio автоскрапинга.
+готовые транскрипты для AI-target'ов YouTube-пересказа.
 
 **Это четвёртый канал ввода в sc-desktop** наравне с paste-screen, clipboard
 и CLI. Расширение его никогда не подменяет — только добавляет источник.
@@ -78,12 +78,15 @@ job, считая что нужен «стабильный jobId для polling�
 `{fromCache:true, cached_file_path}`. Расширение через `/yt-fetch?path=...`
 читает файл напрямую — без job-shape, без polling'а. JobId возвращается
 только если он был (origin='jobs'); при items-origin = null, расширение
-видит `cached_file_path` и сразу идёт за файлом.
+видит `cached_file_path` и сразу идёт за файлом. Один и тот же `/yt-fetch`
+используется разными target'ами по-разному: Gemini/Claude content-script
+вставляет текст в чужую страницу, ChatGPT target читает текст в background,
+собирает prompt и передаёт его в одноразовый `sc-compose` handoff.
 
 ```
 POST /yt-add → {fromCache:true, cached_file_path}
             → расширение GET /yt-fetch?path=… → {text}
-            → autoscrape paste'ит сразу, без полла
+            → autoscrape paste'ит сразу или ChatGPT target собирает sc-compose prompt
 ```
 
 Для miss'а — обычный `startYoutubeSingle`, возвращаем `{jobId}`. Расширение

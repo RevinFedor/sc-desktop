@@ -170,6 +170,7 @@ JobDetail → ожидает читаемый текст, а не сериали
 | `params` (что юзер запросил) | ✅ | ✅ |
 | `type_breakdown` | ✅ | ✅ |
 | `file_path` (после flush) | ✅ | ✅ |
+| `tg_progress` (календарный прогресс `from_date`/range-plan + ETA/saving) | ✅ | ✅ |
 | `yt`, `yt_channel`, `yt_batch` (per-type payload) | ✅ | ✅ |
 | `tk`, `tk_channel`, `tk_batch` (TikTok payloads — same shape as YT) | ✅ | ✅ |
 | `ig_batch` (Instagram batch — same shape as `yt_batch`: saved/skipped/errors/cost_usd/log) | ✅ | ✅ |
@@ -228,13 +229,23 @@ table** (которой может не быть для sourceless-jobs). Сни
 | `video_files: { vid: file_path }` | `yt_batch_transcribe` (search-batch), set on close | resume-фильтр («что уже сохранено»); assembleBatch путь к файлам |
 | `mode='single'` + `url` | `tg_fetch` (single message) | history-row без source_id — после рестарта по этому jobId восстанавливаем что юзер пастил какую ссылку |
 | `transcribe_engine`, `transcribe_lang` | `tg_fetch` (single + voice) | юзер выбрал engine для голоса; resume/история показывают через какой движок прогнали |
+| `shortcodes[]`, `backend`, `target` | `ig_batch_transcribe` без source_id (single reel paste) | cache-lookup по вставленному shortcode и восстановление done-карточки без items table |
 | `entity_title`, `type_breakdown` (snapshotted) | `tg_fetch` (single), set on close | historic snapshot отрисовывает Header «✓ Готово · Пантела · voice 1» без обращения к items table |
 | `_type_breakdown` | `tg_fetch` (любой с source_id), set on close | JobDetail на historic-row рисует chip-ряд «По типам» без обращения к items table |
+| `_tg_progress` | `tg_fetch` `from_date` / range-plan, set during run + close | Activity/History/JobDetail после remount показывают текущую дату, диапазон, ETA и saving-прогресс, а не только stale `items_done` |
+| `_range_plan` | `tg_fetch` после coverage planner | Historic JobDetail объясняет почему job был no-op, clipped или split на интервалы |
 | `_media_phase` | `tg_fetch` (любой), set on close, только если media_phase непустой | JobDetail на historic-row раскрывает chip-ы «Видео ⚠ 14» в per-msg список ошибок/skipped — иначе errors_log теряется при reaping |
+| `_auto_index_after_fetch` | `tg_fetch` с source_id, выставляется из JobDetail toggle | Per-job обещание: после успешного завершения именно этого парсинга запустить semantic/RAG index. Не путать с source-level `auto-index` папок/авто-синка |
+| `_auto_index_after_fetch_started`, `_auto_index_after_fetch_noop`, `_auto_index_after_fetch_error` | `tg_fetch` post-close или включение toggle на уже done job | JobDetail после remount понимает, что RAG уже запущен, уже готов (`already-indexed`) или автозапуск сорвался; кнопка не превращается обратно в «можно включить» |
 
 Принцип: если данные нужны UI **после рестарта** и нет другого носителя (items
 table, fs convention) — кладём в `params`. См. `fact-youtube-search.md::Persistence`
 для search-batch контекста.
+
+`_auto_index_after_fetch` намеренно хранится в params, а не в отдельной колонке:
+это не настройка источника, а одноразовая привязка к конкретному job. Source может
+иметь обычный `auto-index`, ручной `IndexButton` и этот JobDetail-toggle
+одновременно; менять один режим не должно молча менять остальные.
 
 > **Шрам — `db.updateJob` партиал пропускает `params`.** Финальный UPDATE на close
 > делает partial-обновление и **не** пишет `parameters_json` если поле не передано
@@ -248,10 +259,11 @@ table, fs convention) — кладём в `params`. См. `fact-youtube-search.m
 
 Sourceless `yt_transcribe` jobs (single video, без source_id) после рестарта Electron живут только в БД. `listJobs()` дополняет live-list историческими через `rowToYoutubeSnapshot()` — у этих snapshots **id это строка `'db-<rowId>'`** вместо integer. Это маркер: cancel невозможен (нет child), `getJobDetail` идёт в БД через тот же префикс. См. `lookupYoutubeCache()` для cache-hit перед новым spawn.
 
-Тот же подход теперь применяется к ещё трём типам без source_id:
+Тот же подход теперь применяется к ещё четырём типам без source_id:
 - `local_transcribe` через `rowToLocalSnapshot`.
 - `tg_fetch` mode='single' через `rowToTgSingleSnapshot` (history-row при mode='single' пишется в close-handler через `db.recordJob({source_id: null, ...})`).
 - `yt_batch_transcribe` с `params.is_search === true` через `rowToHistoricSnapshot` — search-batch'и не имеют source_id и иначе пропали бы из Activity-overlay после рестарта (открыть их можно было только через прямой URL).
+- `ig_batch_transcribe` от single reel paste через `rowToHistoricSnapshot` — голый reel URL не создаёт source/items, но пользователь всё равно ждёт cache-hit при повторной вставке той же ссылки.
 
 > **Dedup live vs historic.** Когда close-handler пишет DB row для всё ещё живого
 > snapshot'а в Map'е, `listJobs` отдаёт **обе** копии. Renderer-формы (TelegramSingleMessageForm
@@ -260,6 +272,10 @@ Sourceless `yt_transcribe` jobs (single video, без source_id) после ре
 > пропускает финальный update с `file_path`. Симптом: Copy-кнопка остаётся
 > disabled при том что файл уже на диске. Решение — `listJobs` фильтрует
 > historic-rows по совпадению `file_path` с любым live snapshot того же типа.
+> Для Instagram single-paste во время close окно гонки может случиться до
+> появления `file_path`, поэтому dedup дополнительно сверяет `target` и
+> `params.shortcodes`: один reel не должен появляться live-строкой и
+> `db-N` строкой одновременно.
 
 ### Historic recovery для всех остальных типов (через `getJobDetail` DB-fallback)
 
@@ -442,13 +458,13 @@ caption. Если heading уже там (re-fetch с тем же engine) — bod
 
 ### GeminiClient lazy-init с `requires_real_key`
 
-`gemini_utils.GeminiClient.__init__` требует ключ из env или `cli-tools/config.env`
+`gemini_utils.GeminiClient.__init__` требует ключ из env или `~/.config/sc/settings.json`
 **безусловно**, даже если `engine='assemblyai'`. Чистый AAI-путь не делает ни
 одного RPC к Google — но constructor падает если ключа нет.
 
 Вместо placeholder-trick (`os.environ['GEMINI_API_KEY'] = 'unused-by-assemblyai'`
 до import) — helper `_make_gemini_client(*, requires_real_key=True)`:
-1. Создаёт client (он сам подгружает из config.env если в env пусто)
+1. Создаёт client (он сам подгружает ключ из settings, если в env пусто)
 2. Если `requires_real_key=True` (любой Gemini-вызов) и ключ пустой/placeholder
    → `RuntimeError("GEMINI_API_KEY not found — Gemini transcription / vision /
    PDF extraction won't work...")` — чёткое сообщение в UI до попытки RPC
@@ -628,7 +644,7 @@ DB id) — silent no-op: `cancelJob(403)` не находил в `jobs.Map` (т�
 > `j.id` нужен сразу для emit'а в Activity. Two id-пространства проще,
 > чем pre-allocate DB row до spawn'а.
 
-## 🟢 Pending row на entity → UPDATE на close
+## 🟢 Pending row на spawn/entity → UPDATE на close
 
 Раньше для `tg_fetch` строка в БД-таблице `jobs` появлялась **только** на
 успешный close (внутри coverage-recording блока). Симптом: «История парсинга»
@@ -640,13 +656,47 @@ DB id) — silent no-op: `cancelJob(403)` не находил в `jobs.Map` (т�
 — **`db.updateJob(dbRowId, { status, finished_at, file_path, ... })`**, тот
 же id, без второго INSERT. Coverage records пишутся через тот же id.
 
+Если source уже известен до старта (`params._source_id` из SourceDetail,
+media-only или другой source-bound flow), pending row пишется **на spawn**, не
+на `entity`. Entity-resolve может занять десятки секунд: живой логовый симптом
+на Telegram-чате — пользователь нажал «Начать парсинг» много раз, Activity уже
+видела 9 `tg_fetch`, а SourceDetail-история молчала, потому что первые
+`recordJob pending` случились только через 20-24 секунды после `start tg_fetch`.
+Для known-source path `job.source_id` и `job.dbRowId` должны существовать сразу;
+entity-event потом только дополняет title/kind и не создаёт второй history-row
+из-за guard `!job.dbRowId`.
+
+Повторный запуск `tg_fetch` для того же known source, пока предыдущий live job
+ещё не дошёл до terminal, должен вернуть существующий live job, а не создавать
+дубль. Иначе быстрые повторные клики во время pre-entity окна дают пачку
+одинаковых задач, которые видны в глобальной Activity, но не объясняют
+пользователю что происходит на странице источника.
+
 Renderer подписан на `'jobs:<source_id>'` через invalidation bus
 (см. `fact-data-bus.md`) — pending row появляется в истории сразу после
-`entity`-event, обновляется на close.
+spawn для known-source flow или сразу после `entity`-event для ad-hoc flow,
+обновляется на close.
 
 `db.updateJob(id, patch)` — partial update: пишутся только переданные поля.
 Сделано так чтобы coverage-flow и close-flow могли независимо апдейтить
 свою часть row без затирания.
+
+### История парсинга показывает причину ошибки в строке
+
+JobDetail остаётся местом для полного stderr/params, но row в «Истории
+парсинга» обязана дать короткую причину без проваливания внутрь: `Ключ Gemini
+недоступен`, `Telethon не установлен`, `Telegram вернул 0 сообщений: проверь
+сессию`. Пользовательский симптом до фикса — история вся красная, но в строке
+только дата и «Семантический индекс»; чтобы понять `API_KEY_INVALID` или
+`telethon not installed`, нужно было открывать каждую job.
+
+Это не просто косметика. История — triage surface: по ней пользователь решает
+«ждать, перелогиниться, поменять ключ или это нормальный empty result».
+Поэтому structural errors нормализуются в one-line label, а raw сообщение
+остаётся в `title`/JobDetail. Для already-known Telegram source обычный
+history-fetch с 0 items промотится в error/warning с подсказкой про сессию;
+реально пустой личный диалог без сохранённой истории остаётся warning, не
+hard error.
 
 ### Backfill-jobs: pending row на spawn, UPDATE на каждый page
 
@@ -713,6 +763,55 @@ items_total, finished_at, file_path), mid-run пишет только `items_don
 > WRITE'ы, всё равно close сразу финализирует». Не учли что embedBatch
 > идёт **минутами** на средних чатах (32k items × 250 ms = 13 минут), и
 > юзер за это время заходит в History и думает «ничего не делается».
+
+### Календарный прогресс для `tg_fetch from_date`
+
+Для date-range job'а счётчик сообщений не отвечает на главный вопрос пользователя:
+«до какой даты уже дошли и сколько календарного хвоста осталось». Поэтому
+`tg_fetch` хранит `job.tg_progress = {request_from, request_to, current_at,
+interval_index, interval_total}` и пробрасывает его в snapshot как `tg_progress`.
+`current_at` обновляется по `item.date`, а если сообщений ещё нет — UI показывает
+старт диапазона и остаток от `request_from` до `request_to`.
+
+Wall-clock ETA живёт в том же объекте: `eta_sec`, `eta_basis`, `eta_samples`.
+Оценка считается не от всего job'а и не от одного последнего сообщения, а по
+скользящему окну последних 10 page/chunk samples. Для date-mode основной сигнал
+— сколько секунд календарного диапазона прошло за wall-clock время; если
+календарный сигнал недоступен, fallback — items/sec при известном `items_total`.
+Это специально привязано к page/chunk boundaries: ради ETA нельзя возвращаться к
+per-item IPC storm.
+
+Поле обязательно дублируется в `params._tg_progress`: SourceDetail History и
+JobDetail могут открыться по DB-row во время running job или после reaping, и
+без persistence они снова увидят только `items_done`. Для coverage-planner
+добавляется `_range_plan`: no-op job объясняет `already_covered`, clipped job
+показывает исходный диапазон и один missing interval, parent split-job — номер
+интервала `i/n`. Child `tg_fetch` с `_range_plan_child` скрывается из Activity и
+истории, чтобы одно пользовательское действие не превращалось в пачку строк.
+Видимый parent при этом подписывается на snapshot активного child и зеркалит его
+`tg_progress`, заменяя только `interval_index/interval_total`; иначе Activity и
+SourceDetail History показывали бы stale диапазон parent'а до завершения child.
+
+### Chunked close write против main-loop freeze
+
+`better-sqlite3` синхронный: один большой `bulkUpsertItems(66210)` блокирует
+Electron main thread целиком. Реальный production-симптом на `tg_fetch #2732`:
+`bulkUpsertItems rows=66210 took 6722ms`, сразу после этого
+`[Perf:MainLoopGap] gapMs=8024.2`, затем input/click delay до 6 секунд.
+Это не React-ререндер и не IPC-шум — главный поток стоял внутри SQLite write.
+
+Лечение — `bulkUpsertItemsYielding`: close-handler режет rows на чанки
+(сейчас 1000), вызывает обычный DB UPSERT на chunk и делает `setImmediate`
+между чанками. Транзакционность становится chunk-level, зато renderer и IPC
+получают дыхание между пачками; для больших Telegram jobs это важнее, чем
+одна монолитная транзакция на десятки тысяч rows. Timing logs остаются
+обязательными: если freeze вернётся, смотреть `close #... prepare rows`,
+`bulkUpsertItems chunk`, `coverage`, `sidecar json`, а не угадывать по UI.
+
+Этот же chunk callback обновляет `tg_progress.saving_done/saving_total` и
+переключает `eta_basis='saving'`: когда Telegram walk уже дошёл до конца, но
+SQLite ещё пишет десятки тысяч rows, UI обязан показывать «Сохранение N/M ·
+осталось ~T», а не выглядеть как зависший finished fetch.
 
 ## 🧪 `tg_preview` как полноценный job-type
 

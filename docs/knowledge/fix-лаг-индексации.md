@@ -57,6 +57,32 @@ GROUP BY i.source_id
 
 Он считается один раз и join'ится к `sources`, вместо N correlated count'ов.
 
+## Auto-index лагал иначе, чем ручной full-index
+
+В последнем расследовании ручной full-index большого чата работал нормально,
+а auto-проход по папке давал жёсткий лаг скролла. Это не противоречие:
+тяжёлый embedding path был тот же, но auto-оркестратор делал лишнюю работу
+вокруг него.
+
+1. Каждый child `tg_fetch` внутри `tg_catchup` терминально инвалидировал
+   глобальный `'sources'`, и UI запускал серию `sources:list` во время batch'а.
+   Логи связки: `[Perf:JobUpdateBurst]` → `[Perf:DataBusBurst keys=sources:*]`
+   → `[Perf:IpcSlow channel=sources:list ...]` → `[Perf:MainLoopGap ...]`.
+   Фикс: child job внутри umbrella не бьёт `'sources'`; umbrella делает один
+   глобальный refresh в конце.
+2. `sources:list` сам был дорогим из-за correlated aggregates. Его нельзя
+   вызывать десятки раз подряд, и нельзя чинить per-row `IN`-подзапросами —
+   это уже уходило в >60s CPU. Фикс: один grouped aggregate по `items` и
+   grouped vec-count, плюс индексы на `(source_id, published_at)` и caption-
+   present rows.
+3. После успешного catch-up auto-index запускал `IndexJob.start()` на все
+   `auto-index` sources, даже если `selectItems` возвращал `rows=0`. Ручная
+   индексация одного чата делает один такой no-op; auto по 39 чатам делал
+   десятки синхронных no-op подряд. Фикс: `semanticIndexCountsForSources`
+   проверяет coverage группы заранее, уже покрытые чаты логируются
+   `index skip ... already-indexed`, а в `IndexJob` заходят только sources
+   с реальными unindexed items.
+
 ## Финальный контракт
 
 `tg:index` сначала стартует index job и сразу возвращает результат. Если

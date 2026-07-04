@@ -73,6 +73,11 @@ focus-tab/close-tab/open-url в main). Direct-fetch'ей из renderer'а на b
   image-flow это критично: `response_text` может быть пустым, а настоящий результат лежит
   в `result.images[]`. Входные attachments на persist дополняются как `input_images[]`,
   чтобы detail-screen показывал не только «что ответили», но и «что отправили».
+- Для ChatGPT sources panel хранит два разных слоя: URL-ссылки в `result.sources[]` и
+  agentic activity/tool steps в `result.source_activity[]` /
+  `result.sources_meta.activity_items[]` (например «Тестирование загрузки данных с GitHub»
+  + `bash -lc python3 ...`). `AistudioJobScreen` показывает это в блоке «Источники» как
+  `N ссылок · M шагов`; не считать этот слой дублем ссылок.
 - Нормализация истории добавляет `images[]` / `inputImages[]` с `assetUrl` через
   `sc-asset://research-artifacts/...`. Это делается и для live RAM-state, и для SQLite rows,
   чтобы картинка появлялась сразу после done и не пропадала после рестарта.

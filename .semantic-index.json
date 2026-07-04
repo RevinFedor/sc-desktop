@@ -1,291 +1,59 @@
 [
   {
-    "path": "docs/methodology/переносимый-дизайн.md",
+    "path": "docs/knowledge/fact-aistudio-mcp.md",
     "type": "fact",
     "explicit": [
-      "ui_design_rules",
-      "ux_principles",
-      "layout_invariants",
-      "custom_controls",
-      "button_states",
-      "form_state_preservation",
-      "toast_system",
-      "interactive_guidelines"
+      "Google AI Studio integration",
+      "MCP research flow via HTTP",
+      "Deep Research and Antigravity models",
+      "Browser extension architecture",
+      "Chrome debugger focus emulation",
+      "Paid API key dialog handling"
     ],
     "implicit": [
-      "three_pane_invariant",
-      "title_bar_macos_traffic_lights",
-      "custom_checkbox_component",
-      "custom_datepicker_popover",
-      "progress_in_button",
-      "dual_label_anti_jitter",
-      "re_mount_form_restoration",
-      "umbrella_job_batch_progress",
-      "step_row_multi_phase",
-      "split_control_additive",
-      "cache_origin_transparency",
-      "ceiling_vs_client_filter",
-      "hover_gated_third_party_ui",
-      "background_tab_user_gesture",
-      "mutation_observer_spa_protection",
-      "data_bus_throttled_refresh"
+      "chrome_debugger_focus_emulation_cdp",
+      "aistudio_dom_api_window_scaistudio",
+      "http_research_start_status_poll",
+      "storage_local_parallel_atomic_serialize",
+      "usergesture_eval_activation_background_tab",
+      "hidden_tab_visibility_rAF_bypass",
+      "paid_key_dialog_prompt_restore_before_select",
+      "model_interaction_api_vs_generatecontent_phases",
+      "completion_detection_stop_button_vanished",
+      "backend_error_internal_vs_ratelimit_retry",
+      "mutation_observer_sync_sweep_hidden_tab",
+      "titlebar_mcp_popover_composite_pattern",
+      "textContent_vs_innertext_layout_hidden",
+      "double_click_submit_race_angular_material",
+      "net_tap_request_inspection_debugger",
+      "ndjson_progress_events_state_relay",
+      "mcp_job_timer_live_monotonic_client",
+      "tab_auto_close_reason_aware_graceful"
     ],
     "symptoms": [
-      "UI buttons jump in width or shake when their active label changes",
-      "Form inputs get cleared when a user switches screens and returns to the paste draft view",
-      "A background tab task hangs or stops writing transcripts because the browser throttles timers or suspends rendering of hidden DOM trees",
-      "Native browser date pickers and select elements display bright native styling on an Electron dark theme layout",
-      "The search results page is cut off but it is unclear to the user whether the API limit or a client-side filter hid the remaining items",
-      "A user double-clicks an action button because there is no immediate visual busy feedback of at least one second duration"
+      "Background tab research hangs with empty DOM or truncated text despite browser console showing no errors",
+      "Parallel aistudio_run jobs fail with 'job not found in storage' on second/third concurrent call",
+      "Link API key dialog auto-submits empty prompt, leaving agent with 'the actual task is missing' response",
+      "parseLastTurn returns null/empty after waitForCompletion succeeded; parseLastTurn works after manually switching tab to foreground",
+      "result.text contains double response text or two independent answers merged (e.g., '17×23=391.Результат...')",
+      "Deep Research never materializes final answer in background tab, stuck on 'Generating research plan'",
+      "MCP job shows status:running in bridge but zero progress updates reach renderer ActivityPanel",
+      "Internal error from backend despite background tab having valid API key linked",
+      "chrome.debugger.onDetach silently drops focus emulation on concurrent aistudio jobs; parallel runs timeout",
+      "Service worker disconnects mid-job with 'Extension not connected' and never reconnects despite SW still alive"
     ],
     "related_components": [
-      "src/components/Checkbox.jsx",
-      "src/components/DatePicker.jsx",
-      "src/components/ToggleSwitch.jsx",
-      "src/components/ToolbarButton.jsx",
-      "src/lib/dataBus.js",
-      "src/lib/toast.js"
+      "electron/browser-bridge.js",
+      "browser-extension/aistudio-mcp.js",
+      "browser-extension/aistudio-core.js",
+      "browser-extension/background.js",
+      "browser-extension/mcp-handlers.js",
+      "src/components/AistudioJobScreen.jsx",
+      "src/components/McpRunningPopover.jsx",
+      "src/components/McpJobTimer.jsx",
+      "src/screens/ActivityPanel.jsx"
     ],
-    "hash": "922f1eb47ba239233887a073bea5a405c844b062dd5d5f98a3d678fa0d80fe9f"
-  },
-  {
-    "path": "docs/meta/cdp-testing.md",
-    "type": "fact",
-    "explicit": [
-      "CDP end-to-end testing",
-      "Electron remote debugging",
-      "Chrome DevTools Protocol",
-      "Renderer automation",
-      "Screenshot capture",
-      "IPC inspection"
-    ],
-    "implicit": [
-      "cdp_remote_debugging_port_9222",
-      "websocket_debugger_targets",
-      "runtime_evaluate_protocol",
-      "page_captureScreenshot_cdp",
-      "preload_window_api_contextbridge",
-      "renderer_process_testing",
-      "synthetic_click_vs_real_mouseevent",
-      "electron_main_restart_no_hmr",
-      "tail_f_log_streaming",
-      "react_friendly_input_setter",
-      "dom_queryselector_based_assertions",
-      "job_detail_ipc_inspection",
-      "activity_panel_job_updates",
-      "cdp_helper_script_abstraction",
-      "awaitpromise_runtime_evaluate"
-    ],
-    "symptoms": [
-      "Need to automate Electron renderer UI testing without headless mode or Puppeteer",
-      "IPC method call returns Promise object instead of resolved value during test",
-      "React input field state not updating after programmatic DOM value assignment",
-      "CDP connection fails or returns stale data after modifying main.js or preload.js",
-      "Synthetic .click() on buttons does not trigger dropdowns or focus-ring styles",
-      "Need to capture renderer state at specific moments in asynchronous job lifecycle",
-      "Job:update events not flowing to ActivityPanel during automated test sequence",
-      "Electron process crashes or CDP port (9222) becomes unavailable mid-test"
-    ],
-    "related_components": [
-      "electron/main.js",
-      "electron/preload.js",
-      "src/components/ActivityPanel.tsx",
-      "src/components/LibrarySidebar.tsx",
-      "job-runner.js",
-      "logs/dev.log"
-    ],
-    "hash": "ca70241adfce81aefa6160422a2a3aa1a36ab7b1438d4b498ce115f5f70aec32"
-  },
-  {
-    "path": "docs/meta/поиск-по-rag.prompt.md",
-    "type": "fact",
-    "explicit": [
-      "RAG_search_via_MCP",
-      "Telegram_message_indexing",
-      "Gemini_embeddings",
-      "semantic_search_strategies",
-      "context_reconstruction_from_chats"
-    ],
-    "implicit": [
-      "telegram_semantic_search_mcp_tool",
-      "gemini_embedding_001_late_chunking_asymmetry",
-      "reply_thread_ancestors_descendants_hierarchy",
-      "topic_anchor_parent_external_id_duality_forum_topics",
-      "min_cos_adaptive_threshold_calibration_0_55_0_70_0_75",
-      "wide_search_partitioning_15_to_30_angular_recall_expansion",
-      "mcp_failure_strict_no_sql_fallback_protocol",
-      "confirmation_reading_tactic_checklist_6_points",
-      "taxonomy_lock_in_error_4to6_types_not_2to3",
-      "verify_exact_string_semantic_search_guard_against_hallucination"
-    ],
-    "symptoms": [
-      "Semantic search returns high-cos hits that describe different situations than user's question — need to understand confirmation reading and adversarial reading checklist.",
-      "Recall is too low (< 5 relevant results after wide search) — need to understand Late Chunking asymmetry, follow-up wave strategy, and adaptive min_cos lowering.",
-      "Agent hallucinates model names or exact strings that don't appear in database — need verify-by-search guard pattern.",
-      "Multi-chat search across Telegram chats returns incomplete results — need to understand topic anchor duality and parallel wide search strategy.",
-      "Analysis concludes with only 2–3 inferred pattern types on 20+ candidates — indicates under-examined taxonomy; need to re-check for missed pattern classes.",
-      "MCP server falls and operator tries to fallback to raw SQLite query — critical: this bypasses vector search and crashes recall by 80%+, must stop immediately."
-    ],
-    "related_components": [
-      "electron/embedder.js",
-      "mcp/server.js",
-      "src/screens/*",
-      "lib/library_db.py",
-      "electron/database.js",
-      "docs/knowledge/fact-ipc.md"
-    ],
-    "hash": "8b67e1707a7b1af8d370b6651640590dcab175967ac2ce6732002d6cdc0eaa96"
-  },
-  {
-    "path": "docs/knowledge/fact-data-bus.md",
-    "type": "fact",
-    "explicit": [
-      "data_bus",
-      "job_invalidation",
-      "throttling",
-      "tg_live_items",
-      "source_detail_refresh"
-    ],
-    "implicit": [
-      "ipc_context_bridge",
-      "job_runner_lifecycle",
-      "use_invalidator_hook",
-      "react_render_storm",
-      "heavy_vs_light_ipc",
-      "tg_fetch_progress",
-      "live_tail_rendering",
-      "stale_state_invalidation",
-      "double_fetch_prevention"
-    ],
-    "symptoms": [
-      "UI lags, scroll stutters, or chat pagination resets during a large Telegram parser import",
-      "Sidebar item counts or source statistics remain stale after a scraping job finishes",
-      "Component triggers duplicate, concurrent IPC requests to get source details on mount",
-      "Newly created items do not appear in the ChatView until the user navigates away and back",
-      "Clicking or checking items in the live preview tail results in a database race condition"
-    ],
-    "related_components": [
-      "src/hooks/useInvalidator.js",
-      "src/services/jobInvalidation.js",
-      "src/components/SourceDetail.jsx",
-      "src/components/ChatView.jsx"
-    ],
-    "hash": "a8dcc9cda377e1a7e6d4f8b02579d1bb01520989ad7e826deadf81ea45e99e2c"
-  },
-  {
-    "path": "docs/knowledge/fact-database.md",
-    "type": "fact",
-    "explicit": [
-      "library_db_dual_schema",
-      "fts5_contentless_delete",
-      "sqlite_vec_bigint_pk",
-      "caption_preservation_case",
-      "better_sqlite3_abi_rebuild",
-      "source_is_explicit_max",
-      "folder_sources_rebuild_fk_off",
-      "post_comments_composite_unique"
-    ],
-    "implicit": [
-      "library_db_dual_schema",
-      "sqlite_wal_mode",
-      "fts5_contentless_delete",
-      "sqlite_vec_bigint_pk",
-      "caption_preservation_case",
-      "better_sqlite3_abi_rebuild",
-      "source_is_explicit_max",
-      "folder_sources_rebuild_fk_off",
-      "post_comments_composite_unique",
-      "sqlite_busy_timeout",
-      "tg_reply_backfill_loop",
-      "append_item_transcript_replay",
-      "source_coverage_depth"
-    ],
-    "symptoms": [
-      "Database is locked error when running concurrent Python CLI tasks and Electron UI",
-      "AI transcripts or voice note captions disappear after a subsequent channel update or fetch",
-      "A Telegram channel or chat appears twice in the sidebar under different ID types or handles",
-      "Deleting a channel from the UI silently fails or throws a virtual table delete error",
-      "App crashes on launch with Node ABI or better_sqlite3 compile version mismatch"
-    ],
-    "related_components": [
-      "electron/database.js",
-      "cli-tools/shared/library_db.py"
-    ],
-    "hash": "abd13c45da98b6d6f1d1a56501966be33c4cc938741ac95e0503281aa57689b7"
-  },
-  {
-    "path": "docs/knowledge/fix-popover-outside-click.md",
-    "type": "fix",
-    "explicit": [
-      "popover close-on-outside race condition",
-      "React useEffect commit timing",
-      "mousedown listener registration delay",
-      "setTimeout(0) event loop deferral",
-      "outside-click detection pattern"
-    ],
-    "implicit": [
-      "setopen_race_with_mousedown_listener",
-      "useeffect_commit_immediate_listener_add",
-      "settimeout_zero_defer_to_next_tick",
-      "wrapref_contains_outside_click_detect",
-      "mousedown_event_before_click_handler",
-      "ref_current_remounted_between_mousedown_click",
-      "event_propagation_order_mousedown_click_mouseup",
-      "keydown_immediate_vs_mousedown_deferred_listeners",
-      "capture_phase_propagates_down_before_bubble",
-      "composed_path_does_not_solve_timing_issue",
-      "cdp_synthetic_events_show_race_condition",
-      "popover_dropdown_outside_click_pattern"
-    ],
-    "symptoms": [
-      "Popover does not open when clicking the trigger button",
-      "Popover closes immediately on the same click that opens it",
-      "React DevTools shows open=false on next render despite onClick calling setOpen(true)",
-      "Synthetic events in CDP or tests cause popover to not stay open",
-      "Popover fails to reopen after being closed on the first open-and-close cycle"
-    ],
-    "related_components": [
-      "src/components/DatePicker.jsx"
-    ],
-    "hash": "4bcf00587dafb81e755a77a37edf4c16eca4374c8595a8e60f5d0159f0090e1b"
-  },
-  {
-    "path": "docs/knowledge/fix-yt-dlp-meta-retry.md",
-    "type": "fix",
-    "explicit": [
-      "yt-dlp metadata fetch",
-      "transient retry",
-      "YouTube video parsing",
-      "error handling",
-      "subprocess communication"
-    ],
-    "implicit": [
-      "fetch_meta_yt_single_ndjson",
-      "yt_batch_transcribe_ndjson_caller",
-      "yt_comments_ndjson_copy",
-      "ndjson_subprocess_protocol",
-      "job_runner_lifecycle_emit",
-      "ActivityPanel_job_update_listen",
-      "--cookies-from-browser_firefox",
-      "linear_backoff_retry_0.8s_1.6s",
-      "tuple_return_meta_error",
-      "subprocess_stderr_capture",
-      "cookies.sqlite_race_condition",
-      "YouTube_rate_limit_transient"
-    ],
-    "symptoms": [
-      "User clicks + ai on YouTube video → Activity shows generic 'yt-dlp metadata fetch failed'",
-      "Same action retried immediately succeeds without error",
-      "Characteristic pattern: first fetch fails, second attempt works",
-      "Error message has no yt-dlp exit code or stderr details",
-      "Parallel metadata fetches conflict over cookies.sqlite lock"
-    ],
-    "related_components": [
-      "cli-tools/web/yt_single_ndjson.py",
-      "cli-tools/web/yt_batch_transcribe_ndjson.py",
-      "cli-tools/web/yt_comments_ndjson.py"
-    ],
-    "hash": "6aaeedeca43515408af1216c0a2b35fe0aab501714e33f22656944bfb7a4d412"
+    "hash": "bd9148552270b0b8283db68ee287564699b436494a8463e5ef891dc187128e78"
   },
   {
     "path": "docs/knowledge/fact-architecture.md",
@@ -345,45 +113,964 @@
     "hash": "e96438bb67a578f6fc7e9e95655529d6b30244b1b0c1d08b9b7a51198828b03f"
   },
   {
-    "path": "docs/knowledge/fact-titlebar.md",
+    "path": "docs/knowledge/fact-asset-protocol.md",
+    "hash": "c02f5a333d9f9903baa2c8d6bcdd20f112acdf410a1d52e47f0de8b021d4041a",
     "type": "fact",
     "explicit": [
-      "Frameless window with traffic lights reservation",
-      "Drag region CSS cascading behavior",
-      "Title bar height coordination",
-      "DevTools docking in dev mode"
+      "asset protocol",
+      "sc-asset://",
+      "local binary assets",
+      "avatar fallback chain",
+      "path traversal protection",
+      "research artifacts",
+      "twitter media",
+      "avatar_url overload"
     ],
     "implicit": [
-      "frameless_window_titlebar_style_hidden",
-      "webkit_app_region_drag_inheritance_cascading",
-      "env_titlebar_area_x_macOS_overlay_variable",
-      "titlebar_height_40px_tailwind_h10_sync",
-      "traffic_lights_overlap_padding_left_reservation",
-      "popover_fixed_overlay_no_drag_propagation",
-      "main_js_browserwindow_titlebaroverlay_config",
-      "app_jsx_titlebar_flex_items_center_layout",
-      "devtools_docked_right_320px_width_workaround",
-      "chromium_devtools_localstorage_splitviewstate_prefs",
-      "macOS_traffic_lights_vertical_centering_13px",
-      "drag_region_geometry_not_event_driven",
-      "titlebar_child_elements_inherit_drag_region",
-      "leading_none_flex_vertical_align_workaround"
+      "electron.protocol.registerFileProtocol",
+      "app.whenReady",
+      "LIB_ROOT",
+      "Avatar.jsx",
+      "resolveAvatarSrc",
+      "research-artifacts",
+      "twitter-media",
+      "download_profile_photo",
+      "protocol.handle",
+      "webSecurity"
     ],
     "symptoms": [
-      "Window title text overlaps or hides under red/yellow/green traffic light buttons on macOS",
-      "Clicking divs or interactive elements in popovers above the title bar drags the window instead of firing onClick handlers",
-      "Elements in fullscreen overlays (QuickOpen backdrop, popover) respond to drags rather than clicks in the top ~40px",
-      "Title bar text appears misaligned vertically from the traffic lights after changing font size or Tailwind classes",
-      "DevTools opens with 600px width on first dev run, obscures too much of the app content"
+      "When `<img>` needs to show local avatars, research images, or social-media media without turning off `webSecurity`. When a developer needs a stable way to map `sc-asset://` URLs to files under `LIB_ROOT`. When avatar images fail to load because Telegram photos are missing or CDN URLs have expired. When a path-like asset URL might contain `..` and must be rejected before file access. When research attachments or generated images must survive restart and be readable later as plain image files, not base64 blobs. When Twitter/X media needs to be stored locally and later reopened through a safe renderer URL."
+    ],
+    "related_components": [
+      "src/components/Avatar.jsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-avito-mcp.md",
+    "hash": "e6dd1c090e51f83f965a1360c167396a653b0bd05e6c3febc5c08d6761c01de2",
+    "type": "fact",
+    "explicit": [
+      "Avito via browser MCP",
+      "search results and item details",
+      "messenger and chat safety",
+      "background tab protection",
+      "search URL as filter source",
+      "apartment ranking guidelines"
+    ],
+    "implicit": [
+      "mcp/browser/index.js",
+      "browser-extension/mcp-handlers.js",
+      "avito_search",
+      "avito_item_detail",
+      "avito_messages_list",
+      "avito_thread_read",
+      "avito_chat_read",
+      "avito_message_draft",
+      "avito_message_send",
+      "tabs.create",
+      "tabs.update",
+      "tabs.remove",
+      "chrome.tabs.update",
+      "chrome.windows.update",
+      "map_bbox",
+      "f= opaque state",
+      "detail.address",
+      "detail.address.metros",
+      "yandex_maps_search"
+    ],
+    "symptoms": [
+      "When Avito tools suddenly open or close the user's current tab instead of working in the background, this file explains the tab protection rules. When search results look incomplete or rerouted by text relevance, this file explains why raw query text is not enough and why the full Avito URL matters. When a developer needs to read listings, seller details, or mini-chat state through browser MCP, this file describes the available actions and their output shape. When unread chat checks must stay safe, this file shows which actions do not open a thread and which ones can mark it read. When a batch or MCP action needs to be tested without restarting the browser extension, this file explains what hot-reloads and what requires an MCP session restart."
+    ],
+    "related_components": [
+      "mcp/browser/index.js",
+      "browser-extension/mcp-handlers.js",
+      "chrome.tabs.update",
+      "chrome.windows.update",
+      "tabs.create",
+      "tabs.remove"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-browser-extension.md",
+    "hash": "c39734daf110360223f30a365bce996fd91f1b5b8d96e447adb4f14661a4e01f",
+    "type": "fact",
+    "explicit": [
+      "browser extension",
+      "browser parser",
+      "MV3 extension",
+      "native messaging host",
+      "AI Studio export",
+      "Perplexity export",
+      "Claude export",
+      "ChatGPT export",
+      "YouTube pill button",
+      "autoscrape input flow",
+      "browser-only sources",
+      "extension installation",
+      "extension logs",
+      "settings storage"
+    ],
+    "implicit": [
+      "chrome.yandex.browser-extension",
+      "manifest.json",
+      "native-messaging-host",
+      "chrome.runtime.connectNative",
+      "chrome.storage.local",
+      "chrome.storage.sync",
+      "content-scripts",
+      "service-worker",
+      "popup.html",
+      "popup.js",
+      "background.js",
+      "logger.js",
+      "nmh/host.js",
+      "nmh/setup.js",
+      "aistudio-autoscrape.js",
+      "perplexity-content.js",
+      "claude-content.js",
+      "chatgpt-research.js",
+      "youtube-content.js",
+      "libs/jszip.min.js",
+      "host_permissions",
+      "chrome.alarms",
+      "Electron-http-bridge-53127",
+      "browser://extensions",
+      "Load-unpacked",
+      "manifest.content_scripts",
+      "clipboard-export",
+      "markdown-export",
+      "zip-export",
+      "same-origin-fetch",
+      "DOM-scraping",
+      "virtualized-history",
+      "current-branch-export"
+    ],
+    "symptoms": [
+      "When a browser-only source must be parsed but Python workers or yt-dlp cannot reach it. When AI Studio exports copy text but images or reasoning blocks need a zip or richer extraction path. When Perplexity, Claude, or ChatGPT content is missing because the visible DOM is not the full conversation. When YouTube needs a browser-context handoff into SC Desktop with progress shown on the pill button. When the extension logs are empty and the native messaging host or unpacked install is not connected. When settings changes or site detection behavior need to be checked for popup-driven export flows."
+    ],
+    "related_components": [
+      "browser-extension/background.js",
+      "browser-extension/content.js",
+      "browser-extension/perplexity-content.js",
+      "browser-extension/claude-content.js",
+      "browser-extension/chatgpt-research.js",
+      "browser-extension/youtube-content.js",
+      "browser-extension/aistudio-autoscrape.js",
+      "browser-extension/popup.html",
+      "browser-extension/popup.js",
+      "browser-extension/settings.js",
+      "browser-extension/logger.js",
+      "browser-extension/nmh/host.js",
+      "browser-extension/nmh/setup.js",
+      "browser-extension/libs/jszip.min.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-browser-mcp.md",
+    "hash": "2c5a7af574afe53127efb4f987421a9f0d11b4610f426f5bcac6bcfbb734f0af",
+    "type": "fact",
+    "explicit": [
+      "browser MCP architecture",
+      "real user browser control",
+      "WebSocket bridge",
+      "MV3 service worker keep-alive",
+      "multi-session commandId rewriting",
+      "reconnect backoff and leak prevention",
+      "frame routing with frameId 0",
+      "chrome.userScripts evaluate_raw",
+      "synthetic hover limitations",
+      "v2 page interaction anchors and ambiguity guard",
+      "global vs local scope for persistent MCP connections",
+      "recovery flow for browser MCP errors",
+      "known limitation in harvest_list deduplication"
+    ],
+    "implicit": [
+      "mcp/browser/index.js",
+      "mcp/browser/bridge.js",
+      "browser-extension/mcp-handlers.js",
+      "browser-extension/mcp-content.js",
+      "chrome.runtime.reload",
+      "chrome.alarms",
+      "chrome.userScripts",
+      "chrome.scripting.executeScript",
+      "chrome.tabs.sendMessage",
+      "WebSocketServer",
+      "detached spawn",
+      "frameId 0",
+      "anchor-based interaction",
+      "shadow DOM traversal",
+      "same-origin iframe traversal",
+      "reconnectScheduled",
+      "exponential backoff",
+      "navigator.webdriver false",
+      "navigator cookies",
+      "allFrames injection"
+    ],
+    "symptoms": [
+      "When a tool call fails after the browser has been idle for more than 30 seconds, this file explains the service worker keep-alive and how to recover. When only the first of several Claude sessions receives browser responses, this file explains commandId rewriting and session isolation. When clicks or selectors fail only on pages with iframes, this file explains frame routing and why commands must target frame 0. When evaluate_raw breaks on CSP-locked sites, this file explains why chrome.userScripts is required and how to enable it. When reconnecting the bridge causes high CPU or socket buildup, this file explains the historical leak and the backoff fix. When hover works for CSS but not for trusted-only UI behavior, this file explains the synthetic hover boundary. When list harvesting misses items in virtualized lists, this file explains the dedup limitation and workaround."
+    ],
+    "related_components": [
+      "mcp/browser/index.js",
+      "mcp/browser/bridge.js",
+      "browser-extension/background.js",
+      "browser-extension/mcp-handlers.js",
+      "browser-extension/mcp-content.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-browser-tab-marking.md",
+    "type": "fact",
+    "explicit": [
+      "browser_extension_tab_groups_api",
+      "yandex_browser_compatibility",
+      "favicon_title_visual_marking",
+      "mutation_observer_spa_protection",
+      "chrome_storage_persistence",
+      "research_badge_info_display",
+      "mcp_provider_detection"
+    ],
+    "implicit": [
+      "background.js_markTabAsMcpVisually",
+      "chrome.tabs.onUpdated_loading_complete_handler",
+      "MutationObserver_document.head_attribute_guard",
+      "chrome.storage.local__sc_mcp_marked_tabs",
+      "chrome.tabs.query_groupId_yandex_limitation",
+      "window.scResearchBadge_show_hide_api",
+      "aistudio_claude_perplexity_chatgpt_provider_titles",
+      "yandex_maps_service_tab_special_handling",
+      "favicon_chrome_extension_url_web_accessible_resources",
+      "SPA_title_rewrite_detection_per_navigation",
+      "title_MutationObserver_characterData_listener",
+      "initial_parse_150ms_inject_timing_requirement",
+      "tabId_provider_mapping_persistent_storage",
+      "location.reload_reinject_via_onUpdated_mechanism"
+    ],
+    "symptoms": [
+      "Custom favicon or provider title fails to appear in browser tab after MCP job starts",
+      "Visual marking disappears after page navigation or reload in research provider (Claude/AI Studio/Perplexity)",
+      "Yandex Browser shows blank favicon placeholder despite manifest web_accessible_resources defined",
+      "Information badge with jobId, model, and prompt details never renders on MCP-controlled tabs",
+      "Unable to identify which browser tabs are MCP-controlled after Service Worker respins or extension reload"
+    ],
+    "related_components": [
+      "electron/extensions/background.js",
+      "electron/extensions/research-badge.js",
+      "electron/extensions/aistudio-mcp.js",
+      "electron/extensions/perplexity-research.js",
+      "electron/extensions/claude-research.js",
+      "docs/knowledge/fact-aistudio-mcp.md",
+      "docs/knowledge/fact-yandex-maps.md"
+    ],
+    "hash": "0888cfe7d11b6f3f8daf0292fe06fc441e01a12235d2c5ad45e81150af49ce66"
+  },
+  {
+    "path": "docs/knowledge/fact-chatgpt-research.md",
+    "hash": "fc1e49843c709c014b1c39ee4869fde1a3cde7d005bd6dad5c3c70bc86687a2e",
+    "type": "fact",
+    "explicit": [
+      "ChatGPT automation",
+      "research flow",
+      "compose flow",
+      "export flow",
+      "model selection",
+      "effort selection",
+      "sources parsing",
+      "popup export",
+      "hidden tab render freeze",
+      "local network access dialog",
+      "image upload",
+      "generated image output",
+      "submit and done detection"
+    ],
+    "implicit": [
+      "browser-extension/chatgpt-research.js",
+      "fact-deep-research.md",
+      "chrome.storage.local",
+      "__sc_chatgpt_compose_job_*",
+      "/research-start",
+      "/research-state",
+      "/research-attachment",
+      "/api/auth/session",
+      "/backend-api/conversation/<id>",
+      "sc-compose",
+      "sc-research",
+      "window.name",
+      "tabId",
+      "chrome.debugger.attach",
+      "Emulation.setFocusEmulationEnabled",
+      "navigator.clipboard.writeText",
+      "document.execCommand('copy')",
+      "data-testid=\"composer-intelligence-pro-thinking-effort-trigger\"",
+      "data-testid=\"send-button\"",
+      "data-testid=\"stop-button\"",
+      "button[aria-label=\"Источники\"]",
+      "section[aria-label=\"Детали рассуждения\"]"
+    ],
+    "symptoms": [
+      "When a ChatGPT research job never finishes even though the stop button disappeared, this file explains the hidden-tab render freeze and focus emulation workaround.",
+      "When a compose handoff from YouTube opens ChatGPT but does not show a research badge, source panel, or MCP history entry, this file distinguishes the normal chat flow from research.",
+      "When ChatGPT keeps using the wrong model or the wrong effort level after selection, this file documents the verify-and-retry logic and the sticky per-account model behavior.",
+      "When popup export from a long chat silently drops most turns, this file explains the API-first conversation traversal and the DOM fallback limits.",
+      "When clipboard copy fails with a focus error during export, this file covers the textarea-based fallback and file-download last resort.",
+      "When a research result needs sources, activity steps, attachments, or generated images preserved in history, this file describes how those artifacts are collected and stored.",
+      "When a local network access prompt blocks browser-extension calls to ChatGPT, this file records the failure mode and the bridge fallback path."
+    ],
+    "related_components": [
+      "browser-extension/chatgpt-research.js",
+      "browser-extension/background.js",
+      "browser-extension/content-scripts/chatgpt-research-cs.js",
+      "browser-extension/popup-export.js",
+      "browser-extension/fact-deep-research.md",
+      "docs/methodology/переносимый-дизайн.md"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-claude-autoscrape.md",
+    "type": "fact",
+    "explicit": [
+      "claude.ai autoscrape workflow",
+      "YouTube transcript injection",
+      "Project selection via submenu",
+      "Model and thinking selector",
+      "chrome.storage.local contract",
+      "ProseMirror editor manipulation",
+      "Base-ui v2 DOM specifics",
+      "Payload lifecycle"
+    ],
+    "implicit": [
+      "claude_ai_autoscrape_job_lifecycle",
+      "chrome_storage_local_contract",
+      "base_ui_v2_submenu_mechanics",
+      "project_chip_detection",
+      "prosemirror_content_editable",
+      "yt_background_tab_job_routing",
+      "model_selector_dropdown_state",
+      "cross_platform_autoscrape_parity",
+      "storage_cache_vs_polling_strategy",
+      "radio_target_switcher_popup",
+      "messageflow_background_to_foreground",
+      "thinking_toggle_base_ui_checkbox"
+    ],
+    "symptoms": [
+      "Transcript pastes into wrong tab or not at all after YouTube autoscrape trigger",
+      "Project submenu opens but project click does not add chip indicator next to input",
+      "Model selector dropdown does not show expected models or thinking toggle is missing",
+      "Message sends to generic chat instead of selected project when autoscrape completes",
+      "Switching target in popup (Gemini ⟷ Claude) loses stored model or project configuration",
+      "chrome.storage.local payload with key __sc_claude_job_* is malformed or not retrieved",
+      "ProseMirror editor contains stale text from previous message or paste fails to clear field"
+    ],
+    "related_components": [
+      "src/background-tracker.js",
+      "src/claude-autoscrape.js",
+      "src/content-script.js",
+      "src/popup.js",
+      "src/aistudio-autoscrape.js"
+    ],
+    "hash": "a47ec7f29be4784af5f9cb61c55ac7f9a5d4216987283b945be0663dfb4af52e"
+  },
+  {
+    "path": "docs/knowledge/fact-claude-research.md",
+    "type": "fact",
+    "explicit": [
+      "Claude research provider",
+      "model selection",
+      "effort levels (low/medium/high/extra/max)",
+      "thinking mode",
+      "research vs chat mode",
+      "DOM selectors",
+      "menu configuration"
+    ],
+    "implicit": [
+      "claude_model_selector_dom",
+      "effort_level_configuration_persistence",
+      "thinking_toggle_independent_state",
+      "research_mode_flag_behavior",
+      "base_ui_stale_dom_bug",
+      "model_hydration_timing_race",
+      "text_normalization_glyphs",
+      "verify_and_retry_pattern",
+      "model_sticky_per_account",
+      "web_search_always_enabled",
+      "menu_closed_dom_remains",
+      "arial_label_verify_trigger",
+      "model_label_unified_format",
+      "opacity_visibility_filtering",
+      "negative_lookahead_opus_matching"
+    ],
+    "symptoms": [
+      "Job submits on account default model instead of requested model (hydration timeout or model selector failed)",
+      "Effort level selector not responding to clicks or showing wrong level despite UI clicks",
+      "Thinking mode toggle missing from UI or not persisting after selection",
+      "Text matching fails to find menu items (\"Web search\", \"Research\") that visually exist in DOM",
+      "Stale DOM nodes from closed menus are being clicked but no effect occurs",
+      "Research job stuck in configuring state when Opus 3 + research:true combination attempted",
+      "Verify-and-retry loops exhaust without finding model/effort radio despite being in snapshot",
+      "Plus-menu configuration (Research/Web search checkboxes) not preserving state between requests",
+      "Menu reopening shows wrong aria-label after model selection, confusing verify logic"
+    ],
+    "related_components": [
+      "browser-extension/claude-research.js",
+      "external-research skill",
+      "docs/knowledge/fact-deep-research.md",
+      "docs/knowledge/fact-chatgpt-research.md",
+      "docs/knowledge/fact-research-ui.md",
+      "docs/knowledge/fact-claude-autoscrape.md"
+    ],
+    "hash": "ca3bf671570bbfacc29a899cebade81168b29428798ca2ba8332e4d850972516"
+  },
+  {
+    "path": "docs/knowledge/fact-copy-saved.md",
+    "type": "fact",
+    "explicit": [
+      "CopySavedPanel_component",
+      "copy_save_operations",
+      "text_assembly_formatting",
+      "estimate_calculation",
+      "range_presets",
+      "item_eligibility_rules",
+      "telegram_comments",
+      "direction_control"
+    ],
+    "implicit": [
+      "IPC_contextBridge_assemblyEstimate",
+      "itemsAssembleEstimate_debounce_200ms",
+      "assemblyFetch_main_handler",
+      "assemblyTranscriptPaths_byte_stat",
+      "buildAssemblyWhere_type_eligibility_SQL",
+      "octet_length_UTF8_Cyrillic_byte_count",
+      "TelegramScopeFields_shared_form_component",
+      "direction_ASC_DESC_ORDER_BY_toggle",
+      "dialog_showSaveDialog_filename_pattern",
+      "listCommentsForPosts_SQL_JOIN_pattern",
+      "items_type_caption_eligibility_rules",
+      "bodyFor_transcript_file_extraction",
+      "toast_button_fixed_width_duration",
+      "useInvalidator_cache_invalidation_hook",
+      "reactions_caption_append_format"
+    ],
+    "symptoms": [
+      "Byte estimate vastly differs from actual copied size (300 KB shown, 700 KB pasted) due to UTF-8 character vs byte miscounting",
+      "Photos with captions incorrectly excluded from 'Text' selection despite matching eligibility criteria",
+      "Direction toggle (oldest/newest) fails to affect query order or reverses results",
+      "Live estimate stale when new messages arrive parallel to form; doesn't reflect actual count",
+      "Toast shows wrong message count—estimate and fetch use incompatible WHERE clauses"
+    ],
+    "related_components": [
+      "src/components/CopySavedPanel.jsx",
+      "src/components/TelegramScopeFields.jsx",
+      "src/screens/TelegramScreen.jsx",
+      "electron/main.js",
+      "electron/assemble.js",
+      "electron/database.js"
+    ],
+    "hash": "3b7d058896141ff100a52940364aa9ae83736bcc34afc2c61a2e1a13c5670780"
+  },
+  {
+    "path": "docs/knowledge/fact-data-bus.md",
+    "hash": "498755dd4bb5716332a22db5240b29b593cf76aa2247ac447fa575b9d87a0d28",
+    "type": "fact",
+    "explicit": [
+      "data bus",
+      "job invalidation",
+      "renderer-side cache invalidation",
+      "pub-sub keys",
+      "progress throttling",
+      "ChatView live tail",
+      "SourceDetail split refresh paths",
+      "new feature invalidation rules"
+    ],
+    "implicit": [
+      "job:update listener",
+      "window.api.onJobUpdate",
+      "useInvalidator",
+      "wireJobInvalidation",
+      "jobInvalidation.js",
+      "useSources",
+      "SourceDetail.reloadAll",
+      "SourceDetail.reloadJobs",
+      "ChatView",
+      "CopySavedPanel.estimate",
+      "tg_fetch",
+      "tg_live_items",
+      "tg_current_item",
+      "params._folder_umbrella_id",
+      "sourceDetail(id) IPC",
+      "jobs:listForSource"
+    ],
+    "symptoms": [
+      "When a source list, source detail, or chat view shows stale counts after a fetch, this file explains the invalidation bus to use. When big Telegram jobs make the UI jitter, scroll-storm, or reset pagination every 100 ms, this file describes the throttled progress path. When a component refetches too often or too little after `job:update`, this file shows which key should be wired. When SourceDetail feels heavy on progress updates, this file explains why jobs refresh separately from the rest of the source payload. When live Telegram messages appear during `tg_fetch`, this file explains why they stay in a capped read-only tail instead of invalidating the full items list."
+    ],
+    "related_components": [
+      "src/lib/jobInvalidation.js",
+      "src/hooks/useInvalidator.js",
+      "src/hooks/useSources.js",
+      "src/screens/SourceDetail.jsx",
+      "src/screens/ChatView.jsx",
+      "src/components/CopySavedPanel.jsx",
+      "src/components/TelegramConfigForm.jsx",
+      "src/ipc/sourceDetail.js",
+      "src/ipc/jobs.js",
+      "python-workers/telegram/tg_fetch_json.py"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-database.md",
+    "hash": "ecb8cb3df331009fd99385321b596ce31a24aa99bc456c1e33e1447064080cf4",
+    "type": "fact",
+    "explicit": [
+      "SQLite library database",
+      "dual-source schema",
+      "forum-topic columns in items",
+      "reply graph and reply resolution",
+      "Telegram reactions storage",
+      "Telegram discussion comments table",
+      "source explicitness flag",
+      "folder and folder_sources schema",
+      "Telegram session conflict latch",
+      "busy timeout for concurrent writers",
+      "coverage depth ladder",
+      "media-only metadata invariant",
+      "YouTube source uniqueness by external_id",
+      "Telegram source deduplication by identity",
+      "sources.meta_json fields",
+      "FTS5 contentless mode",
+      "appendItemTranscript caption replay",
+      "caption preservation on UPSERT",
+      "cascade delete invariants",
+      "sqlite-vec items_vec index",
+      "better-sqlite3 rebuild gotcha"
+    ],
+    "implicit": [
+      "library.db",
+      "WAL mode",
+      "electron/database.js",
+      "SCHEMA",
+      "python-workers/shared/library_db.py",
+      "SCHEMA_V1",
+      "idx_items_topic",
+      "idx_items_parent",
+      "reply_resolved",
+      "reactions_resolved",
+      "post_comments",
+      "folder_sources",
+      "tg_session_conflict",
+      "source_coverage",
+      "has_media",
+      "media_path",
+      "contentless_delete=1",
+      "items_fts",
+      "items_vec",
+      "BigInt primary key",
+      "electron-rebuild",
+      "PRAGMA busy_timeout"
+    ],
+    "symptoms": [
+      "When a schema change works in Electron but Python workers fail on open, this file tells you the schema must be mirrored in two places. When a Telegram reply backfill keeps reprocessing the same rows, it explains the `reply_resolved` sentinel and the parent reply graph. When reactions look present but cannot be distinguished from unknown state, it shows how the paired `reactions` and `reactions_resolved` columns work. When deleting a source fails or leaves stale search hits, it describes the required `items_fts` cleanup order and contentless FTS behavior. When a source appears twice in the sidebar or a YouTube channel changes identity, it explains canonical lookup and uniqueness by stable external id. When SQLite writes start colliding across CLI and Electron, it points to WAL mode plus the 30-second busy timeout and the shared `library.db` path."
+    ],
+    "related_components": [
+      "electron/database.js",
+      "python-workers/shared/library_db.py",
+      "electron/main.js",
+      "electron/job-runner.js",
+      "electron/preload.js",
+      "src/screens/ChatView.jsx",
+      "src/screens/SourceDetail.jsx",
+      "src/lib/jobInvalidation.js",
+      "src/components/TelegramTypesPopover.jsx",
+      "src/components/TelegramConfigForm.jsx",
+      "src/screens/TelegramScreen.jsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-deep-research.md",
+    "hash": "3f616099b4d35ff6c7216a9562641d81a5f63de0b5c27ab64c9396d039a56711",
+    "type": "fact",
+    "explicit": [
+      "deep research via MCP",
+      "Claude.ai Research mode",
+      "Perplexity.ai deep research",
+      "curl-based research flow",
+      "research completion detection",
+      "background tab throttling and freeze recovery"
+    ],
+    "implicit": [
+      "mcp__browser__deep_research_start",
+      "deep_research_wait",
+      "electron/browser-bridge.js",
+      "electron/research-state.js",
+      "browser-extension/claude-research.js",
+      "browser-extension/perplexity-research.js",
+      "browser-extension/research-badge.js",
+      "browser-extension/background.js",
+      "chrome.runtime.connect",
+      "MutationObserver",
+      "requestAnimationFrame",
+      "chrome.alarms",
+      "chrome.scripting.executeScript",
+      "window.scBridgeFetch",
+      "window.name recovery",
+      "tabId recovery",
+      "local-network-access fallback"
+    ],
+    "symptoms": [
+      "A research job stays in `running` for minutes even though the page looks finished or the answer is already visible. The tool needs to know when to wait for a long-poll result instead of trusting a single MCP timeout.",
+      "A background research tab stops updating until the user focuses it, especially after several minutes or after the browser has been inactive. This file explains the keepalive, throttling, and reload strategy that keeps the tab alive.",
+      "Claude or Perplexity research appears to finish early with a short summary, but the full document is hidden in a separate artifact pane or still streaming. Use this file when the completion detector fires too soon or misses the real document.",
+      "After a browser restart, extension reload, or tab crash-restore, the research job is still visible in the page but the bridge lost or partially lost state. This file describes how to recover the job from the bridge by tab id or persisted snapshot.",
+      "A developer is wiring a new research provider or changing the completion protocol and needs the bridge endpoints, state model, and content-script responsibilities spelled out together.",
+      "A research fetch fails only in the page context but works from the extension side, usually because of Local Network Access restrictions. This file documents the `scBridgeFetch` fallback path."
+    ],
+    "related_components": [
+      "electron/browser-bridge.js",
+      "electron/research-state.js",
+      "browser-extension/claude-research.js",
+      "browser-extension/perplexity-research.js",
+      "browser-extension/research-badge.js",
+      "browser-extension/background.js",
+      "browser-extension/mcp-handlers.js",
+      "browser-extension/manifest.json"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-fetch-strategies.md",
+    "hash": "f3c347e795692f67fbc1fc381cca449d2f7215d6269695c03f202ac1b0ba3609",
+    "type": "fact",
+    "explicit": [
+      "Telegram fetch modes",
+      "pre-analysis preview-only",
+      "incremental sync",
+      "date range fetching",
+      "topic filtering",
+      "chat title resolution",
+      "private t.me/c links",
+      "Instagram fetch modes",
+      "Instagram transcribe pagination",
+      "YouTube batch cost preview"
+    ],
+    "implicit": [
+      "tg_preview",
+      "sync_new",
+      "last_n",
+      "from_date",
+      "all",
+      "single",
+      "resolve_title",
+      "reply_to",
+      "min_id",
+      "offset_date",
+      "reverse_true",
+      "preview_summary",
+      "previewSig",
+      "sourceMaxExternalId",
+      "iter_messages",
+      "iter_dialogs",
+      "get_messages",
+      "bulkUpsertItems",
+      "on_conflict_upsert",
+      "clips/user",
+      "feed/user",
+      "web_profile_info",
+      "signed_video_url",
+      "telethon",
+      "floodwait"
+    ],
+    "symptoms": [
+      "When you need to explain why the UI shows a preview card before a full Telegram fetch starts. When a developer sees stale preview counts or dimmed range chips after changing target, mode, dates, or topics. When sync new only pulls recent Telegram messages and you need to trace the `min_id` or `last_n=200` fallback behavior. When a forum topic, private `t.me/c/...` link, or query-string URL fails to resolve correctly. When an Instagram sync new re-pulls the same reels or transcribe needs to refresh a signed video URL. When YouTube batch setup shows an upper-bound cost instead of an exact pre-analysis."
+    ],
+    "related_components": [
+      "src/screens/TelegramConfigForm.jsx",
+      "src/screens/SourceDetail.jsx",
+      "src/components/TelegramTopicsPopover.jsx",
+      "src/lib/jobInvalidation.js",
+      "electron/job-runner.js",
+      "electron/main.js",
+      "python-workers/telegram/tg_fetch_json.py",
+      "python-workers/instagram/ig_batch_transcribe_ndjson.py",
+      "docs/knowledge/fact-youtube.md",
+      "docs/knowledge/fact-instagram.md",
+      "docs/knowledge/fact-database.md",
+      "docs/knowledge/fact-jobs.md",
+      "docs/knowledge/fact-source-actions.md"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-instagram.md",
+    "hash": "030e435ac0f8edd0110f93a5f613f77dd1d82377365ae6dd182a393ee41e011c",
+    "type": "fact",
+    "explicit": [
+      "Instagram desktop parsing",
+      "library source and item formats",
+      "ndjson worker scripts",
+      "separate metadata and transcribe backends",
+      "cookies-free reels fetch via clips/user",
+      "public profile overview endpoint",
+      "Apify fallback actors",
+      "Instagram session files and login flow",
+      "reel and post external_id prefixes",
+      "saved transcript file locations"
+    ],
+    "implicit": [
+      "instagram",
+      "python-workers/instagram/ig_login_ndjson.py",
+      "python-workers/instagram/ig_sessions_ndjson.py",
+      "python-workers/instagram/ig_profile_ndjson.py",
+      "python-workers/instagram/ig_batch_transcribe_ndjson.py",
+      "IGAPIClient",
+      "skip_session=True",
+      "clips/user endpoint",
+      "web_profile_info endpoint",
+      "apify/instagram-reel-scraper",
+      "apple_yang/instagram-transcripts-scraper",
+      "instagram_session.json",
+      "instagram_api_session.json",
+      "instagram.backend legacy mapping",
+      "reel: shortcode namespace",
+      "post: shortcode namespace",
+      "silenced stdout helper",
+      "library.db",
+      "~/.config/sc/settings.json"
+    ],
+    "symptoms": [
+      "When Instagram profile parsing works but reel transcription still needs a separate backend choice. When a public reel can be fetched without cookies, but a private profile returns login_required. When a developer needs the exact worker script for login, session inventory, profile fetch, or batch transcription. When an existing Instagram source has a numeric user id and a shortcode must be resolved by re-paginating clips/user. When a bare reel URL cannot be handled by the free API path and the UI must explain why Apify is required. When saved transcript or combined file locations need to be traced in the desktop app. When stdout from a helper starts breaking ndjson because ANSI output was not silenced."
     ],
     "related_components": [
       "electron/main.js",
-      "src/App.jsx",
-      "src/components/popover components",
-      "src/screens/QuickOpen (backdrop)",
-      "preload.js (if env variable needs polyfilling)"
+      "electron/main.js::ig:overview",
+      "electron/main.js::_readIgBackends",
+      "python-workers/instagram/ig_login_ndjson.py",
+      "python-workers/instagram/ig_sessions_ndjson.py",
+      "python-workers/instagram/ig_profile_ndjson.py",
+      "python-workers/instagram/ig_batch_transcribe_ndjson.py",
+      "~/.config/sc/settings.json",
+      "~/.config/sc/instagram_session.json",
+      "~/.config/sc/instagram_api_session.json",
+      "~/.config/sc/apify_token",
+      "~/Library/Application Support/sc-desktop/transcripts/instagram",
+      "~/Library/Application Support/sc-desktop/jobs"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-ipc.md",
+    "hash": "7a83d2df3b951d9324f09a1d037ba28b15aa0977980e8c6bbf8e855e18ef2834",
+    "type": "fact",
+    "explicit": [
+      "Electron main and Python subprocess IPC",
+      "ndjson over stdout protocol",
+      "job-runner event ordering and throttled progress updates",
+      "subprocess over HTTP daemon design",
+      "renderer preload IPC channels",
+      "snapshot-only job APIs",
+      "stderr tail handling",
+      "custom asset protocol",
+      "single onJobUpdate listener pattern"
     ],
-    "hash": "236a089e515a0849b0ef247fbb48d67e7f94835e145813da633edd349cd67fdd"
+    "implicit": [
+      "job-runner.js",
+      "child_process.spawn",
+      "stdout ndjson",
+      "SIGTERM cancel",
+      "close event cleanup",
+      "throttled emit 250ms",
+      "page-boundary keep-alive",
+      "stderrTail ring buffer",
+      "window.api.tgFetch",
+      "window.api.tgPreview",
+      "window.api.jobsList",
+      "window.api.jobDetail",
+      "window.api.cancelJob",
+      "window.api.openExternal",
+      "window.api.openUrl",
+      "window.api.revealInFinder",
+      "window.api.itemsList",
+      "window.api.itemsSearch",
+      "window.api.itemsTopics",
+      "window.api.itemsTypeBreakdown",
+      "window.api.itemsAssembleEstimate",
+      "window.api.itemsAssembleCopy",
+      "window.api.itemsAssembleSave",
+      "src/lib/jobInvalidation.js",
+      "sc-asset protocol"
+    ],
+    "symptoms": [
+      "When a Python worker needs to stream progress back to Electron without using HTTP.",
+      "When job progress is frozen between page boundaries and you need to decide whether the problem is IPC throttling or a close-handler stall.",
+      "When the renderer sees too many rerenders or drag-drop becomes laggy during large fetches or batch transcribes.",
+      "When a job must be cancelled, tracked to exit, or cleaned up without keeping a long-running daemon alive.",
+      "When a URL click does nothing because a file-opening handler was used instead of the web URL handler.",
+      "When you need to expose a new renderer IPC action and must decide whether the result should be a live object or a snapshot."
+    ],
+    "related_components": [
+      "electron/job-runner.js",
+      "electron/preload.js",
+      "src/lib/jobInvalidation.js",
+      "fact-jobs.md",
+      "fact-youtube.md",
+      "fact-data-bus.md",
+      "fact-asset-protocol.md"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-jobs.md",
+    "hash": "768516c5a8168d75e45905174180ae87f20d9702063ea7da61692c72989f881c",
+    "type": "fact",
+    "explicit": [
+      "jobs lifecycle",
+      "state machine",
+      "awaiting_ai state",
+      "interrupted zombie jobs",
+      "cancel routing",
+      "resume logic",
+      "dual id space",
+      "pending row on spawn",
+      "mid-run database sync",
+      "job snapshot persistence",
+      "tg_fetch",
+      "tg_index",
+      "tg_reply_backfill",
+      "tg_preview",
+      "media_phase",
+      "auto-combined file output",
+      "auto-copy sound"
+    ],
+    "implicit": [
+      "electron/job-runner.js",
+      "electron/index-job.js",
+      "electron/database.js",
+      "job.items",
+      "job.child",
+      "dbRowId",
+      "jobs.Map",
+      "activeJobs",
+      "snapshot()",
+      "cancelById",
+      "markStuckRunningAsInterrupted",
+      "resumeYoutubeBatch",
+      "resumeYoutubeAi",
+      "bulkUpsertItemsYielding",
+      "appendItemTranscript",
+      "tg_progress",
+      "params._media_phase",
+      "params._tg_progress",
+      "params.video_files",
+      "params._auto_index_after_fetch",
+      "rowToHistoricSnapshot",
+      "rowToTgSingleSnapshot"
+    ],
+    "symptoms": [
+      "When a job is still marked running after the app restarts, this file tells you how to detect and relabel it as interrupted instead of leaving a zombie row in Activity. When the Cancel button works in one screen but not another, this file explains the two id spaces and the separate cancel paths for live jobs and tg_index. When a Telegram or YouTube job shows stale progress in History while Activity looks correct, this file describes the mid-run database sync rules. When a single-message Telegram job or a two-stage YouTube job needs to resume without creating duplicate history rows, this file explains the resume contract. When live progress disappears after close or restart, this file shows which job fields must also exist in the snapshot and params. When the UI shows a result file, combined text, or copy behavior that differs by job type, this file documents the expected lifecycle and persistence rules."
+    ],
+    "related_components": [
+      "electron/job-runner.js",
+      "electron/index-job.js",
+      "electron/database.js",
+      "src/lib/jobInvalidation.js",
+      "src/components/JobDetail.jsx",
+      "src/components/ActivityPanel.jsx",
+      "src/components/TelegramSingleMessageForm.jsx",
+      "src/components/TelegramConfigForm.jsx",
+      "src/components/SourceDetail.jsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-local-files.md",
+    "hash": "32a5b24694cc6300826bc79b2b997b2c324351ac9839ab7f93d0b481f28109fd",
+    "type": "fact",
+    "explicit": [
+      "local files as an ephemeral platform",
+      "paste-flow for absolute local media paths",
+      "local file detection",
+      "AssemblyAI default for local transcription",
+      "Gemini API key init workaround for AssemblyAI path",
+      "AssemblyAI polling progress stages",
+      "form state restoration on return",
+      "local job snapshot and JobDetail body",
+      "recents display for local files"
+    ],
+    "implicit": [
+      "src/lib/detect.js",
+      "LOCAL_AUDIO_VIDEO_EXT_RE",
+      "file:// URI detection",
+      "~/ path detection",
+      "LOCAL_AUDIO_VIDEO_EXT_RE media extensions",
+      "platform:local",
+      "kind:local-file",
+      "python-workers/web/local_transcribe_ndjson.py",
+      "gemini_utils.GeminiClient",
+      "Transcriber.submit",
+      "transcribe_progress",
+      "silenced stdout proxy",
+      "_REAL_STDOUT",
+      "electron/job-runner.js::startLocalTranscribe",
+      "source_id NULL",
+      "LIB_ROOT/transcripts/local",
+      "electron/main.js::local:transcribe",
+      "src/components/LocalFileTranscribeForm.jsx",
+      "useJobs lookup",
+      "rowToLocalSnapshot",
+      "src/screens/JobDetail.jsx::LocalBody",
+      "store.recents"
+    ],
+    "symptoms": [
+      "A user pastes an absolute file path or file:// URI and the app should treat it as a transcribable source, not a library item.",
+      "A local media job should open directly from Home without a SourceDetail screen or persistent channel/profile view.",
+      "A developer sees AssemblyAI selected but the run fails immediately with a missing GEMINI_API_KEY error.",
+      "A long local transcription shows only a spinner unless polling progress events are wired through to the UI.",
+      "After navigating away and back, the local file form should recover the in-flight or finished job from the global job list.",
+      "The detail view for a completed local job must show the full path, basename, size, duration, and copy/open actions.",
+      "Recent items should show only the filename for local files, not the full filesystem path."
+    ],
+    "related_components": [
+      "src/lib/detect.js",
+      "src/components/LocalFileTranscribeForm.jsx",
+      "python-workers/web/local_transcribe_ndjson.py",
+      "electron/job-runner.js",
+      "electron/main.js",
+      "src/screens/JobDetail.jsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-logging.md",
+    "hash": "7400855d4c7f936cf97f0fea4502275a0b429aa2b93d2b4f7590f976e3f1ea88",
+    "type": "fact",
+    "explicit": [
+      "console interception",
+      "file logging",
+      "tag-prefixed console output",
+      "performance diagnostics",
+      "log rotation",
+      "log deduplication",
+      "EPIPE failure with tee"
+    ],
+    "implicit": [
+      "electron/logger.js",
+      "electron/perf-diagnostics.js",
+      "main.js",
+      "console.log",
+      "console.warn",
+      "console.error",
+      "uncaughtException",
+      "unhandledRejection",
+      "ipcMain.handle",
+      "diag:rendererEvent",
+      "app.getPath('logs')",
+      "process.stdout.write",
+      "fs.appendFile"
+    ],
+    "symptoms": [
+      "When logs are missing from the file but visible in stdout, this file explains the required [Tag] prefix contract.",
+      "When the main process starts crashing early or production failures are only visible in logs, this file shows why logger initialization must happen before other imports.",
+      "When the app shows scroll lag, input delay, or IPC storms, this file tells you which [Perf:*] diagnostics to inspect first.",
+      "When repeated log lines are collapsing into xN or old logs disappear after a week, this file describes the dedup and age-based rotation behavior.",
+      "When running the dev server through tee causes EPIPE, bridge hangs, or runaway uncaughtException loops, this file explains the failure mode and fix."
+    ],
+    "related_components": [
+      "electron/logger.js",
+      "electron/perf-diagnostics.js",
+      "main.js",
+      "job-runner.js",
+      "jobInvalidation.js"
+    ]
   },
   {
     "path": "docs/knowledge/fact-navigation.md",
@@ -438,128 +1125,349 @@
     "hash": "ed001f3573ad1e81a4871fb47d71c41688ebef8dfb63ef0d183a48602071c618"
   },
   {
-    "path": "docs/knowledge/fact-youtube.md",
+    "path": "docs/knowledge/fact-ozon-mcp.md",
+    "hash": "3c93508c777a32c99794e1c84824c6dbfa7d614a9be6dfd1653218109dc7a498",
     "type": "fact",
     "explicit": [
-      "youtube_channel_url_canonicalization",
-      "single_video_two_stage_transcribe",
-      "batch_transcribe_workflow",
-      "cache_lookup_items_and_jobs",
-      "youtube_items_architectural_shift",
-      "approximate_dates_tradeoff",
-      "youtube_picker_search_mode",
-      "source_integration_single_paste",
-      "kickoff_stage_scope_fields",
-      "smart_action_button_toggle",
-      "per_video_event_aggregation",
-      "file_layout_transcripts_directory"
+      "Ozon via browser MCP",
+      "direct product links for purchases and favorites",
+      "direct fetch from Ozon API without opening a tab",
+      "orders versus purchases distinction",
+      "pagination rules for Ozon pages",
+      "card parsing and query matching"
     ],
     "implicit": [
-      "youtube_channel_canonicalization_external_id",
-      "yt_single_ndjson_two_stage_spawn",
-      "yt_batch_transcribe_ndjson_protocol",
-      "youtube_cache_lookup_findYoutubeTranscriptForVideo",
-      "youtube_items_branch_source_integration",
-      "youtube_search_picker_emerald_indicators",
-      "youtube_pre_filter_cached_before_spawn",
-      "yt_batch_log_per_video_aggregation",
-      "upsert_channel_by_external_id_not_handle",
-      "youtube_approximate_dates_extractor_args",
-      "youtubescopefields_limit_direction_component",
-      "youtube_channel_form_idle_kickoff_ready_states",
-      "youtube_smart_action_copy_vs_transcribe",
-      "youtube_synthetic_all_cached_batch_job"
+      "mcp/browser/index.js",
+      "browser-extension/mcp-handlers.js",
+      "ozon_search",
+      "ozon_favorites",
+      "ozon_purchases",
+      "ozon_orders",
+      "ozon_order_detail",
+      "https://www.ozon.ru/api/composer-api.bx/page/json/v2",
+      "credentials include",
+      "widgetStates",
+      "tileGridDesktop",
+      "search_page_state",
+      "search_tiles_req",
+      "next_url",
+      "orderdetails",
+      "/my/favorites",
+      "/my/orderlist",
+      "/my/purchases/search",
+      "/my/favorites/list?list=4294967294"
     ],
     "symptoms": [
-      "Single video paste completes but video doesn't appear in Library under channel source",
-      "Batch transcribe processes same video twice instead of using cached transcript from another channel",
-      "Cache lookup misses sourceless yt_transcribe jobs — same URL re-runs Stage 1 and AI",
-      "Channel deduplication fails after handle rename — same channel_id appears twice in sidebar",
-      "All videos in batch display same approximate date (e.g., 26th for all) instead of real dates",
-      "Cached videos missing emerald ✓ indicator in picker — unclear why batch is skipping some"
+      "When a user asks for something they bought and the router returns order numbers instead of direct product links.",
+      "When the result shows only the first screen of orders or purchases and misses most of the catalog.",
+      "When pagination on purchases search times out or repeats pages because a synthetic cursor was used.",
+      "When a product result points to the Ozon home page instead of a real product URL.",
+      "When the account shows a large purchases count but the MCP returns far fewer cards than expected.",
+      "When you need to choose the right source between purchases, orders, favorites, and search results."
     ],
     "related_components": [
-      "src/components/YouTubeChannelForm.jsx",
-      "src/components/YouTubeBatchPicker.jsx",
-      "src/components/SourceDetail.jsx",
-      "src/components/YouTubeScopeFields.jsx",
+      "mcp/browser/index.js",
+      "browser-extension/mcp-handlers.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-python-воркеры.md",
+    "hash": "adeef56b7f0f4cdaff081f2db98491452ed9a3350dfda6b366530aa20f2b5196",
+    "type": "fact",
+    "explicit": [
+      "Python workers runtime",
+      "worker root selection",
+      "dependency installation",
+      "worker dependency missing",
+      "config and credentials",
+      "database schema dual source",
+      "legacy cli-tools references",
+      "desktop runtime packaging"
+    ],
+    "implicit": [
+      "electron/job-runner.js",
+      "process.resourcesPath/python-workers",
+      "SC_DESKTOP_PYTHON",
+      "python-workers/.venv/bin/python3",
+      "npm run build:install",
+      "npm run python:setup",
+      "worker_dependency_missing",
+      "telethon not installed",
+      "~/.config/sc/settings.json",
+      "TELEGRAM_API_ID",
+      "TELEGRAM_API_HASH",
+      "GEMINI_API_KEY",
+      "electron/database.js",
+      "python-workers/shared/library_db.py",
+      "python-workers/*_ndjson.py",
+      "python-workers/shared/*",
+      "Contents/Resources/python-workers"
+    ],
+    "symptoms": [
+      "When Telegram fetch or session creation fails with 'telethon not installed' even though the code is present, this file explains that Python dependencies or the bundled .venv are missing.",
+      "When a developer is tempted to fix a desktop feature inside old cli-tools core modules, this file identifies that as the wrong runtime entry point.",
+      "When production works differently from dev because the worker root is resolved from app resources, this file explains where the runtime is loaded from in each environment.",
+      "When a job stops immediately with code worker_dependency_missing and umbrella batches abort their remaining children, this file describes the intended failure handling.",
+      "When a credential change does not take effect after editing config.env, this file shows that workers read env and ~/.config/sc/settings.json instead.",
+      "When changing the library.db schema, this file reminds you that both Electron and Python copies of the schema must be updated together."
+    ],
+    "related_components": [
       "electron/job-runner.js",
       "electron/database.js",
-      "cli-tools/web/yt_channel_ndjson.py",
-      "cli-tools/web/yt_single_ndjson.py",
-      "cli-tools/web/yt_batch_transcribe_ndjson.py"
-    ],
-    "hash": "34072915b297c5d94c57d34a32dc5d8433b0d718c0d07f82d5b0188fe2ed8be1"
+      "python-workers/shared/library_db.py",
+      "python-workers/requirements.txt",
+      "python-workers/*_ndjson.py",
+      "python-workers/shared/*"
+    ]
   },
   {
-    "path": "docs/knowledge/fix-лаг-индексации.md",
-    "type": "fix",
+    "path": "docs/knowledge/fact-reddit.md",
+    "hash": "de40ac9d4e160e80300318d15461a4b439a1b3baf5fadf2d1ed23e1a780bb04e",
+    "type": "fact",
     "explicit": [
-      "indexing_lag",
-      "tg_reply_backfill",
-      "better_sqlite3_blocking",
-      "reactions_resolved"
+      "Reddit backend selection",
+      "api backend",
+      "auto backend",
+      "apify backend",
+      "cookie-based Reddit JSON access",
+      "search source type",
+      "thread source type",
+      "comment tree reconstruction",
+      "Reddit NDJSON events",
+      "MCP Reddit tools",
+      "search pagination limits",
+      "thread pagination limits"
     ],
     "implicit": [
-      "better_sqlite3_sync_lag",
-      "electron_main_blocking",
-      "job_runner_lifecycle",
-      "python_cli_ipc",
-      "vector_search_sqlite",
-      "telethon_backfill",
-      "stop_job_cancellation",
-      "main_thread_sampling"
+      "reddit.com/*.json",
+      "reddit_session",
+      "token_v2",
+      "SC_REDDIT_COOKIE_HEADER",
+      "browser_cookie3",
+      "trudax/reddit-scraper-lite",
+      "~/.config/sc/settings.json",
+      "reddit.backend",
+      "q-<sha8>",
+      "t-<post_id>",
+      "parent_external_id",
+      "depth",
+      "rd_search_ndjson.py",
+      "rd_thread_ndjson.py",
+      "reddit_auth.py",
+      "RedditBackendControl.jsx",
+      "RedditThreadForm.jsx",
+      "RedditSearchForm.jsx",
+      "RedditThreadView.jsx",
+      "RedditSearchView.jsx",
+      "mcp/server.js",
+      "library.db"
     ],
     "symptoms": [
-      "App freezes or lag occurs immediately after clicking Index button",
-      "Stop indexing button appears non-responsive or delayed",
-      "Duplicate reply backfill jobs trigger continuously on already indexed sources",
-      "Electron main process hits 100% CPU with silent logs during SQLite execution"
+      "When Reddit anonymous JSON requests start returning 403 or 429 and the job must not silently switch to a paid path.",
+      "When a developer needs to understand why Free mode exits with an error instead of retrying through Apify.",
+      "When a search result should open as a new thread source rather than extend the existing search source.",
+      "When comment nesting looks wrong and the depth or parent linkage must be reconstructed from backend data.",
+      "When the UI needs an explicit Free, Auto, or Apify selector that matches the backend contract.",
+      "When the search or thread job stops around 100 results or maxComments and the limit is expected behavior, not a bug."
+    ],
+    "related_components": [
+      "python-workers/reddit/reddit_auth.py",
+      "python-workers/reddit/rd_thread_ndjson.py",
+      "python-workers/reddit/rd_search_ndjson.py",
+      "src/components/RedditBackendControl.jsx",
+      "src/components/RedditThreadForm.jsx",
+      "src/components/RedditSearchForm.jsx",
+      "src/components/RedditThreadView.jsx",
+      "src/components/RedditSearchView.jsx",
+      "mcp/server.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-research-ui.md",
+    "hash": "7ceb6a2a73dd8b325dea9d13ce736ad50c50e716214e81bcfc807d36330a66b7",
+    "type": "fact",
+    "explicit": [
+      "research launch UI",
+      "research history UI",
+      "running MCP popover",
+      "NewResearchScreen",
+      "McpHistoryPanel",
+      "McpJobTimer",
+      "research_jobs SQLite history",
+      "external-jobs aggregation",
+      "watchEarlyError",
+      "humanError",
+      "ChatGPT continuation history"
+    ],
+    "implicit": [
+      "renderer external-research flow",
+      "window.api.researchStart",
+      "window.api.researchStatus",
+      "window.api.pplxModels",
+      "research:stop IPC",
+      "bridge:tabCommand",
+      "persistResearchJob",
+      "persistAistudioJob",
+      "library.db research_jobs",
+      "sc-asset://research-artifacts",
+      "provider tabs",
+      "Claude research options",
+      "Perplexity search mode",
+      "AI Studio model selector",
+      "ChatGPT sources panel",
+      "JobTimer live sync",
+      "RAM plus SQLite merge",
+      "jobId deduplication"
+    ],
+    "symptoms": [
+      "When the New research screen opens from the TitleBar plus area and the provider tabs or per-provider fields do not match the expected behavior. When Enter, Shift+Enter, or Cmd/Ctrl+Enter in the prompt area does not start research or insert a newline correctly. When a research request shows 'Sent' but then fails shortly after and the UI needs to surface the real error from early polling. When the running MCP popover or history panel shows stale, missing, or duplicated jobs after a restart. When a stop action or open-url action from the popup does nothing because the renderer is still using a direct fetch instead of IPC. When ChatGPT or AI Studio jobs need the full structured result, attached images, or sources/activity details to render correctly in history or the job page."
+    ],
+    "related_components": [
+      "src/screens/NewResearchScreen.jsx",
+      "src/components/McpRunningPopover.jsx",
+      "src/components/McpJobTimer.jsx",
+      "src/components/McpHistoryPanel.jsx",
+      "src/screens/AistudioJobScreen.jsx",
+      "electron/database.js",
+      "electron/browser-bridge.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-semantic-search.md",
+    "hash": "58f4bec1fb04928c8930cc24e9beea1163c410c39d9a13692341a4438c6604d6",
+    "type": "fact",
+    "explicit": [
+      "semantic search for messages",
+      "vector index over library.db",
+      "late chunking",
+      "sqlite-vec gotchas",
+      "Gemini embedding throttling",
+      "vector-only search",
+      "cosine thresholds",
+      "load more semantic results",
+      "semantic progress bar",
+      "MCP Telegram RAG tools",
+      "reply graph search"
+    ],
+    "implicit": [
+      "library.db",
+      "items_vec virtual table",
+      "bulkUpsertVectors",
+      "hybridSearch",
+      "embedder.js",
+      "gemini-embedding-001",
+      "l2Normalise",
+      "sqlite-vec",
+      "BigInt primary key coercion",
+      "ROLLING_WINDOW_60S_LEDGGER",
+      "RPM_TARGET",
+      "FTS5",
+      "Reciprocal Rank Fusion",
+      "Context Neighbors",
+      "telegram_semantic_search",
+      "telegram_neighbors",
+      "telegram_reply_thread",
+      "job:update",
+      "CoverageBars.jsx",
+      "ChatView confidenceColor",
+      "SourceDetail.jsx"
+    ],
+    "symptoms": [
+      "When exact-word search misses paraphrases, synonyms, or short replies that should match the conversation. When indexing fails around message 3000 with Gemini 429 quota errors even though TPM is still low. When sqlite-vec throws a primary-key type error on insert or delete for items_vec. When search results look wrong because FTS hits are bubbling above more relevant vector matches. When the UI needs a relevance threshold, confidence color, or a way to load more semantic results without rerunning a different search mode. When a developer needs to understand how Telegram semantic search, neighbors, and reply-thread retrieval are wired together through MCP and the Electron job pipeline."
     ],
     "related_components": [
       "electron/database.js",
+      "electron/embedder.js",
+      "electron/index-job.js",
       "electron/main.js",
-      "cli-tools/shared/library_db.py",
-      "src/components/ActivityPanel.tsx"
-    ],
-    "hash": "7e1d2f80b01b21d7f74111936ed22dfebd289c849e3b6eef8ed4f2d081cc4206"
+      "src/components/IndexButton.jsx",
+      "src/components/CoverageBars.jsx",
+      "src/components/ChatView.jsx",
+      "src/screens/SourceDetail.jsx",
+      "mcp/server.js",
+      "mcp/run.sh"
+    ]
   },
   {
-    "path": "docs/knowledge/fact-yandex-maps.md",
+    "path": "docs/knowledge/fact-source-actions.md",
+    "hash": "7c88a7778aad1711e07ef180532fe237dc6aac64741f7dc9917eaad5816e1e71",
     "type": "fact",
     "explicit": [
-      "yandex_maps_search",
-      "browser_mcp_tool",
-      "organization_search",
-      "ssr_state_extraction",
-      "pagination_strategy"
+      "source actions",
+      "action-row pattern",
+      "ToolbarButton contract",
+      "platform-specific action matrix",
+      "overview button rule",
+      "new request form",
+      "copy saved panel",
+      "picker button",
+      "index button",
+      "catch up comments",
+      "inline panels",
+      "source history paging",
+      "stop button",
+      "backfill-aware skipDupes",
+      "ephemeral paste flows",
+      "TelegramScopeFields",
+      "quick fetch parameters",
+      "visible feedback for quick actions",
+      "multi-select in sidebar",
+      "catch-up batch"
     ],
     "implicit": [
-      "main_world_chrome_scripting_injection",
-      "ssr_state_inline_script_parsing",
-      "background_tab_own_tab_creation",
-      "own_tab_finally_cleanup_with_ownTab_guard",
-      "site_url_yclid_utm_parameter_stripping",
-      "url_pagination_page_parameter",
-      "area_bounds_consistency_ll_spn_pinning",
-      "organization_id_dedupe_map",
-      "completion_marker_complete_flag",
-      "social_media_link_normalization_wa_me_viber",
-      "token_budget_weight_optimization",
-      "no_api_key_free_ssr_extraction"
+      "ToolbarButton",
+      "CopySavedPanel",
+      "TelegramConfigForm",
+      "InstagramConfigForm",
+      "YouTubeQuickFetchForm",
+      "YouTubeBatchPicker",
+      "InstagramBatchPicker",
+      "TikTokBatchPicker",
+      "IndexButton",
+      "CoverageBars",
+      "NewRequestSplitButton",
+      "TelegramTopicsPopover",
+      "TelegramTypesPopover",
+      "lib/tgFetchParams.js",
+      "lib/telegramSelection.js",
+      "tg_fetch_json.py",
+      "tg:indexStatus",
+      "tg_catchup",
+      "listJobsForSource",
+      "jobs:cancel",
+      "tg:catchUpComments",
+      "items_vec"
     ],
     "symptoms": [
-      "Search pagination returns fewer results than Yandex reports in total count",
-      "Website URLs extracted include tracking redirects (yclid, utm_source parameters)",
-      "Search results change or inconsistent when refining location area (ll, spn parameters)",
-      "Social media contact links are excessively long due to URL-encoded message text",
-      "Need to find organizations by category in specific geographic area without API key"
+      "You need this file when action buttons on a source page look duplicated, misaligned, or inconsistent across platforms.",
+      "You need this file when deciding whether a control should be an inline toggle panel or a separate screen.",
+      "You need this file when the overview summary changes after editing fetch parameters and you need to know it belongs inside the form.",
+      "You need this file when a source page is missing the copy, picker, index, or catch-up comments controls and you need the visibility rules.",
+      "You need this file when job history pagination makes older runs unreachable or when the page shows only the first server-side batch.",
+      "You need this file when adding a new source-page action and you need the shared ToolbarButton and mutex-panel rules.",
+      "You need this file when batch fetch, quick fetch, and sidebar catch-up must read the same last-used TG parameters."
     ],
     "related_components": [
-      "browser-extension/mcp-handlers.js",
-      "mcp/browser/index.js"
-    ],
-    "hash": "8e1e1506138b8b10694cd09d65815773427646a121607d51dfe6d187a80336ac"
+      "src/components/ToolbarButton.jsx",
+      "src/components/TelegramConfigForm.jsx",
+      "src/components/CopySavedPanel.jsx",
+      "src/components/TelegramScopeFields.jsx",
+      "src/components/TelegramTopicsPopover.jsx",
+      "src/components/TelegramTypesPopover.jsx",
+      "src/components/NewRequestSplitButton.jsx",
+      "src/components/TelegramScreen.jsx",
+      "src/components/InstagramConfigForm.jsx",
+      "src/components/YouTubeQuickFetchForm.jsx",
+      "src/components/YouTubeBatchPicker.jsx",
+      "src/components/InstagramBatchPicker.jsx",
+      "src/components/TikTokBatchPicker.jsx",
+      "src/components/IndexButton.jsx",
+      "src/lib/tgFetchParams.js",
+      "src/lib/telegramSelection.js",
+      "electron/main.js",
+      "electron/job-runner.js",
+      "python-workers/telegram/tg_fetch_json.py"
+    ]
   },
   {
     "path": "docs/knowledge/fact-telegram-comments.md",
@@ -626,522 +1534,288 @@
     "path": "docs/knowledge/fact-telegram-folders.md",
     "type": "fact",
     "explicit": [
-      "Telegram folders",
-      "DialogFilter",
+      "telegram_folders",
+      "telegram_screen",
       "tg_folder_refresh",
-      "tg_folder_fetch",
-      "demote_migration"
-    ],
-    "implicit": [
-      "telegram_folders_schema",
-      "tg_folder_refresh_job",
-      "tg_folder_fetch_umbrella",
-      "telethon_session_lock",
-      "sidebar_demote_heuristics",
-      "is_explicit_source",
-      "folder_sources_sorting",
-      "batch_auto_rules_selection",
-      "telegram_scope_fields_inline",
-      "folder_session_pruning",
-      "activity_panel_umbrella_filter",
-      "meta_json_kind_classification"
-    ],
-    "symptoms": [
-      "Telegram folders belonging to another profile disappear after refreshing folders on a different account",
-      "Telethon database locked error occurs when starting a batch fetch on multiple Telegram channels inside a folder",
-      "Sidebar list is flooded with empty or folder-only Telegram channels instead of grouping them under Other",
-      "Batch copy estimate or item size count does not update when changing selected date ranges or content types on Telegram screen",
-      "Auto-pull or auto-index settings apply to hidden sources when switching folder tabs during active selection"
-    ],
-    "related_components": [
-      "src/renderer/screens/TelegramScreen.jsx",
-      "src/renderer/components/LibrarySidebar.jsx",
-      "src/renderer/components/TelegramScopeFields.jsx",
-      "electron/database.js",
-      "cli-tools/shared/library_db.py"
-    ],
-    "hash": "cb56fce96fac5ce508bebe25c3043e229e3607259f54288bb0cec3a2a049a488"
-  },
-  {
-    "path": "docs/knowledge/fact-fetch-strategies.md",
-    "type": "fact",
-    "explicit": [
-      "fetch_strategies",
-      "telegram_fetch",
-      "instagram_fetch",
-      "preview_mode",
-      "sync_new",
-      "resolve_title",
-      "min_id",
-      "skip_dupes",
-      "topic_filter"
+      "tg_folder_fetch"
     ],
     "implicit": [
       "ndjson_subprocess_protocol",
       "library_db_dual_schema",
-      "telethon_session_quirks",
-      "job_runner_lifecycle",
-      "preview_signature_stale_detection",
-      "backfill_aware_skip_dupes",
-      "pre_flight_ffprobe_voice",
-      "resolve_by_chat_title",
-      "private_channel_c_url_parsing",
-      "multi_topic_prefetch_filter",
-      "instagram_signed_url_pagination"
+      "telethon_session_lock",
+      "activity_panel_filtering",
+      "is_explicit_demote_migration",
+      "assembly_estimate_ipc",
+      "telegram_dialog_filter",
+      "folder_sources_junction",
+      "session_scoped_prune",
+      "batch_auto_pull_delta",
+      "kind_based_tab_filters"
     ],
     "symptoms": [
-      "Telethon fails with 'Cannot find any entity' error on numeric chat IDs during backend fetch",
-      "Single message parsing crashes or returns 400 when pasting Telegram links with query parameters",
-      "Backfilling message bodies or polls results in zero items imported because skipDupes cuts them off",
-      "AssemblyAI jobs fail during upload with 'No audio stream found' on silent video stickers",
-      "Fetching a forum-style group results in high FloodWait limits or downloads messages from unrelated topics"
+      "Telegram folders disappearing after refreshing under a different account session",
+      "Library sidebar cluttered with hundreds of unparsed or empty folder chats",
+      "Sequential folder fetch stalling or showing individual chat jobs instead of a single umbrella row",
+      "Folder-specific settings like date range or content types not persisting between tab switches",
+      "Telethon database is locked errors during batch channel processing"
     ],
     "related_components": [
-      "tg_fetch_json.py",
-      "detect.js",
-      "src/components/TelegramConfigForm.tsx",
-      "src/screens/SourceDetail.tsx"
-    ],
-    "hash": "cdae49fbe80972186e6b987ff33ad539413b593c9dbd2436868358694b113804"
-  },
-  {
-    "path": "docs/knowledge/fact-logging.md",
-    "type": "fact",
-    "explicit": [
-      "console interceptor",
-      "file logging",
-      "[Tag] prefix contract",
-      "log deduplication",
-      "log rotation",
-      "electron/logger.js",
-      "crash hooks",
-      "dev.log path",
-      "production.log path"
-    ],
-    "implicit": [
-      "logger_tag_prefix_contract",
-      "electron_logger_js_console_intercept",
-      "process_stdout_write_epipe_handling",
-      "file_logging_deduplication_xn_compression",
-      "log_rotation_age_based_7days_no_size_cap",
-      "electron_app_getpath_logs_production_path",
-      "dev_log_path_desktop_sc_desktop_logs",
-      "npm_run_dev_tee_pipe_deadlock_anti_pattern",
-      "uncaughtexception_unhandledrejection_crash_hooks",
-      "logger_init_order_must_run_first_in_main_js"
-    ],
-    "symptoms": [
-      "Console.log() output visible in terminal but missing from logs/ file",
-      "Electron dev server hangs with EPIPE errors in logger.js when run as 'npm run dev | tee'",
-      "Production crash never appears in logs despite exception occurring",
-      "Repeated identical log lines spam file instead of collapsing to ×N",
-      "Early initialization errors or uncaught rejections missing from file log"
-    ],
-    "related_components": [
-      "electron/main.js",
-      "electron/job-runner.js",
-      "electron/logger.js"
-    ],
-    "hash": "d3330731130cc807c6547abcb00bfb4f4d59f91d2f8774ab7734a8d789e8cfa2"
-  },
-  {
-    "path": "docs/knowledge/fact-browser-tab-marking.md",
-    "type": "fact",
-    "explicit": [
-      "browser_extension_tab_groups_api",
-      "yandex_browser_compatibility",
-      "favicon_title_visual_marking",
-      "mutation_observer_spa_protection",
-      "chrome_storage_persistence",
-      "research_badge_info_display",
-      "mcp_provider_detection"
-    ],
-    "implicit": [
-      "background.js_markTabAsMcpVisually",
-      "chrome.tabs.onUpdated_loading_complete_handler",
-      "MutationObserver_document.head_attribute_guard",
-      "chrome.storage.local__sc_mcp_marked_tabs",
-      "chrome.tabs.query_groupId_yandex_limitation",
-      "window.scResearchBadge_show_hide_api",
-      "aistudio_claude_perplexity_chatgpt_provider_titles",
-      "yandex_maps_service_tab_special_handling",
-      "favicon_chrome_extension_url_web_accessible_resources",
-      "SPA_title_rewrite_detection_per_navigation",
-      "title_MutationObserver_characterData_listener",
-      "initial_parse_150ms_inject_timing_requirement",
-      "tabId_provider_mapping_persistent_storage",
-      "location.reload_reinject_via_onUpdated_mechanism"
-    ],
-    "symptoms": [
-      "Custom favicon or provider title fails to appear in browser tab after MCP job starts",
-      "Visual marking disappears after page navigation or reload in research provider (Claude/AI Studio/Perplexity)",
-      "Yandex Browser shows blank favicon placeholder despite manifest web_accessible_resources defined",
-      "Information badge with jobId, model, and prompt details never renders on MCP-controlled tabs",
-      "Unable to identify which browser tabs are MCP-controlled after Service Worker respins or extension reload"
-    ],
-    "related_components": [
-      "electron/extensions/background.js",
-      "electron/extensions/research-badge.js",
-      "electron/extensions/aistudio-mcp.js",
-      "electron/extensions/perplexity-research.js",
-      "electron/extensions/claude-research.js",
-      "docs/knowledge/fact-aistudio-mcp.md",
-      "docs/knowledge/fact-yandex-maps.md"
-    ],
-    "hash": "0888cfe7d11b6f3f8daf0292fe06fc441e01a12235d2c5ad45e81150af49ce66"
-  },
-  {
-    "path": "docs/knowledge/fact-semantic-search.md",
-    "type": "fact",
-    "explicit": [
-      "semantic_search",
-      "sqlite_vec",
-      "late_chunking",
-      "gemini_embeddings",
-      "mcp_server",
-      "reply_graph"
-    ],
-    "implicit": [
-      "sqlite_vec_dylib",
-      "sqlite_vec_bigint_coercion",
-      "gemini_rpm_ledger",
-      "mcp_electron_abi",
-      "reply_recursive_cte",
-      "telethon_backfill_concurrency",
-      "l2_normalisation_cosine",
-      "cross_project_mcp_gt_editor",
-      "hybrid_search_exclusion",
-      "index_progress_cumulative_snapshot"
-    ],
-    "symptoms": [
-      "Gemini API returns 429 quota exceeded error during batch indexing",
-      "sqlite-vec throws only integers are allowed for primary key values error",
-      "Vector search results score is showing Euclidean distance instead of 0 to 1 range",
-      "MCP server fails to load better-sqlite3 due to Node vs Electron ABI mismatch",
-      "Index progress bar jumps, resets to zero, or shows more than 100 percent completion",
-      "Telethon background backfill crashes due to session lock or concurrent database write limits"
-    ],
-    "related_components": [
-      "electron/database.js",
-      "electron/embedder.js",
-      "electron/index-job.js",
-      "mcp/server.js",
-      "src/components/ChatView.jsx"
-    ],
-    "hash": "1b99ed6e94a3809df855a1a84bbea3a969f1cbc099d4cb4d5430b1882b250d65"
-  },
-  {
-    "path": "docs/knowledge/fact-ipc.md",
-    "type": "fact",
-    "explicit": [
-      "ipc",
-      "ndjson",
-      "preload_bridge",
-      "subprocess",
-      "throttle",
-      "custom_protocol"
-    ],
-    "implicit": [
-      "ndjson_subprocess_protocol",
-      "job_progress_throttle",
-      "context_bridge_api",
-      "open_external_validation",
-      "sc_asset_protocol",
-      "tg_live_items_tail",
-      "logger_jobs_prefix",
-      "youtube_batch_transcribe_ndjson",
-      "stderr_ring_buffer"
-    ],
-    "symptoms": [
-      "UI freezing or lagging when processing thousands of items in a single job",
-      "External web links fail silently when clicked inside the Electron app",
-      "Job progress bar stays frozen for long periods and then jumps to completion",
-      "Multiple duplicate subscriptions to job updates causing memory leaks",
-      "Local avatars or assets failing to display in the UI due to security sandbox"
-    ],
-    "related_components": [
-      "electron/main.js",
-      "src/preload.js",
-      "src/lib/job-runner.js",
-      "src/lib/jobInvalidation.js"
-    ],
-    "hash": "adf14a50e1e5d5ea202467f44c18059083f58f5b358af905db5fc23b146b4367"
-  },
-  {
-    "path": "docs/knowledge/fix-production-asar-spawn.md",
-    "type": "fix",
-    "explicit": [
-      "asar_bundle",
-      "spawn_enotdir",
-      "extraResources",
-      "app_isPackaged",
-      "native_library_loading",
-      "cli_tools",
-      "electron_builder",
-      "sqlite_vec",
-      "session_files",
-      "homebrew_path",
-      "yt_dlp",
-      "ffmpeg",
-      "launchd",
-      "embedder_js"
-    ],
-    "implicit": [
-      "asar_unpacked_directory_requirement",
-      "spawn_cwd_filesystem_constraint",
-      "process_resourcesPath_dev_prod_switch",
-      "app_isPackaged_detection_pattern",
-      "sqlite_loadExtension_asar_limitation",
-      "require_resolve_rewrite_pattern",
-      "native_dylib_asarUnpack_rule",
-      "launchd_environment_path_minimal",
-      "homebrew_path_augmentation_pattern",
-      "extraResources_filter_inclusion_rule",
-      "session_file_priority_fallback",
-      "cli_tools_dual_read_pattern",
-      "logger_startup_tag_verification",
-      "child_process_environment_inheritance",
-      "job_runner_spawn_error_propagation"
-    ],
-    "symptoms": [
-      "Job fails with 'spawn ENOTDIR' in production but succeeds in dev",
-      "SQLite vector search crashes with 'no such module: vec0' after packaging",
-      "Embedding indexation fails because config.env not found in asar",
-      "Telegram fetch completes instantly with 'Session file not found' after clean install",
-      "yt-dlp fails when app launched from Finder (but works from terminal dev-server)"
-    ],
-    "related_components": [
-      "electron/job-runner.js",
-      "electron/main.js",
-      "electron/database.js",
-      "electron/embedder.js",
-      "package.json",
-      "cli-tools/shared/",
-      "cli-tools/telegram/"
-    ],
-    "hash": "76077d3be8479531e5be5510af800e4e27c10338fa1427cfba71b01587f2248f"
-  },
-  {
-    "path": "docs/knowledge/fact-chatgpt-research.md",
-    "type": "fact",
-    "explicit": [
-      "chatgpt-research",
-      "options.model",
-      "options.effort",
-      "render-freeze",
-      "LNA-dialog",
-      "sources-parsing",
-      "image-generation"
-    ],
-    "implicit": [
-      "deep_research_extension",
-      "chatgpt_automation_provider",
-      "hidden_tab_render_freeze",
-      "chrome_debugger_focus_emulation",
-      "local_network_access_bypass",
-      "content_script_bridge_fetch",
-      "multimodal_done_detection",
-      "research_artifact_storage",
-      "virtualized_sidebar_parsing",
-      "terminal_state_confirmation"
-    ],
-    "symptoms": [
-      "ChatGPT background research jobs get stuck in running state but complete instantly when manually focused",
-      "ChatGPT uses a wrong or previous model/effort level instead of the requested one",
-      "Fetch requests from ChatGPT content script to local bridge timeout or fail silently with no CORS logs",
-      "Completed research job remains stuck in running state for hours because close signal did not register with bridge",
-      "Multimodal image-only responses from ChatGPT cause the job to hang because no markdown text was generated"
-    ],
-    "related_components": [
-      "browser-extension/chatgpt-research.js",
-      "browser-extension/background.js",
-      "docs/knowledge/fact-deep-research.md",
-      "docs/knowledge/fact-asset-protocol.md"
-    ],
-    "hash": "d7bbc87dd5015f2f2cdc943aa008edbf7e79287e7074802b1ed14cb7cad16e8f"
-  },
-  {
-    "path": "docs/knowledge/fact-youtube-search.md",
-    "type": "fact",
-    "explicit": [
-      "YouTube search workflow and yt-dlp integration",
-      "&sp= base64 protobuf parameter decoding",
-      "Batch transcription without source record",
-      "Client-side filtering and sorting",
-      "Pagination with ranking deduplication",
-      "Sourceless job persistence and recovery",
-      "Ceiling detection for limited results",
-      "Search batch as ephemeral paste-flow"
-    ],
-    "implicit": [
-      "youtube_search_form_component",
-      "youtube_batch_picker_component",
-      "yt_dlp_search_ndjson_wrapper",
-      "sp_parameter_protobuf_decoder_js",
-      "search_batch_params_is_search_flag",
-      "search_batch_video_files_map",
-      "listjobs_sourceless_batch_recovery",
-      "ceiling_detection_limit_snapping",
-      "job_runner_youtube_search_oneshot",
-      "ipc_yt_search_fetch_handler",
-      "ipc_yt_assemble_batch_transcript_sourceless",
-      "activity_panel_sourceless_job_display",
-      "paste_screen_max_w_4xl_youtube",
-      "ndjson_protocol_job_progress_stream",
-      "yt_batch_transcribe_close_handler_video_files"
-    ],
-    "symptoms": [
-      "Search pagination returns same results twice or changes result order between requests",
-      "Search batch missing from Activity panel history or shows empty after app restart",
-      "URL &sp= filters display as garbled hex codes or lock/unlock incorrectly when URL changes",
-      "yt-dlp pagination fetches repeatedly but result count doesn't increase or list flickers",
-      "JobDetail shows empty table for completed search batch instead of selected videos and transcripts"
-    ],
-    "related_components": [
-      "src/components/YouTubeSearchForm.jsx",
-      "src/components/YouTubeBatchPicker.jsx",
-      "src/components/DatePicker.jsx",
-      "src/screens/JobDetail.jsx",
-      "electron/job-runner.js",
-      "electron/main.js",
-      "cli-tools/web/yt_search_ndjson.py"
-    ],
-    "hash": "0e7809af1324a106dc9f0b7354c0768788bb7ab78084c68bc5f10694259190ac"
-  },
-  {
-    "path": "docs/knowledge/fix-frontend-gotchas.md",
-    "type": "fix",
-    "explicit": [
-      "SQLite integer coercion in JSX",
-      "React JSX number rendering gotcha",
-      "Vite watcher configuration",
-      "Telethon sqlite WAL file mutations",
-      "Infinite scroll race condition",
-      "useSyncExternalStore snapshot identity",
-      "Functional updater timing issues",
-      "JSX comment parser edge case"
-    ],
-    "implicit": [
-      "sqlite_integer_truthiness_coercion",
-      "jsx_render_number_as_string",
-      "better_sqlite3_return_types",
-      "vite_watch_ignored_patterns",
-      "telethon_wal_file_mutations",
-      "cli_tools_isolation_from_watcher",
-      "infinite_scroll_race_between_observer_and_async_state",
-      "useref_synchronous_guard_vs_async_setstate",
-      "usesyncexternalstore_emit_from_functional_updater",
-      "batch_updates_in_custom_store",
-      "jsx_comment_with_asterisks_parser_bug",
-      "usesyncexternalstore_object_is_snapshot_comparison",
-      "filter_memoization_with_identity_cache",
-      "intersection_observer_pagination",
-      "pastescreen_paste_state_subscription",
-      "telegramscreen_sources_filter_selector",
-      "activity_panel_job_counter_display",
-      "job_detail_youtube_body_cost_display"
-    ],
-    "symptoms": [
-      "Literal '0' appears under every Telegram message in ChatView without explanation — SQLite integer column treated as falsy in JSX &&",
-      "Cost, duration, and view count display as '0' text in JobRow and JobDetail despite NOT NULL constraints — number types not coerced to boolean",
-      "Page white-screens with 'Maximum update depth exceeded' error on TelegramScreen mount — useSyncExternalStore getSnapshot returns new filtered array each call",
-      "DevTools flickers and screen resets to Home when opening TelegramClient session list — Telethon sqlite WAL mutation triggers Vite full-reload",
-      "Vite dev server crashes on 'Expected corresponding JSX closing tag' in file with `*/` or `/*` inside comment text — JSX parser closes comment prematurely",
-      "ChatView infinite scroll shows duplicate messages with React 'duplicate key' warning — race between IntersectionObserver and async setLoading state",
-      "Keystroke in PasteScreen input emits 'Cannot update component while rendering' warning every keystroke — subscription emit happening from functional updater phase",
-      "Repeated 'Maximum update depth exceeded' crash when opening screen with filtered source list — memoization missing on useSyncExternalStore filter selector"
-    ],
-    "related_components": [
-      "src/screens/ChatView.tsx",
-      "src/screens/PasteScreen.tsx",
-      "src/screens/TelegramScreen.tsx",
-      "src/components/ActivityPanel.tsx",
-      "src/components/JobRow.tsx",
-      "src/components/JobDetail.tsx",
-      "src/lib/sources.js",
-      "vite.config.js",
-      "electron/ipc.js"
-    ],
-    "hash": "7742c3f7a6819efe8395b7d767d8fcd22be4ce7e9006f3881de3d11f902b2f47"
-  },
-  {
-    "path": "docs/knowledge/fact-copy-saved.md",
-    "type": "fact",
-    "explicit": [
-      "CopySavedPanel_component",
-      "copy_save_operations",
-      "text_assembly_formatting",
-      "estimate_calculation",
-      "range_presets",
-      "item_eligibility_rules",
-      "telegram_comments",
-      "direction_control"
-    ],
-    "implicit": [
-      "IPC_contextBridge_assemblyEstimate",
-      "itemsAssembleEstimate_debounce_200ms",
-      "assemblyFetch_main_handler",
-      "assemblyTranscriptPaths_byte_stat",
-      "buildAssemblyWhere_type_eligibility_SQL",
-      "octet_length_UTF8_Cyrillic_byte_count",
-      "TelegramScopeFields_shared_form_component",
-      "direction_ASC_DESC_ORDER_BY_toggle",
-      "dialog_showSaveDialog_filename_pattern",
-      "listCommentsForPosts_SQL_JOIN_pattern",
-      "items_type_caption_eligibility_rules",
-      "bodyFor_transcript_file_extraction",
-      "toast_button_fixed_width_duration",
-      "useInvalidator_cache_invalidation_hook",
-      "reactions_caption_append_format"
-    ],
-    "symptoms": [
-      "Byte estimate vastly differs from actual copied size (300 KB shown, 700 KB pasted) due to UTF-8 character vs byte miscounting",
-      "Photos with captions incorrectly excluded from 'Text' selection despite matching eligibility criteria",
-      "Direction toggle (oldest/newest) fails to affect query order or reverses results",
-      "Live estimate stale when new messages arrive parallel to form; doesn't reflect actual count",
-      "Toast shows wrong message count—estimate and fetch use incompatible WHERE clauses"
-    ],
-    "related_components": [
-      "src/components/CopySavedPanel.jsx",
-      "src/components/TelegramScopeFields.jsx",
       "src/screens/TelegramScreen.jsx",
-      "electron/main.js",
-      "electron/assemble.js",
-      "electron/database.js"
+      "src/components/LibrarySidebar.jsx",
+      "src/components/ActivityPanel.jsx",
+      "cli-tools/shared/library_db.py"
     ],
-    "hash": "3b7d058896141ff100a52940364aa9ae83736bcc34afc2c61a2e1a13c5670780"
+    "hash": "74042ae4852db2823e1c9c13361ba1adc01baa914a3894092187c71fdce03daa"
   },
   {
-    "path": "docs/knowledge/fact-asset-protocol.md",
+    "path": "docs/knowledge/fact-telegram-sessions.md",
+    "hash": "f7a87bfebcc544abe7bfaba57ae3bfa8ebbc596efd6ed792a6ab2f7b853d1474",
     "type": "fact",
     "explicit": [
-      "custom_asset_protocol",
-      "avatar_fallback_chain",
-      "path_traversal_protection"
+      "Telegram sessions",
+      "Telethon session files",
+      "active Telegram session",
+      "session file locations",
+      "session login state machine",
+      "session binding to chats and folders",
+      "session conflict handling",
+      "deauthorized session handling"
     ],
     "implicit": [
-      "custom_file_protocol",
-      "web_security_electron",
-      "avatar_url_resolution",
-      "avatar_fallback_ui",
-      "research_artifacts_storage",
-      "twitter_media_cache",
-      "electron_main_protocol",
-      "library_root_directory",
-      "local_media_loading"
+      "shared/tg_session_path.py",
+      "python-workers/telegram/*.session",
+      "~/Library/Application Support/sc-desktop/sessions/telegram/*.session",
+      "~/.config/sc/settings.json",
+      "TelegramClient",
+      "tg_sessions_ndjson.py",
+      "tg_fetch_json.py",
+      "job-runner.js",
+      "tg:setActiveSession",
+      "sources.tg_session",
+      "tg_session_conflict",
+      "connect_authorized"
     ],
     "symptoms": [
-      "Local avatars or media attachments not loading in the UI due to webSecurity restrictions",
-      "Console error showing Not Allowed to load local resource file://",
-      "Telegram avatars show blank initials fallback even when downloaded to disk",
-      "Path traversal warning or directory escape vulnerability found in local resource loading",
-      "Images from research artifacts or generated by ChatGPT fail to render in the chat history"
+      "When a Telegram job suddenly uses the wrong account after the user switched sessions, this file explains the snapshot and override rules. When a known chat returns 0 items or a saved chat looks missing, this file helps distinguish active-session routing bugs from genuine Telegram behavior. When login or session validation fails with a blank Python exit, this file points to the session state machine and authorization checks. When a chat or folder seems tied to one account but appears under another, this file explains how session binding and conflicts are stored. When a production install cannot find or write a session file, this file explains the dev path, user-dir fallback, and bundle exclusion rules."
     ],
     "related_components": [
-      "src/components/Avatar.jsx",
-      "electron/main.js"
+      "shared/tg_session_path.py",
+      "tg_fetch_json.py",
+      "tg_sessions_ndjson.py",
+      "job-runner.js",
+      "main.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-telegram-topics.md",
+    "type": "fact",
+    "explicit": [
+      "Telegram forum topics (forum-supergroups)",
+      "Telethon GetForumTopicsRequest versioning",
+      "Database items table topic columns",
+      "ChatView chip-row rendering",
+      "Topic filtering UI patterns",
+      "Pre-fetch multi-select vs post-fetch single-select"
     ],
-    "hash": "e367eb63b598d9c388f20120dc2ac035145437f3525f03977be5cdd886f1b8b2"
+    "implicit": [
+      "telegram_forum_detection_entity_flag",
+      "telethon_version_cascade_import_strategy",
+      "telethon_peer_argument_vs_channel",
+      "telegram_general_topic_hardcoded_id1",
+      "message_reply_to_forum_topic_field",
+      "topic_titles_cache_scope_lifecycle",
+      "items_table_topic_id_topic_title_columns",
+      "chatview_topic_chip_row_component",
+      "forum_vs_nonforum_conditional_rendering",
+      "topic_filter_pre_fetch_server_side",
+      "selectedtopic_state_reset_useeffect_deps",
+      "telegram_topics_popover_multi_select",
+      "topicid_single_vs_topicids_multi_field_split",
+      "max_topic_title_on_rename_aggregate",
+      "topic_filter_opacity40_empty_types"
+    ],
+    "symptoms": [
+      "Forum topics showing as `#<id>` instead of title in chip-row or UI",
+      "ImportError mentioning GetForumTopicsRequest on job startup or parse",
+      "General topic missing from chip selection on forum-supergroup chats",
+      "Topic filter disappears or shows wrong count after navigating to another source",
+      "Chat items saved with topic_id=null when source.forum=true",
+      "Pre-fetch topics popover not appearing on first load of forum chat",
+      "Wrong topic_id or topic_title saved across renames (stale cache)",
+      "Argument error in Telethon call mentioning peer vs channel signature"
+    ],
+    "related_components": [
+      "src/components/ChatView.tsx",
+      "src/components/TelegramConfigForm.tsx",
+      "src/components/TelegramTopicsPopover.tsx",
+      "src/components/TelegramScopeFields.tsx",
+      "src/components/CopySavedPanel.tsx",
+      "src/database/schema.ts",
+      "electron/database.js",
+      "cli-tools/telegram_parser.py"
+    ],
+    "hash": "80d4f44a7a6f3df60f074764f0696f6ea09df43b8e4c520d87296969635bc3ae"
+  },
+  {
+    "path": "docs/knowledge/fact-tiktok.md",
+    "hash": "32b7cbed3e230169a48a7d126071ab485baf7f902396a8d43cbf2a988bcf9f50",
+    "type": "fact",
+    "explicit": [
+      "TikTok platform behavior in SC Desktop",
+      "single video transcription",
+      "channel listing via yt-dlp",
+      "batch transcription jobs",
+      "canonical TikTok URL handling",
+      "TikTok channel IDs and source matching",
+      "batch cost estimation",
+      "transcript file location",
+      "channel fetch history exclusion"
+    ],
+    "implicit": [
+      "platform=tiktok",
+      "tk_transcribe",
+      "tk_channel_fetch",
+      "tk_batch_transcribe",
+      "python-workers/web/tk_single_ndjson.py",
+      "python-workers/web/tk_channel_ndjson.py",
+      "python-workers/web/tk_batch_transcribe_ndjson.py",
+      "yt-dlp --flat-playlist --dump-single-json",
+      "TikWM play URL",
+      "uploader_id",
+      "db._upsertWebChannel",
+      "transcripts/tiktok"
+    ],
+    "symptoms": [
+      "When a TikTok single-video flow is being wired, this file tells you that there is no awaiting_ai stage and the job should go straight to audio download plus Gemini transcription.",
+      "When channel sync is slow or expensive, this file explains that TikTok listings use yt-dlp, not Apify, and why full re-fetches can still happen on large channels.",
+      "When downloaded TikTok media starts failing later in the queue, this file explains that TikWM play URLs expire quickly and must be fetched per video inside the processing loop.",
+      "When dates look wrong in the UI, this file clarifies that TikTok timestamps are real and can be rendered as full dates, unlike YouTube's approximate dates.",
+      "When a TikTok profile URL, short URL, or video URL is pasted, this file defines the canonicalization and the expected kind detection.",
+      "When source matching breaks after a TikTok handle change, this file shows that uploader_id is the stable channel key and handle is only a fallback.",
+      "When history becomes noisy after a channel refresh, this file explains why tk_channel_fetch must not be written to jobs history."
+    ],
+    "related_components": [
+      "python-workers/web/tk_single_ndjson.py",
+      "python-workers/web/tk_channel_ndjson.py",
+      "python-workers/web/tk_batch_transcribe_ndjson.py",
+      "main.js",
+      "detect.js",
+      "db._upsertWebChannel",
+      "TikTokBatchPicker.fmtDate",
+      "ChatView"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-titlebar.md",
+    "type": "fact",
+    "explicit": [
+      "Frameless window with traffic lights reservation",
+      "Drag region CSS cascading behavior",
+      "Title bar height coordination",
+      "DevTools docking in dev mode"
+    ],
+    "implicit": [
+      "frameless_window_titlebar_style_hidden",
+      "webkit_app_region_drag_inheritance_cascading",
+      "env_titlebar_area_x_macOS_overlay_variable",
+      "titlebar_height_40px_tailwind_h10_sync",
+      "traffic_lights_overlap_padding_left_reservation",
+      "popover_fixed_overlay_no_drag_propagation",
+      "main_js_browserwindow_titlebaroverlay_config",
+      "app_jsx_titlebar_flex_items_center_layout",
+      "devtools_docked_right_320px_width_workaround",
+      "chromium_devtools_localstorage_splitviewstate_prefs",
+      "macOS_traffic_lights_vertical_centering_13px",
+      "drag_region_geometry_not_event_driven",
+      "titlebar_child_elements_inherit_drag_region",
+      "leading_none_flex_vertical_align_workaround"
+    ],
+    "symptoms": [
+      "Window title text overlaps or hides under red/yellow/green traffic light buttons on macOS",
+      "Clicking divs or interactive elements in popovers above the title bar drags the window instead of firing onClick handlers",
+      "Elements in fullscreen overlays (QuickOpen backdrop, popover) respond to drags rather than clicks in the top ~40px",
+      "Title bar text appears misaligned vertically from the traffic lights after changing font size or Tailwind classes",
+      "DevTools opens with 600px width on first dev run, obscures too much of the app content"
+    ],
+    "related_components": [
+      "electron/main.js",
+      "src/App.jsx",
+      "src/components/popover components",
+      "src/screens/QuickOpen (backdrop)",
+      "preload.js (if env variable needs polyfilling)"
+    ],
+    "hash": "236a089e515a0849b0ef247fbb48d67e7f94835e145813da633edd349cd67fdd"
+  },
+  {
+    "path": "docs/knowledge/fact-twitter.md",
+    "type": "fact",
+    "explicit": [
+      "twitter_mcp_integration",
+      "twitter_browser_scraping",
+      "lazy_media_fetch",
+      "thread_tree_parsing"
+    ],
+    "implicit": [
+      "twitter_browser_bridge_mcp",
+      "browser_user_session_scraping",
+      "library_db_dual_schema",
+      "active_tab_visibility_constraint",
+      "twitter_reply_hierarchy_tree",
+      "sc_asset_custom_protocol",
+      "mcp_tool_definitions",
+      "query_string_preservation_twimg",
+      "lazy_image_caching",
+      "dom_stagnation_detection"
+    ],
+    "symptoms": [
+      "Twitter thread replies are missing when fetched in a background tab",
+      "Twitter images show 404 errors or download in extremely low resolution",
+      "Local Twitter media assets fail to load in the Electron renderer",
+      "Thread structure parent_external_id links are broken or missing depth levels",
+      "Twitter search runs slowly or gets stuck during DOM scroll virtualization"
+    ],
+    "related_components": [
+      "mcp/server.js",
+      "mcp/twitter-browser.js"
+    ],
+    "hash": "ac8a2885bd94070a1b41bf5f861e2f12019d098f3f17a84428eabd16b70e391b"
+  },
+  {
+    "path": "docs/knowledge/fact-yandex-maps.md",
+    "type": "fact",
+    "explicit": [
+      "yandex_maps_search",
+      "browser_mcp_tool",
+      "organization_search",
+      "ssr_state_extraction",
+      "pagination_strategy"
+    ],
+    "implicit": [
+      "main_world_chrome_scripting_injection",
+      "ssr_state_inline_script_parsing",
+      "background_tab_own_tab_creation",
+      "own_tab_finally_cleanup_with_ownTab_guard",
+      "site_url_yclid_utm_parameter_stripping",
+      "url_pagination_page_parameter",
+      "area_bounds_consistency_ll_spn_pinning",
+      "organization_id_dedupe_map",
+      "completion_marker_complete_flag",
+      "social_media_link_normalization_wa_me_viber",
+      "token_budget_weight_optimization",
+      "no_api_key_free_ssr_extraction"
+    ],
+    "symptoms": [
+      "Search pagination returns fewer results than Yandex reports in total count",
+      "Website URLs extracted include tracking redirects (yclid, utm_source parameters)",
+      "Search results change or inconsistent when refining location area (ll, spn parameters)",
+      "Social media contact links are excessively long due to URL-encoded message text",
+      "Need to find organizations by category in specific geographic area without API key"
+    ],
+    "related_components": [
+      "browser-extension/mcp-handlers.js",
+      "mcp/browser/index.js"
+    ],
+    "hash": "8e1e1506138b8b10694cd09d65815773427646a121607d51dfe6d187a80336ac"
   },
   {
     "path": "docs/knowledge/fact-youtube-comments.md",
@@ -1200,218 +1874,404 @@
     "hash": "94032dbf21a7eb2cb08be2244b912bcf4c0fdbd587d71343bddf13fc3029353a"
   },
   {
-    "path": "docs/knowledge/fact-jobs.md",
+    "path": "docs/knowledge/fact-youtube-search.md",
+    "hash": "9da3fffa83a6b19cf0d2b8fb78b6e826d0a7cde6ae127c2d6c5cd1370cd65ec5",
     "type": "fact",
     "explicit": [
-      "jobs_lifecycle",
-      "state_machine",
-      "zombie_jobs",
-      "in_memory_items",
-      "dual_id_space",
-      "inline_ai_processing",
-      "skip_processed_media",
-      "mid_run_db_sync",
-      "tg_preview_job"
+      "YouTube search sourceless batch flow",
+      "Plain query vs YouTube results URL input",
+      "yt-dlp search modes",
+      "YouTube sp filter decoding",
+      "Client-side search filters and sorting",
+      "Pagination with deduplication",
+      "Ceiling detection for limited result sets",
+      "Search-batch persistence without source_id",
+      "JobDetail read-only finalized picker",
+      "Wider max-w-4xl search container"
     ],
     "implicit": [
-      "job_runner_lifecycle",
-      "sqlite_db_row_fallback",
-      "tg_fetch_media_pipeline",
-      "assemblyai_polling_loop",
-      "skip_processed_file_protocol",
-      "tg_index_custom_cancel",
-      "sound_feedback_afplay",
-      "ig_batch_combined_auto",
-      "library_db_dual_schema",
-      "mid_run_db_sync"
-    ],
-    "symptoms": [
-      "Job remains stuck in running state in Activity Panel after restarting Electron",
-      "Cancel button in Activity Panel does nothing when trying to stop Telegram index",
-      "Infinite loading spinner shown when opening a historical job from Source History",
-      "Activity Panel shows progress but Source History shows zero processed items",
-      "AssemblyAI transcription status freezes or does not show real-time progress"
-    ],
-    "related_components": [
+      "python-workers/web/yt_search_ndjson.py",
       "electron/job-runner.js",
-      "electron/index-job.js",
-      "electron/database.js",
-      "cli-tools/tg_fetch_json.py",
-      "cli-tools/gemini_utils.py",
-      "src/components/JobDetail.jsx",
-      "src/components/ActivityPanel.jsx"
-    ],
-    "hash": "536eb22d92e3a7e17fa8c507298f8891a65a2d8109bc4ccc53006985a1a256f8"
-  },
-  {
-    "path": "docs/knowledge/fact-twitter.md",
-    "type": "fact",
-    "explicit": [
-      "twitter_mcp_integration",
-      "twitter_browser_scraping",
-      "lazy_media_fetch",
-      "thread_tree_parsing"
-    ],
-    "implicit": [
-      "twitter_browser_bridge_mcp",
-      "browser_user_session_scraping",
-      "library_db_dual_schema",
-      "active_tab_visibility_constraint",
-      "twitter_reply_hierarchy_tree",
-      "sc_asset_custom_protocol",
-      "mcp_tool_definitions",
-      "query_string_preservation_twimg",
-      "lazy_image_caching",
-      "dom_stagnation_detection"
+      "electron/job-runner.js::runYoutubeSearch",
+      "electron/job-runner.js::startYoutubeBatchTranscribe",
+      "electron/main.js::yt:searchFetch",
+      "electron/main.js::yt:assembleBatchTranscript",
+      "src/components/YouTubeSearchForm.jsx",
+      "src/components/YouTubeBatchPicker.jsx",
+      "src/components/DatePicker.jsx",
+      "src/screens/JobDetail.jsx::YoutubeBatchBody",
+      "decodeYtSp",
+      "ytsearchN",
+      "playlist-end",
+      "approximate_date",
+      "search_videos",
+      "video_files",
+      "source_id_NULL",
+      "max-w-4xl",
+      "showSearchControls"
     ],
     "symptoms": [
-      "Twitter thread replies are missing when fetched in a background tab",
-      "Twitter images show 404 errors or download in extremely low resolution",
-      "Local Twitter media assets fail to load in the Electron renderer",
-      "Thread structure parent_external_id links are broken or missing depth levels",
-      "Twitter search runs slowly or gets stuck during DOM scroll virtualization"
+      "A user pastes a YouTube search URL or plain query and expects a batch transcription flow with no Library source created.",
+      "The result list changes when filters or sort are adjusted, but the developer must keep the controls in sync with URL-provided `sp` filters.",
+      "Pagination appears to repeat or reshuffle items, so the implementation must refetch a larger window and deduplicate by video id.",
+      "A batch job restarts after Electron reload and the JobDetail still needs the original selected videos and transcript file map.",
+      "The UI shows too few results after a filter-heavy query, so the code must detect a ceiling and explain that YouTube returned all available videos.",
+      "Search results need to stay ephemeral, with activity history persistence but no source-backed library item."
     ],
     "related_components": [
-      "mcp/server.js",
-      "mcp/twitter-browser.js"
-    ],
-    "hash": "ac8a2885bd94070a1b41bf5f861e2f12019d098f3f17a84428eabd16b70e391b"
-  },
-  {
-    "path": "docs/knowledge/fact-browser-mcp.md",
-    "type": "fact",
-    "explicit": [
-      "browser_mcp",
-      "claude_code",
-      "bridge_js",
-      "browser_extension",
-      "chrome_mv3",
-      "chrome_user_scripts",
-      "shadow_dom"
-    ],
-    "implicit": [
-      "mcp_browser_architecture",
-      "mcp_bridge_autospawn",
-      "mv3_sw_keepalive",
-      "reconnect_leak_backoff",
-      "frame_routing_gotcha",
-      "chrome_userscripts_csp",
-      "synthetic_hover_limits",
-      "ambiguity_guard",
-      "shadow_dom_scan",
-      "multi_session_command_rewrite",
-      "harvest_list_virtualization"
-    ],
-    "symptoms": [
-      "First MCP tool call fails with 'Extension not connected' or 'No response' after 30 seconds of inactivity",
-      "High system CPU usage or kernel_task spikes with thousands of closed TCP sockets on port 3458",
-      "Selector queries like click or harvest_list return 'Element not found' on pages containing iframes",
-      "Raw JavaScript evaluation fails with Content Security Policy violations on secure sites like AI Studio",
-      "Click actions target the wrong element silently when multiple identical buttons exist on the page"
-    ],
-    "related_components": [
-      "mcp/browser/index.js",
-      "mcp/browser/bridge.js",
-      "browser-extension/mcp-handlers.js",
-      "browser-extension/mcp-content.js"
-    ],
-    "hash": "c1c7144b7b24d7f1d4e7da8415d685d41f016e28877ce7165bb17cf6dc1760f9"
-  },
-  {
-    "path": "docs/knowledge/fact-tiktok.md",
-    "type": "fact",
-    "explicit": [
-      "tk_single_ndjson: sourceless single video transcription",
-      "tk_channel_ndjson: channel listing via yt-dlp --flat-playlist",
-      "tk_batch_transcribe_ndjson: batch video transcription with Gemini",
-      "Single video lacks awaiting_ai stage (unlike YouTube)",
-      "TikWM play URL expires in 5-15 minutes (CDN signed URLs)",
-      "URL canonicalization: @handle, profile paths, short vt.tiktok.com/vm.tiktok.com",
-      "Actual Unix timestamps from yt-dlp (not approximate dates)",
-      "uploader_id as numeric external_id for channel deduplication"
-    ],
-    "implicit": [
-      "tk_single_ndjson_script",
-      "tk_channel_ndjson_yt_dlp_flat_playlist",
-      "tk_batch_transcribe_ndjson_script",
-      "awaiting_ai_stage_absent_tiktok_design",
-      "tikwm_play_url_5_15min_expiration_constraint",
-      "canonicalize_tiktok_url_head_redirect_short",
-      "tiktok_unix_timestamp_actual_not_approximate",
-      "uploader_id_numeric_external_id_upsert",
-      "transcripts_tiktok_storage_path_platform",
-      "gemini_16khz_mono_batch_cost_formula",
-      "ndjson_subprocess_protocol_job_runner",
-      "batch_picker_youtube_pattern_mirror",
-      "channel_fetch_job_filtered_history_not_logged",
-      "library_db_dual_schema_sync_external_id",
-      "fts5_transcript_indexing_tiktok_files"
-    ],
-    "symptoms": [
-      "Single video transcription fails because code tries to implement awaiting_ai stage that TikTok never has",
-      "Channel fetch events polluting ActivityPanel history instead of being filtered like yt_channel_fetch",
-      "Batch transcription hits silent failures: play URLs expired mid-queue because TikWM CDN URLs only last 5-15 minutes",
-      "Short vt.tiktok.com or vm.tiktok.com URLs not canonicalized properly (need HEAD redirect to extract @handle)",
-      "Dates showing as approximate when should be precise (actual Unix timestamp available from yt-dlp)",
-      "Handle rebrand causes duplicate channels because UPSERT not checking uploader_id first"
-    ],
-    "related_components": [
+      "python-workers/web/yt_search_ndjson.py",
       "electron/job-runner.js",
-      "cli-tools/web/tk_single_ndjson.py",
-      "cli-tools/web/tk_channel_ndjson.py",
-      "cli-tools/web/tk_batch_transcribe_ndjson.py",
-      "electron/database.js (_upsertWebChannel)",
-      "src/detect.js (canonicalize routing)",
-      "TikTokBatchPicker (UI component)",
-      "PasteScreen (URL detection)",
-      "ActivityPanel (job history filtering)",
-      "fact-youtube.md",
-      "fact-jobs.md",
-      "fact-apify.md"
+      "electron/main.js",
+      "src/components/YouTubeSearchForm.jsx",
+      "src/components/YouTubeBatchPicker.jsx",
+      "src/components/DatePicker.jsx",
+      "src/screens/JobDetail.jsx"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-youtube.md",
+    "hash": "12568dec852873a0c1bed7048688b288adf6d8fa4b51493d84398ad6a1c4d6c7",
+    "type": "fact",
+    "explicit": [
+      "YouTube platform behavior",
+      "channel as source",
+      "video as item",
+      "single video without channel",
+      "URL canonicalization",
+      "channel_id UPSERT",
+      "approximate dates",
+      "two-stage single video transcription",
+      "single-paste source plus items",
+      "cache lookup",
+      "search picker cache hits",
+      "batch transcription",
+      "unified picker component",
+      "kickoff stage",
+      "YouTubeScopeFields",
+      "smart action button",
+      "video URL to resolve channel",
+      "file locations",
+      "channel fetch is not stored in jobs"
     ],
-    "hash": "1ab5c3f380718681643d0a279f55a6cd37d098e527da1129fabafab45ee63403"
+    "implicit": [
+      "python-workers/web/yt_single_ndjson.py",
+      "python-workers/web/yt_channel_ndjson.py",
+      "python-workers/web/yt_batch_transcribe_ndjson.py",
+      "python-workers/web/yt_comments_ndjson.py",
+      "python-workers/web/yt_batch_comments_ndjson.py",
+      "db.upsertYoutubeChannel",
+      "db.findYoutubeTranscriptForVideo",
+      "db.findYoutubeTranscriptsByVideoIds",
+      "db.bulkUpsertItems",
+      "yt-dlp",
+      "flat-playlist",
+      "youtubetab:approximate_date",
+      "React.memo",
+      "useMemo",
+      "CacheHitPanel",
+      "YouTubeBatchPicker.jsx",
+      "YouTubeChannelForm.jsx",
+      "YouTubeScopeFields",
+      "Activity Recent",
+      "LibrarySidebar",
+      "ytAssembleBatchTranscript",
+      "job-runner.js"
+    ],
+    "symptoms": [
+      "When a pasted YouTube video becomes a new source in Library instead of staying sourceless, this file explains the new source-plus-items contract.",
+      "When the same video is pasted again and you expect an instant cache hit but the app re-runs yt-dlp or AI, this file describes the cache lookup paths.",
+      "When channel dates all look the same day or seem approximate, this file explains the yt-dlp date tradeoff and the UI formatting choice.",
+      "When a YouTube channel paste needs a manual limit or direction before fetching, this file covers the kickoff stage and scope fields.",
+      "When a batch selection should show green cache marks or a copy button instead of transcribe, this file explains the picker and smart action behavior.",
+      "When you need to know why channel fetches do not appear in job history while transcribes do, this file states the intentional history policy."
+    ],
+    "related_components": [
+      "python-workers/web/yt_single_ndjson.py",
+      "python-workers/web/yt_channel_ndjson.py",
+      "python-workers/web/yt_batch_transcribe_ndjson.py",
+      "python-workers/web/yt_comments_ndjson.py",
+      "python-workers/web/yt_batch_comments_ndjson.py",
+      "src/components/YouTubeBatchPicker.jsx",
+      "src/components/YouTubeChannelForm.jsx",
+      "src/components/YouTubeScopeFields.jsx",
+      "src/components/ChatView.jsx",
+      "src/lib/job-runner.js",
+      "src/main.js",
+      "electron/database.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fact-yt-extension-bridge.md",
+    "hash": "22da890bf0bb77c387ccc62f59e43cfcf773795f052ec4da438ba99ad92cb89c",
+    "type": "fact",
+    "explicit": [
+      "HTTP bridge between sc-desktop and browser-extension",
+      "loopback server on 127.0.0.1:53127",
+      "YouTube add/status/fetch/resume endpoints",
+      "cache-first YouTube import",
+      "clipboard behavior on cache-hit and comments",
+      "long-poll status updates",
+      "hot-reload of the browser extension",
+      "Yandex circuit-breaker behavior",
+      "CORS allow-list and path traversal protection"
+    ],
+    "implicit": [
+      "electron/browser-bridge.js",
+      "job-runner.js",
+      "browser-extension background.js",
+      "chrome.storage.local",
+      "chrome.runtime.reload",
+      "chrome.alarms",
+      "ws reload channel",
+      "jobRunner.subscribe",
+      "lookupYoutubeCache",
+      "copyFileToClipboard",
+      "LIB_ROOT",
+      "ALLOWED_ORIGINS",
+      "yt_transcribe",
+      "yt_comments_ndjson"
+    ],
+    "symptoms": [
+      "When clicking the YouTube pill shows that sc-desktop is unavailable, this file explains the health check and fixed bridge port. When a cached transcript exists but the extension still starts a new transcription job, this file describes the cache-first branch and why items-origin and jobs-origin now both return cached_file_path. When the clipboard is empty after a successful transcript, or comments overwrite the transcript text, this file explains the bridge-side clipboard merge logic. When the status pill updates several seconds late after the file is already ready, this file explains the long-poll /yt-status flow and the old alarm-polling gap. When extension changes do not apply immediately, or the service worker keeps reloading too often in Yandex, this file explains the hot-reload watcher, cooldown, and circuit-breaker behavior. When /yt-fetch can read arbitrary paths or a request from an unexpected site is rejected, this file explains the CORS allow-list and path traversal check."
+    ],
+    "related_components": [
+      "electron/browser-bridge.js",
+      "electron/job-runner.js",
+      "browser-extension/background.js",
+      "browser-extension/youtube-content.js",
+      "browser-extension/settings.js",
+      "browser-extension/mcp-content.js",
+      "docs/knowledge/fact-yt-extension-flow.md",
+      "docs/knowledge/fact-browser-extension.md",
+      "docs/knowledge/fact-youtube.md",
+      "docs/knowledge/fact-database.md"
+    ]
   },
   {
     "path": "docs/knowledge/fact-yt-extension-flow.md",
+    "hash": "e7f20d747882e61216b275affebf52929d2e1f4e39b6efed9a16bdecbc84e7e0",
     "type": "fact",
     "explicit": [
-      "YouTube extension content-scripts",
-      "Gemini Studio autoscrape integration",
-      "Pill UI (singleton/per-card/dock variants)",
-      "State management via videoStateMap",
-      "Chrome background tracker with job polling",
-      "Toast notifications and visibility-aware delivery",
-      "Player speed control (Comma/Period shortcuts)",
-      "Cmd-row with comments selection"
+      "YouTube to sc-desktop end-to-end flow",
+      "singleton per-card and player dock pills",
+      "state map per video id",
+      "stage-aware progress",
+      "global toast stack",
+      "shorts support",
+      "split SC-pill copy plus AI",
+      "cmd-row with comments",
+      "AI target dispatch and autoscrape",
+      "background tracker and visibility-aware delivery"
     ],
     "implicit": [
-      "youtube_pill_singleton_video_preview_dom_reuse",
-      "youtube_pill_per_card_yt_thumbnail_view_model_hover",
-      "player_dock_position_fixed_anchor_bbox_rAF_poller",
-      "chrome_storage_local_requestId_payload_autoscrape_handoff",
-      "videoStateMap_per_videoId_state_broadcast_renderer",
-      "chrome_alarms_tracker_jobs_6s_polling_cycle",
-      "keyboard_shortcut_comma_period_capture_preventDefault_dups",
-      "chrome_runtime_sendMessage_callback_vs_fire_and_forget_sw",
-      "aistudio_autoscrape_waitForCompletion_before_postrun_mutation_scar",
-      "thumb_recycle_dataset_videoId_read_at_click_time_idempotency",
-      "visibility_aware_toast_ttl_on_visibilitychange_trigger"
+      "youtube-content.js",
+      "aistudio-autoscrape.js",
+      "background tracker",
+      "chrome.alarms",
+      "chrome.storage.local",
+      "tabs.sendMessage",
+      "tabs.create",
+      "ytThumbnailViewModelHost",
+      "ytd-video-preview",
+      "ytd-watch-next-secondary-results-renderer",
+      "ytd-rich-grid-renderer",
+      "ytd-shelf-renderer",
+      "ytd-item-section-renderer",
+      "ytd-channel-featured-content-renderer",
+      "ytm-shorts-lockup-view-model",
+      "ytLockupViewModelContentImage",
+      "#sc-yt-toast-host",
+      "#sc-ai-toast-host",
+      "#sc-yt-shorts-dock",
+      "videoStateMap",
+      "data-sc-pinned",
+      "data-video-id",
+      "visibilitychange",
+      "openTargetBackground",
+      "Gemini Studio",
+      "Claude",
+      "ChatGPT",
+      "sc-compose"
     ],
     "symptoms": [
-      "Pill button copies wrong video after scrolling homepage—shows another video's ID instead",
-      "Transcription completes successfully, but notification toast vanishes when you switch back to YouTube tab",
-      "Speed controls (−/1.0x/+) render off-screen or in top-left corner after F5 refresh on /shorts/",
-      "Gemini Studio autoscrape fails with 'permission denied' error when system instructions or model are switched",
-      "Double-clicking the pill button creates duplicate transcription jobs instead of ignoring the second attempt"
+      "When a YouTube click should save a video and open an AI target, this file explains the full chain from card hover to background completion.",
+      "When a pill appears in the wrong place, duplicates on virtualized cards, or keeps the wrong video id after scroll, this file shows the intended DOM strategy.",
+      "When progress looks stuck at a generic working state, this file explains the stage-aware states and why the UI should update by job stage.",
+      "When done or error disappears too early on a hidden tab, this file describes the visibility-aware delivery and TTL rules.",
+      "When an AI target opens before the transcript is ready, or a background autoscrape loses its payload, this file covers the tracker and handoff model.",
+      "When shorts, watch pages, and channel pages need the same YouTube action UI but different anchors, this file documents the page-specific behavior.",
+      "When you need to understand why copy, + ai, and comments are split into different click paths, this file explains the product contract."
     ],
     "related_components": [
       "docs/knowledge/fact-yt-extension-bridge.md",
-      "docs/knowledge/fact-browser-extension.md",
-      "docs/knowledge/fact-aistudio-mcp.md",
-      "docs/knowledge/fact-claude-autoscrape.md",
-      "docs/knowledge/methodology/переносимый-дизайн.md"
+      "docs/methodology/переносимый-дизайн.md",
+      "browser-extension/content-scripts/youtube-content.js",
+      "browser-extension/content-scripts/aistudio-autoscrape.js",
+      "browser-extension/background.js",
+      "electron/browser-bridge.js"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-bash-jq-echo-pitfall.md",
+    "type": "fix",
+    "explicit": [
+      "bash echo escape interpretation",
+      "JSON control character validation",
+      "jq parse error handling",
+      "here-string operator",
+      "printf safe redirection"
     ],
-    "hash": "73d3963991090c6d82fc8437f4007437b929d92e3e9057f34ba5b45171e2df6c"
+    "implicit": [
+      "bash_echo_escape_interpretation",
+      "zsh_echo_behavior_difference",
+      "json_backslash_escape_sequences",
+      "jq_parse_error_control_char",
+      "shell_here_string_operator_syntax",
+      "printf_percent_s_safe_pipe",
+      "curl_response_json_piping",
+      "xpg_echo_bash_option_macos",
+      "zsh_dash_E_semantics_incompatible",
+      "skill_external_research_bridge_loop",
+      "multiline_text_field_escaping"
+    ],
+    "symptoms": [
+      "jq reports 'parse error: Invalid control character at line 1' after piping curl response",
+      "Deep research status loop hangs indefinitely, never reads .status field from bridge response",
+      "Bridge returns valid JSON with escaped newlines but echo converts them to literal LF bytes",
+      "Same external-research SKILL works on Linux but fails on macOS Catalina+ with default zsh shell"
+    ],
+    "related_components": [
+      "~/.claude/skills/external-research/SKILL.md",
+      "docs/knowledge/fact-deep-research.md"
+    ],
+    "hash": "52c19e612b4912212f58e673e216cb9cdd16dcb862cf790ef9fe9218c078f27b"
+  },
+  {
+    "path": "docs/knowledge/fix-frontend-gotchas.md",
+    "hash": "aa8a7a83fd73ac3a4b35fc80f1ae4a6c31d62b6cafdcda7b4b0188735b548afa",
+    "type": "fix",
+    "explicit": [
+      "JSX `&& 0` with SQLite integer columns",
+      "Vite full reload from `python-workers` WAL files",
+      "ChatView infinite scroll race on async `setLoading`",
+      "Cannot update a component while rendering from a functional updater",
+      "JSX comments containing `*/` break the Vite parser",
+      "`useSyncExternalStore` with `arr.filter()` causes an infinite render loop"
+    ],
+    "implicit": [
+      "SQLite INTEGER columns returning 0/1 numbers",
+      "better-sqlite3 number coercion",
+      "React JSX child rendering of numeric 0",
+      "Vite file watcher on project root",
+      "python-workers Telethon WAL artifacts",
+      "IntersectionObserver pagination race",
+      "React 18 state batching",
+      "useRef in-flight guard",
+      "custom store synchronous emit",
+      "functional updater side effects",
+      "JSX comment parsing",
+      "useSyncExternalStore snapshot identity",
+      "Object.is snapshot comparison",
+      "module-level filter cache"
+    ],
+    "symptoms": [
+      "A boolean-looking field from SQLite renders a stray `0` in the UI instead of hiding the element.",
+      "Opening a Telegram settings view or any Telethon-backed screen suddenly reloads the renderer and sends the user back to Home.",
+      "Infinite scroll loads the same page twice and produces duplicate message keys or repeated rows.",
+      "React warns that one component is updating another during render, usually after typing into a local input tied to a shared store.",
+      "A JSX comment with glob-like text or `*/` makes Vite fail on a line after the comment and the page goes blank.",
+      "A store selector built on `useSyncExternalStore` starts an endless rerender loop or crashes with maximum update depth exceeded."
+    ],
+    "related_components": [
+      "src/components/ChatView.jsx",
+      "src/components/ActivityPanel.jsx",
+      "src/screens/JobDetail.jsx",
+      "src/screens/PasteScreen.jsx",
+      "src/lib/sources.js",
+      "vite.config.js",
+      "python-workers/telegram/tg_sessions_ndjson.py"
+    ]
+  },
+  {
+    "path": "docs/knowledge/fix-popover-outside-click.md",
+    "type": "fix",
+    "explicit": [
+      "popover close-on-outside race condition",
+      "React useEffect commit timing",
+      "mousedown listener registration delay",
+      "setTimeout(0) event loop deferral",
+      "outside-click detection pattern"
+    ],
+    "implicit": [
+      "setopen_race_with_mousedown_listener",
+      "useeffect_commit_immediate_listener_add",
+      "settimeout_zero_defer_to_next_tick",
+      "wrapref_contains_outside_click_detect",
+      "mousedown_event_before_click_handler",
+      "ref_current_remounted_between_mousedown_click",
+      "event_propagation_order_mousedown_click_mouseup",
+      "keydown_immediate_vs_mousedown_deferred_listeners",
+      "capture_phase_propagates_down_before_bubble",
+      "composed_path_does_not_solve_timing_issue",
+      "cdp_synthetic_events_show_race_condition",
+      "popover_dropdown_outside_click_pattern"
+    ],
+    "symptoms": [
+      "Popover does not open when clicking the trigger button",
+      "Popover closes immediately on the same click that opens it",
+      "React DevTools shows open=false on next render despite onClick calling setOpen(true)",
+      "Synthetic events in CDP or tests cause popover to not stay open",
+      "Popover fails to reopen after being closed on the first open-and-close cycle"
+    ],
+    "related_components": [
+      "src/components/DatePicker.jsx"
+    ],
+    "hash": "4bcf00587dafb81e755a77a37edf4c16eca4374c8595a8e60f5d0159f0090e1b"
+  },
+  {
+    "path": "docs/knowledge/fix-production-asar-spawn.md",
+    "hash": "de93b4cea711d08b1b1bf57081c06c25bf948cfe0774b80df76a39305a50e221",
+    "type": "fix",
+    "explicit": [
+      "production asar spawn ENOTDIR",
+      "python-workers bundled inside app.asar",
+      "extraResources packaging",
+      "app.isPackaged path switching",
+      "sqlite-vec vec0.dylib asarUnpack",
+      "Telegram session file fallback",
+      "GUI-launched PATH augmentation for yt-dlp and ffmpeg"
+    ],
+    "implicit": [
+      "electron-builder",
+      "app.asar",
+      "process.resourcesPath",
+      "child_process.spawn",
+      "extraResources",
+      "asarUnpack",
+      "app.isPackaged",
+      "python-workers",
+      "bundle .venv",
+      "sqlite-vec-darwin-arm64",
+      "vec0.dylib",
+      "tg_session_path.py",
+      "launchd PATH",
+      "yt-dlp",
+      "ffmpeg"
+    ],
+    "symptoms": [
+      "A production build starts jobs, but Telegram fetch or transcription fails immediately with spawn ENOTDIR in the Activity panel.",
+      "The same feature works in dev, which points to a packaging-only path problem rather than a worker logic bug.",
+      "A packaged app cannot spawn Python workers or load native extensions because the resolved path still points inside app.asar.",
+      "After installation, Telegram jobs fail with missing session files unless the session path falls back to the user data directory.",
+      "On a GUI-launched Mac build, yt-dlp or ffmpeg metadata steps fail because the process PATH is too minimal."
+    ],
+    "related_components": [
+      "electron/job-runner.js",
+      "electron/database.js",
+      "package.json",
+      "electron/main.js",
+      "python-workers/shared/tg_session_path.py"
+    ]
   },
   {
     "path": "docs/knowledge/fix-react-strictmode-alive-flag.md",
@@ -1451,727 +2311,320 @@
     "hash": "1f6a2f5a99749f115c8f2141300d5c4fb8e958fa4bcc03ad4cc2ac661b0acbeb"
   },
   {
-    "path": "docs/knowledge/fact-telegram-topics.md",
-    "type": "fact",
-    "explicit": [
-      "Telegram forum topics (forum-supergroups)",
-      "Telethon GetForumTopicsRequest versioning",
-      "Database items table topic columns",
-      "ChatView chip-row rendering",
-      "Topic filtering UI patterns",
-      "Pre-fetch multi-select vs post-fetch single-select"
-    ],
-    "implicit": [
-      "telegram_forum_detection_entity_flag",
-      "telethon_version_cascade_import_strategy",
-      "telethon_peer_argument_vs_channel",
-      "telegram_general_topic_hardcoded_id1",
-      "message_reply_to_forum_topic_field",
-      "topic_titles_cache_scope_lifecycle",
-      "items_table_topic_id_topic_title_columns",
-      "chatview_topic_chip_row_component",
-      "forum_vs_nonforum_conditional_rendering",
-      "topic_filter_pre_fetch_server_side",
-      "selectedtopic_state_reset_useeffect_deps",
-      "telegram_topics_popover_multi_select",
-      "topicid_single_vs_topicids_multi_field_split",
-      "max_topic_title_on_rename_aggregate",
-      "topic_filter_opacity40_empty_types"
-    ],
-    "symptoms": [
-      "Forum topics showing as `#<id>` instead of title in chip-row or UI",
-      "ImportError mentioning GetForumTopicsRequest on job startup or parse",
-      "General topic missing from chip selection on forum-supergroup chats",
-      "Topic filter disappears or shows wrong count after navigating to another source",
-      "Chat items saved with topic_id=null when source.forum=true",
-      "Pre-fetch topics popover not appearing on first load of forum chat",
-      "Wrong topic_id or topic_title saved across renames (stale cache)",
-      "Argument error in Telethon call mentioning peer vs channel signature"
-    ],
-    "related_components": [
-      "src/components/ChatView.tsx",
-      "src/components/TelegramConfigForm.tsx",
-      "src/components/TelegramTopicsPopover.tsx",
-      "src/components/TelegramScopeFields.tsx",
-      "src/components/CopySavedPanel.tsx",
-      "src/database/schema.ts",
-      "electron/database.js",
-      "cli-tools/telegram_parser.py"
-    ],
-    "hash": "80d4f44a7a6f3df60f074764f0696f6ea09df43b8e4c520d87296969635bc3ae"
-  },
-  {
-    "path": "docs/knowledge/fact-claude-research.md",
-    "type": "fact",
-    "explicit": [
-      "Claude research provider",
-      "model selection",
-      "effort levels (low/medium/high/extra/max)",
-      "thinking mode",
-      "research vs chat mode",
-      "DOM selectors",
-      "menu configuration"
-    ],
-    "implicit": [
-      "claude_model_selector_dom",
-      "effort_level_configuration_persistence",
-      "thinking_toggle_independent_state",
-      "research_mode_flag_behavior",
-      "base_ui_stale_dom_bug",
-      "model_hydration_timing_race",
-      "text_normalization_glyphs",
-      "verify_and_retry_pattern",
-      "model_sticky_per_account",
-      "web_search_always_enabled",
-      "menu_closed_dom_remains",
-      "arial_label_verify_trigger",
-      "model_label_unified_format",
-      "opacity_visibility_filtering",
-      "negative_lookahead_opus_matching"
-    ],
-    "symptoms": [
-      "Job submits on account default model instead of requested model (hydration timeout or model selector failed)",
-      "Effort level selector not responding to clicks or showing wrong level despite UI clicks",
-      "Thinking mode toggle missing from UI or not persisting after selection",
-      "Text matching fails to find menu items (\"Web search\", \"Research\") that visually exist in DOM",
-      "Stale DOM nodes from closed menus are being clicked but no effect occurs",
-      "Research job stuck in configuring state when Opus 3 + research:true combination attempted",
-      "Verify-and-retry loops exhaust without finding model/effort radio despite being in snapshot",
-      "Plus-menu configuration (Research/Web search checkboxes) not preserving state between requests",
-      "Menu reopening shows wrong aria-label after model selection, confusing verify logic"
-    ],
-    "related_components": [
-      "browser-extension/claude-research.js",
-      "external-research skill",
-      "docs/knowledge/fact-deep-research.md",
-      "docs/knowledge/fact-chatgpt-research.md",
-      "docs/knowledge/fact-research-ui.md",
-      "docs/knowledge/fact-claude-autoscrape.md"
-    ],
-    "hash": "ca3bf671570bbfacc29a899cebade81168b29428798ca2ba8332e4d850972516"
-  },
-  {
-    "path": "docs/knowledge/fact-local-files.md",
-    "type": "fact",
-    "explicit": [
-      "local-files-as-platform",
-      "detection-mechanism",
-      "assemblyai-engine-default",
-      "gemini-api-key-gotcha",
-      "progress-polling",
-      "form-persistence"
-    ],
-    "implicit": [
-      "detect_js_local_file_kind",
-      "local_audio_video_ext_regex",
-      "ephemeral_platform_no_library_entry",
-      "gemini_api_key_placeholder_workaround",
-      "assemblyai_polling_submit_2sec_interval",
-      "aai_progress_stages_uploading_queued_transcribing_completed",
-      "eta_calculation_0_2x_realtime_ratio",
-      "silenced_stdout_real_stdout_capture",
-      "local_transcribe_ndjson_py_wrapper",
-      "useJobs_reattachment_mount_identity_pattern",
-      "local_transcript_storage_null_source_id",
-      "ipc_command_local_transcribe",
-      "LocalBody_component_readonly_view",
-      "recent_files_local_basename_display",
-      "ndjson_transcribe_progress_event"
-    ],
-    "symptoms": [
-      "User pastes local file path, but it doesn't create a persistent source entity like Telegram or YouTube does",
-      "Long transcription (30+ minutes) shows spinner with no progress updates or time estimate",
-      "AssemblyAI engine selection fails with 'GEMINI_API_KEY not found' error despite not using Gemini",
-      "Navigation away from Home and back causes transcribe form state to reset, hiding job progress",
-      "Confused why local files never appear in Library panel like other platforms",
-      "Progress callback output missing or garbled when transcription runs inside silenced() context"
-    ],
-    "related_components": [
-      "src/lib/detect.js",
-      "src/components/LocalFileTranscribeForm.jsx",
-      "src/screens/JobDetail.jsx",
-      "cli-tools/web/local_transcribe_ndjson.py",
-      "electron/job-runner.js",
-      "electron/main.js"
-    ],
-    "hash": "801f5dfa1478eb535d5c127240122eb9cd810249c3264ff1d15bab776422563c"
-  },
-  {
-    "path": "docs/knowledge/fact-source-actions.md",
-    "type": "fact",
-    "explicit": [
-      "action-row",
-      "ToolbarButton",
-      "TelegramScopeFields",
-      "NewRequestSplitButton",
-      "TelegramSelection"
-    ],
-    "implicit": [
-      "action_row_toolbar",
-      "toolbar_button_component",
-      "source_page_navigation",
-      "telegram_scope_fields",
-      "copy_saved_panel",
-      "telegram_config_form",
-      "instagram_config_form",
-      "youtube_quick_fetch_form",
-      "new_request_split_button",
-      "ephemeral_paste_flows",
-      "telegram_selection_store",
-      "inline_form_toggle",
-      "source_overview_logic",
-      "index_button_embeddings",
-      "catch_up_comments_tg",
-      "backfill_aware_skip_dupes",
-      "job_history_pagination"
-    ],
-    "symptoms": [
-      "Toolbar buttons on the channel/source page are misaligned or have different heights",
-      "Opening the settings form resets the navigation breadcrumbs or sidebar selection",
-      "Form inputs are duplicated or drift between the fetch parameters and copy-to-clipboard panel",
-      "A single video or message link paste creates an unwanted permanent channel in the sidebar library",
-      "Sidebar multi-select right-click triggers a quick fetch with default instead of last-used parameters",
-      "Old jobs are missing from the source history because of a hard limit with no load-more option"
-    ],
-    "related_components": [
-      "src/components/ToolbarButton.tsx",
-      "src/components/TelegramScopeFields.tsx",
-      "src/components/TelegramConfigForm.tsx",
-      "src/components/CopySavedPanel.tsx",
-      "src/components/NewRequestSplitButton.tsx",
-      "src/lib/telegramSelection.js"
-    ],
-    "hash": "8169e74d5509de2f8aae4b650108e391db70d76b984e309226e2394cc6b00acd"
-  },
-  {
     "path": "docs/knowledge/fix-telethon-electron-spawn.md",
+    "hash": "a21850a2561f3426256714c1465668f53f3709e2cc85fe71aca1f3dd31edbcc4",
     "type": "fix",
     "explicit": [
-      "telethon_mac_ver_crash",
-      "macOS_Tahoe_sandbox_restriction",
-      "Electron_CoreFoundation_plist_isolation",
-      "platform.mac_ver_monkey_patch_solution",
-      "sw_vers_shell_utility_workaround"
+      "Telethon mac_ver crash on Electron spawn on macOS Tahoe",
+      "platform.mac_ver monkey patch before Telethon import",
+      "Electron child_process.spawn sandbox on macOS",
+      "sw_vers fallback for macOS version detection",
+      "telethon/crypto/libssl.py _find_ssl_lib failure"
     ],
     "implicit": [
-      "telethon_spawn_macos_sandbox",
-      "platform_mac_ver_electron_isolation",
-      "monkey_patch_platform_preimport_order",
-      "electron_subprocess_spawn_environment_sandbox",
-      "sw_vers_posix_shell_workaround_bypass",
-      "libssl_dylib_version_detection_macos",
-      "corefs_plist_access_blocked_by_sandbox",
-      "tg_fetch_json_import_order_critical",
-      "cli_tools_shared_compat_module_pattern",
-      "child_process_spawn_environment_constraints",
-      "ActivityPanel_job_error_display_tracking",
-      "job_exit_code_1_error_correlation",
-      "cryptography_urllib3_mac_ver_risk_propagation"
+      "python-workers/telegram/tg_fetch_json.py",
+      "python-workers/shared/_electron_compat.py",
+      "telethon.crypto.libssl",
+      "platform.mac_ver",
+      "subprocess.check_output",
+      "/usr/bin/sw_vers",
+      "child_process.spawn",
+      "Electron sandbox helper",
+      "libssl.dylib"
     ],
     "symptoms": [
-      "Job crashes in Activity panel with ValueError: not enough values to unpack when parsing platform.mac_ver() in telethon/crypto/libssl.py line 26",
-      "Python subprocess exits with code 1 when spawned from Electron child_process.spawn(), but identical script succeeds in direct terminal invocation",
-      "platform.mac_ver() returns empty tuple ('', '', '') when subprocess starts from Electron on macOS Tahoe, blocking Telethon's libssl version detection",
-      "Job detail screen shows error containing _find_ssl_lib, mac_ver, or release.split() ValueError when running tg_fetch_json.py from Activity panel"
+      "A Telegram parsing job fails in Activity panel with status error, while the same Python script works in a normal terminal.",
+      "The detail view shows python exited 1 with a traceback inside telethon/crypto/libssl.py and a ValueError about split/unpack.",
+      "The failure appears only when Python is launched from Electron on macOS Tahoe or similar versions.",
+      "You need this file when Telethon import crashes before any items are emitted and the job never reaches done.",
+      "You need this file when a macOS version detection error mentions mac_ver, _find_ssl_lib, or libssl selection."
     ],
     "related_components": [
-      "cli-tools/telegram/tg_fetch_json.py",
-      "cli-tools/shared/_electron_compat.py",
-      "electron/main.js",
-      "docs/knowledge/fact-ipc.md"
-    ],
-    "hash": "d7e0ee0b17079f58c47583a174b9e1b63fab7c555c6000e516f7accc31ef0590"
-  },
-  {
-    "path": "docs/knowledge/fact-telegram-sessions.md",
-    "type": "fact",
-    "explicit": [
-      "telegram-sessions",
-      "session-file-paths",
-      "session-resolution-priority",
-      "active-session-config",
-      "session-chat-binding",
-      "login-state-machine",
-      "telethon-client",
-      "session-authorization",
-      "session-security"
-    ],
-    "implicit": [
-      "tg_session_path_resolve_session_dirs",
-      "settings_json_telegram_session_single_source",
-      "job_runner_snapshot_at_spawn",
-      "telethon_client_session_sqlite_format",
-      "dev_path_cli_tools_telegram",
-      "prod_path_library_application_support",
-      "tg_sessions_ndjson_login_subcommands",
-      "session_argument_override_--session",
-      "sources_tg_session_binding_upsert",
-      "folder_unique_tg_filter_id_tg_session",
-      "telegram_api_iter_messages_dialog_policy",
-      "phone_code_hash_short_lived_ephemeral",
-      "session_unauthorized_error_code_machine_readable",
-      "sqlitesession_busy_timeout_patch_telethon",
-      "connect_authorized_not_client_start",
-      "conflict_latch_manual_pin_recovery"
-    ],
-    "symptoms": [
-      "Fetch job with @username target completes with 0 items saved despite entity found",
-      "Job exits with status=1 but stderr is empty — no error message visible in Activity",
-      "Running fetch job continues with original session after user switches active session in Settings",
-      "'database is locked' error when fetch and folder_refresh jobs run simultaneously",
-      "Chat shows conflict badge and tg_session_conflict=1 after successful fetch despite correct session"
-    ],
-    "related_components": [
-      "electron/main.js",
-      "electron/job-runner.js",
-      "cli-tools/shared/tg_session_path.py",
-      "cli-tools/telegram/tg_sessions_ndjson.py",
-      "cli-tools/telegram/tg_fetch_json.py",
-      "cli-tools/telegram/tg_reply_backfill_ndjson.py",
-      "cli-tools/telegram/tg_resolve_folder_ndjson.py",
-      "renderer/screens/TelegramScreen.tsx",
-      "renderer/lib/sessionToasts.js",
-      "~/.config/sc/settings.json"
-    ],
-    "hash": "95d5cfadb7707fdc6e54fed0962852d2ad7a87ad41eecba07a45284677a57287"
-  },
-  {
-    "path": "docs/knowledge/fact-reddit.md",
-    "type": "fact",
-    "explicit": [
-      "reddit",
-      "reddit_search",
-      "reddit_thread",
-      "reddit_backends"
-    ],
-    "implicit": [
-      "reddit_auth_cookies",
-      "reddit_scraper_apify",
-      "subreddit_normalization_lstrip",
-      "reddit_comment_bfs_tree",
-      "mcp_reddit_tools",
-      "reddit_ndjson_events",
-      "reddit_view_dfs",
-      "settings_json_reddit",
-      "job_runner_lifecycle"
-    ],
-    "symptoms": [
-      "Reddit search or thread jobs fail with 403 Forbidden errors in api mode",
-      "Reddit comment trees are flattened or lack proper indentation in the ThreadView",
-      "Subreddit names are truncated incorrectly, turning redditdev into edditdev",
-      "The application initiates unexpected paid Apify runs without explicit user opt-in",
-      "Reddit search results cap out at 100 items even when setting a higher limit parameter"
-    ],
-    "related_components": [
-      "cli-tools/reddit/reddit_auth.py",
-      "cli-tools/reddit/rd_thread_ndjson.py",
-      "cli-tools/reddit/rd_search_ndjson.py",
-      "src/components/RedditThreadView.jsx",
-      "src/components/RedditSearchView.jsx",
-      "src/components/RedditBackendControl.jsx",
-      "mcp/server.js"
-    ],
-    "hash": "2e57016def73e8f3ab188a5b3a1b48eb053d4e2042f9f1b1996da8eb8374c16b"
-  },
-  {
-    "path": "docs/knowledge/fix-bash-jq-echo-pitfall.md",
-    "type": "fix",
-    "explicit": [
-      "bash echo escape interpretation",
-      "JSON control character validation",
-      "jq parse error handling",
-      "here-string operator",
-      "printf safe redirection"
-    ],
-    "implicit": [
-      "bash_echo_escape_interpretation",
-      "zsh_echo_behavior_difference",
-      "json_backslash_escape_sequences",
-      "jq_parse_error_control_char",
-      "shell_here_string_operator_syntax",
-      "printf_percent_s_safe_pipe",
-      "curl_response_json_piping",
-      "xpg_echo_bash_option_macos",
-      "zsh_dash_E_semantics_incompatible",
-      "skill_external_research_bridge_loop",
-      "multiline_text_field_escaping"
-    ],
-    "symptoms": [
-      "jq reports 'parse error: Invalid control character at line 1' after piping curl response",
-      "Deep research status loop hangs indefinitely, never reads .status field from bridge response",
-      "Bridge returns valid JSON with escaped newlines but echo converts them to literal LF bytes",
-      "Same external-research SKILL works on Linux but fails on macOS Catalina+ with default zsh shell"
-    ],
-    "related_components": [
-      "~/.claude/skills/external-research/SKILL.md",
-      "docs/knowledge/fact-deep-research.md"
-    ],
-    "hash": "52c19e612b4912212f58e673e216cb9cdd16dcb862cf790ef9fe9218c078f27b"
-  },
-  {
-    "path": "docs/knowledge/fact-research-ui.md",
-    "type": "fact",
-    "explicit": [
-      "research_ui",
-      "mcp_history",
-      "new_research_form",
-      "electron_bridge_ipc",
-      "sqlite_research_jobs"
-    ],
-    "implicit": [
-      "renderer_ipc_bridge_only",
-      "cors_null_origin_fetch_bypass",
-      "ram_sqlite_merged_jobs",
-      "research_jobs_desktop_only",
-      "sc_asset_research_artifacts",
-      "chatgpt_conversation_chaining",
-      "watch_early_error_polling",
-      "mcp_job_timer_shared",
-      "new_research_screen",
-      "mcp_running_popover",
-      "mcp_history_panel",
-      "aistudio_job_screen"
-    ],
-    "symptoms": [
-      "Failed to fetch error when starting or stopping a research job from the renderer UI",
-      "Research history is lost and empty after restarting the desktop application",
-      "Thinking depth effort dropdown is active while the thinking checkbox is unchecked in Claude settings",
-      "Perplexity or Claude rate limit errors fail silently without updating the form button state",
-      "Research image artifacts or input pictures do not display properly in the job history panel"
-    ],
-    "related_components": [
-      "src/screens/NewResearchScreen.jsx",
-      "src/components/McpRunningPopover.jsx",
-      "src/components/McpJobTimer.jsx",
-      "src/components/McpHistoryPanel.jsx",
-      "src/screens/AistudioJobScreen.jsx",
-      "electron/database.js",
-      "electron/browser-bridge.js"
-    ],
-    "hash": "5d86f7aab99845515f0e326e9857fd9b0f38d1c62641ae11410a4070c15da864"
-  },
-  {
-    "path": "docs/knowledge/fact-browser-extension.md",
-    "type": "fact",
-    "explicit": [
-      "browser_extension",
-      "google_ai_studio",
-      "perplexity_scraper",
-      "claude_scraper",
-      "youtube_parser"
-    ],
-    "implicit": [
-      "nmh_node_subprocess",
-      "aistudio_deep_research",
-      "perplexity_rest_api",
-      "claude_dom_export",
-      "virtual_scroll_teardown",
-      "nmh_idempotent_setup",
-      "electron_http_bridge_53127",
-      "strict_determinism_guard",
-      "clipboard_vs_zip",
-      "logging_nmh_facade"
-    ],
-    "symptoms": [
-      "Deep Research chats in Google AI Studio missing answers or failing with skipped turn errors",
-      "Browser extension logs are not written to the exporter file or NMH ping fails",
-      "Claude.ai thread export times out or hangs on files inside the artifacts sidebar",
-      "Perplexity exporter misses answer content or returns empty files on task threads",
-      "YouTube button on video cards does not update its status or trigger the background tab"
-    ],
-    "related_components": [
-      "browser-extension/manifest.json",
-      "browser-extension/content.js",
-      "browser-extension/claude-content.js",
-      "browser-extension/perplexity-content.js",
-      "browser-extension/background.js",
-      "browser-extension/nmh/host.js",
-      "browser-extension/nmh/setup.js"
-    ],
-    "hash": "95053323ec8b2831650786d8e83bc445f485d6aaa1376685249232f2c5f70505"
-  },
-  {
-    "path": "docs/knowledge/fact-yt-extension-bridge.md",
-    "type": "fact",
-    "explicit": [
-      "http_bridge",
-      "browser_extension",
-      "loopback_server",
-      "long_polling",
-      "clipboard_concurrency",
-      "auto_resume",
-      "hot_reload",
-      "yandex_browser_quirks"
-    ],
-    "implicit": [
-      "electron_browser_bridge",
-      "job_runner_cache_hit",
-      "path_traversal_protection",
-      "clipboard_write_concurrency",
-      "awaiting_ai_resume",
-      "chrome_runtime_reload_circuit_breaker",
-      "websocket_keepalive_service_worker",
-      "chrome_storage_session_yandex_bug",
-      "browser_mcp_hot_reload"
-    ],
-    "symptoms": [
-      "Browser extension shows 'sc-desktop is not running' even when the Electron app is active",
-      "Clipboard is left empty or is overwritten by comments instead of the video transcript after scraping",
-      "Scraper gets stuck in 'awaiting_ai' or 'searching' state forever, especially after transient network drop",
-      "Extension in Yandex Browser triggers yellow warning 'This extension has reloaded too frequently' and freezes",
-      "Long polling lag where the desktop app plays success sound but extension UI takes up to 6 seconds to update"
-    ],
-    "related_components": [
-      "electron/browser-bridge.js",
-      "browser-extension/background.js",
-      "browser-extension/youtube-content.js"
-    ],
-    "hash": "3d2c253c1f40a6605ad731a2a2a2034beb21473beeac51304fa6794e48ce86a2"
+      "python-workers/telegram/tg_fetch_json.py",
+      "python-workers/shared/_electron_compat.py",
+      "telethon/crypto/libssl.py"
+    ]
   },
   {
     "path": "docs/knowledge/fix-telethon-session-lock.md",
+    "hash": "6559fc9717f347b81573f82c3437568ce28067113cd1a4a3cf23c2bf5942aeb7",
     "type": "fix",
     "explicit": [
-      "Telethon SQLiteSession busy_timeout patch",
-      "Database lock on parallel subprocess access",
-      "Concurrent Telegram job guard mechanism",
-      "WAL + timeout SQLite pattern"
+      "Telethon session lock",
+      "sqlite database is locked",
+      "busy_timeout",
+      "parallel Telegram jobs",
+      "reply backfill guard",
+      "library.db busy_timeout"
     ],
     "implicit": [
-      "telethon_session_sqlite_lock",
-      "ndjson_subprocess_protocol",
-      "tg_fetch_json_helper",
-      "library_db_dual_schema",
-      "job_runner_lifecycle",
-      "ActivityPanel_job_error_display",
-      "busy_timeout_pragma",
-      "concurrent_job_guard",
-      "cli_electron_shared_db",
-      "telethon_sqlitesession_auth",
-      "wal_mode_sqlite",
-      "paste_flow_preview_resolve"
-    ],
-    "symptoms": [
-      "Job shows 'OperationalError: database is locked' in Activity panel after spawning 50+ second Telegram fetch",
-      "Simultaneous preview request triggered during active fetch fails instantly with lock error",
-      "Chat name resolution (resolve-title) crashes when another Telegram job is running on the same source",
-      "Manual backfill attempt returns 'another Telegram job is running for source #X' instead of executing",
-      "Second Python subprocess attempting to write to session2.session fails immediately without retry or timeout"
-    ],
-    "related_components": [
-      "cli-tools/telegram/tg_fetch_json.py",
+      "python-workers/telegram/tg_fetch_json.py",
+      "TelegramClient",
+      "SQLiteSession",
+      "PRAGMA busy_timeout",
       "electron/database.js",
-      "src/components/ActivityPanel.tsx",
-      "src/ipc/tg.ts",
-      "src/jobs/jobRunner.ts"
-    ],
-    "hash": "5979f5929a90cef233edc906883a7ac911860c1aa79c636e29e04494c69c4407"
-  },
-  {
-    "path": "docs/knowledge/fact-deep-research.md",
-    "type": "fact",
-    "explicit": [
-      "deep_research_mcp",
-      "browser_bridge",
-      "claude_ai_research",
-      "perplexity_ai_research",
-      "chrome_extension_keepalive",
-      "tab_freezing",
-      "lexical_paste_clipboard",
-      "recovery_state"
-    ],
-    "implicit": [
-      "mcp_browser_bridge",
-      "research_state_ram_only",
-      "chrome_focus_emulation_debugger",
-      "mutation_observer_throttling",
-      "claude_spa_reload_bug",
-      "perplexity_document_stable_polling",
-      "main_world_click_execute_script",
-      "local_network_access_bypass",
-      "tab_closed_zombie_fallback",
-      "confirmed_terminal_write",
-      "dual_history_sqlite_ram"
+      "jobs.values()",
+      "source_id",
+      "tg_fetch",
+      "tg_folder_fetch",
+      "tg_preview",
+      "tg_reply_backfill",
+      "tg:index IPC",
+      "Gemini index job",
+      "WAL mode"
     ],
     "symptoms": [
-      "Research job stuck in 'running' state forever after browser tab is closed by user",
-      "Claude.ai automation fails to click 'Confirm' or 'Send' button due to CSP restrictions",
-      "Perplexity deep research returns only a few hundred characters instead of the full multi-page document",
-      "Background automation tab stops executing scripts or rendering updates when user switches away from the browser",
-      "Deep research state is lost or displays as queued after the main desktop application restarts"
+      "A long Telegram fetch starts and another Telegram action immediately fails with OperationalError: database is locked.",
+      "A paste-flow preview runs while a fetch job is active and the preview errors instantly.",
+      "Resolving a chat title while another Telegram job is running produces the same lock error.",
+      "A reply backfill starts during an active Telegram fetch on the same source and exits with database is locked.",
+      "Running CLI and Electron at the same time against the shared library database causes write conflicts."
     ],
     "related_components": [
-      "electron/research-state.js",
-      "electron/browser-bridge.js",
-      "browser-extension/claude-research.js",
-      "browser-extension/perplexity-research.js",
-      "browser-extension/chatgpt-research.js",
-      "browser-extension/background.js",
-      "browser-extension/mcp-handlers.js",
-      "browser-extension/research-badge.js"
-    ],
-    "hash": "b4d9264061abebc3697b2eb49094c600652afa2b316334b2ce4ba938b04e69e0"
+      "python-workers/telegram/tg_fetch_json.py",
+      "electron/database.js",
+      "cli-tools/docs/knowledge/fact-telegram.md"
+    ]
   },
   {
-    "path": "docs/knowledge/fact-aistudio-mcp.md",
-    "type": "fact",
+    "path": "docs/knowledge/fix-yt-dlp-meta-retry.md",
+    "hash": "cffa2379814840252743f2e176176dc3bb8146787adf95ebd3e49b2fc8aa4190",
+    "type": "fix",
     "explicit": [
-      "Google AI Studio integration",
-      "MCP research flow via HTTP",
-      "Deep Research and Antigravity models",
-      "Browser extension architecture",
-      "Chrome debugger focus emulation",
-      "Paid API key dialog handling"
+      "transient yt-dlp metadata fetch failure on first click",
+      "retrying fetch_meta with linear backoff",
+      "returning metadata and error tuple instead of None",
+      "diagnostic stderr and exit code propagation",
+      "YouTube single-video and batch transcription metadata fetch"
     ],
     "implicit": [
-      "chrome_debugger_focus_emulation_cdp",
-      "aistudio_dom_api_window_scaistudio",
-      "http_research_start_status_poll",
-      "storage_local_parallel_atomic_serialize",
-      "usergesture_eval_activation_background_tab",
-      "hidden_tab_visibility_rAF_bypass",
-      "paid_key_dialog_prompt_restore_before_select",
-      "model_interaction_api_vs_generatecontent_phases",
-      "completion_detection_stop_button_vanished",
-      "backend_error_internal_vs_ratelimit_retry",
-      "mutation_observer_sync_sweep_hidden_tab",
-      "titlebar_mcp_popover_composite_pattern",
-      "textContent_vs_innertext_layout_hidden",
-      "double_click_submit_race_angular_material",
-      "net_tap_request_inspection_debugger",
-      "ndjson_progress_events_state_relay",
-      "mcp_job_timer_live_monotonic_client",
-      "tab_auto_close_reason_aware_graceful"
+      "python-workers/web/yt_single_ndjson.py",
+      "yt_batch_transcribe_ndjson.py",
+      "yt_comments_ndjson.py",
+      "yt-dlp --dump-json",
+      "cookies.sqlite",
+      "Firefox cookies extraction",
+      "remote-components ejs:github",
+      "nsig sigfuncs warmup",
+      "subprocess.run"
     ],
     "symptoms": [
-      "Background tab research hangs with empty DOM or truncated text despite browser console showing no errors",
-      "Parallel aistudio_run jobs fail with 'job not found in storage' on second/third concurrent call",
-      "Link API key dialog auto-submits empty prompt, leaving agent with 'the actual task is missing' response",
-      "parseLastTurn returns null/empty after waitForCompletion succeeded; parseLastTurn works after manually switching tab to foreground",
-      "result.text contains double response text or two independent answers merged (e.g., '17×23=391.Результат...')",
-      "Deep Research never materializes final answer in background tab, stuck on 'Generating research plan'",
-      "MCP job shows status:running in bridge but zero progress updates reach renderer ActivityPanel",
-      "Internal error from backend despite background tab having valid API key linked",
-      "chrome.debugger.onDetach silently drops focus emulation on concurrent aistudio jobs; parallel runs timeout",
-      "Service worker disconnects mid-job with 'Extension not connected' and never reconnects despite SW still alive"
+      "The first click on a YouTube card or player triggers `yt-dlp metadata fetch failed` in Activity, but an immediate retry works.",
+      "A `+ ai` action fails once, `copy` succeeds, and a second `+ ai` succeeds on the same valid video.",
+      "You need this file when a metadata fetch is flaky only on the cold first attempt and the real stderr is missing.",
+      "You need to diagnose why the UI shows a generic metadata error instead of the actual yt-dlp exit code and stderr.",
+      "You are deciding whether a failure is a true content problem or a transient yt-dlp/browser-cookie warmup issue."
     ],
     "related_components": [
-      "electron/browser-bridge.js",
-      "browser-extension/aistudio-mcp.js",
-      "browser-extension/aistudio-core.js",
-      "browser-extension/background.js",
-      "browser-extension/mcp-handlers.js",
-      "src/components/AistudioJobScreen.jsx",
-      "src/components/McpRunningPopover.jsx",
-      "src/components/McpJobTimer.jsx",
-      "src/screens/ActivityPanel.jsx"
-    ],
-    "hash": "bd9148552270b0b8283db68ee287564699b436494a8463e5ef891dc187128e78"
+      "python-workers/web/yt_single_ndjson.py",
+      "python-workers/web/yt_batch_transcribe_ndjson.py",
+      "python-workers/web/yt_comments_ndjson.py",
+      "docs/knowledge/fact-youtube.md",
+      "docs/knowledge/fact-yt-extension-bridge.md"
+    ]
   },
   {
-    "path": "docs/knowledge/fact-instagram.md",
-    "type": "fact",
+    "path": "docs/knowledge/fix-лаг-индексации.md",
+    "hash": "1cfce5aa313f0674ec4fc7f532d7ea02069d117d95cb0abcf6e3be7974fa6be1",
+    "type": "fix",
     "explicit": [
-      "clips/user pagination for stateless reel listing without cookies",
-      "two-backend split: metadata_backend and transcribe_backend in settings.json",
-      "apify/instagram-reel-scraper actor for profile metadata fetch",
-      "apple_yang/instagram-transcripts-scraper actor for per-reel audio extraction",
-      "IGAPIClient with skip_session=True for anonymous X-IG-App-ID requests",
-      "web_profile_info endpoint for profile overview (follower count, media_count, biography)",
-      "ndjson protocol in ig_profile_ndjson.py and ig_batch_transcribe_ndjson.py",
-      "ig_sessions_ndjson.py inventory and delete operations for cookies files",
-      "external_id prefix scheme: reel: and post: for shortcode namespace collision avoidance",
-      "signed video_url from clips/user payload with 5-15 minute TTL",
-      "instagram_session.json (Playwright) and instagram_api_session.json for private profile cookies",
-      "batch cache per user_id to avoid repeated clips/user pagination",
-      "apify run polling every 3 seconds until status=SUCCEEDED",
-      "forceForm prop to override auto-lookup in InstagramConfigForm",
-      "combined transcript auto-saved to jobs/<date>_ig_batch_<jobN>_combined.txt",
-      "deliberate no auto-fallback: visible error required when api rate-limited",
-      "Android User-Agent with X-IG-App-ID 936619743392459 header for public requests"
+      "indexing lag",
+      "hidden reply backfill",
+      "stop button appears unresponsive",
+      "synchronous SQLite work in main process",
+      "auto-index scroll lag",
+      "already-indexed no-op behavior",
+      "cancel-aware throttle sleep"
     ],
     "implicit": [
-      "ndjson_subprocess_protocol",
-      "library_db_external_id_prefix_namespace",
-      "spawn_subprocess_ig_api_core_silenced_ansi",
-      "settings_json_instagram_metadata_transcribe_backends_split",
-      "clips_user_endpoint_pagination_state_machine",
-      "apify_run_polling_liveness_check_3sec",
-      "signed_video_url_ttl_expiration_handling",
-      "batch_cache_per_user_id_hit_ratio_optimization",
-      "cookies_session_optional_private_profiles_only",
-      "rate_limit_visible_error_no_silent_fallback_pattern",
-      "shortcode_post_reel_collision_prevention_prefix",
-      "combined_txt_auto_generation_batch_outcome",
-      "metadata_vs_transcribe_independent_workflows",
-      "ig_api_client_stateless_mode_public_profiles",
-      "apify_actor_run_incomplete_cancel_cost_issue"
+      "tg:index",
+      "tg_reply_backfill",
+      "IndexJob",
+      "selectItems",
+      "vectorCountForSource",
+      "semanticIndexCountsForSources",
+      "sources:list",
+      "items_vec",
+      "better_sqlite3",
+      "sample",
+      "reply_resolved",
+      "reactions_resolved",
+      "setImmediate",
+      "data-bus invalidation",
+      "batch catch-up orchestration"
     ],
     "symptoms": [
-      "Profile metadata fetch gets rate-limited on api backend, need to understand when to independently switch metadata_backend to apify",
-      "Batch transcription retrieves stale or expired video URLs, suspect signed CDN TTL expiration or per-user_id cache bug in pagination",
-      "Adding support for private Instagram profiles, confused about when cookies are required vs when stateless mode is sufficient",
-      "Transcribe batch runs slow on large profiles with 100+ reels, need to verify if per-user_id cache is accumulating seen reels correctly",
-      "Cancelled transcription job on Apify still consumes credits after SIGTERM, need to understand why actor run abort API is not called",
-      "External ID collision alert between post and reel in same profile, need to verify prefix namespacing and UNIQUE constraint enforcement",
-      "InstagramConfigForm behavior differs between paste-flow and SourceDetail new-request context, need forceForm prop explanation",
-      "Apify actor run returns empty dataset or polling timeout, need to understand failure modes and whether silent fallback should exist"
+      "When clicking index on a chat makes the app lag at different moments, this file is needed.",
+      "When Stop seems ignored even though the click was accepted, this file explains the cancel path and throttle sleep issue.",
+      "When a chat is already indexed but the click still triggers heavy work, this file covers the no-op and backfill guard.",
+      "When auto-indexing a folder causes scroll stutter or 100% CPU, this file points to the extra orchestration work around indexing.",
+      "When logs show reply backfill repeating on the same source, this file explains the reply/reactions backfill state bug.",
+      "When a source list becomes slow after aggregate changes, this file covers the bad correlated-query pattern and the grouped-aggregate fix."
     ],
     "related_components": [
-      "cli-tools/instagram/ig_api_core.py",
-      "cli-tools/instagram/ig_profile_ndjson.py",
-      "cli-tools/instagram/ig_batch_transcribe_ndjson.py",
-      "cli-tools/instagram/ig_sessions_ndjson.py",
       "electron/main.js",
-      "src/components/InstagramSettings.tsx",
-      "src/components/InstagramConfigForm.tsx",
-      "src/screens/SourceDetail.tsx"
-    ],
-    "hash": "3deeb515034698529382aca570d28291b91fcb1704dd644afb1164b2c3366ebe"
+      "electron/job-runner.js",
+      "electron/database.js",
+      "src/lib/jobInvalidation.js",
+      "src/components/ActivityPanel.jsx",
+      "python-workers/telegram/tg_fetch_json.py",
+      "python-workers/telegram/tg_reply_backfill_ndjson.py"
+    ]
   },
   {
-    "path": "docs/knowledge/fact-claude-autoscrape.md",
+    "path": "docs/meta/cdp-testing.md",
     "type": "fact",
     "explicit": [
-      "claude.ai autoscrape workflow",
-      "YouTube transcript injection",
-      "Project selection via submenu",
-      "Model and thinking selector",
-      "chrome.storage.local contract",
-      "ProseMirror editor manipulation",
-      "Base-ui v2 DOM specifics",
-      "Payload lifecycle"
+      "CDP end-to-end testing",
+      "Electron remote debugging",
+      "Chrome DevTools Protocol",
+      "Renderer automation",
+      "Screenshot capture",
+      "IPC inspection"
     ],
     "implicit": [
-      "claude_ai_autoscrape_job_lifecycle",
-      "chrome_storage_local_contract",
-      "base_ui_v2_submenu_mechanics",
-      "project_chip_detection",
-      "prosemirror_content_editable",
-      "yt_background_tab_job_routing",
-      "model_selector_dropdown_state",
-      "cross_platform_autoscrape_parity",
-      "storage_cache_vs_polling_strategy",
-      "radio_target_switcher_popup",
-      "messageflow_background_to_foreground",
-      "thinking_toggle_base_ui_checkbox"
+      "cdp_remote_debugging_port_9222",
+      "websocket_debugger_targets",
+      "runtime_evaluate_protocol",
+      "page_captureScreenshot_cdp",
+      "preload_window_api_contextbridge",
+      "renderer_process_testing",
+      "synthetic_click_vs_real_mouseevent",
+      "electron_main_restart_no_hmr",
+      "tail_f_log_streaming",
+      "react_friendly_input_setter",
+      "dom_queryselector_based_assertions",
+      "job_detail_ipc_inspection",
+      "activity_panel_job_updates",
+      "cdp_helper_script_abstraction",
+      "awaitpromise_runtime_evaluate"
     ],
     "symptoms": [
-      "Transcript pastes into wrong tab or not at all after YouTube autoscrape trigger",
-      "Project submenu opens but project click does not add chip indicator next to input",
-      "Model selector dropdown does not show expected models or thinking toggle is missing",
-      "Message sends to generic chat instead of selected project when autoscrape completes",
-      "Switching target in popup (Gemini ⟷ Claude) loses stored model or project configuration",
-      "chrome.storage.local payload with key __sc_claude_job_* is malformed or not retrieved",
-      "ProseMirror editor contains stale text from previous message or paste fails to clear field"
+      "Need to automate Electron renderer UI testing without headless mode or Puppeteer",
+      "IPC method call returns Promise object instead of resolved value during test",
+      "React input field state not updating after programmatic DOM value assignment",
+      "CDP connection fails or returns stale data after modifying main.js or preload.js",
+      "Synthetic .click() on buttons does not trigger dropdowns or focus-ring styles",
+      "Need to capture renderer state at specific moments in asynchronous job lifecycle",
+      "Job:update events not flowing to ActivityPanel during automated test sequence",
+      "Electron process crashes or CDP port (9222) becomes unavailable mid-test"
     ],
     "related_components": [
-      "src/background-tracker.js",
-      "src/claude-autoscrape.js",
-      "src/content-script.js",
-      "src/popup.js",
-      "src/aistudio-autoscrape.js"
+      "electron/main.js",
+      "electron/preload.js",
+      "src/components/ActivityPanel.tsx",
+      "src/components/LibrarySidebar.tsx",
+      "job-runner.js",
+      "logs/dev.log"
     ],
-    "hash": "a47ec7f29be4784af5f9cb61c55ac7f9a5d4216987283b945be0663dfb4af52e"
+    "hash": "ca70241adfce81aefa6160422a2a3aa1a36ab7b1438d4b498ce115f5f70aec32"
+  },
+  {
+    "path": "docs/meta/поиск-по-rag.prompt.md",
+    "hash": "84692d42a206998ebe9267d6c11759a6088c952d313cd1e2a73cd57937647e77",
+    "type": "fact",
+    "explicit": [
+      "RAG search instructions",
+      "Telegram chat vector search",
+      "MCP search workflow",
+      "reply_thread and neighbors context expansion",
+      "multi-chat search",
+      "time-window post-filter",
+      "late chunking behavior",
+      "taxonomy lock-in",
+      "confirmation reading",
+      "topic anchors in forum topics"
+    ],
+    "implicit": [
+      "sc-desktop-tg-search",
+      "library.db",
+      "sqlite-vec",
+      "Gemini embeddings",
+      "telegram_semantic_search",
+      "telegram_neighbors",
+      "telegram_reply_thread",
+      "telegram_get_by_external_id",
+      "list_telegram_chats",
+      "published_at",
+      "parent_external_id",
+      "reactions.total",
+      "item_id",
+      "external_id",
+      "forum topics",
+      "late chunking",
+      "multi-chat parallel search"
+    ],
+    "symptoms": [
+      "You need this file when a Telegram semantic search result looks plausible but the surrounding context is missing. You need it when a short reply or reaction only makes sense after loading reply_thread and neighbors together. You need it when you are searching across several chats and must decide which chats to query in parallel. You need it when a time-bound request like 'this week' must be handled as a post-filter instead of inside the embedding query. You need it when a message belongs to a forum topic and parent_external_id may point to a topic anchor rather than a reply target. You need it when you are comparing cases and must avoid confirmation bias, taxonomy lock-in, or hallucinated names and numbers."
+    ],
+    "related_components": [
+      "/Users/fedor/Desktop/sc-desktop/python-workers/shared/library_db.py",
+      "/Users/fedor/Desktop/sc-desktop/electron/embedder.js",
+      "/Users/fedor/Desktop/sc-desktop/mcp/server.js",
+      "/Users/fedor/Desktop/sc-desktop/docs/meta/поиск-по-rag.prompt.md"
+    ]
+  },
+  {
+    "path": "docs/methodology/переносимый-дизайн.md",
+    "hash": "11115db58a1057720937c0b4f05455282a1ce1607407119ee4652a9738bc9f38",
+    "type": "fact",
+    "explicit": [
+      "portable design",
+      "UI methodology",
+      "deterministic UX",
+      "inline vs push navigation",
+      "default safe for money",
+      "pre-analysis before paid operations",
+      "persistent mode chips",
+      "toast and status feedback",
+      "custom controls",
+      "deletion confirmation",
+      "copy feedback",
+      "cache transparency",
+      "layout invariants",
+      "iconography and labels",
+      "step rows",
+      "multi-phase operations",
+      "range inputs",
+      "batch operations",
+      "history expansion"
+    ],
+    "implicit": [
+      "sc-desktop",
+      "TelegramConfigForm",
+      "SourceDetail",
+      "action-row",
+      "ToolbarButton",
+      "DatePicker.jsx",
+      "Checkbox.jsx",
+      "ToggleSwitch",
+      "ToastHost.jsx",
+      "lib/toast.js",
+      "lib/dataBus.js",
+      "lib/jobInvalidation.js",
+      "fact-navigation.md",
+      "fact-source-actions.md",
+      "fact-fetch-strategies.md",
+      "fact-youtube-comments.md",
+      "fact-telegram-folders.md",
+      "fact-aistudio-mcp.md"
+    ],
+    "symptoms": [
+      "When a new button or panel is being designed and you need to decide whether it belongs inside a form or outside it. When two similar features should not be unified because they behave differently in substance. When a UI flow feels ambiguous, requires extra clicks, or hides what will happen before the user commits. When an action should open inline instead of pushing a new screen and you need to preserve scroll, sidebar, or breadcrumbs. When defaults might accidentally trigger paid work and you need a safe-first form contract. When feedback labels, chips, toasts, or status rows need to explain what is happening now versus what happened before. When a batch or history view needs to show partial results, counts, cached origin, or stage-by-stage progress without lying to the user."
+    ],
+    "related_components": [
+      "src/lib/store.js",
+      "src/lib/dataBus.js",
+      "src/lib/jobInvalidation.js",
+      "src/components/ToastHost.jsx",
+      "src/lib/toast.js",
+      "src/components/Checkbox.jsx",
+      "src/components/DatePicker.jsx",
+      "src/components/ToggleSwitch.jsx",
+      "src/components/ToolbarButton.jsx",
+      "electron/assemble.js",
+      "electron/database.js",
+      "src/styles/main.css"
+    ]
   }
 ]

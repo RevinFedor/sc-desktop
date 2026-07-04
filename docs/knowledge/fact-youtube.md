@@ -10,11 +10,11 @@
 
 | Скрипт | Что делает | Тип job |
 |---|---|---|
-| `cli-tools/web/yt_single_ndjson.py` | Один URL → транскрипт (subs или AI) | `yt_transcribe` (с source_id) |
-| `cli-tools/web/yt_channel_ndjson.py` | URL канала → список видео (flat-playlist) | `yt_channel_fetch` (с source_id) |
-| `cli-tools/web/yt_batch_transcribe_ndjson.py` | Список video_ids → batch транскрипция | `yt_batch_transcribe` (с source_id) |
-| `cli-tools/web/yt_comments_ndjson.py` | Один URL → комментарии в .txt | `yt_comments` (с source_id) |
-| `cli-tools/web/yt_batch_comments_ndjson.py` | Список video_ids → батч комментариев | `yt_batch_comments` (с source_id опционально) |
+| `python-workers/web/yt_single_ndjson.py` | Один URL → транскрипт (subs или AI) | `yt_transcribe` (с source_id) |
+| `python-workers/web/yt_channel_ndjson.py` | URL канала → список видео (flat-playlist) | `yt_channel_fetch` (с source_id) |
+| `python-workers/web/yt_batch_transcribe_ndjson.py` | Список video_ids → batch транскрипция | `yt_batch_transcribe` (с source_id) |
+| `python-workers/web/yt_comments_ndjson.py` | Один URL → комментарии в .txt | `yt_comments` (с source_id) |
+| `python-workers/web/yt_batch_comments_ndjson.py` | Список video_ids → батч комментариев | `yt_batch_comments` (с source_id опционально) |
 
 Batch и channel-fetch ассоциируются с source. Single — теперь тоже (см.
 ниже «Single-paste = source + items»); видео попадает в Library под своим

@@ -97,6 +97,103 @@ function fmtDuration(sec) {
   return `${m}:${String(r).padStart(2, '0')}`
 }
 
+function fmtDateTime(unix) {
+  if (!unix) return null
+  const d = new Date(Number(unix) * 1000)
+  if (!Number.isFinite(d.getTime())) return null
+  const pad = n => String(n).padStart(2, '0')
+  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function fmtRemaining(sec) {
+  if (sec == null || !Number.isFinite(Number(sec))) return null
+  if (Number(sec) <= 0) return null
+  const days = Math.max(0, Math.ceil(Number(sec) / 86400))
+  if (days <= 1) return '<1 дн.'
+  if (days < 60) return `${days} дн.`
+  const months = Math.ceil(days / 30)
+  if (months < 24) return `${months} мес.`
+  const years = Math.floor(months / 12)
+  const rest = months % 12
+  return rest ? `${years} г ${rest} мес.` : `${years} г`
+}
+
+function fmtEta(sec) {
+  if (sec == null || !Number.isFinite(Number(sec))) return null
+  const s = Math.max(0, Math.ceil(Number(sec)))
+  if (s <= 0) return null
+  if (s < 60) return `${s} сек`
+  if (s < 3600) {
+    const m = Math.floor(s / 60)
+    const r = s % 60
+    if (m < 10 && r >= 10) return `${m} мин ${r} сек`
+    return `${Math.ceil(s / 60)} мин`
+  }
+  const h = Math.floor(s / 3600)
+  const m = Math.ceil((s % 3600) / 60)
+  return m ? `${h} ч ${m} мин` : `${h} ч`
+}
+
+function DateProgressLine({ progress, variant }) {
+  if (!progress?.request_from || !progress?.request_to) return null
+  const current = progress.current_at || progress.request_from
+  const currentText = fmtDateTime(current)
+  const fromText = fmtDateTime(progress.request_from)
+  const toText = fmtDateTime(progress.request_to)
+  const remaining = fmtRemaining(progress.remaining_sec)
+  const eta = fmtEta(progress.eta_sec)
+  const savingDone = Number(progress.saving_done || 0)
+  const savingTotal = Number(progress.saving_total || 0)
+  const isSaving = savingTotal > 0 && savingDone < savingTotal
+  const savingText = savingTotal > 0
+    ? `${savingDone.toLocaleString('ru-RU')} / ${savingTotal.toLocaleString('ru-RU')}`
+    : null
+  const intervalTotal = Number(progress.interval_total || 1)
+  const intervalIndex = Number(progress.interval_index || 0)
+  const intervalText = intervalTotal > 1 ? `интервал ${intervalIndex + 1}/${intervalTotal}` : null
+
+  if (variant === 'compact') {
+    return (
+      <span className="mr-3">
+        <span className="text-zinc-400">Дата</span>
+        {currentText && <span className="ml-1.5 tabular-nums text-zinc-300">{currentText.slice(0, 10)}</span>}
+        {remaining && <span className="text-zinc-600 ml-1.5">осталось {remaining}</span>}
+        {isSaving && savingText && <span className="text-zinc-600 ml-1.5">сохр. {savingText}</span>}
+        {eta && <span className="text-zinc-500 ml-1.5">по времени ~{eta}</span>}
+        {intervalText && <span className="text-zinc-700 ml-1.5">{intervalText}</span>}
+      </span>
+    )
+  }
+
+  return (
+    <>
+      {intervalText && (
+        <div className="flex items-center gap-2 py-1">
+          <span className="text-zinc-400 w-28 shrink-0">План</span>
+          <span className="text-zinc-300">{intervalText}</span>
+        </div>
+      )}
+      <div className="flex items-center gap-2 py-1">
+        <span className="text-zinc-400 w-28 shrink-0">Текущая дата</span>
+        <span className="tabular-nums text-zinc-300">{currentText || '—'}</span>
+        {remaining && <span className="text-zinc-500">· осталось {remaining}</span>}
+        {eta && !isSaving && <span className="text-zinc-500">· по времени ~{eta}</span>}
+      </div>
+      {savingText && (
+        <div className="flex items-center gap-2 py-1">
+          <span className="text-zinc-400 w-28 shrink-0">Сохранение</span>
+          <span className="tabular-nums text-zinc-300">{savingText}</span>
+          {eta && <span className="text-zinc-500">· осталось ~{eta}</span>}
+        </div>
+      )}
+      <div className="flex items-center gap-2 py-1">
+        <span className="text-zinc-400 w-28 shrink-0">Диапазон</span>
+        <span className="tabular-nums text-zinc-300">{fromText || '—'} — {toText || '—'}</span>
+      </div>
+    </>
+  )
+}
+
 // AAI is roughly ~5x realtime; ETA = audio_duration × 0.2. Imperfect (load
 // varies) but better than nothing — the user sees a moving target instead
 // of a frozen «transcribing…».
@@ -231,12 +328,13 @@ export default function JobProgress({ job, variant = 'compact' }) {
   // 2. Items counter — useful both during and after the run, but suppressed
   // for tg_index/tg_reply_backfill/etc. that have their own bodies.
   const showItems = (job.items_done || job.items_total) && !showResolve
+  const dateProgress = job.tg_progress || job.params?._tg_progress || null
 
   // 3. Media phase — any kind that has activity.
   const mp = job.media_phase || null
   const mpKinds = mp ? ['voice', 'photo', 'pdf'].filter(k => mp[k]) : []
 
-  if (!showResolve && !showItems && mpKinds.length === 0) return null
+  if (!showResolve && !showItems && !dateProgress && mpKinds.length === 0) return null
 
   if (variant === 'compact') {
     return (
@@ -255,6 +353,7 @@ export default function JobProgress({ job, variant = 'compact' }) {
             {job.items_total ? <span className="text-zinc-600">/{job.items_total}</span> : null}
           </span>
         )}
+        {dateProgress && <DateProgressLine progress={dateProgress} variant="compact" />}
         {mpKinds.map(k => (
           <MediaKindLine key={k} kind={k} slot={mp[k]} variant="compact" />
         ))}
@@ -283,6 +382,7 @@ export default function JobProgress({ job, variant = 'compact' }) {
           </span>
         </div>
       )}
+      {dateProgress && <DateProgressLine progress={dateProgress} variant="full" />}
       {mpKinds.map(k => (
         <MediaKindLine key={k} kind={k} slot={mp[k]} variant="full" />
       ))}

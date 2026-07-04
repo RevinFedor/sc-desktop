@@ -169,11 +169,7 @@ The intended flow is:
 2. it receives the relevant `fact-*`, `fix-*`, and methodology files from `.semantic-index.json`
 3. only then it edits code or reasons about the pipeline
 
-After documentation changes, rebuild the index with:
-
-```bash
-bash scripts/ai/build-index.sh --gemini-write
-```
+After documentation changes, rebuild the index through MCP `docs_reindex` with this repository as `projectPath`. Repo-local shell indexers are not used.
 
 ## Repository Notes
 

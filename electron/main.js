@@ -7,6 +7,8 @@ const path = require('node:path')
 const { init: initLogger } = require('./logger')
 const { logPath } = initLogger()
 console.log(`[Startup] SC Desktop launching (log: ${logPath})`)
+const perfDiagnostics = require('./perf-diagnostics')
+perfDiagnostics.install(ipcMain)
 
 // macOS GUI-launched apps (Dock/Finder) inherit PATH=/usr/bin:/bin:/usr/sbin:/sbin
 // from launchd — no /opt/homebrew/bin, no /usr/local/bin. Python subprocesses
@@ -27,7 +29,12 @@ const indexJob = require('./index-job')
 const db = require('./database')
 const { embedQuery } = require('./embedder')
 const { assembleText } = require('./assemble')
-const { startTelegramAutoScheduler, stopTelegramAutoScheduler } = require('./telegram-auto')
+const {
+  startTelegramAutoScheduler,
+  stopTelegramAutoScheduler,
+  clearTelegramAutoSessionBlock,
+} = require('./telegram-auto')
+const { createTelegramBotService } = require('./telegram-bot')
 
 const isDev = process.env.NODE_ENV === 'development'
 
@@ -98,9 +105,11 @@ function createWindow() {
 
   // Forward job events to the renderer.
   jobRunner.subscribe(job => {
+    perfDiagnostics.noteJobUpdate(job, 'jobRunner')
     if (!win.isDestroyed()) win.webContents.send('job:update', job)
   })
   indexJob.subscribe(job => {
+    perfDiagnostics.noteJobUpdate(job, 'indexJob')
     if (!win.isDestroyed()) win.webContents.send('job:update', job)
   })
 }
@@ -277,12 +286,68 @@ function writeScSettings(next) {
   }
 }
 
-ipcMain.handle('tg:listSessions', async () => {
+const telegramBot = createTelegramBotService({
+  readScSettings,
+  writeScSettings,
+  jobRunner,
+  db,
+})
+
+telegramBot.subscribe(state => {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send('telegramBot:update', state)
+  }
+})
+
+ipcMain.handle('telegramBot:state', () => telegramBot.getState())
+ipcMain.handle('telegramBot:restart', () => telegramBot.restart())
+
+async function listTelegramSessionsSnapshot() {
   const events = await jobRunner.runTgSessionsCommand(['list'])
   const sessions = events.filter(e => e.type === 'session')
   const settings = readScSettings()
   const active   = (settings.telegram && settings.telegram.session) || null
   return { sessions, active }
+}
+
+function telegramSessionLabel(sess) {
+  const who = sess?.me || sess?.me_cached || null
+  if (who?.username) return `@${who.username}`
+  if (who?.first_name) return who.first_name
+  if (who?.phone) return `+${who.phone}`
+  return sess?.name || 'Telegram'
+}
+
+async function resolveTelegramTargetAllSessions(text, send) {
+  const inv = await listTelegramSessionsSnapshot()
+  const sessions = (inv.sessions || []).filter(s => s.authorized)
+  if (!sessions.length) {
+    return { matches: [], error: 'Нет авторизованных Telegram-аккаунтов.' }
+  }
+  const matches = []
+  const errors = []
+  for (const sess of sessions) {
+    try {
+      const res = await jobRunner.runTelegramResolveTitle(text, msg => {
+        try { send && send({ ...msg, session: sess.name, session_label: telegramSessionLabel(sess) }) } catch {}
+      }, { session: sess.name })
+      for (const m of (res.matches || [])) {
+        matches.push({
+          ...m,
+          tg_session: sess.name,
+          session_label: telegramSessionLabel(sess),
+        })
+      }
+      if (res.error) errors.push(`${telegramSessionLabel(sess)}: ${res.error}`)
+    } catch (err) {
+      errors.push(`${telegramSessionLabel(sess)}: ${String(err && err.message || err)}`)
+    }
+  }
+  return { matches, error: matches.length ? null : (errors[0] || null), errors }
+}
+
+ipcMain.handle('tg:listSessions', async () => {
+  return await listTelegramSessionsSnapshot()
 })
 
 ipcMain.handle('tg:setActiveSession', (_evt, name) => {
@@ -312,7 +377,10 @@ ipcMain.handle('tg:loginFinish', async (_evt, { phone, hash, code, password, nam
   if (errEv) return { ok: false, error: errEv.message }
   if (events.find(e => e.type === '2fa_needed')) return { ok: false, twofa: true }
   const done = events.find(e => e.type === 'logged_in')
-  if (done) return { ok: true, ...done }
+  if (done) {
+    clearTelegramAutoSessionBlock(done.session_name || name || null, 'login_finish')
+    return { ok: true, ...done }
+  }
   return { ok: false, error: 'unknown response from python' }
 })
 
@@ -513,29 +581,38 @@ ipcMain.handle('tg:catchUp', (_e, params) => {
   if (!params || !Array.isArray(params.source_ids) || params.source_ids.length === 0) {
     return { ok: false, error: 'source_ids required' }
   }
-  const targets = []
-  const sinces  = []
+  const groups = new Map()
   for (const sid of params.source_ids) {
     try {
       const s = db.getSource(Number(sid))
       if (!s || s.platform !== 'telegram' || !s.handle) continue
-      targets.push(s.handle)
+      if (s.tg_session_conflict) return { ok: false, error: `Выбери Telegram-аккаунт для «${s.display_name || s.handle}»` }
+      if (!s.tg_session) return { ok: false, error: `У «${s.display_name || s.handle}» не выбран Telegram-аккаунт` }
+      if (!groups.has(s.tg_session)) groups.set(s.tg_session, { source_ids: [], targets: [], sinces: [] })
+      const group = groups.get(s.tg_session)
+      group.source_ids.push(Number(sid))
+      group.targets.push(s.handle)
       let since = 0
       try { since = db.maxExternalId(s.id) || 0 } catch {}
-      sinces.push(since)
+      group.sinces.push(since)
     } catch {}
   }
-  if (!targets.length) return { ok: false, error: 'no resolvable telegram sources' }
+  if (!groups.size) return { ok: false, error: 'no resolvable telegram sources' }
 
   try {
-    const id = jobRunner.startTelegramCatchUp({
-      source_ids:        params.source_ids.map(Number),
-      targets,
-      per_source_since:  sinces,
-      types:             Array.isArray(params.types) ? params.types : ['text'],
-      engine:            params.engine || null,
-    })
-    return { ok: true, jobId: id }
+    const jobIds = []
+    for (const [session, group] of groups.entries()) {
+      const id = jobRunner.startTelegramCatchUp({
+        source_ids:        group.source_ids,
+        targets:           group.targets,
+        per_source_since:  group.sinces,
+        types:             Array.isArray(params.types) ? params.types : ['text'],
+        engine:            params.engine || null,
+        tg_session:        session,
+      })
+      jobIds.push(id)
+    }
+    return { ok: true, jobId: jobIds[0] || null, jobIds }
   } catch (err) {
     return { ok: false, error: String(err && err.message || err) }
   }
@@ -549,10 +626,17 @@ ipcMain.handle('folder:fetch', (_e, params) => {
   }
   // Resolve each source_id → telegram handle the Python side speaks.
   const targets = []
+  let tgSession = null
   for (const sid of params.source_ids) {
     try {
       const s = db.getSource(Number(sid))
-      if (s && s.platform === 'telegram' && s.handle) targets.push(s.handle)
+      if (s && s.platform === 'telegram' && s.handle) {
+        if (s.tg_session_conflict) return { ok: false, error: `Выбери Telegram-аккаунт для «${s.display_name || s.handle}»` }
+        if (!s.tg_session) return { ok: false, error: `У «${s.display_name || s.handle}» не выбран Telegram-аккаунт` }
+        if (tgSession && tgSession !== s.tg_session) return { ok: false, error: 'Выбранные чаты относятся к разным Telegram-аккаунтам' }
+        tgSession = s.tg_session
+        targets.push(s.handle)
+      }
     } catch {}
   }
   if (!targets.length) return { ok: false, error: 'no resolvable telegram sources' }
@@ -565,6 +649,8 @@ ipcMain.handle('folder:fetch', (_e, params) => {
       mode:       params.mode || 'last_n',
       limit:      params.limit || 0,
       date:       params.date || null,
+      date_to:    params.date_to || null,
+      tg_session: tgSession || null,
       // Content types + engine — applied to every child tg_fetch. Engine
       // is null when neither voice nor video is picked; tg_fetch_json
       // silently ignores it then.
@@ -585,7 +671,7 @@ ipcMain.handle('tg:resolveTitle', async (evt, text) => {
     const send = (msg) => {
       try { evt.sender.send('tg:resolveProgress', { text, ...msg }) } catch {}
     }
-    return await jobRunner.runTelegramResolveTitle(text, send)
+    return await resolveTelegramTargetAllSessions(text, send)
   } catch (err) {
     return { matches: [], error: String(err && err.message || err) }
   }
@@ -612,7 +698,7 @@ ipcMain.handle('tg:index', (_evt, { sourceId, limit }) => {
     const sid = Number(sourceId)
     const t0 = Date.now()
     console.log(`[tg:index] request source #${sid} limit=${limit || 'full'}`)
-    const result = indexJob.start({ sourceId, limit: limit || null })
+    const result = indexJob.start({ sourceId, limit: limit || null, origin: 'manual-ipc' })
     if (result && typeof result === 'object' && result.noop) {
       console.log(`[tg:index] source #${sid} noop reason=${result.reason} total_ms=${Date.now() - t0}`)
       return { ok: true, noop: true, reason: result.reason }
@@ -715,7 +801,49 @@ function _readIgBackends(ig) {
   }
 }
 
-ipcMain.handle('ig:getSettings', () => {
+function _checkApifyToken(token) {
+  const clean = String(token || '').trim()
+  if (!clean) {
+    return Promise.resolve({ status: 'missing', ok: false, message: 'token not set' })
+  }
+  return new Promise(resolve => {
+    const https = require('node:https')
+    const url = `https://api.apify.com/v2/users/me?token=${encodeURIComponent(clean)}`
+    const req = https.get(url, { timeout: 12000 }, res => {
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', chunk => { body += chunk })
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          resolve({
+            status: 'invalid',
+            ok: false,
+            http_status: res.statusCode,
+            message: `HTTP ${res.statusCode}: ${body.slice(0, 160)}`,
+          })
+          return
+        }
+        try {
+          const data = JSON.parse(body)
+          const user = data && data.data || {}
+          resolve({
+            status: 'valid',
+            ok: true,
+            http_status: res.statusCode,
+            username: user.username || user.id || null,
+            message: 'token accepted',
+          })
+        } catch (err) {
+          resolve({ status: 'invalid', ok: false, http_status: res.statusCode, message: `invalid JSON: ${err.message}` })
+        }
+      })
+    })
+    req.on('timeout', () => { req.destroy(); resolve({ status: 'error', ok: false, message: 'timeout' }) })
+    req.on('error', err => resolve({ status: 'error', ok: false, message: err.message }))
+  })
+}
+
+ipcMain.handle('ig:getSettings', async () => {
   const s = readScSettings()
   const ig = s.instagram || {}
   let legacyToken = null
@@ -725,11 +853,14 @@ ipcMain.handle('ig:getSettings', () => {
     }
   } catch {}
   const backends = _readIgBackends(ig)
+  const token = ig.apify_token || legacyToken || null
+  const apifyTokenCheck = await _checkApifyToken(token)
   return {
     metadata_backend:   backends.metadata_backend,
     transcribe_backend: backends.transcribe_backend,
-    apify_token_set:    !!(ig.apify_token || legacyToken),
+    apify_token_set:    !!token,
     apify_token_legacy: !ig.apify_token && !!legacyToken,
+    apify_token_check:  apifyTokenCheck,
   }
 })
 
@@ -768,7 +899,7 @@ ipcMain.handle('ig:setApifyToken', (_evt, token) => {
 })
 
 ipcMain.handle('ig:listSessions', async () => {
-  const events = await jobRunner.runIgSessionsCommand(['list'])
+  const events = await jobRunner.runIgSessionsCommand(['list', '--check'])
   return { sessions: events.filter(e => e.type === 'session') }
 })
 
@@ -862,6 +993,78 @@ ipcMain.handle('ig:lookupProfile', (_evt, payload) => {
   }
 })
 
+ipcMain.handle('ig:lookupReel', (_evt, payload) => {
+  const raw = String(payload?.shortcode || payload?.url || '').trim()
+  const m = raw.match(/(?:^|\/)(?:reel|reels|p)\/([A-Za-z0-9_-]+)/i)
+  const shortcode = (m ? m[1] : raw).replace(/[^A-Za-z0-9_-]/g, '')
+  if (!shortcode) return null
+  try {
+    const dbCon = db.getDb()
+    const itemHit = dbCon.prepare(
+      `SELECT
+          i.id AS item_id,
+          i.source_id,
+          i.external_id,
+          i.url,
+          i.caption,
+          i.title,
+          i.duration_seconds,
+          i.transcript_path,
+          s.handle AS source_handle,
+          s.display_name AS source_display_name,
+          s.external_id AS source_external_id
+         FROM items i
+         JOIN sources s ON s.id = i.source_id
+        WHERE s.platform = 'instagram'
+          AND i.external_id = ?
+        ORDER BY i.id DESC
+        LIMIT 1`,
+    ).get(`reel:${shortcode}`) || null
+    if (itemHit) return itemHit
+
+    // Sourceless single-reel Apify jobs do not create an items row.
+    // Recover their cache state from the jobs table so re-pasting the same
+    // URL shows "already transcribed" instead of offering another paid run.
+    const rows = dbCon.prepare(
+      `SELECT id, file_path, parameters_json, cost_usd, started_at, finished_at
+         FROM jobs
+        WHERE type = 'ig_batch_transcribe'
+          AND status = 'done'
+          AND file_path IS NOT NULL
+        ORDER BY started_at DESC
+        LIMIT 300`,
+    ).all()
+    for (const row of rows) {
+      let params = null
+      try { params = row.parameters_json ? JSON.parse(row.parameters_json) : null } catch {}
+      const codes = Array.isArray(params?.shortcodes) ? params.shortcodes : []
+      if (!codes.includes(shortcode)) continue
+      const idx = codes.indexOf(shortcode)
+      const captions = Array.isArray(params?.captions) ? params.captions : []
+      return {
+        item_id: null,
+        source_id: null,
+        external_id: `reel:${shortcode}`,
+        url: params?.target || `https://www.instagram.com/reel/${shortcode}/`,
+        caption: captions[idx] || '',
+        title: null,
+        duration_seconds: null,
+        transcript_path: row.file_path,
+        source_handle: null,
+        source_display_name: null,
+        source_external_id: null,
+        job_id: row.id,
+        cost_usd: row.cost_usd || 0,
+        finished_at: row.finished_at || null,
+      }
+    }
+    return null
+  } catch (err) {
+    console.error('[IG] lookupReel failed', err)
+    return null
+  }
+})
+
 ipcMain.handle('ig:batchTranscribe', (_evt, params) => {
   // Pick the configured backend; the renderer doesn't need to know about
   // the api/apify split at the picker level. Same source of truth as
@@ -877,7 +1080,7 @@ ipcMain.handle('ig:batchTranscribe', (_evt, params) => {
   if (backend === 'api' && !user_id && params?.source_id) {
     try {
       const src = db.getSource(params.source_id)
-      if (src && src.external_id) user_id = String(src.external_id)
+      if (src && /^\d+$/.test(String(src.external_id || ''))) user_id = String(src.external_id)
     } catch (err) {
       console.error('[IG] resolve user_id failed', err)
     }
@@ -1315,6 +1518,15 @@ ipcMain.handle('jobs:cancel', (_evt, id) => {
 
 ipcMain.handle('jobs:detail', (_evt, id) => jobRunner.getJobDetail(id))
 
+ipcMain.handle('jobs:setAutoIndexAfterFetch', (_evt, { jobId, enabled } = {}) => {
+  try {
+    return jobRunner.setAutoIndexAfterFetch(jobId, enabled === true)
+  } catch (err) {
+    console.error('[Jobs] setAutoIndexAfterFetch failed', err)
+    return { ok: false, error: String(err && err.message || err) }
+  }
+})
+
 // Copy file path or its content to clipboard.
 ipcMain.handle('jobs:copyFile', (_evt, filePath) => {
   if (!filePath || !fs.existsSync(filePath)) return { ok: false, error: 'File not found' }
@@ -1506,6 +1718,8 @@ ipcMain.handle('items:search', (_e, { source_id, query, limit }) =>
 ipcMain.handle('items:topics', (_e, source_id) => db.listSourceTopics(source_id))
 ipcMain.handle('items:typeBreakdown', (_e, { source_id, topic_id }) =>
   db.itemTypeBreakdown(source_id, topic_id ?? null))
+ipcMain.handle('items:telegramMediaEstimate', (_e, scope) =>
+  db.telegramMediaEstimate(scope || {}))
 
 // Copy the caption(s) of specific saved messages (per-row «копировать» and the
 // bulk «копировать N» action in ChatView). The caption already carries any
@@ -1724,9 +1938,13 @@ app.whenReady().then(() => {
     console.log(`[BrowserBridge] failed to start: ${err?.message || err}`)
   }
   startTelegramAutoScheduler({ db, jobRunner, indexJob })
+  telegramBot.start()
 })
 
-app.on('before-quit', () => stopTelegramAutoScheduler())
+app.on('before-quit', () => {
+  stopTelegramAutoScheduler()
+  telegramBot.stop()
+})
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()

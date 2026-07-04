@@ -10,6 +10,7 @@ import YouTubeChannelForm from '../components/YouTubeChannelForm'
 import TikTokSingleForm from '../components/TikTokSingleForm'
 import TikTokChannelForm from '../components/TikTokChannelForm'
 import InstagramConfigForm from '../components/InstagramConfigForm'
+import InstagramSingleReelForm from '../components/InstagramSingleReelForm'
 import RedditThreadForm from '../components/RedditThreadForm'
 import RedditSearchForm from '../components/RedditSearchForm'
 import LocalFileTranscribeForm from '../components/LocalFileTranscribeForm'
@@ -741,12 +742,22 @@ function PlatformForm({ formRef, platform, kind, target, includeComments, detect
     )
   }
   // Instagram profile (chip-pick on @username, profile URL, or username
-  // detected as profile). Single reel/post deep-links — placeholder for now.
+  // detected as profile). Single reel/post deep-links are one-shot jobs:
+  // api when the source profile is already known, otherwise explicit Apify.
   if (platform === 'instagram' && (kind === 'profile' || kind === 'username')) {
     return (
       <InstagramConfigForm
         ref={formRef}
         target={target}
+        onStarted={onStarted}
+      />
+    )
+  }
+  if (platform === 'instagram' && kind === 'reel') {
+    return (
+      <InstagramSingleReelForm
+        ref={formRef}
+        url={target}
         onStarted={onStarted}
       />
     )
