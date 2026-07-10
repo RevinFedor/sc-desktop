@@ -119,6 +119,20 @@ function workerEnv() {
     ['api_keys', 'ASSEMBLYAI_API_KEY'],
     ['api', 'assemblyai_api_key'],
   ])
+  setEnvFromSettings(env, settings, 'SONIOX_API_KEY', [
+    ['api_keys', 'SONIOX_API_KEY'],
+    ['api', 'soniox_api_key'],
+  ])
+  if (!env.SONIOX_API_KEY) {
+    try {
+      const envPath = path.join(os.homedir(), '.noted-terminal', '.env')
+      const body = fs.readFileSync(envPath, 'utf8')
+      const m = body.match(/^\s*SONIOX_API_KEY\s*=\s*(.+?)\s*$/m)
+      if (m && m[1]) {
+        env.SONIOX_API_KEY = String(m[1]).replace(/^['"]|['"]$/g, '').trim()
+      }
+    } catch {}
+  }
   setEnvFromSettings(env, settings, 'OPENAI_API_KEY', [
     ['api_keys', 'OPENAI_API_KEY'],
     ['api', 'openai_api_key'],
@@ -1112,8 +1126,16 @@ function rowToLocalSnapshot(row) {
       size_bytes:   p?.size_bytes || null,
       duration_sec: p?.duration_sec || null,
       engine:       p?.engine || null,
+      with_timings: !!p?.with_timings,
       kind:         'ai',
       file_path:    row.file_path,
+      srt_path:     p?.srt_path || p?.result_files?.srt || null,
+      srt_cues:     p?.srt_cues || null,
+      token_count:  p?.token_count || null,
+      result_files: p?.result_files || {
+        text: row.file_path,
+        srt: p?.srt_path || null,
+      },
       cost_usd:     row.cost_usd || 0,
       stage:        row.status === 'done' ? 'transcribed' : 'idle',
     },
@@ -6168,6 +6190,7 @@ function handleInstagramBatchEvent(job, evt) {
       b.errors += 1
       job.items_done = (b.saved + b.skipped + b.errors)
       b.log.push({ video_id: evt.video_id, kind: 'error', message: evt.message })
+      console.warn(`[Jobs] ig_batch item_error #${job.id} video=${evt.video_id || '-'} message=${String(evt.message || '-').replace(/\s+/g, ' ').slice(0, 600)}`)
       emit(job)
       break
     case 'done':
@@ -6532,8 +6555,8 @@ async function runYoutubeSearch({ query, limit = 20, offset = 0 }) {
 //
 // Mirror of yt_transcribe minus the subs stage. One spawn → file event +
 // transcribe_start/done + saved + done. AssemblyAI is the default engine
-// because it's better at arbitrary user audio (longer files, less language
-// guessing) than Gemini's chunked path.
+// for plain text; Soniox is the timed-output path because it returns tokens
+// with start/end times that can be converted into SRT subtitles.
 
 const LOCAL_SCRIPT = path.join(WORKERS_ROOT, 'web', 'local_transcribe_ndjson.py')
 
@@ -6543,7 +6566,12 @@ function startLocalTranscribe(params) {
   if (!inputPath) {
     throw new Error('startLocalTranscribe: path required')
   }
-  const engine = params.engine === 'gemini' ? 'gemini' : 'assemblyai'
+  const engine = params.engine === 'gemini'
+    ? 'gemini'
+    : params.engine === 'soniox'
+      ? 'soniox'
+      : 'assemblyai'
+  const withTimings = engine === 'soniox' && params.with_timings === true
 
   const args = [
     LOCAL_SCRIPT,
@@ -6551,8 +6579,9 @@ function startLocalTranscribe(params) {
     '--out-dir', LOCAL_TRANSCRIPTS_DIR,
     '--engine', engine,
   ]
+  if (withTimings) args.push('--timings')
 
-  console.log(`[Jobs] start local_transcribe #${id} engine=${engine} path=${inputPath}`)
+  console.log(`[Jobs] start local_transcribe #${id} engine=${engine} timings=${withTimings ? 'on' : 'off'} path=${inputPath}`)
 
   const job = {
     id,
@@ -6562,10 +6591,10 @@ function startLocalTranscribe(params) {
     items_done: 0,
     items_total: null,
     started_at: Math.floor(Date.now() / 1000),
-    params: { ...params, engine },
+    params: { ...params, engine, with_timings: withTimings },
     entity_title: path.basename(inputPath),
     entity_kind: 'local_file',
-    local: { stage: 'transcribing', path: inputPath, engine,
+    local: { stage: 'transcribing', path: inputPath, engine, with_timings: withTimings,
              name: path.basename(inputPath) },
     child: null,
   }
@@ -6629,6 +6658,11 @@ function attachLocalStreams(job, child) {
             size_bytes:   job.local?.size_bytes || null,
             duration_sec: job.local?.duration_sec || null,
             engine:       job.params?.engine || job.local?.engine,
+            with_timings: !!(job.params?.with_timings || job.local?.with_timings),
+            result_files: job.local?.result_files || null,
+            srt_path:     job.local?.srt_path || null,
+            srt_cues:     job.local?.srt_cues || null,
+            token_count:  job.local?.token_count || null,
           },
           error:       job.error,
           started_at:  job.started_at,
@@ -6669,17 +6703,23 @@ function handleLocalEvent(job, evt) {
       emit(job)
       break
     case 'transcribe_progress':
-      // AssemblyAI ndjson polling — fine-grained sub-stages so the UI can
-      // show "Заливаем → в очереди → транскрибируем 4:32 / ~22 мин" instead
-      // of a frozen spinner. evt.stage ∈ {uploading, queued, transcribing,
-      // completed}; transcribing carries elapsed_sec + audio_duration_sec.
-      job.local = { ...(job.local || {}),
-                    stage: 'transcribing',
-                    aai_stage:           evt.stage,
-                    aai_status:          evt.aai_status,
-                    aai_elapsed_sec:     evt.elapsed_sec,
-                    aai_audio_dur_sec:   evt.audio_duration_sec,
-                    aai_transcript_id:   evt.transcript_id }
+      // Provider polling — fine-grained sub-stages so the UI can show
+      // upload/queue/process/fetch progress instead of one frozen spinner.
+      if (evt.engine === 'soniox') {
+        job.local = { ...(job.local || {}),
+                      stage: 'transcribing',
+                      soniox_stage:   evt.stage,
+                      soniox_status:  evt.status,
+                      soniox_attempt: evt.attempt }
+      } else {
+        job.local = { ...(job.local || {}),
+                      stage: 'transcribing',
+                      aai_stage:           evt.stage,
+                      aai_status:          evt.aai_status,
+                      aai_elapsed_sec:     evt.elapsed_sec,
+                      aai_audio_dur_sec:   evt.audio_duration_sec,
+                      aai_transcript_id:   evt.transcript_id }
+      }
       emit(job)
       break
     case 'transcribe_done':
@@ -6689,7 +6729,24 @@ function handleLocalEvent(job, evt) {
       break
     case 'saved':
       job.file_path = evt.file_path
+      job.params = { ...(job.params || {}),
+        result_files: {
+          text: evt.file_path || null,
+          srt: evt.srt_path || null,
+        },
+        srt_path: evt.srt_path || null,
+        srt_cues: evt.srt_cues || null,
+        token_count: evt.token_count || null,
+      }
       job.local = { ...(job.local || {}), file_path: evt.file_path,
+                    srt_path: evt.srt_path || null,
+                    srt_cues: evt.srt_cues || null,
+                    token_count: evt.token_count || null,
+                    with_timings: !!evt.timings,
+                    result_files: {
+                      text: evt.file_path || null,
+                      srt: evt.srt_path || null,
+                    },
                     kind: evt.kind, chars: evt.chars }
       try {
         const r = copyFileToClipboard(evt.file_path)

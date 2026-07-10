@@ -203,6 +203,7 @@ async function planInstagramSingleReel({ db, readScSettings, url, engine = 'gemi
   ])
 
   if (cached?.transcript_path && fs.existsSync(cached.transcript_path)) {
+    console.log(`[InstagramReel] cache hit shortcode=${shortcode} path=${cached.transcript_path}`)
     return {
       ok: true,
       cached: true,
@@ -215,15 +216,15 @@ async function planInstagramSingleReel({ db, readScSettings, url, engine = 'gemi
 
   const configuredBackend = settings?.transcribe_backend || 'api'
   const hasLocalOwner = cached?.source_id && isNumericId(cached?.source_external_id)
-  const backend = configuredBackend === 'apify'
-    ? 'apify'
-    : (hasLocalOwner ? 'api' : 'apify')
+  const backend = configuredBackend === 'apify' ? 'apify' : 'api'
+  console.log(`[InstagramReel] plan shortcode=${shortcode} configured_backend=${configuredBackend} has_local_owner=${hasLocalOwner ? 'yes' : 'no'} backend=${backend}`)
 
   if (backend === 'api' && !hasLocalOwner) {
+    console.warn(`[InstagramReel] blocked api job shortcode=${shortcode} reason=missing_owner`)
     return {
       ok: false,
       code: 'missing_owner',
-      error: 'android-api может транскрибировать одиночный reels только если профиль уже есть в базе.',
+      error: 'В настройках выбран Android API, но эта Instagram-ссылка не привязана к сохранённому профилю. Apify автоматически не запускаю. Сначала спарси профиль в Instagram-разделе или переключи Instagram backend на Apify.',
       shortcode,
       settings,
     }

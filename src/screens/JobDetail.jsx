@@ -915,6 +915,7 @@ function LocalBody({ job, busy, toast, copyFile, openIn, reveal }) {
       <Section title="Транскрипт">
         <KV k="Источник" v={`AI · ${local.engine || job.params?.engine || ''}`.trim()} />
         {local.chars     != null && <KV k="Размер"     v={`${local.chars.toLocaleString('ru-RU')} символов`} />}
+        {local.srt_path        && <KV k="Таймкоды"   v={local.srt_cues ? `SRT · ${local.srt_cues} фрагм.` : 'SRT готов'} />}
         {local.cost_usd  > 0     && <KV k="Стоимость"  v={`$${Number(local.cost_usd).toFixed(4)}`} />}
         {local.duration_sec > 0  && <KV k="Длина файла" v={fmtSecs(local.duration_sec)} />}
         {local.size_bytes != null && <KV k="Размер файла" v={fmtBytes(local.size_bytes)} />}
@@ -924,7 +925,39 @@ function LocalBody({ job, busy, toast, copyFile, openIn, reveal }) {
       </Section>
 
       <FileCard job={job} busy={busy} toast={toast} copyFile={copyFile} openIn={openIn} reveal={reveal} />
+      {local.srt_path && <LocalTimedFilesCard job={job} local={local} />}
     </>
+  )
+}
+
+function LocalTimedFilesCard({ job, local }) {
+  const pathList = [
+    job.target ? `Видео: ${job.target}` : null,
+    (local.file_path || job.file_path) ? `Текст: ${local.file_path || job.file_path}` : null,
+    local.srt_path ? `SRT: ${local.srt_path}` : null,
+  ].filter(Boolean).join('\n')
+
+  return (
+    <Section title="Файлы для нейронки">
+      <div className="text-zinc-400 mb-3" style={{ fontSize: '14px' }}>
+        Для сопоставления с видео используй исходный файл и SRT.
+      </div>
+      <div className="space-y-2 mb-3">
+        <div className="text-xs text-zinc-500 break-all font-mono">Видео: {job.target}</div>
+        <div className="text-xs text-zinc-500 break-all font-mono">SRT: {local.srt_path}</div>
+      </div>
+      <div className="flex gap-2">
+        <Button onClick={() => window.api?.copyText?.(pathList)}>
+          <span className="inline-flex items-center gap-1.5"><Copy size={14} />Копировать пути</span>
+        </Button>
+        <Button onClick={() => window.api?.openExternal?.(local.srt_path)}>
+          <span className="inline-flex items-center gap-1.5"><FileText size={14} />Открыть SRT</span>
+        </Button>
+        <Button onClick={() => window.api?.revealInFinder?.(local.srt_path)} variant="ghost">
+          <span className="inline-flex items-center gap-1.5"><FolderOpen size={14} />Показать в Finder</span>
+        </Button>
+      </div>
+    </Section>
   )
 }
 

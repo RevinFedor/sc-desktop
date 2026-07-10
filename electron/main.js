@@ -1528,6 +1528,11 @@ ipcMain.handle('jobs:setAutoIndexAfterFetch', (_evt, { jobId, enabled } = {}) =>
 })
 
 // Copy file path or its content to clipboard.
+ipcMain.handle('clipboard:writeText', (_evt, text) => {
+  clipboard.writeText(String(text || ''))
+  return { ok: true, bytes: Buffer.byteLength(String(text || ''), 'utf8') }
+})
+
 ipcMain.handle('jobs:copyFile', (_evt, filePath) => {
   if (!filePath || !fs.existsSync(filePath)) return { ok: false, error: 'File not found' }
   try {

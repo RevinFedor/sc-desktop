@@ -1263,11 +1263,11 @@
               pro: 'Pro стандартный', 'pro-extended': 'Pro расширенный' })[key] || key;
   }
 
-  // ── Реестр моделей. В том же меню composer-pill'а пункт «GPT-5.5»
-  // (role=menuitem, текст = ТЕКУЩАЯ модель) раскрывает сабменю с radio:
-  // 5.5 / 5.4 / 5.3 / 5.2 / 4.5 / o3 (живой DOM 2026-06). ChatGPT запоминает
-  // выбор per-аккаунт — поэтому модель ВСЕГДА верифицируем, не «скип если
-  // дефолт»: прошлый job мог оставить o3.
+  // ── Реестр моделей. В меню composer-pill'а текущая модель раскрывает
+  // сабменю с radio. Реестр намеренно статический: новые доступные в UI модели
+  // добавляются отдельно, но DOM-подписи и их порядок не являются контрактом.
+  // ChatGPT запоминает выбор per-аккаунт — поэтому модель ВСЕГДА верифицируем,
+  // не «скип если дефолт»: прошлый job мог оставить другую модель.
   const MODELS = [
     { key: '5.5', aliases: ['5.5', 'gpt-5.5', 'gpt5.5', 'gpt 5.5'] },
     { key: '5.4', aliases: ['5.4', 'gpt-5.4', 'gpt5.4'] },
@@ -1325,63 +1325,105 @@
   function findProSubTrigger() {
     return visibleAll('[data-testid="composer-intelligence-pro-thinking-effort-trigger"]')[0] || null;
   }
-  // Сабменю-триггер модели: role=menuitem, текст = текущая модель
-  // («GPT-5.5» / «GPT-5.4» / «o3»). testid у него нет — матчим текстом.
-  function findModelSubTrigger() {
-    return visibleAll('[role="menuitem"]')
-      .find(el => /^(GPT-[\d.]+|o3)$/i.test(nodeText(el)));
+  // ChatGPT меняет полную подпись модели независимо от её идентификатора:
+  // «GPT-5.6 Sol», «GPT-5.4 Доступна до ...», старое короткое «5.5». Для
+  // выбора важен только токен версии; по отображаемому полному тексту и
+  // позиции в меню матчить нельзя.
+  function modelKeyFromText(text) {
+    const label = String(text || '').replace(/\s+/g, ' ').trim();
+    if (/^o3(?:\b|$)/i.test(label)) return 'o3';
+    const gpt = label.match(/\bGPT[\s-]*(\d+(?:\.\d+)?)(?=\D|$)/i);
+    if (gpt) return gpt[1];
+    const bare = label.match(/^(\d+(?:\.\d+)?)$/);
+    return bare ? bare[1] : null;
   }
-  // Пункт модели в раскрытом сабменю — radio с КОРОТКИМ текстом («5.5», «o3»).
-  // Точный матч: «5.5» не должен ловить «Очень высокий» и пр.
+  function modelMenuSnapshot() {
+    return visibleAll('[role="menuitem"], [role="menuitemradio"]')
+      .map(el => {
+        const text = nodeText(el);
+        return {
+          text,
+          modelKey: modelKeyFromText(text),
+          role: el.getAttribute('role'),
+          checked: el.getAttribute('aria-checked'),
+          expanded: el.getAttribute('aria-expanded'),
+          hasPopup: el.getAttribute('aria-haspopup'),
+        };
+      })
+      .filter(x => x.text || x.role);
+  }
+  // Сабменю-триггер модели: обычно role=menuitem. Номер может быть ещё не
+  // известен нашему реестру (например, GPT-5.6 Sol), потому что это всего лишь
+  // текущая sticky-модель, из которой нужно перейти к запрошенной.
+  function findModelSubTrigger() {
+    const candidates = visibleAll('[role="menuitem"], button[aria-haspopup="menu"]')
+      .filter(el => !!modelKeyFromText(nodeText(el)));
+    return candidates.find(el => el.getAttribute('aria-haspopup') === 'menu' || el.hasAttribute('aria-expanded'))
+      || candidates[0]
+      || null;
+  }
+  // Пункт модели в раскрытом сабменю — radio. Подпись бывает короткой («5.5»)
+  // или полной («GPT-5.5»), поэтому сравниваем разобранный ключ.
   function findModelItem(modelKey) {
     return visibleAll('[role="menuitemradio"]')
-      .find(el => nodeText(el) === modelKey);
+      .find(el => modelKeyFromText(nodeText(el)) === modelKey);
+  }
+  async function openModelSubmenu(modelKey) {
+    const sub = await waitFor(() => findModelSubTrigger(), 'model submenu trigger (GPT / o-series)', 8000);
+    nativeHover(sub);
+    await sleep(700);
+    if (!findModelItem(modelKey)) {
+      nativeMouseClick(sub);
+      await sleep(700);
+    }
+    const item = await waitFor(() => findModelItem(modelKey), 'model item: ' + modelKey, 8000);
+    return { sub, item };
   }
 
   // Выбор модели — verify-and-retry, та же механика что ensureEffortSelected.
-  // Не-фатально: при провале продолжаем на текущей модели аккаунта.
+  // Вызывающий flow делает провал фатальным: нельзя молча отправить запрос
+  // sticky-моделью, отличающейся от запрошенной.
   async function ensureModelSelected(modelKey) {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         await openEffortMenu();
-        const sub = await waitFor(() => findModelSubTrigger(), 'model submenu trigger (GPT-x)', 8000);
-        // Сабменю-триггер показывает текущую модель — если уже она, готово.
-        const curLabel = (sub.textContent || '').trim();
-        if (curLabel === modelDisplay(modelKey)) {
-          log('model.already_set', { model: modelKey });
-          bridgeLog('gpt.model.already_set', { model: modelKey }, getRequestId(), null);
-          pressEscape(); await sleep(200);
-          return true;
-        }
-        nativeHover(sub);
-        await sleep(700);
-        if (!findModelItem(modelKey)) { nativeMouseClick(sub); await sleep(700); }
-        const item = await waitFor(() => findModelItem(modelKey), 'model item: ' + modelKey, 8000);
+        const { sub, item } = await openModelSubmenu(modelKey);
         if (item.getAttribute('aria-checked') === 'true') {
-          log('model.already_checked', { model: modelKey });
+          log('model.already_set', { model: modelKey, shown: modelKeyFromText(nodeText(sub)) });
+          bridgeLog('gpt.model.already_set', { model: modelKey }, getRequestId(), null);
           pressEscape(); await sleep(200);
           return true;
         }
         nativeMouseClick(item);
         await sleep(600);
-        // verify через переоткрытие: сабменю-триггер должен показать новую модель.
+        // Verify через переоткрытие: подпись родителя и checked у visible radio
+        // должны указывать на запрошенную модель. Закрытые меню ChatGPT оставляет
+        // в DOM, поэтому читаем только visibleAll.
         await openEffortMenu();
-        const after = findModelSubTrigger();
-        const ok = after && (after.textContent || '').trim() === modelDisplay(modelKey);
+        const { sub: after, item: checkedItem } = await openModelSubmenu(modelKey);
+        const shown = modelKeyFromText(nodeText(after));
+        const checked = checkedItem.getAttribute('aria-checked') === 'true';
+        const ok = shown === modelKey && checked;
+        const items = ok ? null : modelMenuSnapshot();
         pressEscape(); await sleep(200);
         if (ok) {
           log('model.selected', { model: modelKey, attempt });
           bridgeLog('gpt.model.selected', { model: modelKey, attempt }, getRequestId(), null);
           return true;
         }
-        log('model.verify_failed', { model: modelKey, attempt, shows: after ? (after.textContent||'').trim() : null });
+        const data = { model: modelKey, attempt, shown, checked, items };
+        log('model.verify_failed', data);
+        bridgeLog('gpt.model.verify_failed', data, getRequestId(), null);
       } catch (e) {
-        log('model.attempt_threw', { attempt, err: e?.message });
+        const data = { attempt, err: e?.message, items: modelMenuSnapshot() };
+        log('model.attempt_threw', data);
+        bridgeLog('gpt.model.attempt_threw', data, getRequestId(), null);
         pressEscape(); await sleep(200);
       }
     }
-    log('model.select_failed', { model: modelKey });
-    bridgeLog('gpt.model.select_failed', { model: modelKey }, getRequestId(), null);
+    const data = { model: modelKey, items: modelMenuSnapshot() };
+    log('model.select_failed', data);
+    bridgeLog('gpt.model.select_failed', data, getRequestId(), null);
     return false;
   }
 

@@ -96,6 +96,7 @@ contextBridge.exposeInMainWorld('api', {
 
   // Local file transcribe — paste an absolute path → AssemblyAI/Gemini.
   localTranscribe:  (params)  => ipcRenderer.invoke('local:transcribe', params),
+  copyText:       (text)    => ipcRenderer.invoke('clipboard:writeText', text),
   jobsList:       ()       => ipcRenderer.invoke('jobs:list'),
 
   // AI Studio MCP jobs зеркало из browser-bridge (RAM-only, перезапуск

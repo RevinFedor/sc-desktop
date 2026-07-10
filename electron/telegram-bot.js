@@ -133,6 +133,33 @@ function createTelegramBotService({ readScSettings, writeScSettings, jobRunner, 
     }
   }
 
+  async function sendInstagramTranscriptText(chatId, transcript) {
+    const parsed = splitInstagramTranscriptForTelegram(transcript)
+    const body = parsed.body || '(пустой транскрипт)'
+    const escapedMetaLen = markdownTextEscapedLength(parsed.meta)
+    const firstMax = Math.max(900, Math.min(3600, 3900 - escapedMetaLen - 12))
+    const chunks = splitCodeBlockContent(body, firstMax)
+
+    for (let i = 0; i < chunks.length; i += 1) {
+      const prefix = i === 0
+        ? parsed.meta
+        : `часть ${i + 1}/${chunks.length}`
+      const message = buildMarkdownCodeMessage(prefix, chunks[i])
+      try {
+        await api('sendMessage', {
+          chat_id: chatId,
+          text: message,
+          parse_mode: 'MarkdownV2',
+          disable_web_page_preview: true,
+        })
+      } catch (err) {
+        console.warn(`[TelegramBot] transcript send failed chat=${chatId}: ${err?.message || err}`)
+        const plain = [prefix, '```', chunks[i], '```'].filter(Boolean).join('\n')
+        await sendMessage(chatId, plain)
+      }
+    }
+  }
+
   function isAllowed(config, message) {
     const chatId = String(message?.chat?.id || '')
     const userId = String(message?.from?.id || '')
@@ -259,15 +286,9 @@ function createTelegramBotService({ readScSettings, writeScSettings, jobRunner, 
         return
       }
 
-      const caption = result.cached
-        ? 'Готово. Взял транскрипт из кэша SC Desktop.'
-        : 'Готово. Транскрипт создан через обычную обработку SC Desktop.'
-      await sendMessage(chatId, caption)
       await sendChatAction(chatId, 'typing')
       const transcript = fs.readFileSync(result.file_path, 'utf8')
-      const parsed = splitInstagramTranscriptForTelegram(transcript)
-      if (parsed.meta) await sendMessage(chatId, parsed.meta)
-      await sendCodeBlockText(chatId, parsed.body || '(пустой транскрипт)')
+      await sendInstagramTranscriptText(chatId, transcript)
       console.log(`[TelegramBot] Instagram result sent chat=${chatId} cached=${result.cached ? 'yes' : 'no'}`)
     } finally {
       clearInterval(actionTimer)
@@ -429,14 +450,20 @@ function splitInstagramTranscriptForTelegram(text) {
 
   const metaLines = [formatInstagramMetaLine(m[1])]
   let i = 1
-  while (i < lines.length) {
-    const line = lines[i]
-    if (!line.trim()) {
+
+  while (i < lines.length && !lines[i].trim()) i += 1
+
+  if (/^Caption:/i.test(lines[i] || '')) {
+    while (i < lines.length) {
+      const line = lines[i]
+      if (!line.trim()) {
+        i += 1
+        break
+      }
+      metaLines.push(line)
       i += 1
-      break
     }
-    metaLines.push(line)
-    i += 1
+    while (i < lines.length && !lines[i].trim()) i += 1
   }
 
   return {
@@ -449,13 +476,28 @@ function formatInstagramMetaLine(line) {
   const s = String(line || '').trim()
   const m = s.match(/^(.*?)\s*\|\s*(https?:\/\/\S+)\s*$/)
   if (!m) return s
-  return `${m[1].trim()}\n${m[2].trim()}`
+  return `📸 ${m[2].trim()}`
 }
 
 function escapeMarkdownV2Code(text) {
   return String(text || '')
     .replace(/\\/g, '\\\\')
     .replace(/`/g, '\\`')
+}
+
+function escapeMarkdownV2Text(text) {
+  return String(text || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1')
+}
+
+function markdownTextEscapedLength(text) {
+  return escapeMarkdownV2Text(text).length
+}
+
+function buildMarkdownCodeMessage(prefix, body) {
+  const head = prefix ? `${escapeMarkdownV2Text(prefix)}\n\n` : ''
+  return `${head}\`\`\`\n${escapeMarkdownV2Code(body)}\n\`\`\``
 }
 
 function markdownCodeEscapedLength(text) {
@@ -466,8 +508,7 @@ function markdownCodeEscapedLength(text) {
   return n
 }
 
-function splitCodeBlockContent(text) {
-  const maxEscapedLen = 3600
+function splitCodeBlockContent(text, maxEscapedLen = 3600) {
   const parts = String(text || '').replace(/\r\n/g, '\n').split(/(\n)/)
   const chunks = []
   let current = ''

@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useImperativeHandle, useMemo, forwardRef } from 'react'
-import { Mic, Copy } from 'lucide-react'
+import { Mic, Copy, Link2, Clock3, Clapperboard } from 'lucide-react'
 import { startLocalTranscribe, watchJob, useJobs } from '../lib/jobs'
 import { formatCopyToast } from '../lib/formatTokens'
 
 const ENGINES = [
-  { id: 'assemblyai', label: 'AssemblyAI',       hint: '🔊 long-form (>2ч), default' },
-  { id: 'gemini',     label: 'Gemini 2.5 Flash', hint: '⚡ дёшево, чанки 10мин' },
+  { id: 'assemblyai', label: 'AssemblyAI',       hint: 'long-form (>2ч), default' },
+  { id: 'gemini',     label: 'Gemini 2.5 Flash', hint: 'дёшево, чанки 10мин' },
+  { id: 'soniox',     label: 'Soniox',           hint: 'таймкоды + SRT' },
 ]
 
 /**
@@ -21,6 +22,7 @@ const LocalFileTranscribeForm = forwardRef(function LocalFileTranscribeForm({ pa
   // Stages: 'idle' | 'transcribing' | 'done' | 'error'
   const [stage, setStage] = useState('idle')
   const [engine, setEngine] = useState('assemblyai')
+  const [withTimings, setWithTimings] = useState(false)
   const [job, setJob] = useState(null)
   const [err, setErr] = useState(null)
   const [toast, setToast] = useState(null)
@@ -47,6 +49,7 @@ const LocalFileTranscribeForm = forwardRef(function LocalFileTranscribeForm({ pa
       if (match.local?.engine) {
         setEngine(match.local.engine)
       }
+      setWithTimings(!!(match.local?.with_timings || match.params?.with_timings))
       if (match.status === 'done') {
         setStage('done')
       } else if (match.status === 'error') {
@@ -68,6 +71,7 @@ const LocalFileTranscribeForm = forwardRef(function LocalFileTranscribeForm({ pa
       setStage('idle')
       setErr(null)
       setEngine('assemblyai')
+      setWithTimings(false)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path])
@@ -80,7 +84,7 @@ const LocalFileTranscribeForm = forwardRef(function LocalFileTranscribeForm({ pa
     }
     setStage('transcribing'); setErr(null); setBusy(true)
     try {
-      const id = await startLocalTranscribe({ path, engine })
+      const id = await startLocalTranscribe({ path, engine, with_timings: withTimings && engine === 'soniox' })
       if (id == null) {
         setErr('Электрон-IPC недоступен')
         setStage('error'); return
@@ -119,6 +123,19 @@ const LocalFileTranscribeForm = forwardRef(function LocalFileTranscribeForm({ pa
     }
   }
 
+  async function copyPaths() {
+    const text = buildPathList(job)
+    if (!text || !window.api?.copyText) return
+    setBusy(true)
+    try {
+      const r = await window.api.copyText(text)
+      if (r?.ok) setToast(formatCopyToast({ bytes: r.bytes }))
+    } finally {
+      setBusy(false)
+      setTimeout(() => setToast(null), 2200)
+    }
+  }
+
   useImperativeHandle(ref, () => ({
     trigger() {
       if (busy) return true
@@ -128,7 +145,7 @@ const LocalFileTranscribeForm = forwardRef(function LocalFileTranscribeForm({ pa
       // 'transcribing' — busy, no-op
       return true
     },
-  }), [stage, busy, engine, job?.file_path])
+  }), [stage, busy, engine, withTimings, job?.file_path])
 
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-6">
@@ -137,7 +154,15 @@ const LocalFileTranscribeForm = forwardRef(function LocalFileTranscribeForm({ pa
       {(stage === 'idle' || stage === 'error') && (
         <ConfigPanel
           engine={engine}
-          setEngine={setEngine}
+          setEngine={(next) => {
+            setEngine(next)
+            if (next !== 'soniox') setWithTimings(false)
+          }}
+          withTimings={withTimings}
+          setWithTimings={(next) => {
+            setWithTimings(next)
+            if (next) setEngine('soniox')
+          }}
           onStart={kickOff}
           busy={busy}
           err={stage === 'error' ? err : null}
@@ -149,7 +174,7 @@ const LocalFileTranscribeForm = forwardRef(function LocalFileTranscribeForm({ pa
       )}
 
       {stage === 'done' && (
-        <DonePanel job={job} onCopyAgain={copyAgain} busy={busy} />
+        <DonePanel job={job} onCopyAgain={copyAgain} onCopyPaths={copyPaths} busy={busy} />
       )}
 
       {toast && (
@@ -184,12 +209,12 @@ function Header({ fileName, job, stage }) {
 function FileIcon() {
   return (
     <div className="w-16 h-10 rounded bg-zinc-900 border border-zinc-800 shrink-0 flex items-center justify-center text-zinc-500">
-      🎬
+      <Clapperboard className="w-5 h-5" />
     </div>
   )
 }
 
-function ConfigPanel({ engine, setEngine, onStart, busy, err }) {
+function ConfigPanel({ engine, setEngine, withTimings, setWithTimings, onStart, busy, err }) {
   return (
     <div className={`rounded-md border ${err ? 'border-red-800/50 bg-red-900/10' : 'border-zinc-800 bg-zinc-900'} px-4 py-3 mb-3`}>
       {err && (
@@ -205,11 +230,12 @@ function ConfigPanel({ engine, setEngine, onStart, busy, err }) {
             чтобы транскрибировать
           </div>
         </div>
+        <TimingSwitch enabled={withTimings} onChange={setWithTimings} />
         <Btn primary onClick={onStart} busy={busy}>
           <Mic className="w-4 h-4" /> {err ? 'Повторить' : 'Транскрибировать'}
         </Btn>
       </div>
-      <div className="grid grid-cols-2 gap-2">
+      <div className="grid grid-cols-3 gap-2">
         {ENGINES.map(e => (
           <button
             key={e.id}
@@ -226,7 +252,33 @@ function ConfigPanel({ engine, setEngine, onStart, busy, err }) {
           </button>
         ))}
       </div>
+      {withTimings && (
+        <div className="text-zinc-500 mt-2" style={{ fontSize: '14px' }}>
+          Таймкоды идут через Soniox. После завершения появятся текстовый файл и SRT.
+        </div>
+      )}
     </div>
+  )
+}
+
+function TimingSwitch({ enabled, onChange }) {
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(!enabled)}
+      className={`shrink-0 h-10 px-3 rounded-md border inline-flex items-center gap-2 transition-colors ${
+        enabled
+          ? 'bg-zinc-100 text-zinc-900 border-zinc-100'
+          : 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:border-zinc-500'
+      }`}
+      title="Создать SRT с таймкодами"
+    >
+      <Clock3 className="w-4 h-4" />
+      <span>Таймкоды</span>
+      <span className={`w-8 h-4 rounded-full p-0.5 flex ${enabled ? 'bg-zinc-700 justify-end' : 'bg-zinc-700 justify-start'}`}>
+        <span className="w-3 h-3 rounded-full bg-white" />
+      </span>
+    </button>
   )
 }
 
@@ -237,11 +289,15 @@ function TranscribingPanel({ job, engine }) {
   // For Gemini there's no fine-grained progress (chunked pipeline runs
   // internally), so we keep the legacy "Файл уходит в API…" hint.
   const aaiStage = eng === 'assemblyai' ? local.aai_stage : null
+  const sonioxStage = eng === 'soniox' ? local.soniox_stage : null
   const stageLabel =
     aaiStage === 'uploading'    ? 'Заливаем файл на сервер AssemblyAI…' :
     aaiStage === 'queued'       ? 'В очереди обработки…' :
     aaiStage === 'transcribing' ? buildAAILabel(local) :
     aaiStage === 'completed'    ? 'Получаем результат…' :
+    sonioxStage === 'uploading'   ? 'Заливаем аудио на сервер Soniox…' :
+    sonioxStage === 'processing'  ? buildSonioxLabel(local) :
+    sonioxStage === 'fetching'    ? 'Получаем текст и таймкоды…' :
     null
 
   return (
@@ -269,6 +325,14 @@ function buildAAILabel(local) {
   return `Транскрибируем · ${elFmt}`
 }
 
+function buildSonioxLabel(local) {
+  const status = local.soniox_status
+  if (status === 'queued') return 'В очереди обработки…'
+  if (status === 'processing') return 'Транскрибируем и собираем таймкоды…'
+  if (status === 'completed') return 'Получаем результат…'
+  return 'Обработка Soniox…'
+}
+
 function mmssLocal(sec) {
   const s = Math.max(0, Math.floor(sec || 0))
   const m = Math.floor(s / 60)
@@ -285,22 +349,27 @@ function humanShortLocal(sec) {
   return mm ? `${h} ч ${mm} мин` : `${h} ч`
 }
 
-function DonePanel({ job, onCopyAgain, busy }) {
+function DonePanel({ job, onCopyAgain, onCopyPaths, busy }) {
   const local = job?.local || {}
+  const hasSrt = !!local.srt_path
   return (
     <div className="rounded-md border border-emerald-800/50 bg-emerald-900/10 px-4 py-3 mb-3 flex items-center gap-3">
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-1">
           <span className="text-emerald-400">✓</span>
-          <span className="text-zinc-200">Готово — текст в буфере</span>
+          <span className="text-zinc-200">{hasSrt ? 'Готово — текст и SRT сохранены' : 'Готово — текст в буфере'}</span>
         </div>
         <div className="text-zinc-400" style={{ fontSize: '14px' }}>
           AI · {local.engine || ''}
           {local.chars ? <> · {local.chars.toLocaleString('ru-RU')} символов</> : null}
+          {hasSrt ? <> · SRT {local.srt_cues ? `${local.srt_cues} фрагм.` : 'готов'}</> : null}
           {local.cost_usd ? <> · ${local.cost_usd.toFixed(4)}</> : null}
         </div>
       </div>
-      <Btn primary onClick={onCopyAgain} busy={busy}><Copy className="w-4 h-4" /> Скопировать ещё раз</Btn>
+      <div className="flex gap-2 shrink-0">
+        <Btn primary onClick={onCopyAgain} busy={busy}><Copy className="w-4 h-4" /> Текст</Btn>
+        <Btn onClick={onCopyPaths} busy={busy}><Link2 className="w-4 h-4" /> Пути</Btn>
+      </div>
     </div>
   )
 }
@@ -308,7 +377,7 @@ function DonePanel({ job, onCopyAgain, busy }) {
 // ─── helpers ────────────────────────────────────────────────────────────
 
 function Btn({ children, onClick, busy, primary }) {
-  const base = 'px-3 py-1.5 rounded-md transition-colors min-w-[180px] text-center inline-flex items-center justify-center gap-1.5'
+  const base = 'px-3 py-1.5 rounded-md transition-colors min-w-[120px] text-center inline-flex items-center justify-center gap-1.5'
   const styles = primary
     ? 'bg-zinc-100 text-zinc-900 hover:bg-white disabled:bg-zinc-800 disabled:text-zinc-500'
     : 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
@@ -317,6 +386,16 @@ function Btn({ children, onClick, busy, primary }) {
       {busy ? '…' : children}
     </button>
   )
+}
+
+function buildPathList(job) {
+  if (!job) return ''
+  const local = job.local || {}
+  const lines = []
+  if (job.target) lines.push(`Видео: ${job.target}`)
+  if (local.file_path || job.file_path) lines.push(`Текст: ${local.file_path || job.file_path}`)
+  if (local.srt_path) lines.push(`SRT: ${local.srt_path}`)
+  return lines.join('\n')
 }
 
 function Spinner() {
