@@ -82,7 +82,10 @@
         return false;
       }
       if (req && req.action === 'getStatus') {
-        sendResponse({ isExporting: popupExportRunning });
+        sendResponse({
+          isExporting: popupExportRunning,
+          chatgptMode: currentChatgptMode() || 'chat',
+        });
         return false;
       }
       if (req && req.action === 'cancel') {
@@ -182,6 +185,61 @@
         chrome.storage.local.remove(COMPOSE_JOB_PREFIX + id, resolve);
       });
     } catch (_) {}
+  }
+
+  async function updateComposeJob(id, patch) {
+    const key = COMPOSE_JOB_PREFIX + id;
+    const current = await fetchComposeJob(id);
+    const next = { ...current, ...patch };
+    await new Promise(resolve => chrome.storage.local.set({ [key]: next }, resolve));
+    return next;
+  }
+
+  async function claimComposeTab(id) {
+    return await new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage({ __sc_chatgpt_compose_claim: true, requestId: id }, response => {
+          const error = chrome.runtime.lastError;
+          resolve(!error && response?.ok === true);
+        });
+      } catch (_) {
+        resolve(false);
+      }
+    });
+  }
+
+  async function reportComposeResult(id, job, result, attempts = 5) {
+    const payload = {
+      __sc_chatgpt_compose_result: true,
+      requestId: id,
+      ok: result.ok === true,
+      error: result.error || null,
+      mode: result.mode || job?.mode || 'chat',
+      model: result.model || job?.model || null,
+      effort: result.effort || job?.effort || null,
+      ytTabId: job?.ytTabId ?? null,
+      ytVideoId: job?.ytVideoId || null,
+      ytTitle: job?.ytTitle || null,
+    };
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const response = await new Promise(resolve => {
+        try {
+          chrome.runtime.sendMessage(payload, value => {
+            const error = chrome.runtime.lastError;
+            resolve(error ? { ok: false, error: error.message } : (value || { ok: false }));
+          });
+        } catch (error) {
+          resolve({ ok: false, error: error?.message || String(error) });
+        }
+      });
+      if (response?.ok) {
+        log('compose.result_ack', { id, attempt, ok: payload.ok, targetLabel: response.targetLabel || null });
+        return true;
+      }
+      log('compose.result_ack_retry', { id, attempt, ok: payload.ok, err: response?.error || null });
+      await sleep(Math.min(1600, 250 * attempt));
+    }
+    return false;
   }
 
   // bfetch: page→bridge с SW-fallback (см. scBridgeFetch в research-badge.js).
@@ -341,6 +399,84 @@
   }
   function nodeText(el) {
     return (el?.textContent || '').trim().replace(/\s+/g, ' ');
+  }
+
+  const CHATGPT_MODES = Object.freeze(['chat', 'work']);
+  function resolveChatgptMode(value) {
+    return String(value || '').trim().toLowerCase() === 'work' ? 'work' : 'chat';
+  }
+  function chatgptModeLabel(mode) {
+    return resolveChatgptMode(mode) === 'work' ? 'Work' : 'Chat';
+  }
+  function modeFromRadioText(value) {
+    const text = String(value || '').trim();
+    if (/^Work$/i.test(text)) return 'work';
+    if (/^Chat$/i.test(text)) return 'chat';
+    return null;
+  }
+  function isModeRadioChecked(el) {
+    if (!el) return false;
+    const dataState = String(el.getAttribute('data-state') || '').toLowerCase();
+    return el.getAttribute('aria-checked') === 'true'
+      || dataState === 'checked'
+      || dataState === 'active'
+      || dataState === 'on';
+  }
+  function chatgptModeRadios() {
+    return visibleAll('[role="radio"]')
+      .map(el => ({ el, mode: modeFromRadioText(nodeText(el)) }))
+      .filter(item => item.mode)
+      .sort((a, b) => a.el.getBoundingClientRect().top - b.el.getBoundingClientRect().top);
+  }
+  function currentChatgptMode() {
+    const radios = chatgptModeRadios();
+    const selected = radios.find(item => isModeRadioChecked(item.el));
+    return selected?.mode || null;
+  }
+  function chatgptModeSnapshot() {
+    return chatgptModeRadios().map(({ el, mode }) => ({
+      mode,
+      text: nodeText(el),
+      ariaChecked: el.getAttribute('aria-checked'),
+      dataState: el.getAttribute('data-state'),
+      top: Math.round(el.getBoundingClientRect().top),
+    }));
+  }
+  async function ensureChatgptModeSelected(requestedMode) {
+    const mode = resolveChatgptMode(requestedMode);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const target = await waitFor(
+        () => chatgptModeRadios().find(item => item.mode === mode)?.el || null,
+        `ChatGPT ${chatgptModeLabel(mode)} radio`,
+        15000,
+        200,
+      );
+      const before = currentChatgptMode();
+      if (before === mode && isModeRadioChecked(target)) {
+        log('mode.already_set', { mode, attempt, radios: chatgptModeSnapshot() });
+        return true;
+      }
+      nativeMouseClick(target);
+      try {
+        await waitFor(
+          () => currentChatgptMode() === mode,
+          `ChatGPT ${chatgptModeLabel(mode)} mode verify`,
+          5000,
+          150,
+        );
+      } catch (_) {}
+      const ok = currentChatgptMode() === mode;
+      log(ok ? 'mode.selected' : 'mode.verify_failed', {
+        mode,
+        attempt,
+        before,
+        radios: chatgptModeSnapshot(),
+      });
+      if (ok) return true;
+      await sleep(300);
+    }
+    log('mode.select_failed', { mode, radios: chatgptModeSnapshot() });
+    return false;
   }
 
   // ── Popup export: текущий ChatGPT-чат → markdown ─────────────────────
@@ -777,11 +913,13 @@
     return md;
   }
 
-  function buildChatGPTExportHeader(turnCount, stats) {
+  function buildChatGPTExportHeader(turnCount, stats, mode) {
     const title = (document.title || 'ChatGPT').replace(/\s*[-–]\s*ChatGPT\s*$/i, '').trim() || 'ChatGPT chat';
     const exportedAt = new Date().toISOString();
+    const providerLabel = `ChatGPT · ${chatgptModeLabel(mode)}`;
     let md = `# ${title}\n\n`;
-    md += `> **Сводка экспорта ChatGPT**  \n`;
+    md += `> **Сводка экспорта ${providerLabel}**  \n`;
+    md += `> Режим: ${providerLabel}  \n`;
     md += `> Сообщений: ${turnCount}; User: ${stats.user}; ChatGPT: ${stats.assistant}  \n`;
     md += `> Источников: ${stats.sources}; activity-шагов: ${stats.activity}; картинок: ${stats.images}  \n`;
     md += `> URL: ${location.href}  \n`;
@@ -1014,7 +1152,7 @@
     return md;
   }
 
-  function buildChatGPTApiMarkdown(data, settings, stats) {
+  function buildChatGPTApiMarkdown(data, settings, stats, mode) {
     const nodes = chatgptCurrentPathNodes(data)
       .filter(node => node?.message && apiMessageRole(node) !== 'system' && !isHiddenApiMessage(node));
     const turns = [];
@@ -1098,8 +1236,10 @@
 
     const title = data.title || document.title || 'ChatGPT chat';
     const exportedAt = new Date().toISOString();
+    const providerLabel = `ChatGPT · ${chatgptModeLabel(mode)}`;
     let markdown = `# ${title}\n\n`;
-    markdown += `> **Сводка экспорта ChatGPT**  \n`;
+    markdown += `> **Сводка экспорта ${providerLabel}**  \n`;
+    markdown += `> Режим: ${providerLabel}  \n`;
     markdown += `> Источник: ChatGPT backend API  \n`;
     markdown += `> User-сообщений: ${stats.user}; ответов ChatGPT: ${stats.assistant}  \n`;
     markdown += `> Источников: ${stats.sources}; activity-шагов: ${stats.activity}; картинок/вложений: ${stats.images}  \n`;
@@ -1116,6 +1256,8 @@
     popupExportRunning = true;
     popupExportCancel = false;
     const settings = normalizeChatGPTExportSettings(rawSettings || {});
+    const exportMode = currentChatgptMode() || 'chat';
+    const exportProviderLabel = `ChatGPT · ${chatgptModeLabel(exportMode)}`;
     const started = performance.now();
     const stats = { user: 0, assistant: 0, sources: 0, activity: 0, images: 0 };
     const parts = [];
@@ -1128,7 +1270,7 @@
       try {
         const apiData = await fetchChatGPTConversationJson();
         assertPopupExportNotCancelled();
-        if (apiData) apiBuilt = buildChatGPTApiMarkdown(apiData, settings, stats);
+        if (apiData) apiBuilt = buildChatGPTApiMarkdown(apiData, settings, stats, exportMode);
       } catch (apiError) {
         log('popup_export.api_fallback', { err: apiError?.message || String(apiError) });
       }
@@ -1136,11 +1278,12 @@
       if (apiBuilt?.markdown && apiBuilt.turnCount > 0) {
         assertPopupExportNotCancelled();
         updateChatGPTExportOverlay('Собираю markdown...', 'Шаг 3/3: упаковка');
-        const filename = `chatgpt-${safeFilenamePart(document.title || 'chat')}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.md`;
+        const filename = `chatgpt-${exportMode}-${safeFilenamePart(document.title || 'chat')}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.md`;
         const delivery = await deliverMarkdown(apiBuilt.markdown, filename, settings.__export.downloadFile);
         const elapsed = ((performance.now() - started) / 1000).toFixed(1);
         log('popup_export.done', {
           source: apiBuilt.source,
+          mode: exportMode,
           turns: apiBuilt.turnCount,
           delivery,
           sources: stats.sources,
@@ -1155,7 +1298,7 @@
             : delivery === 'download-fallback'
               ? `Буфер обмена был недоступен, скачан файл: ${filename}`
           : `Файл: ${filename}`));
-        return { success: true, message: 'Экспорт ChatGPT завершён' };
+        return { success: true, message: `Экспорт ${exportProviderLabel} завершён`, chatgptMode: exportMode };
       }
       if (apiBuilt?.markdown) {
         log('popup_export.api_empty_fallback', { turns: apiBuilt.turnCount });
@@ -1204,12 +1347,13 @@
 
       updateChatGPTExportOverlay('Собираю markdown...', 'Шаг 3/3: упаковка');
       const body = parts.join('\n---\n\n');
-      const markdown = buildChatGPTExportHeader(turns.length, stats) + body + '\n';
-      const filename = `chatgpt-${safeFilenamePart(document.title || 'chat')}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.md`;
+      const markdown = buildChatGPTExportHeader(turns.length, stats, exportMode) + body + '\n';
+      const filename = `chatgpt-${exportMode}-${safeFilenamePart(document.title || 'chat')}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.md`;
       const delivery = await deliverMarkdown(markdown, filename, settings.__export.downloadFile);
       const elapsed = ((performance.now() - started) / 1000).toFixed(1);
       log('popup_export.done', {
         turns: turns.length,
+        mode: exportMode,
         delivery,
         sources: stats.sources,
         activity: stats.activity,
@@ -1223,7 +1367,7 @@
           : delivery === 'download-fallback'
             ? `Буфер обмена был недоступен, скачан файл: ${filename}`
             : `Файл: ${filename}`));
-      return { success: true, message: 'Экспорт ChatGPT завершён' };
+      return { success: true, message: `Экспорт ${exportProviderLabel} завершён`, chatgptMode: exportMode };
     } catch (e) {
       const msg = e?.message || String(e);
       log('popup_export.failed', { err: msg });
@@ -1245,7 +1389,7 @@
     { key: 'instant',      match: /^Instant$/i,                          sub: false, aliases: ['instant'] },
     { key: 'medium',       match: /^Medium$/i,                           sub: false, aliases: ['medium', 'mid'] },
     { key: 'high',         match: /^High$/i,                             sub: false, aliases: ['high'] },
-    { key: 'xhigh',        match: /^(Очень высокий|Extra\s*high)$/i,     sub: false, aliases: ['xhigh', 'x-high', 'extra high', 'очень высокий', 'very high'] },
+    { key: 'xhigh',        match: /^(Очень высокий|Very\s*high|Extra\s*high)$/i, sub: false, aliases: ['xhigh', 'x-high', 'extra high', 'очень высокий', 'very high'] },
     { key: 'pro',          match: /^(Pro стандартный|Pro standard)$/i,   sub: true,  aliases: ['pro', 'pro-standard', 'pro стандартный'] },
     { key: 'pro-extended', match: /^(Pro расширенный|Pro extended)$/i,   sub: true,  aliases: ['pro-extended', 'pro-ext', 'extended', 'pro расширенный'] },
   ];
@@ -1296,7 +1440,7 @@
     return pills.find(b => (b.className || '').includes('__composer-pill'))
         || pills.find(b => {
              const t = nodeText(b);
-             return t.length < 30 && /^(Pro|Instant|Medium|High|Очень высокий|Extra\s*high|Auto)/i.test(t);
+             return t.length < 30 && /^(Pro|Instant|Medium|High|Очень высокий|Very\s*high|Extra\s*high|Auto)/i.test(t);
            });
   }
   function findEffortItem(eff) {
@@ -2343,30 +2487,92 @@
     log('compose.start', { id, tabId: myTabId });
     const stopKeepAlive = startKeepAlivePort();
     let submitted = false;
+    let job = null;
     try {
-      const job = await fetchComposeJob(id);
+      const claimed = await claimComposeTab(id);
+      log('compose.claim', { id, tabId: myTabId, ok: claimed });
+      job = await fetchComposeJob(id);
+      const mode = resolveChatgptMode(job.mode);
       const effortKey = resolveEffort(job.effort);
       const modelKey = resolveModel(job.model);
+
+      // Background уже принял terminal result, но не смог доставить его в
+      // YouTube (например, SW перезапустился между сообщениями). После F5
+      // повторяем только ACK, а не настройки/paste/Send.
+      if (job.terminalResult && typeof job.terminalResult === 'object') {
+        submitted = job.terminalResult.ok === true || !!job.submitAcceptedAt;
+        const acknowledged = await reportComposeResult(id, job, job.terminalResult);
+        if (acknowledged) await removeComposeJob(id);
+        return;
+      }
+
+      // ACK мог дойти до ChatGPT, но ответ SW потеряться при respin. Метка
+      // submitAcceptedAt запрещает повторную отправку после F5/re-inject:
+      // повторяем только подтверждение в исходную YouTube-кнопку.
+      if (job.submitAcceptedAt) {
+        submitted = true;
+        const acknowledged = await reportComposeResult(id, job, {
+          ok: true,
+          mode: job.acceptedMode || mode,
+          model: job.acceptedModel || modelKey,
+          effort: job.acceptedEffort || effortKey,
+        });
+        if (acknowledged) await removeComposeJob(id);
+        return;
+      }
+
       await waitFor(() => findComposer(), 'composer (#prompt-textarea — логин?)', 20000);
+      const okMode = await ensureChatgptModeSelected(mode);
+      if (!okMode) throw new Error(`chatgpt_mode_select_failed: не удалось выбрать ChatGPT · ${chatgptModeLabel(mode)}`);
+      await waitFor(() => findComposer(), 'composer after Chat/Work selection', 15000);
       const okModel = await ensureModelSelected(modelKey);
       if (!okModel) throw new Error(`chatgpt_model_select_failed: не удалось выбрать модель ${modelDisplay(modelKey)}`);
-      await ensureEffortSelected(effortKey);
+      const okEffort = await ensureEffortSelected(effortKey);
+      if (!okEffort) throw new Error(`chatgpt_effort_select_failed: не удалось выбрать интеллект ${effortLabel(effortKey)}`);
       pasteIntoComposer(job.prompt);
-      await waitComposerReadyAfterPaste(null);
+      await waitComposerReadyAfterPaste(id);
       await clickSend();
       submitted = true;
-      await removeComposeJob(id);
+      job = await updateComposeJob(id, {
+        submitAcceptedAt: Date.now(),
+        acceptedMode: mode,
+        acceptedModel: modelKey,
+        acceptedEffort: effortKey,
+      });
       log('compose.submitted', {
         id,
+        mode,
         model: modelKey,
         effort: effortKey,
         promptLen: job.prompt.length,
       });
+      const acknowledged = await reportComposeResult(id, job, {
+        ok: true,
+        mode,
+        model: modelKey,
+        effort: effortKey,
+      });
+      if (acknowledged) await removeComposeJob(id);
+      else log('compose.result_ack_pending', { id, mode, model: modelKey, effort: effortKey });
     } catch (e) {
-      log('compose.flow_err', { id, err: e?.message || String(e) });
+      const error = e?.message || String(e);
+      log('compose.flow_err', { id, err: error });
+      if (job && !submitted) {
+        const acknowledged = await reportComposeResult(id, job, {
+          ok: false,
+          error,
+          mode: resolveChatgptMode(job.mode),
+          model: resolveModel(job.model),
+          effort: resolveEffort(job.effort),
+        });
+        if (acknowledged) await removeComposeJob(id);
+      }
     } finally {
       stopKeepAlive();
-      if (submitted) await detachFocusEmulation(myTabId);
+      // Compose закончен и после принятого Send, и после ошибки настройки.
+      // CDP focus-emulation нужен только пока скрытая вкладка выполняет шаги;
+      // не оставляем debugger attached на терминальной ошибке.
+      await detachFocusEmulation(myTabId);
     }
   }
 

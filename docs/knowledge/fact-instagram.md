@@ -10,8 +10,8 @@
 
 | Скрипт | Что делает | Тип job |
 |---|---|---|
-| `python-workers/instagram/ig_login_ndjson.py` | headed-login в Instagram и запись cookies | one-shot, не job |
-| `python-workers/instagram/ig_sessions_ndjson.py` | inventory/health-check cookies-файлов + delete | one-shot, не job |
+| `python-workers/instagram/ig_login_ndjson.py` | headed-login, проверка доступа и запись двух session-форматов | one-shot, не job |
+| `python-workers/instagram/ig_sessions_ndjson.py` | inventory + раздельный web/Android API health-check + delete | one-shot, не job |
 | `python-workers/instagram/ig_profile_ndjson.py` | username → список reels/posts | `ig_profile_fetch` |
 | `python-workers/instagram/ig_batch_transcribe_ndjson.py` | список shortcodes → транскрипты | `ig_batch_transcribe` |
 
@@ -52,29 +52,36 @@
 
 ---
 
-## 🎯 Почему transcribe **повторно** ходит в `clips/user/`, а не в `media/info/`
+## 🎯 Два Android API-пути получения `video_url`
 
-Натуральный путь для «получить видео по shortcode» — `media/info/?media_id=<pk>_<user_id>`. Но он **требует ds_user_id cookie** (логинного юзера), без cookies возвращает 401. У stateless-клиента нет ds_user_id → не работает.
+`--backend api` выбирает бесплатный Android API, но способ разрешения reel зависит
+от известного контекста. Backend при этом не меняется:
 
-Есть и другие пути, тоже не работают без cookies:
-- `instagram.com/api/v1/media/by_shortcode/?shortcode=<c>` → 404 для анонимных.
-- `instagram.com/graphql/query/?...` → `require_login: true`.
-- `instagram.com/p/<c>/?__a=1&__d=dis` → 404.
+1. **Есть числовой owner `user_id`** — stateless-клиент повторно пагинирует
+   `clips/user/<user_id>` до нужного shortcode. Этот путь не читает cookies и
+   сохраняет анонимный профильный batch быстрым.
+2. **Есть только bare shortcode/URL** — authenticated-клиент переводит shortcode
+   в media PK и вызывает канонический `media/<pk>/info/`. Он требует сохранённую
+   Android API-сессию, зато owner заранее не нужен: ответ самого reel содержит
+   owner и свежий signed `video_url`.
 
-Что работает — это **повторно** дёрнуть `clips/user/` (тот же endpoint, что использует `ig_profile_ndjson.py`) для конкретного `target_user_id` и пагинировать пока нужный shortcode не появится. У каждого reel в payload уже есть свежий signed `video_url` (минуты-часы TTL).
+Проверено прямыми запросами на одном и том же reel: старый маршрут
+`media/info/?media_id=...` вернул HTTP 404 с HTML, а
+`media/<pk>/info/` с действующей сессией вернул HTTP 200, owner и video URL.
+Анонимный запрос к media endpoint вернул `login_required`. Поэтому отсутствие
+owner в локальной БД не является ошибкой Android API; ошибкой является только
+отсутствующая или отклонённая Instagram-сессия.
 
-**Архитектура transcribe-job через `--backend api`:**
-1. `ig_batch_transcribe_ndjson.py` принимает обязательный `--user-id <pk>` (passed из `source.external_id` в job-runner). Если job sourceless или у source нет числового Instagram `user_id`, api-путь невозможен: `clips/user/` не умеет резолвить произвольный shortcode без владельца.
-2. Перед первым reel'ом `_get_ig_client()` создаёт singleton `IGAPIClient(skip_session=True)`.
-3. Для каждого shortcode из batch:
-    - Сначала смотрим `_cache[user_id].reels[shortcode]` — был ли он уже спарсен в предыдущем page.
-    - Если нет — пагинируем `clips/user/` страницами по 12, **накапливая все встреченные** reels в кэш.
-    - Останавливаемся, когда нужный shortcode появился (early-exit), либо когда `paging_info.more_available=false`.
-4. Из reel-объекта берём `video_url`, скачиваем curl'ом → ffmpeg → Gemini.
+Для профильного batch кэш `per-user_id` остаётся критичным: страницы
+`clips/user/` накапливаются один раз на весь job, а следующие shortcodes ищутся
+в уже полученных reels. Для bare URL используется отдельный session-клиент, чтобы
+профильный stateless flow не начал случайно зависеть от login cookies.
 
-**Кэш per-user_id на весь batch** — критичен. Без него для batch из 50 reels в одном профиле скрипт бы пагинировал `clips/user/` 50 раз с нуля. С кэшем — один раз пагинируем профиль до полного покрытия shortcodes из batch (обычно 1-3 страницы), дальше hits идут из памяти.
-
-**Альтернатива через apify (transcribe_backend=apify):** актор `apple_yang/instagram-transcripts-scraper` принимает `videoUrl` (полный URL рилса), отдаёт audioUrl. $0.001 за reel. Используется как fallback и для случаев когда нужен **приватный** рилс на который у юзера есть подписка (apify-actors сами держат залогиненную сессию).
+`api_resolution` делает выбранный путь явным в job/logs:
+`profile_clips` для известного owner и `shortcode_session` для bare URL. При
+ошибке ни один из путей не переключается на Apify. Актор
+`apple_yang/instagram-transcripts-scraper` запускается только если пользователь
+сам выбрал `transcribe_backend=apify`.
 
 ---
 
@@ -92,30 +99,59 @@ Apify-runs работают так: POST `acts/<actor>/runs?token=...`, полу
 
 ---
 
-## 🍪 Cookies для приватных профилей — опциональны
+## 🍪 Instagram-сессии и повторный вход
 
-`~/.config/sc/instagram_session.json` (Playwright storage_state) и `~/.config/sc/instagram_api_session.json` (плоский dict) — два формата одной Instagram-сессии. Если файл есть и `IGAPIClient` создан **без** `skip_session=True`, он подхватит cookies и будет ходить как залогиненный юзер. Это нужно **только** для приватных профилей на которые юзер подписан.
+`~/.config/sc/instagram_session.json` хранит Playwright storage state,
+`~/.config/sc/instagram_api_session.json` — cookies и постоянную identity
+Android-устройства. Это два представления одного входа с разной проверяемой
+способностью: browser-session нужна headed flow, API-session — bare reel и
+authenticated mobile endpoints. Публичный профиль через `clips/user/` по-прежнему
+работает stateless.
 
-**Login-flow:** `sc -i --login` (shim в `cli-tools/scripts/sc`) запускает тот же путь что и `npm run instagram:login`: headed Chrome через Playwright, пользователь логинится руками, скрипт ждёт `sessionid` cookie и сохраняет оба файла. Это не «браузерный парсер» и не Docker — только ручной способ получить cookies без автозаполнения Instagram-форм.
+В Settings сессии видны сразу в секции `Android API · Instagram-сессия`, потому
+что bare URL зависит от них. Кнопка `Войти заново` запускает headed Chrome через
+IPC без терминальной команды. Helper сначала пробует Instagram one-tap
+`Продолжить`, затем ждёт ручной ввод только если Instagram действительно показал
+login form/challenge, обрабатывает известную post-login кнопку сохранения входа и
+записывает оба файла только после успешного сетевого web-check. Наличие старого
+`sessionid` в browser context само по себе больше не завершает login как success.
 
-**В UI** управление сессиями скрыто за `Расширенное · Cookies-сессии` в InstagramSettings. Юзер видит файлы, возраст файла, результат проверки и может удалить сессию. Наличие `sessionid` в JSON больше не считается доказательством авторизации: старая cookie могла протухнуть месяц назад, поэтому Settings вызывает `ig_sessions_ndjson.py list --check`.
+`ig_sessions_ndjson.py list --check` проверяет форматы раздельно:
 
-`ig_sessions_ndjson.py` — inventory + optional health-check:
-- `list` → emit per-file `{kind:'playwright'|'api', authorized, user_id, error, age_days}`
-- `list --check` → дополнительно делает network-check на `instagram.com/api/v1/accounts/edit/web_form_data/` и возвращает `health.ok`, `health.username` или HTTP/JSON-причину невалидности.
-- `delete --kind <k>` → удалить файл (используется в UI кнопкой 🗑)
+- Playwright cookies — web endpoint аккаунта без redirect-following; redirect на
+  login является invalid, а не циклом `TooManyRedirects`.
+- Android API cookies — representative authenticated mobile request
+  `discover/media_metadata/?media_id=1`. Для действующей сессии он возвращает
+  HTTP 200/status ok даже без реального media, для anonymous/отозванной —
+  HTTP 403 `login_required`.
 
-Файл без network-check — это только inventory («на диске что-то есть»). UI-статусы «сессия проверена» / «не прошла проверку» опираются на `health`, а не на `authorized`.
+Успешный web-check не доказывает, что mobile API принимает те же cookies, поэтому
+зелёный статус Android API строится только по mobile probe. Username для строки
+берётся дополнительным web-check и не влияет на API verdict.
+
+API-session сохраняет device/app UUID и Android ID между worker-запусками, чтобы
+не представляться Instagram новым устройством на каждый запрос. Это hardening,
+а не доказанная причина прежней инвалидизации: после серии диагностических
+private API-запросов старая сессия была отозвана сервером, но точную server-side
+причину текущие логи не установили.
 
 ## 🎬 Одиночный reel из paste-flow
 
 Inline-форма для `https://www.instagram.com/reel/<shortcode>/...` больше не должна показывать CLI-заглушку. Поток такой:
 
-1. Сначала `ig:lookupReel` ищет уже готовый текст: `items.external_id = 'reel:<shortcode>'` для source-attached reels, затем sourceless `ig_batch_transcribe` jobs по `parameters_json.shortcodes` + `file_path`. Cache-hit сразу показывает «Уже есть транскрипт» и копирует combined-файл, без нового Apify run.
-2. Если shortcode уже привязан к локальному Instagram source с числовым `user_id`, можно идти бесплатным `android-api`: transcribe заново пагинирует `clips/user/<user_id>` и берёт свежий `video_url`.
-3. Если юзер вставил **голый reel URL**, а владельца/source в БД нет, бесплатный api-путь невозможен. `clips/user/` требует owner `user_id`; надёжного cookies-free shortcode-resolve в текущем стеке нет. В этом случае UI явно планирует Apify, проверяет валидность токена и пишет почему android-api не подходит.
+1. Сначала `ig:lookupReel` ищет уже готовый текст: `items.external_id = 'reel:<shortcode>'` для source-attached reels, затем sourceless `ig_batch_transcribe` jobs по `parameters_json.shortcodes` + `file_path`. Cache-hit сразу показывает «Уже есть транскрипт» и копирует combined-файл без нового network/AI job.
+2. Если shortcode привязан к source с числовым owner, Android API использует
+   stateless `profile_clips` и берёт свежий `video_url` из `clips/user/`.
+3. Если юзер вставил **голый reel URL**, а source в БД нет, выбранный Android API
+   использует `shortcode_session`. Такой job остаётся sourceless, не создаёт
+   фиктивный профиль/items и требует валидную API-session.
+4. Если пользователь явно выбрал Apify, форма проверяет его token и запускает
+   только Apify. Невалидная Android session не является разрешением потратить
+   деньги через автоматический fallback.
 
-Это не silent fallback: переключение на платный backend для bare URL видно в форме до запуска. Если Apify token невалиден или не задан, кнопка блокируется с причиной.
+Тот же service вызывается Telegram-ботом, поэтому cache/backend/error contract
+не расходится между paste-flow и сообщением. Формат и lifecycle бота описаны в
+`fact-telegram-bot.md`.
 
 ---
 
@@ -157,10 +193,15 @@ Combined.txt пишется **автоматически** при close batch-jo
 
 ## 🪤 Что пробовали и почему не сработало
 
-- **`media/info/` для transcribe вместо re-pagination `clips/user/`** — 401 без `ds_user_id` cookie. Без cookies endpoint не доступен независимо от `X-IG-App-ID`.
+- **`media/info/?media_id=...` как shortcode-resolve** — это не канонический
+  private API route: с валидной сессией он вернул 404 HTML. Рабочий маршрут —
+  `media/<pk>/info/`; без session cookies он ожидаемо отвечает `login_required`.
 - **`graphql/query/?shortcode=<c>`** — отвечает `require_login: true` для анонимных запросов. Workaround нет.
 - **Хранить `video_url` в БД при первом fetch** — signed URL экспирится через 5-15 минут, БД переполнится протухшими URL. Re-fetch перед скачиванием обязателен.
 - **Auto-fallback api → apify при ошибке** — отбросили: тихо тратятся деньги на apify в случаях которые юзер бы сам решил перезагрузкой / переключением. Failure visible — лучше чем quiet retry.
 - **Парсинг через Docker/browser** — первый вариант был ближе к «открыть Instagram как страницу и вытащить данные», но Android mobile endpoints оказались быстрее и проще. Браузер не возвращаем в runtime-парсинг; он нужен только для headed login.
 - **Импорт cookies из Yandex/Chrome как основной flow** — browser cookies часто зашифрованы системным keychain и не читаются детерминированно из worker'а. Надёжнее дать пользователю headed-login, сохранить оба app-specific session-файла и потом проверять их network-check'ом.
-- **Свой phone+code login flow в UI (как у Telegram)** — IG банит за автозаполнение полей входа. Логин остаётся ручным в headed Chrome, UI только показывает команду и валидность получившихся cookies.
+- **Свой phone+code login flow и автозаполнение password в UI** — challenge/2FA
+  Instagram нельзя надёжно свести к нашей форме. UI запускает headed Chrome и
+  автоматизирует только безопасные известные шаги one-tap/save-login; credentials
+  и challenge остаются в Instagram, после чего worker сам проверяет результат.

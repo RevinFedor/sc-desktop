@@ -177,6 +177,12 @@ const CHATGPT_AVAILABLE_EFFORTS = Object.freeze([
   { id: 'pro-extended', label: 'Pro расширенный' },
 ]);
 
+const CHATGPT_MODES = Object.freeze(['chat', 'work']);
+const CHATGPT_MODE_LABELS = Object.freeze({
+  chat: 'Chat',
+  work: 'Work',
+});
+
 // Куда отправляется транскрипт после клика «+ ai» на YouTube-карточке.
 // Один target за раз — выбор Gemini, Claude или ChatGPT. Раздельные настройки
 // (sys-prompt, проект, prompt, модель) каждого target'а живут параллельно в
@@ -189,10 +195,12 @@ const YOUTUBE_TARGET_LABELS = Object.freeze({
 });
 
 const YOUTUBE_ENGINES = Object.freeze(['gemini', 'assemblyai']);
+const YOUTUBE_SETTINGS_SCHEMA_VERSION = 1;
 
 const YOUTUBE_DEFAULT_SETTINGS = Object.freeze({
   auto_aistudio: false,           // legacy-поле, всегда false (split-pill решает)
   with_comments: false,
+  preferred_lang: 'ru',
   // Движок AI-транскрипции когда субтитров нет (awaiting_ai → resume).
   // gemini (дёшево, быстро) | assemblyai (длинные файлы 1-10ч). Прокидывается
   // в __sc_track_job → trackJob.engine → POST /yt-resume-ai. Дефолт gemini.
@@ -226,6 +234,14 @@ const YOUTUBE_DEFAULT_SETTINGS = Object.freeze({
   // Prompt складывается перед текстом транскрипта и отправляется через
   // sc-compose handoff. Модель/effort зеркалят chatgpt-research.js.
   chatgpt_prompt: 'перескажи кратко',
+  chatgpt_mode: 'chat',
+  // Chat и Work запоминают модель/интеллект независимо. Legacy aliases
+  // chatgpt_model/chatgpt_effort ниже всегда зеркалят АКТИВНЫЙ режим —
+  // youtube-content.js старых версий продолжает получать корректную пару.
+  chatgpt_chat_model: '5.5',
+  chatgpt_chat_effort: 'xhigh',
+  chatgpt_work_model: '5.5',
+  chatgpt_work_effort: 'xhigh',
   chatgpt_model: '5.5',
   chatgpt_effort: 'xhigh',
 });
@@ -235,6 +251,9 @@ function sanitizeYoutubeSettings(raw = {}) {
   const cb = (v, fb) => typeof v === 'boolean' ? v : fb;
   s.auto_aistudio = cb(raw.auto_aistudio, s.auto_aistudio);
   s.with_comments = cb(raw.with_comments, s.with_comments);
+  if (typeof raw.preferred_lang === 'string' && raw.preferred_lang.trim()) {
+    s.preferred_lang = raw.preferred_lang.trim().slice(0, 32);
+  }
   if (typeof raw.engine === 'string' && YOUTUBE_ENGINES.includes(raw.engine)) {
     s.engine = raw.engine;
   }
@@ -271,11 +290,36 @@ function sanitizeYoutubeSettings(raw = {}) {
   if (typeof raw.chatgpt_prompt === 'string') {
     s.chatgpt_prompt = raw.chatgpt_prompt.slice(0, 4000);
   }
-  if (typeof raw.chatgpt_model === 'string' && CHATGPT_AVAILABLE_MODELS.some(m => m.id === raw.chatgpt_model)) {
-    s.chatgpt_model = raw.chatgpt_model;
+  if (typeof raw.chatgpt_mode === 'string' && CHATGPT_MODES.includes(raw.chatgpt_mode)) {
+    s.chatgpt_mode = raw.chatgpt_mode;
   }
-  if (typeof raw.chatgpt_effort === 'string' && CHATGPT_AVAILABLE_EFFORTS.some(e => e.id === raw.chatgpt_effort)) {
-    s.chatgpt_effort = raw.chatgpt_effort;
-  }
+  const validChatgptModel = value => typeof value === 'string'
+    && CHATGPT_AVAILABLE_MODELS.some(m => m.id === value);
+  const validChatgptEffort = value => typeof value === 'string'
+    && CHATGPT_AVAILABLE_EFFORTS.some(e => e.id === value);
+
+  // До появления Chat/Work существовала одна пара chatgpt_model/effort.
+  // Она относилась к обычному Chat, поэтому переносим её именно туда.
+  const legacyModel = validChatgptModel(raw.chatgpt_model) ? raw.chatgpt_model : null;
+  const legacyEffort = validChatgptEffort(raw.chatgpt_effort) ? raw.chatgpt_effort : null;
+  if (validChatgptModel(raw.chatgpt_chat_model)) s.chatgpt_chat_model = raw.chatgpt_chat_model;
+  else if (legacyModel) s.chatgpt_chat_model = legacyModel;
+  if (validChatgptEffort(raw.chatgpt_chat_effort)) s.chatgpt_chat_effort = raw.chatgpt_chat_effort;
+  else if (legacyEffort) s.chatgpt_chat_effort = legacyEffort;
+  if (validChatgptModel(raw.chatgpt_work_model)) s.chatgpt_work_model = raw.chatgpt_work_model;
+  if (validChatgptEffort(raw.chatgpt_work_effort)) s.chatgpt_work_effort = raw.chatgpt_work_effort;
+
+  // Совместимые flat aliases: desktop и старые content-script'ы видят
+  // модель/интеллект текущего режима, не теряя отдельные пары.
+  s.chatgpt_model = s[`chatgpt_${s.chatgpt_mode}_model`];
+  s.chatgpt_effort = s[`chatgpt_${s.chatgpt_mode}_effort`];
   return s;
+}
+
+function diffYoutubeSettings(before, after) {
+  const patch = {};
+  for (const [key, value] of Object.entries(after || {})) {
+    if (!before || before[key] !== value) patch[key] = value;
+  }
+  return patch;
 }

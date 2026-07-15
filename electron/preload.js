@@ -1,6 +1,10 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('api', {
+  // Unified, non-secret application settings exposed to the Settings screen.
+  appSettingsGet:   ()        => ipcRenderer.invoke('appSettings:get'),
+  appSettingsPatch: (payload) => ipcRenderer.invoke('appSettings:patch', payload),
+
   // Telegram fetch via tg_fetch_json.py (ndjson stream).
   tgFetch:           (params)   => ipcRenderer.invoke('tg:fetch', params),
   tgPreview:         (params)   => ipcRenderer.invoke('tg:preview', params),
@@ -51,6 +55,7 @@ contextBridge.exposeInMainWorld('api', {
   igSetBackend:     (payload)  => ipcRenderer.invoke('ig:setBackend', payload),
   igSetApifyToken:  (token)    => ipcRenderer.invoke('ig:setApifyToken', token),
   igListSessions:   ()         => ipcRenderer.invoke('ig:listSessions'),
+  igLogin:          ()         => ipcRenderer.invoke('ig:login'),
   igDeleteSession:  (kind)     => ipcRenderer.invoke('ig:deleteSession', kind),
   igOverview:       (payload)  => ipcRenderer.invoke('ig:overview', payload),
   igLookupProfile:  (payload)  => ipcRenderer.invoke('ig:lookupProfile', payload),

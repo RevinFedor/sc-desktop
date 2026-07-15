@@ -190,6 +190,39 @@ class IGAPIClient:
         for name, value in cookies_dict.items():
             self.session.cookies.set(name, value, domain=".instagram.com")
 
+    def _device_state(self):
+        return {
+            "device": self.device,
+            "app_version": self.app_version,
+            "version_code": self.version_code,
+            "bloks_versioning_id": self.bloks_versioning_id,
+            "uuid": self.uuid,
+            "phone_id": self.phone_id,
+            "client_session_id": self.client_session_id,
+            "advertising_id": self.advertising_id,
+            "android_device_id": self.android_device_id,
+            "request_id": self.request_id,
+            "tray_session_id": self.tray_session_id,
+            "locale": self.locale,
+            "country": self.country,
+            "country_code": self.country_code,
+            "timezone_offset": self.timezone_offset,
+        }
+
+    def _load_device_state(self, state):
+        if not isinstance(state, dict):
+            return
+        if isinstance(state.get("device"), dict):
+            self.device = dict(state["device"])
+        for name in (
+            "app_version", "version_code", "bloks_versioning_id", "uuid",
+            "phone_id", "client_session_id", "advertising_id",
+            "android_device_id", "request_id", "tray_session_id", "locale",
+            "country", "country_code", "timezone_offset",
+        ):
+            if state.get(name) is not None:
+                setattr(self, name, state[name])
+
     def _load_session(self):
         """Load cookies from existing Playwright session file."""
         # Try API session first
@@ -198,7 +231,10 @@ class IGAPIClient:
                 with open(SESSION_FILE) as f:
                     data = json.load(f)
                 if "cookies" in data:
+                    self._load_device_state(data.get("device_state"))
                     self._load_cookies(data["cookies"])
+                    if not data.get("device_state"):
+                        self._save_session()
                     print_success("API session loaded")
                     return
             except Exception:
@@ -231,7 +267,10 @@ class IGAPIClient:
             return
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
         with open(SESSION_FILE, "w") as f:
-            json.dump({"cookies": self.cookies}, f, indent=2)
+            json.dump({
+                "cookies": self.cookies,
+                "device_state": self._device_state(),
+            }, f, indent=2)
 
     @property
     def base_headers(self):
@@ -554,13 +593,9 @@ class IGAPIClient:
         return self.get_user_reels(user_id, amount=amount, sleep=sleep)
 
     def get_media_info_by_shortcode(self, shortcode):
-        """Get media info by shortcode (from URL like /reel/ABC123/)."""
-        # Convert shortcode to media_id
+        """Get media info by shortcode using an authenticated Android session."""
         media_pk = self._shortcode_to_pk(shortcode)
-        result = self._request(
-            "media/info/",
-            params={"media_id": f"{media_pk}_{self.user_id}"}
-        )
+        result = self._request(f"media/{media_pk}/info/")
         if not result or "items" not in result:
             return None
         return self._extract_reel(result["items"][0])

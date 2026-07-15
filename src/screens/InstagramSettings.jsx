@@ -1,8 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { Trash2, ChevronDown, ChevronRight } from 'lucide-react'
-import PlatformLogo from '../components/PlatformLogo'
-
-const LOGIN_COMMAND = 'cd ~/Desktop/sc-desktop && npm run instagram:login'
+import { LogIn, RotateCw, Trash2 } from 'lucide-react'
 
 /**
  * Instagram settings (per-platform settings screen, opened from
@@ -14,24 +11,14 @@ const LOGIN_COMMAND = 'cd ~/Desktop/sc-desktop && npm run instagram:login'
  *        • transcribe (api default · apify $0.001/reel)
  *      Apify token field is shared (only relevant when *either* selector
  *      is set to apify).
- *   2. Расширенное → Cookies-сессии — collapsed by default, only matters
- *      for private profiles you're logged in to. Login itself is done by a
- *      local Playwright helper command in the terminal.
+ *   2. Android API session inventory. A saved login is required for a bare
+ *      reel URL and for private profiles, so it is always visible.
  */
 export default function InstagramSettings() {
   return (
-    <div className="h-full flex flex-col">
-      <div className="flex-1 overflow-auto px-8 py-6">
-        <div className="max-w-3xl">
-          <div className="mb-6 flex items-center gap-3">
-            <PlatformLogo platform="instagram" size={20} />
-            <span className="text-xl font-semibold text-zinc-100">Instagram · настройки</span>
-          </div>
-
-          <BackendBlock />
-          <AdvancedBlock />
-        </div>
-      </div>
+    <div>
+      <BackendBlock />
+      <SessionsBlock />
     </div>
   )
 }
@@ -63,6 +50,8 @@ function BackendBlock() {
       const r = await window.api.igSetBackend({ which, backend })
       if (!r.ok) { setErr(r.error || 'failed'); return }
       setSettings(s => ({ ...s, [`${which}_backend`]: backend }))
+    } catch (e) {
+      setErr(String(e?.message || e))
     } finally { setBusy(false) }
   }
 
@@ -73,7 +62,9 @@ function BackendBlock() {
       if (!r.ok) { setErr(r.error || 'failed'); return }
       setEditingToken(false)
       setTokenInput('')
-      refresh()
+      await refresh()
+    } catch (e) {
+      setErr(String(e?.message || e))
     } finally { setBusy(false) }
   }
 
@@ -90,9 +81,8 @@ function BackendBlock() {
   return (
     <Section title="Backend">
       <div className="text-zinc-500 mb-4" style={{ fontSize: '14px' }}>
-        Два независимых переключателя. <b>api</b> — встроенный путь через мобильные эндпоинты,
-        бесплатно, без логина. <b>Apify</b> — облачный актор, нужен токен,
-        полезен когда api тротлит или нужны приватные профили без cookies.
+        <b>Android API</b> — бесплатный путь. Профиль он читает без входа, а одиночную
+        ссылку разрешает через Instagram-сессию ниже. <b>Apify</b> запускается только когда он выбран.
       </div>
 
       {err && <ErrorBox text={err} />}
@@ -114,7 +104,7 @@ function BackendBlock() {
           title="Транскрипция рилсов"
           subtitle="Откуда брать видео для скачивания и транскрипции."
           choices={[
-            { id: 'api',   title: 'android-api', subtitle: 'Бесплатно · video_url из clips/user/' },
+            { id: 'api',   title: 'android-api', subtitle: 'Бесплатно · профиль через clips/user/, ссылка через cookie-сессию' },
             { id: 'apify', title: 'Apify',       subtitle: '~$0.001 / рилс (apple_yang)' },
           ]}
           value={settings.transcribe_backend}
@@ -126,16 +116,16 @@ function BackendBlock() {
       <div className={`rounded-md border bg-zinc-950 px-4 py-3 ${
         apifyAnywhere ? 'border-zinc-800' : 'border-zinc-900 opacity-70'
       }`}>
-        <div className="flex items-center gap-3">
-          <div className="flex-1 min-w-0">
-            <div className="text-zinc-200" style={{ fontSize: '14px' }}>Apify token</div>
-            <div className="text-zinc-500 mt-0.5" style={{ fontSize: '14px' }}>
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="flex-1 min-w-0 flex items-center gap-2 overflow-hidden whitespace-nowrap" style={{ fontSize: '14px' }}>
+            <span className="text-zinc-200 shrink-0">Apify token</span>
+            <span className="text-zinc-500 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
               {settings.apify_token_set
                 ? <TokenStatus settings={settings} />
                 : apifyAnywhere
                   ? <span className="text-amber-400">не задан — Apify backend не сможет работать</span>
                   : <span className="text-zinc-600">не нужен — оба селектора на api</span>}
-            </div>
+            </span>
           </div>
           <button
             onClick={refresh}
@@ -184,15 +174,15 @@ function BackendBlock() {
 function TokenStatus({ settings }) {
   const check = settings.apify_token_check || {}
   const suffix = settings.apify_token_legacy
-    ? <span className="text-amber-400 ml-2">· из legacy-файла, пересохрани чтобы перенести</span>
+    ? <span className="text-amber-400 ml-2" title="Токен прочитан из legacy-файла; пересохрани, чтобы перенести">· legacy-файл</span>
     : null
   if (check.status === 'valid') {
-    return <>● ● ● ● ● ● ● ● <span className="text-emerald-400">проверен</span>{check.username && <span className="text-zinc-500 ml-2">· {check.username}</span>}{suffix}</>
+    return <><span className="font-mono text-zinc-600">●●●●●●●●</span> <span className="text-emerald-400">проверен</span>{check.username && <span className="text-zinc-500 ml-2">· {check.username}</span>}{suffix}</>
   }
   if (check.status === 'invalid' || check.status === 'error') {
-    return <>● ● ● ● ● ● ● ● <span className="text-red-300">не прошёл проверку</span><span className="text-zinc-500 ml-2">· {check.message || check.status}</span>{suffix}</>
+    return <><span className="font-mono text-zinc-600">●●●●●●●●</span> <span className="text-red-300">не прошёл проверку</span><span className="text-zinc-500 ml-2">· {check.message || check.status}</span>{suffix}</>
   }
-  return <>● ● ● ● ● ● ● ● <span className="text-zinc-400">сохранён</span>{suffix}</>
+  return <><span className="font-mono text-zinc-600">●●●●●●●●</span> <span className="text-zinc-400">сохранён</span>{suffix}</>
 }
 
 function SelectorGroup({ title, subtitle, choices, value, onPick, disabled }) {
@@ -242,39 +232,24 @@ function BackendRow({ checked, onPick, title, subtitle, disabled }) {
   )
 }
 
-// ─── Advanced (collapsed) — cookie sessions for private profiles ───────
+// ─── Android API session ────────────────────────────────────────────────
 
-function AdvancedBlock() {
-  const [open, setOpen] = useState(false)
+function SessionsBlock() {
   return (
-    <div className="mb-8">
-      <button
-        onClick={() => setOpen(o => !o)}
-        className="w-full text-left text-zinc-400 hover:text-zinc-200 flex items-center gap-2 mb-3"
-        style={{ fontSize: '14px' }}
-      >
-        {open ? <ChevronDown size={16} className="text-zinc-600" /> : <ChevronRight size={16} className="text-zinc-600" />}
-        Расширенное · Cookies-сессии
-      </button>
-      {open && (
-        <>
-          <div className="text-zinc-500 mb-3" style={{ fontSize: '14px' }}>
-            Cookies нужны только если ты хочешь парсить <b>приватный</b> профиль, на
-            который у тебя есть подписка. Для публичных reels ничего настраивать не надо
-            — backend api работает без логина.
-          </div>
-          <SessionsInventory />
-        </>
-      )}
-    </div>
+    <Section title="Android API · Instagram-сессия">
+      <div className="text-zinc-500 mb-3" style={{ fontSize: '14px' }}>
+        Сессия нужна для одиночных reel-ссылок и приватных профилей. Статус ниже проверяется реальным запросом к Instagram.
+      </div>
+      <SessionsInventory />
+    </Section>
   )
 }
 
 function SessionsInventory() {
   const [sessions, setSessions] = useState([])
   const [loading, setLoading]   = useState(true)
+  const [loginBusy, setLoginBusy] = useState(false)
   const [err, setErr]           = useState(null)
-  const [copied, setCopied]     = useState(false)
 
   async function refresh() {
     setLoading(true); setErr(null)
@@ -297,30 +272,37 @@ function SessionsInventory() {
     refresh()
   }
 
-  function copyLogin() {
-    navigator.clipboard.writeText(LOGIN_COMMAND)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1600)
+  async function startLogin() {
+    setLoginBusy(true); setErr(null)
+    try {
+      const result = await window.api.igLogin()
+      if (!result?.ok) {
+        setErr(result?.error || 'Не удалось войти в Instagram')
+        return
+      }
+      await refresh()
+    } catch (e) {
+      setErr(String(e?.message || e))
+    } finally {
+      setLoginBusy(false)
+    }
   }
 
   return (
     <>
-      <div className="text-zinc-500 mb-3" style={{ fontSize: '14px' }}>
-        Чтобы добавить сессию — выполни в терминале:
+      <div className="flex items-center justify-end gap-2 mb-3">
         <button
-          onClick={copyLogin}
-          className="ml-2 px-2 py-0.5 rounded-md bg-zinc-800 text-zinc-200 hover:bg-zinc-700 font-mono"
+          onClick={startLogin}
+          disabled={loginBusy || loading}
+          className="px-3 py-1.5 rounded-md bg-zinc-800 text-zinc-200 hover:bg-zinc-700 disabled:opacity-60 inline-flex items-center gap-1.5"
           style={{ fontSize: '13px' }}
-          title="Скопировать команду"
-        >
-          {copied ? 'скопировано' : LOGIN_COMMAND}
-        </button>
+        ><LogIn size={14} />{loginBusy ? 'Ожидаю вход…' : 'Войти заново'}</button>
         <button
           onClick={refresh}
-          disabled={loading}
-          className="ml-2 px-2 py-0.5 rounded-md bg-zinc-900 text-zinc-300 hover:bg-zinc-800 disabled:opacity-60"
+          disabled={loading || loginBusy}
+          className="px-3 py-1.5 rounded-md bg-zinc-900 text-zinc-300 hover:bg-zinc-800 disabled:opacity-60 inline-flex items-center gap-1.5"
           style={{ fontSize: '13px' }}
-        >{loading ? 'проверяю…' : 'Проверить'}</button>
+        ><RotateCw size={14} className={loading ? 'animate-spin' : ''} />{loading ? 'Проверяю…' : 'Проверить'}</button>
       </div>
 
       {err && <ErrorBox text={err} />}
@@ -331,10 +313,10 @@ function SessionsInventory() {
         )}
         {!loading && sessions.length === 0 && (
           <div className="px-4 py-4 text-zinc-500 italic" style={{ fontSize: '14px' }}>
-            Сессий нет. Это нормально — публичные профили работают без них.
+            Instagram-сессии нет. Профиль можно парсить без входа, но одиночная ссылка потребует вход.
           </div>
         )}
-        {sessions.map(s => (
+        {[...sessions].sort((a, b) => (a.kind === 'api' ? -1 : 1) - (b.kind === 'api' ? -1 : 1)).map(s => (
           <SessionRow key={s.kind} session={s} onDelete={() => deleteSession(s.kind)} />
         ))}
       </div>
@@ -344,8 +326,8 @@ function SessionsInventory() {
 
 function SessionRow({ session, onDelete }) {
   const label = session.kind === 'playwright'
-    ? 'Playwright (browser/headed flow)'
-    : 'API (mobile cookies)'
+    ? 'Вход через браузер'
+    : 'Android API · cookie-сессия'
   return (
     <div className="px-4 py-3 flex items-center gap-3">
       <div className="flex-1 min-w-0">

@@ -1,18 +1,24 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { ChevronDown, ChevronRight, Settings, Plus, RotateCw } from 'lucide-react'
+import { ChevronDown, ChevronRight, ChevronUp, Minus } from 'lucide-react'
 import { PLATFORMS } from '../lib/detect'
-import { pushScreen, useStore } from '../lib/store'
-import { useSources, refreshSources, useSourcesLoaded } from '../lib/sources'
+import { toggleScreen, useStore } from '../lib/store'
+import { useSources, useSourcesLoaded } from '../lib/sources'
 import { useJobs } from '../lib/jobs'
 import PlatformLogo from './PlatformLogo'
 import Avatar from './Avatar'
 import { useTelegramSelection } from '../lib/telegramSelection'
 import SidebarContextMenu from './SidebarContextMenu'
 
-// Platforms that get a group header even when they have no sources yet —
-// because the header itself is a clickable shortcut into per-platform
-// settings (Telegram sessions, Instagram backend / sessions).
-const PLATFORM_GROUP_ORDER = ['telegram', 'youtube', 'instagram', 'reddit']
+// Keep every first-class platform reachable even when its source list is
+// empty. The same names are the platform-level screen routes.
+const PLATFORM_GROUP_ORDER = [
+  'telegram',
+  'youtube',
+  'instagram',
+  'reddit',
+  'tiktok',
+  'twitter',
+]
 
 const COLLAPSED_KEY = 'sc-other-collapsed'
 
@@ -44,6 +50,13 @@ export default function LibrarySidebar() {
   // Сохраняем какие «Прочее»-подгруппы свёрнуты — между перезапусками. Свёрнуто
   // по умолчанию (пустой Set значит «всё свёрнуто»: см. PlatformGroup).
   const [collapsed, setCollapsed] = useState(loadCollapsedSet)
+  const sidebarRef = useRef(null)
+  const scrollRef = useRef(null)
+  const headerNodesRef = useRef(new Map())
+  const groupNodesRef = useRef(new Map())
+  const [platformPositions, setPlatformPositions] = useState({})
+  const [visiblePlatforms, setVisiblePlatforms] = useState({})
+  const [widePlatformPanel, setWidePlatformPanel] = useState(false)
 
   // Multi-select state lives in a small dedicated module — sidebar reads it,
   // the context-menu component reads it, and we want the same selection
@@ -70,6 +83,90 @@ export default function LibrarySidebar() {
     selection.pruneTo(known)
   }, [tgOrderedIds.join(',')])
 
+  const registerHeaderNode = useCallback((platform, node) => {
+    if (node) headerNodesRef.current.set(platform, node)
+    else headerNodesRef.current.delete(platform)
+  }, [])
+
+  const registerGroupNode = useCallback((platform, node) => {
+    if (node) groupNodesRef.current.set(platform, node)
+    else groupNodesRef.current.delete(platform)
+  }, [])
+
+  const updatePlatformPositions = useCallback(() => {
+    const viewport = scrollRef.current
+    if (!viewport) return
+    const viewportRect = viewport.getBoundingClientRect()
+    const next = {}
+    const nextVisible = {}
+
+    for (const platform of PLATFORM_GROUP_ORDER) {
+      const header = headerNodesRef.current.get(platform) ||
+        viewport.querySelector(`[data-library-platform-header="${platform}"]`)
+      const groupNode = groupNodesRef.current.get(platform) ||
+        viewport.querySelector(`[data-library-platform-group="${platform}"]`)
+      if (header) {
+        const rect = header.getBoundingClientRect()
+        if (rect.bottom <= viewportRect.top + 1) next[platform] = 'up'
+        else if (rect.top >= viewportRect.bottom - 1) next[platform] = 'down'
+        else next[platform] = 'visible'
+      }
+      if (groupNode) {
+        const rect = groupNode.getBoundingClientRect()
+        nextVisible[platform] = rect.bottom > viewportRect.top + 1
+          && rect.top < viewportRect.bottom - 1
+      }
+    }
+
+    setPlatformPositions(prev => {
+      const changed = PLATFORM_GROUP_ORDER.some(platform => prev[platform] !== next[platform])
+      return changed ? next : prev
+    })
+    setVisiblePlatforms(prev => {
+      const changed = PLATFORM_GROUP_ORDER.some(platform => prev[platform] !== nextVisible[platform])
+      return changed ? nextVisible : prev
+    })
+  }, [])
+
+  const schedulePositionUpdate = useCallback(() => {
+    // Six header rectangles are cheap to read. Updating synchronously keeps
+    // the visible highlight deterministic even when Electron throttles
+    // animation frames for a window that was recently in the background.
+    updatePlatformPositions()
+  }, [updatePlatformPositions])
+
+  const updatePlatformPanelLayout = useCallback(() => {
+    const wide = (sidebarRef.current?.clientWidth || 0) >= 340
+    setWidePlatformPanel(prev => prev === wide ? prev : wide)
+  }, [])
+
+  useEffect(() => {
+    // Refs and layout are ready when the effect runs. Compute once directly:
+    // a background/hidden first frame can defer requestAnimationFrame and must
+    // not leave every shortcut in the indeterminate/disabled state.
+    updatePlatformPositions()
+    updatePlatformPanelLayout()
+    const observer = new ResizeObserver(() => {
+      schedulePositionUpdate()
+      updatePlatformPanelLayout()
+    })
+    if (sidebarRef.current) observer.observe(sidebarRef.current)
+    if (scrollRef.current) observer.observe(scrollRef.current)
+    for (const node of headerNodesRef.current.values()) observer.observe(node)
+    for (const node of groupNodesRef.current.values()) observer.observe(node)
+    return () => observer.disconnect()
+  }, [loaded, sources, collapsed, schedulePositionUpdate, updatePlatformPanelLayout, updatePlatformPositions])
+
+  const scrollToPlatform = useCallback((platform) => {
+    const viewport = scrollRef.current
+    const target = headerNodesRef.current.get(platform) ||
+      viewport?.querySelector(`[data-library-platform-header="${platform}"]`)
+    if (!viewport || !target) return
+    const viewportRect = viewport.getBoundingClientRect()
+    const targetRect = target.getBoundingClientRect()
+    viewport.scrollTop += targetRect.top - viewportRect.top
+  }, [])
+
   function toggleCollapsed(platform) {
     setCollapsed(prev => {
       const next = new Set(prev)
@@ -89,24 +186,31 @@ export default function LibrarySidebar() {
   // Close on Esc / outside click — handled inside SidebarContextMenu itself.
 
   return (
-    <aside className="border-r border-zinc-800 flex flex-col h-full min-h-0 min-w-0 max-w-full overflow-hidden">
-      <div className="px-4 pt-4 pb-2 flex items-center justify-between">
-        <div className="text-xs uppercase tracking-wider text-zinc-500">Library</div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={refreshSources}
-            title="Refresh"
-            className="text-zinc-500 hover:text-zinc-200"
-          ><RotateCw size={13} /></button>
-          <button
-            onClick={() => pushScreen('paste')}
-            title="Add source"
-            className="text-zinc-500 hover:text-zinc-200"
-          ><Plus size={15} /></button>
-        </div>
-      </div>
+    <aside
+      ref={sidebarRef}
+      className="border-r border-zinc-800 flex flex-col h-full min-h-0 min-w-0 max-w-full overflow-hidden"
+    >
+      <nav
+        className={`shrink-0 grid gap-1 px-2 pt-2 pb-2 border-b border-zinc-800 ${
+          widePlatformPanel ? 'grid-cols-6' : 'grid-cols-3'
+        }`}
+        aria-label="Платформы"
+      >
+        {PLATFORM_GROUP_ORDER.map(platform => (
+          <PlatformShortcut
+            key={platform}
+            platform={platform}
+            position={platformPositions[platform]}
+            visible={!!visiblePlatforms[platform]}
+            onOpen={() => toggleScreen(platform)}
+            onScroll={() => scrollToPlatform(platform)}
+          />
+        ))}
+      </nav>
 
       <div
+        ref={scrollRef}
+        onScroll={schedulePositionUpdate}
         className="flex-1 overflow-x-hidden overflow-y-auto overscroll-contain px-2 pb-2 min-h-0 min-w-0"
         style={{ scrollbarGutter: 'stable' }}
       >
@@ -142,6 +246,9 @@ export default function LibrarySidebar() {
             selection={selection}
             liveIndexBySource={liveIndexBySource}
             onContextMenu={(payload) => setCtxMenu(payload)}
+            headerRef={(node) => registerHeaderNode(platform, node)}
+            groupRef={(node) => registerGroupNode(platform, node)}
+            active={screen.name === platform}
           />
         ))}
         {Object.entries(grouped)
@@ -158,6 +265,9 @@ export default function LibrarySidebar() {
               selection={selection}
               liveIndexBySource={liveIndexBySource}
               onContextMenu={(payload) => setCtxMenu(payload)}
+              headerRef={(node) => registerHeaderNode(platform, node)}
+              groupRef={(node) => registerGroupNode(platform, node)}
+              active={screen.name === platform}
             />
           ))}
       </div>
@@ -173,24 +283,64 @@ export default function LibrarySidebar() {
   )
 }
 
+function PlatformShortcut({ platform, position, visible, onOpen, onScroll }) {
+  const meta = PLATFORMS[platform]
+  const headerVisible = position === 'visible'
+  const disabled = !position || headerVisible
+  const DirectionIcon = position === 'up'
+    ? ChevronUp
+    : position === 'down'
+      ? ChevronDown
+      : Minus
+  const directionLabel = position === 'up' ? 'выше' : 'ниже'
+
+  return (
+    <div data-library-shortcut={platform} className={`flex h-8 min-w-0 overflow-hidden rounded-md border transition-colors ${
+      visible
+        ? 'border-zinc-600 bg-zinc-800'
+        : 'border-zinc-800 bg-zinc-950 hover:border-zinc-700'
+    }`}>
+      <button
+        type="button"
+        onClick={onOpen}
+        className="flex-1 min-w-0 flex items-center justify-center hover:bg-zinc-800"
+        title={`Открыть ${meta?.label || platform}`}
+        aria-label={`Открыть ${meta?.label || platform}`}
+      >
+        <PlatformLogo platform={platform} size={16} />
+      </button>
+      <button
+        type="button"
+        onClick={onScroll}
+        disabled={disabled}
+        className={`w-6 shrink-0 border-l border-zinc-800 flex items-center justify-center ${
+          disabled
+            ? 'text-zinc-700 cursor-default'
+            : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100'
+        }`}
+        title={headerVisible
+          ? `${meta?.label || platform} уже виден в библиотеке`
+          : position
+            ? `${meta?.label || platform} ${directionLabel} — прокрутить к разделу`
+            : 'Определяю положение раздела'}
+        aria-label={headerVisible
+          ? `${meta?.label || platform} уже виден в библиотеке`
+          : `Прокрутить к разделу ${meta?.label || platform}`}
+      >
+        <DirectionIcon size={13} />
+      </button>
+    </div>
+  )
+}
+
 function PlatformGroup({
   platform, items, activeSourceId, collapsedOther, onToggleOther,
   tgOrderedIds, selection, liveIndexBySource, onContextMenu,
+  headerRef, groupRef, active,
 }) {
   const meta = PLATFORMS[platform]
-  // Per-platform header screen. Telegram has a dedicated TelegramScreen with
-  // folders + multi-chat batch fetch; settings live in its top-right corner
-  // (no separate sidebar entry to keep). Instagram still goes to its existing
-  // settings screen until it gets the same treatment.
-  const headerScreen =
-    platform === 'telegram'  ? 'telegram' :
-    platform === 'instagram' ? 'ig-settings' :
-    null
-  const headerIcon =
-    platform === 'telegram'  ? null :     // no ⚙ — header is the screen, not "settings"
-    platform === 'instagram' ? 'settings' :
-    null
-  const onHeaderClick = headerScreen ? () => pushScreen(headerScreen) : null
+  const headerScreen = PLATFORM_GROUP_ORDER.includes(platform) ? platform : null
+  const onHeaderClick = headerScreen ? () => toggleScreen(headerScreen) : null
 
   // Разделяем источники на основной список и свёрнутый «Прочее». См.
   // splitSources() — для Telegram туда же уезжают чаты с 0 сохранённых
@@ -200,38 +350,36 @@ function PlatformGroup({
   const totalCount = items.length
 
   const isTelegram = platform === 'telegram'
+  const Header = onHeaderClick ? 'button' : 'div'
 
   return (
-    <div className="mb-3">
-      <div
+    <div ref={groupRef} data-library-platform-group={platform} className="mb-3">
+      <Header
+        ref={headerRef}
+        data-library-platform-header={platform}
+        type={onHeaderClick ? 'button' : undefined}
         onClick={onHeaderClick || undefined}
-        role={onHeaderClick ? 'button' : undefined}
-        title={onHeaderClick
-          ? (platform === 'telegram'
-              ? `${meta?.label} · все чаты и папки`
-              : `${meta?.label} · settings`)
-          : undefined}
-        className={`px-2 pt-2 pb-1 mb-1 flex items-center gap-1.5 border-b border-zinc-800 min-w-0 ${
-          onHeaderClick ? 'cursor-pointer hover:text-zinc-300 group' : ''
+        title={onHeaderClick ? `Открыть ${meta?.label || platform}` : undefined}
+        className={`w-full px-2 py-1.5 mb-1 flex items-center gap-2 rounded-md border min-w-0 group transition-colors ${
+          onHeaderClick
+            ? active
+              ? 'border-zinc-700 bg-zinc-800'
+              : 'border-zinc-800 bg-zinc-950 hover:border-zinc-700 hover:bg-zinc-900'
+            : 'border-transparent'
         }`}
       >
-        <PlatformLogo platform={platform} size={11} />
+        <PlatformLogo platform={platform} size={14} />
         <span
-          className="text-zinc-500 group-hover:text-zinc-400 truncate min-w-0 uppercase tracking-wider"
-          style={{ fontSize: '11px', letterSpacing: '0.08em' }}
+          className="text-zinc-400 group-hover:text-zinc-200 truncate min-w-0 text-sm"
         >
           {meta?.label || platform}
         </span>
-        {onHeaderClick && headerIcon === 'settings' && (
-          <Settings size={11} className="text-zinc-700 group-hover:text-zinc-400 shrink-0" />
-        )}
         <span
-          className="text-zinc-600 ml-auto shrink-0 tabular-nums"
-          style={{ fontSize: '11px' }}
+          className="text-zinc-500 ml-auto shrink-0 tabular-nums text-xs"
         >
-          {totalCount > 0 ? totalCount : ''}
+          {totalCount.toLocaleString('ru-RU')}
         </span>
-      </div>
+      </Header>
       <div>
         {explicit.map(s => (
           <SourceRow
@@ -294,7 +442,7 @@ function SourceRow({
   // Plain click = single-select navigation (existing behaviour).
   const onClick = (e) => {
     if (!isTelegram) {
-      pushScreen('source-detail', { sourceId: source.id })
+      toggleScreen('source-detail', { sourceId: source.id })
       return
     }
     const meta = e.metaKey || e.ctrlKey
@@ -313,7 +461,7 @@ function SourceRow({
     // Preserve anchor so the NEXT shift-click can extend a range starting
     // from this row, even though nothing is visually selected yet.
     selection.setAnchorOnly(source.id)
-    pushScreen('source-detail', { sourceId: source.id })
+    toggleScreen('source-detail', { sourceId: source.id })
   }
 
   const onCtx = (e) => {
@@ -334,6 +482,7 @@ function SourceRow({
 
   return (
     <button
+      data-library-source-id={source.id}
       onClick={onClick}
       onContextMenu={onCtx}
       className={`relative w-full text-left ${isTelegram ? 'pl-4 pr-2' : 'px-2'} py-1.5 rounded-md flex items-center gap-2 group min-w-0 select-none outline-none focus:outline-none ${

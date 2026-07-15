@@ -17,6 +17,8 @@
 //
 // Идемпотентность: после reload расширения popup'у contextInvalid'нется,
 // reload-вызов не повторится бесконечно.
+const SC_EXTENSION_ID = 'phnlfhkblebijojjnnlbcbklijgcijgf';
+
 (function () {
   try {
     const params = new URLSearchParams(location.search);
@@ -114,6 +116,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     chatgpt_model:               document.getElementById('yt_chatgpt_model'),
     chatgpt_effort:              document.getElementById('yt_chatgpt_effort'),
   };
+  const ytChatgptModeButtons = {
+    chat: document.getElementById('yt_chatgpt_mode_chat'),
+    work: document.getElementById('yt_chatgpt_mode_work'),
+  };
   const ytTargetSelect = document.getElementById('yt_target');
   const ytCards = {
     aistudio: document.getElementById('cardAistudio'),
@@ -121,6 +127,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     chatgpt:  document.getElementById('cardChatgpt'),
   };
   let currentTarget = 'aistudio'; // active target (Gemini по умолчанию)
+  let currentChatgptMode = 'chat';
+  let youtubeState = sanitizeYoutubeSettings(YOUTUBE_DEFAULT_SETTINGS);
+  let lastPersistedYoutubeState = youtubeState;
+  let pendingDesktopPatch = {};
+  let youtubeBridgeIncompatible = false;
 
   for (const target of YOUTUBE_TARGETS) {
     const opt = document.createElement('option');
@@ -163,6 +174,37 @@ document.addEventListener('DOMContentLoaded', async () => {
     ytInputs.chatgpt_effort.appendChild(opt);
   }
 
+  function saveVisibleChatgptPair() {
+    if (!CHATGPT_MODES.includes(currentChatgptMode)) return;
+    youtubeState = sanitizeYoutubeSettings({
+      ...youtubeState,
+      chatgpt_mode: currentChatgptMode,
+      [`chatgpt_${currentChatgptMode}_model`]: String(ytInputs.chatgpt_model.value || ''),
+      [`chatgpt_${currentChatgptMode}_effort`]: String(ytInputs.chatgpt_effort.value || ''),
+    });
+  }
+
+  function applyChatgptMode(mode, { captureCurrent = true } = {}) {
+    const nextMode = CHATGPT_MODES.includes(mode) ? mode : 'chat';
+    if (captureCurrent) saveVisibleChatgptPair();
+    currentChatgptMode = nextMode;
+    youtubeState = sanitizeYoutubeSettings({ ...youtubeState, chatgpt_mode: nextMode });
+    for (const [id, btn] of Object.entries(ytChatgptModeButtons)) {
+      btn.setAttribute('aria-checked', String(id === nextMode));
+    }
+    ytInputs.chatgpt_model.value = youtubeState[`chatgpt_${nextMode}_model`];
+    ytInputs.chatgpt_effort.value = youtubeState[`chatgpt_${nextMode}_effort`];
+  }
+
+  for (const [mode, btn] of Object.entries(ytChatgptModeButtons)) {
+    btn.addEventListener('click', () => {
+      if (mode === currentChatgptMode) return;
+      const previousState = youtubeState;
+      applyChatgptMode(mode);
+      persistYoutube({ previousState });
+    });
+  }
+
   function applyTargetUi(target) {
     currentTarget = YOUTUBE_TARGETS.includes(target) ? target : 'aistudio';
     ytTargetSelect.value = currentTarget;
@@ -183,6 +225,128 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function storageSetSync(payload) {
     return new Promise(resolve => chrome.storage.sync.set(payload, resolve));
+  }
+
+  function storageLocalGet(defaults) {
+    return new Promise(resolve => chrome.storage.local.get(defaults, resolve));
+  }
+
+  function storageLocalSet(payload) {
+    return new Promise(resolve => chrome.storage.local.set(payload, resolve));
+  }
+
+  async function savePendingDesktopPatch() {
+    await storageLocalSet({ __sc_yt_pending_desktop_patch: { ...pendingDesktopPatch } });
+  }
+
+  async function clearSentPendingDesktopPatch(sentPatch) {
+    if (!sentPatch || !Object.keys(sentPatch).length) return { ...pendingDesktopPatch };
+    const raw = await storageLocalGet({ __sc_yt_pending_desktop_patch: {} });
+    const current = raw.__sc_yt_pending_desktop_patch
+      && typeof raw.__sc_yt_pending_desktop_patch === 'object'
+      ? { ...raw.__sc_yt_pending_desktop_patch }
+      : {};
+    for (const [key, value] of Object.entries(sentPatch)) {
+      if (current[key] === value) delete current[key];
+    }
+    await storageLocalSet({ __sc_yt_pending_desktop_patch: current });
+    return current;
+  }
+
+  async function fetchBridgeJson(path, init = {}, timeoutMs = 1800) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch('http://127.0.0.1:53127' + path, {
+        ...init,
+        headers: {
+          'X-SC-Extension-Id': SC_EXTENSION_ID,
+          ...(init.headers || {}),
+        },
+        signal: controller.signal,
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        const error = new Error(data?.error || ('HTTP ' + response.status));
+        error.status = response.status;
+        error.incompatible = response.status === 409 || data?.incompatible === true;
+        throw error;
+      }
+      return data;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function postYoutubeSettingsPatch(patch) {
+    const data = await fetchBridgeJson('/extension-settings/youtube', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ patch }),
+    });
+    if (data?.ok !== true || !data.settings || typeof data.settings !== 'object') {
+      throw new Error('desktop returned no YouTube settings');
+    }
+    return sanitizeYoutubeSettings({ ...youtubeState, ...data.settings });
+  }
+
+  // Desktop settings are canonical after the first bootstrap. On an older
+  // install the desktop block is absent while chrome.storage already contains
+  // the user's real values; initialized=false means upload local first.
+  async function syncYoutubeSettingsFromBridge(localSettings) {
+    try {
+      const data = await fetchBridgeJson('/extension-settings/youtube');
+      const schemaVersion = Number(data?.schemaVersion);
+      if (Number.isFinite(schemaVersion) && schemaVersion > YOUTUBE_SETTINGS_SCHEMA_VERSION) {
+        const error = new Error(`YouTube settings schema ${schemaVersion} is newer than extension schema ${YOUTUBE_SETTINGS_SCHEMA_VERSION}`);
+        error.incompatible = true;
+        throw error;
+      }
+      if (data?.initialized === false) {
+        const bootstrap = { ...localSettings };
+        if (Array.isArray(data.dirty_keys) && data.settings && typeof data.settings === 'object') {
+          for (const key of data.dirty_keys) {
+            if (Object.prototype.hasOwnProperty.call(data.settings, key)) bootstrap[key] = data.settings[key];
+          }
+        }
+        const sentPending = { ...pendingDesktopPatch };
+        const bootstrapped = await postYoutubeSettingsPatch(bootstrap);
+        const currentPending = await clearSentPendingDesktopPatch(sentPending);
+        for (const [key, value] of Object.entries(sentPending)) {
+          if (pendingDesktopPatch[key] === value) delete pendingDesktopPatch[key];
+        }
+        pendingDesktopPatch = { ...pendingDesktopPatch, ...currentPending };
+        return sanitizeYoutubeSettings({
+          ...localSettings,
+          ...bootstrapped,
+          ...pendingDesktopPatch,
+        });
+      }
+      if (data?.initialized === true && data.settings && typeof data.settings === 'object') {
+        if (Object.keys(pendingDesktopPatch).length) {
+          const sentPending = { ...pendingDesktopPatch };
+          const synced = await postYoutubeSettingsPatch(sentPending);
+          const currentPending = await clearSentPendingDesktopPatch(sentPending);
+          for (const [key, value] of Object.entries(sentPending)) {
+            if (pendingDesktopPatch[key] === value) delete pendingDesktopPatch[key];
+          }
+          pendingDesktopPatch = { ...pendingDesktopPatch, ...currentPending };
+          return sanitizeYoutubeSettings({
+            ...localSettings,
+            ...data.settings,
+            ...synced,
+            ...pendingDesktopPatch,
+          });
+        }
+        return sanitizeYoutubeSettings({ ...localSettings, ...data.settings });
+      }
+    } catch (error) {
+      if (error?.incompatible) youtubeBridgeIncompatible = true;
+      console.warn('[SC-Popup] YouTube settings bridge unavailable:', error?.message || String(error));
+    }
+    // Неподтверждённые desktop-изменения побеждают remote/default и
+    // переживают закрытие popup в chrome.storage.local.
+    return sanitizeYoutubeSettings({ ...localSettings, ...pendingDesktopPatch });
   }
 
   function applyExportTab(tab) {
@@ -229,7 +393,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     return s;
   }
   function readYoutubeSettings() {
-    return {
+    return sanitizeYoutubeSettings({
+      ...youtubeState,
       auto_aistudio:            false, // legacy
       with_comments:            !!ytInputs.with_comments.checked,
       target:                   currentTarget,
@@ -245,9 +410,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       claude_adaptive_thinking: !!ytInputs.claude_adaptive_thinking.checked,
       // ChatGPT-side
       chatgpt_prompt:           String(ytInputs.chatgpt_prompt.value || ''),
-      chatgpt_model:            String(ytInputs.chatgpt_model.value || ''),
-      chatgpt_effort:           String(ytInputs.chatgpt_effort.value || ''),
-    };
+      chatgpt_mode:             currentChatgptMode,
+      [`chatgpt_${currentChatgptMode}_model`]: String(ytInputs.chatgpt_model.value || ''),
+      [`chatgpt_${currentChatgptMode}_effort`]: String(ytInputs.chatgpt_effort.value || ''),
+    });
   }
 
   // Format hint depends on site & settings
@@ -370,68 +536,131 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Debounce ввода в textarea на 300ms чтоб не спамить storage на каждый
   // символ (chrome.storage.sync лимитит на ~120 операций/мин).
   let ytSaveTimer = null;
-  function persistYoutube() {
+  let ytPersistRevision = 0;
+  function persistYoutube({ syncNow = true, previousState = youtubeState } = {}) {
+    const revision = ++ytPersistRevision;
+    const previous = previousState;
+    const immediate = readYoutubeSettings();
+    // Записываем не только отличия от последнего desktop snapshot, а каждое
+    // реально изменённое сейчас поле. Иначе быстрый A → B → A оставляет в
+    // pending старое B: второй diff относительно desktop-A пустой и не
+    // перекрывает промежуточное значение.
+    const touchedNow = diffYoutubeSettings(previous, immediate);
+    for (const key of Object.keys(touchedNow)) pendingDesktopPatch[key] = immediate[key];
+    youtubeState = immediate;
+    // Popup может закрыться сразу после клика. Pending local создаётся в тот
+    // же event-turn; debounce ниже относится только к bridge POST.
+    savePendingDesktopPatch().catch(() => {});
+    if (syncNow) storageSetSync({ __yt: immediate }).catch(() => {});
     clearTimeout(ytSaveTimer);
-    ytSaveTimer = setTimeout(() => {
-      chrome.storage.sync.set({ __yt: sanitizeYoutubeSettings(readYoutubeSettings()) });
+    ytSaveTimer = setTimeout(async () => {
+      const next = readYoutubeSettings();
+      const changed = diffYoutubeSettings(lastPersistedYoutubeState, next);
+      Object.assign(pendingDesktopPatch, changed);
+      youtubeState = next;
+      await storageSetSync({ __yt: next });
+      await savePendingDesktopPatch();
+      if (!Object.keys(pendingDesktopPatch).length) return;
+      if (youtubeBridgeIncompatible) return;
+      const sentPatch = { ...pendingDesktopPatch };
+      try {
+        const data = await fetchBridgeJson('/extension-settings/youtube', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ patch: sentPatch }),
+        });
+        if (!data?.settings) throw new Error('desktop returned no settings');
+        for (const [key, value] of Object.entries(sentPatch)) {
+          if (pendingDesktopPatch[key] === value) delete pendingDesktopPatch[key];
+        }
+        const currentPending = await clearSentPendingDesktopPatch(sentPatch);
+        pendingDesktopPatch = { ...pendingDesktopPatch, ...currentPending };
+        lastPersistedYoutubeState = sanitizeYoutubeSettings(data.settings);
+        if (revision === ytPersistRevision) {
+          const canonical = sanitizeYoutubeSettings({
+            ...lastPersistedYoutubeState,
+            ...pendingDesktopPatch,
+          });
+          youtubeState = canonical;
+          await storageSetSync({ __yt: canonical });
+        }
+      } catch (error) {
+        if (error?.incompatible) youtubeBridgeIncompatible = true;
+        console.warn('[SC-Popup] YouTube settings save to desktop failed:', error?.message || String(error));
+        // Пока popup открыт, повторяем. После закрытия pending остаётся в
+        // storage.local и будет отправлен перед следующим GET-merge.
+        if (!youtubeBridgeIncompatible && revision === ytPersistRevision) setTimeout(() => persistYoutube(), 1800);
+      }
     }, 300);
   }
   ytInputs.with_comments.addEventListener('change', () => { persistYoutube(); updateFormatHint(); });
-  ytInputs.system_instruction.addEventListener('input', () => { persistYoutube(); });
-  ytInputs.post_system_instruction.addEventListener('input', () => { persistYoutube(); });
+  ytInputs.system_instruction.addEventListener('input', () => { persistYoutube({ syncNow: false }); });
+  ytInputs.post_system_instruction.addEventListener('input', () => { persistYoutube({ syncNow: false }); });
   ytInputs.model_title.addEventListener('change', () => { persistYoutube(); });
   ytInputs.post_model_title.addEventListener('change', () => { persistYoutube(); });
-  ytInputs.claude_project.addEventListener('input', () => { persistYoutube(); });
-  ytInputs.claude_post_project.addEventListener('input', () => { persistYoutube(); });
+  ytInputs.claude_project.addEventListener('input', () => { persistYoutube({ syncNow: false }); });
+  ytInputs.claude_post_project.addEventListener('input', () => { persistYoutube({ syncNow: false }); });
   ytInputs.claude_model.addEventListener('change', () => { persistYoutube(); });
   ytInputs.claude_adaptive_thinking.addEventListener('change', () => { persistYoutube(); });
-  ytInputs.chatgpt_prompt.addEventListener('input', () => { persistYoutube(); });
+  ytInputs.chatgpt_prompt.addEventListener('input', () => { persistYoutube({ syncNow: false }); });
   ytInputs.chatgpt_model.addEventListener('change', () => { persistYoutube(); });
   ytInputs.chatgpt_effort.addEventListener('change', () => { persistYoutube(); });
 
-  function loadSettings() {
-    chrome.storage.sync.get({
+  async function loadSettings() {
+    const raw = await new Promise(resolve => chrome.storage.sync.get({
       ...AI_STUDIO_DEFAULT_SETTINGS,
       __export: EXPORT_DEFAULT_SETTINGS,
       __pplx: PERPLEXITY_DEFAULT_SETTINGS,
       __claude: CLAUDE_EXPORT_DEFAULT_SETTINGS,
       __chatgpt: CHATGPT_EXPORT_DEFAULT_SETTINGS,
-      __yt:   YOUTUBE_DEFAULT_SETTINGS,
-    }, (raw) => {
-      const e = sanitizeExportSettings(raw.__export || {});
-      exportInputs.downloadFile.checked = e.downloadFile;
+      __yt: YOUTUBE_DEFAULT_SETTINGS,
+    }, resolve));
 
-      const s = sanitizeSettings(raw);
-      for (const [k, el] of Object.entries(aistudioInputs)) el.checked = !!s[k];
-      reflectAttachmentsState();
+    const e = sanitizeExportSettings(raw.__export || {});
+    exportInputs.downloadFile.checked = e.downloadFile;
 
-      const p = sanitizePerplexitySettings(raw.__pplx || {});
-      for (const [k, el] of Object.entries(perplexityInputs)) el.checked = !!p[k];
+    const s = sanitizeSettings(raw);
+    for (const [k, el] of Object.entries(aistudioInputs)) el.checked = !!s[k];
+    reflectAttachmentsState();
 
-      const c = sanitizeClaudeExportSettings(raw.__claude || {});
-      claudeInputs.includeReattachedFiles.checked = c.includeReattachedFiles;
+    const p = sanitizePerplexitySettings(raw.__pplx || {});
+    for (const [k, el] of Object.entries(perplexityInputs)) el.checked = !!p[k];
 
-      const g = sanitizeChatGPTExportSettings(raw.__chatgpt || {});
-      for (const [k, el] of Object.entries(chatgptInputs)) el.checked = !!g[k];
+    const c = sanitizeClaudeExportSettings(raw.__claude || {});
+    claudeInputs.includeReattachedFiles.checked = c.includeReattachedFiles;
 
-      const y = sanitizeYoutubeSettings(raw.__yt || {});
-      ytInputs.with_comments.checked              = y.with_comments;
-      ytInputs.system_instruction.value           = y.system_instruction;
-      ytInputs.post_system_instruction.value      = y.post_system_instruction;
-      ytInputs.model_title.value                  = y.model_title;
-      ytInputs.post_model_title.value             = y.post_model_title;
-      ytInputs.claude_project.value               = y.claude_project;
-      ytInputs.claude_post_project.value          = y.claude_post_project;
-      ytInputs.claude_model.value                 = y.claude_model;
-      ytInputs.claude_adaptive_thinking.checked   = y.claude_adaptive_thinking;
-      ytInputs.chatgpt_prompt.value               = y.chatgpt_prompt;
-      ytInputs.chatgpt_model.value                = y.chatgpt_model;
-      ytInputs.chatgpt_effort.value               = y.chatgpt_effort;
-      applyTargetUi(y.target);
-      applyExportTab(currentExportTab);
+    const g = sanitizeChatGPTExportSettings(raw.__chatgpt || {});
+    for (const [k, el] of Object.entries(chatgptInputs)) el.checked = !!g[k];
 
-      updateFormatHint();
+    const pendingRaw = await storageLocalGet({ __sc_yt_pending_desktop_patch: {} });
+    pendingDesktopPatch = pendingRaw.__sc_yt_pending_desktop_patch
+      && typeof pendingRaw.__sc_yt_pending_desktop_patch === 'object'
+      ? pendingRaw.__sc_yt_pending_desktop_patch
+      : {};
+    const localYoutube = sanitizeYoutubeSettings({
+      ...(raw.__yt || {}),
+      ...pendingDesktopPatch,
     });
+    const y = await syncYoutubeSettingsFromBridge(localYoutube);
+    youtubeState = y;
+    lastPersistedYoutubeState = y;
+    await storageSetSync({ __yt: y });
+
+    ytInputs.with_comments.checked              = y.with_comments;
+    ytInputs.system_instruction.value           = y.system_instruction;
+    ytInputs.post_system_instruction.value      = y.post_system_instruction;
+    ytInputs.model_title.value                  = y.model_title;
+    ytInputs.post_model_title.value             = y.post_model_title;
+    ytInputs.claude_project.value               = y.claude_project;
+    ytInputs.claude_post_project.value          = y.claude_post_project;
+    ytInputs.claude_model.value                 = y.claude_model;
+    ytInputs.claude_adaptive_thinking.checked   = y.claude_adaptive_thinking;
+    ytInputs.chatgpt_prompt.value               = y.chatgpt_prompt;
+    applyChatgptMode(y.chatgpt_mode, { captureCurrent: false });
+    applyTargetUi(y.target);
+    applyExportTab(currentExportTab);
+    updateFormatHint();
+    if (Object.keys(pendingDesktopPatch).length) setTimeout(() => persistYoutube(), 0);
   }
 
   // ── UI state ───────────────────────────────────────────────────────────
@@ -525,6 +754,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Check if export already running in that tab.
       try {
         const response = await chrome.tabs.sendMessage(tab.id, { action: 'getStatus' });
+        const chatgptSiteLabel = site === 'chatgpt'
+          ? `ChatGPT · ${CHATGPT_MODE_LABELS[response?.chatgptMode] || 'Chat'}`
+          : 'ChatGPT';
         if (response && response.isExporting) {
           const runningLabel = site === 'aistudio'
             ? 'Экспорт идёт (Gemini Studio)...'
@@ -532,7 +764,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               ? 'Экспорт идёт (Perplexity)...'
               : site === 'claude'
                 ? 'Экспорт идёт (Claude)...'
-                : 'Экспорт идёт (ChatGPT)...';
+                : `Экспорт идёт (${chatgptSiteLabel})...`;
           updateStatus(true, runningLabel, 'exporting');
           setLoading(true, true);
         } else {
@@ -542,7 +774,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               ? 'Подключено к Perplexity'
               : site === 'claude'
                 ? 'Подключено к Claude'
-                : 'Подключено к ChatGPT';
+                : `Подключено к ${chatgptSiteLabel}`;
           updateStatus(true, readyLabel, 'ready');
           setLoading(false);
         }
@@ -616,7 +848,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  loadSettings();
+  await loadSettings();
   await checkStatus();
 
   chrome.tabs.onActivated.addListener(() => checkStatus());

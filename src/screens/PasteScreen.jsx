@@ -31,7 +31,7 @@ function extractSearchQuery(urlOrText) {
   } catch { return urlOrText }
 }
 
-export default function PasteScreen() {
+export default function PasteScreen({ payload }) {
   // value + committed live in the store so the user's draft survives
   // navigating to a source and back. Local copies kept here for fast re-render.
   const persistedValue = useStore(s => s.paste.value)
@@ -40,6 +40,15 @@ export default function PasteScreen() {
   // What the user explicitly committed to. Until they click a chip,
   // detection just suggests — nothing parses.  { platform, kind } | null
   const [committed, setCommittedLocal] = useState(persistedCommitted)
+  const inputRef = useRef(null)
+
+  // The global + action can be used while Home is already open. In that
+  // case the screen is not remounted, so autoFocus alone is insufficient.
+  useEffect(() => {
+    if (!payload?.focusComposer) return
+    const frame = requestAnimationFrame(() => inputRef.current?.focus())
+    return () => cancelAnimationFrame(frame)
+  }, [payload?.focusComposer, payload?.focusRequestId])
 
   // Local-only setters — the mirror-effect below syncs to the store after
   // each render. Doing the store write inside a functional updater (like
@@ -273,6 +282,7 @@ export default function PasteScreen() {
 
         <div className="relative">
           <input
+            ref={inputRef}
             autoFocus
             value={value}
             onChange={e => onInputChange(e.target.value)}

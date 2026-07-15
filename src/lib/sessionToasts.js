@@ -9,7 +9,7 @@
 // branch here, not a new listener.
 
 import { showToast } from './toast'
-import { pushScreen } from './store'
+import { openSettings } from './store'
 
 let wired = false
 
@@ -29,7 +29,7 @@ export function wireSessionToasts() {
         message: j.error
           || 'Telegram-сессия не авторизована — нужно войти заново.',
         actionLabel: 'Открыть настройки Telegram',
-        onAction: () => pushScreen('tg-settings'),
+        onAction: () => openSettings('telegram'),
         // One toast for the condition, not one per failed chat/job. A folder
         // catch-up that fails N children with the same deauth refreshes the
         // single existing toast instead of stacking N copies.

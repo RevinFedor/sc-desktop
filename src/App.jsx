@@ -15,12 +15,11 @@ wireSessionToasts()
 
 import PasteScreen from './screens/PasteScreen'
 import TelegramConfig from './screens/TelegramConfig'
-import TelegramSettings from './screens/TelegramSettings'
 import TelegramScreen from './screens/TelegramScreen'
 import YouTubeConfig from './screens/YouTubeConfig'
 import InstagramConfig from './screens/InstagramConfig'
-import InstagramSettings from './screens/InstagramSettings'
 import SettingsScreen from './screens/SettingsScreen'
+import PlatformScreen from './screens/PlatformScreen'
 import JobDetail from './screens/JobDetail'
 import SourceDetail from './screens/SourceDetail'
 import NotesScreen from './screens/NotesScreen'
@@ -28,14 +27,23 @@ import AistudioJobScreen from './screens/AistudioJobScreen'
 import NewResearchScreen from './screens/NewResearchScreen'
 import McpHistoryPanel from './components/McpHistoryPanel'
 
+const YouTubeScreen = () => <PlatformScreen platform="youtube" />
+const InstagramScreen = () => <PlatformScreen platform="instagram" />
+const RedditScreen = () => <PlatformScreen platform="reddit" />
+const TikTokScreen = () => <PlatformScreen platform="tiktok" />
+const TwitterScreen = () => <PlatformScreen platform="twitter" />
+
 const SCREENS = {
   paste:           PasteScreen,
   'tg-config':     TelegramConfig,
-  'tg-settings':   TelegramSettings,
   telegram:        TelegramScreen,
+  youtube:         YouTubeScreen,
+  instagram:       InstagramScreen,
+  reddit:          RedditScreen,
+  tiktok:          TikTokScreen,
+  twitter:         TwitterScreen,
   'yt-config':     YouTubeConfig,
   'ig-config':     InstagramConfig,
-  'ig-settings':   InstagramSettings,
   settings:        SettingsScreen,
   'job-detail':    JobDetail,
   'source-detail': SourceDetail,

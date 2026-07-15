@@ -85,10 +85,16 @@ function crumbFor(screen, sources, folders) {
       return { label: 'Новый запрос' }
     case 'telegram':
       return { label: 'Telegram' }
-    case 'tg-settings':
-      return { label: 'Telegram · сессии', icon: <Settings size={13} /> }
-    case 'ig-settings':
-      return { label: 'Instagram', icon: <Settings size={13} /> }
+    case 'youtube':
+      return { label: 'YouTube' }
+    case 'instagram':
+      return { label: 'Instagram' }
+    case 'reddit':
+      return { label: 'Reddit' }
+    case 'tiktok':
+      return { label: 'TikTok' }
+    case 'twitter':
+      return { label: 'X' }
     case 'tg-config':
       return { label: payload?.target ? `Custom fetch · ${payload.target}` : 'Custom fetch' }
     case 'yt-config':
@@ -96,7 +102,17 @@ function crumbFor(screen, sources, folders) {
     case 'ig-config':
       return { label: 'Instagram' }
     case 'settings':
-      return { label: 'Настройки', icon: <Settings size={13} /> }
+      if (!payload?.section || payload.section === 'main') {
+        return { label: 'Настройки', icon: <Settings size={13} /> }
+      }
+      return { label: ({
+        telegram: 'Telegram',
+        youtube: 'YouTube',
+        instagram: 'Instagram',
+        reddit: 'Reddit',
+        tiktok: 'TikTok',
+        twitter: 'X',
+      })[payload.section] || 'Настройки' }
     case 'new-research':
       return { label: 'Новый research' }
     case 'source-detail': {

@@ -5,7 +5,7 @@ import {
   startInstagramProfileFetch, getInstagramSettings, watchJob,
 } from '../lib/jobs'
 import Checkbox from './Checkbox'
-import { pushScreen } from '../lib/store'
+import { openSettings, pushScreen } from '../lib/store'
 import { refreshSources } from '../lib/sources'
 import { backendLabel } from '../lib/instagram'
 import PlatformLogo from './PlatformLogo'
@@ -256,7 +256,7 @@ const InstagramConfigForm = forwardRef(function InstagramConfigForm({ target, on
         <div className="px-3 py-2 rounded bg-amber-950/40 border border-amber-900/60 text-amber-300" style={{ fontSize: '14px' }}>
           Apify-токен не задан, а в настройках выбран Apify backend.{' '}
           <button
-            onClick={() => pushScreen('ig-settings')}
+            onClick={() => openSettings('instagram')}
             className="underline hover:text-amber-200"
           >Открыть настройки</button>{' '}
           чтобы задать токен или переключиться на api.
@@ -275,7 +275,7 @@ const InstagramConfigForm = forwardRef(function InstagramConfigForm({ target, on
           transcribe: <span className="text-zinc-300">{backendLabel((settings && settings.transcribe_backend) || 'api')}</span>
           {' · '}
           <button
-            onClick={() => pushScreen('ig-settings')}
+            onClick={() => openSettings('instagram')}
             className="text-zinc-500 hover:text-zinc-200 underline"
           >настройки</button>
         </span>

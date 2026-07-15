@@ -20,10 +20,10 @@ function isNumericId(value) {
 
 function readIgBackends(ig = {}) {
   const legacy = ig.backend
-  const legacyMapped = legacy === 'android' ? 'api' : (legacy || null)
+  const legacyMapped = legacy === 'apify' ? 'apify' : (legacy ? 'api' : null)
   return {
-    metadata_backend:   ig.metadata_backend   || legacyMapped || 'api',
-    transcribe_backend: ig.transcribe_backend || 'api',
+    metadata_backend:   ig.metadata_backend === 'apify' ? 'apify' : (ig.metadata_backend ? 'api' : (legacyMapped || 'api')),
+    transcribe_backend: ig.transcribe_backend === 'apify' ? 'apify' : 'api',
   }
 }
 
@@ -217,18 +217,10 @@ async function planInstagramSingleReel({ db, readScSettings, url, engine = 'gemi
   const configuredBackend = settings?.transcribe_backend || 'api'
   const hasLocalOwner = cached?.source_id && isNumericId(cached?.source_external_id)
   const backend = configuredBackend === 'apify' ? 'apify' : 'api'
-  console.log(`[InstagramReel] plan shortcode=${shortcode} configured_backend=${configuredBackend} has_local_owner=${hasLocalOwner ? 'yes' : 'no'} backend=${backend}`)
-
-  if (backend === 'api' && !hasLocalOwner) {
-    console.warn(`[InstagramReel] blocked api job shortcode=${shortcode} reason=missing_owner`)
-    return {
-      ok: false,
-      code: 'missing_owner',
-      error: 'В настройках выбран Android API, но эта Instagram-ссылка не привязана к сохранённому профилю. Apify автоматически не запускаю. Сначала спарси профиль в Instagram-разделе или переключи Instagram backend на Apify.',
-      shortcode,
-      settings,
-    }
-  }
+  const apiResolution = backend === 'api'
+    ? (hasLocalOwner ? 'profile_clips' : 'shortcode_session')
+    : null
+  console.log(`[InstagramReel] plan shortcode=${shortcode} configured_backend=${configuredBackend} has_local_owner=${hasLocalOwner ? 'yes' : 'no'} backend=${backend} resolve=${apiResolution || 'apify'}`)
 
   if (backend === 'apify' && !settings?.apify_token_check?.ok) {
     return {
@@ -248,8 +240,9 @@ async function planInstagramSingleReel({ db, readScSettings, url, engine = 'gemi
     engine,
     backend,
     target: url,
+    ...(apiResolution ? { api_resolution: apiResolution } : {}),
   }
-  if (backend === 'api') {
+  if (backend === 'api' && hasLocalOwner) {
     params.source_id = cached.source_id
     params.user_id = String(cached.source_external_id)
   }

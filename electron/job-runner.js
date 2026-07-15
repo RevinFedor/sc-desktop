@@ -6045,7 +6045,10 @@ function startInstagramBatchTranscribe(params) {
     args.push('--user-id', String(params.user_id))
   }
 
-  console.log(`[Jobs] start ig_batch_transcribe #${id} count=${params.shortcodes.length} backend=${backend} engine=${params.engine || 'gemini'}`)
+  const apiResolution = backend === 'api'
+    ? (params.api_resolution || (params.user_id ? 'profile_clips' : 'shortcode_session'))
+    : 'apify'
+  console.log(`[Jobs] start ig_batch_transcribe #${id} count=${params.shortcodes.length} backend=${backend} resolve=${apiResolution} engine=${params.engine || 'gemini'}`)
 
   const child = spawn(WORKER_PYTHON, args, {
     cwd: WORKERS_ROOT,
@@ -6083,7 +6086,8 @@ function startInstagramBatchTranscribe(params) {
 
   child.on('close', code => {
     if (job.status === 'running') {
-      job.status = code === 0 ? 'done' : 'error'
+      const allFailed = job.yt_batch.saved === 0 && (job.yt_batch.errors > 0 || !!job.error)
+      job.status = code === 0 && !allFailed ? 'done' : 'error'
       if (code !== 0) job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
     }
     job.finished_at = Math.floor(Date.now() / 1000)
@@ -6160,6 +6164,9 @@ function handleInstagramBatchEvent(job, evt) {
       job.items_done = evt.i - 1
       emit(job)
       break
+    case 'resolve_start':
+      console.log(`[Jobs] ig_batch resolve #${job.id} video=${evt.video_id || '-'} backend=${evt.backend || '-'} mode=${evt.mode || '-'}`)
+      break
     case 'transcribe_start':
       if (b.current) { b.current.stage = 'transcribing'; b.current.engine = evt.engine }
       break
@@ -6188,6 +6195,7 @@ function handleInstagramBatchEvent(job, evt) {
       break
     case 'item_error':
       b.errors += 1
+      job.error = job.error || evt.message || 'Instagram item failed'
       job.items_done = (b.saved + b.skipped + b.errors)
       b.log.push({ video_id: evt.video_id, kind: 'error', message: evt.message })
       console.warn(`[Jobs] ig_batch item_error #${job.id} video=${evt.video_id || '-'} message=${String(evt.message || '-').replace(/\s+/g, ' ').slice(0, 600)}`)
@@ -6415,8 +6423,9 @@ function handleRedditEvent(job, evt) {
 const TG_SESSIONS_SCRIPT = path.join(WORKERS_ROOT, 'telegram', 'tg_sessions_ndjson.py')
 const TG_SEND_SAVED_SCRIPT = path.join(WORKERS_ROOT, 'telegram', 'tg_send_saved_ndjson.py')
 const IG_SESSIONS_SCRIPT = path.join(WORKERS_ROOT, 'instagram', 'ig_sessions_ndjson.py')
+const IG_LOGIN_SCRIPT = path.join(WORKERS_ROOT, 'instagram', 'ig_login_ndjson.py')
 
-function runOneShotNdjson(scriptPath, argv) {
+function runOneShotNdjson(scriptPath, argv, { onEvent } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(WORKER_PYTHON, [scriptPath, ...argv], {
       cwd: WORKERS_ROOT,
@@ -6428,7 +6437,11 @@ function runOneShotNdjson(scriptPath, argv) {
     const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
     rl.on('line', line => {
       if (!line.trim()) return
-      try { events.push(JSON.parse(line)) } catch {}
+      try {
+        const event = JSON.parse(line)
+        events.push(event)
+        onEvent?.(event)
+      } catch {}
     })
     child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk.toString()).slice(-2000) })
     child.on('close', code => {
@@ -6474,6 +6487,26 @@ async function sendTelegramSavedMessage({ text = '', images = [], files = [], se
 
 function runIgSessionsCommand(argv) {
   return runOneShotNdjson(IG_SESSIONS_SCRIPT, argv)
+}
+
+let igLoginPromise = null
+function runIgLogin() {
+  if (igLoginPromise) return igLoginPromise
+  console.log('[InstagramLogin] start')
+  igLoginPromise = runOneShotNdjson(IG_LOGIN_SCRIPT, [], {
+    onEvent: event => {
+      const detail = String(event.message || event.code || '').replace(/\s+/g, ' ').slice(0, 240)
+      console.log(`[InstagramLogin] stage=${event.type || '-'}${detail ? ` detail=${detail}` : ''}`)
+    },
+  }).then(events => {
+    const error = events.find(event => event.type === 'error')
+    const done = events.some(event => event.type === 'done')
+    console.log(`[InstagramLogin] end status=${done && !error ? 'done' : 'error'} events=${events.length}`)
+    return events
+  }).finally(() => {
+    igLoginPromise = null
+  })
+  return igLoginPromise
 }
 
 // ─── YouTube search (sourceless) ──────────────────────────────────────
@@ -6793,6 +6826,7 @@ module.exports = {
   runTgSessionsCommand,
   sendTelegramSavedMessage,
   runIgSessionsCommand,
+  runIgLogin,
   startInstagramProfileFetch,
   startInstagramBatchTranscribe,
   startRedditThreadFetch,

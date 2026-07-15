@@ -13,6 +13,8 @@
 // mcp-handlers.js сам вызывает connectMcpBridge() в конце файла.
 try { importScripts('mcp-handlers.js'); }
 catch (e) { console.warn('[SC-BG] mcp-handlers load failed:', e); }
+try { importScripts('settings.js'); }
+catch (e) { console.warn('[SC-BG] settings load failed:', e); }
 
 const NMH_NAME = 'com.fedor.aistudio_exporter';
 const SC_BRIDGE = 'http://127.0.0.1:53127';
@@ -21,6 +23,176 @@ const POLL_ALARM = 'sc-yt-poll';
 const POLL_PERIOD_MIN = 0.1; // 6 seconds — minimum supported by chrome.alarms
 const TRACKER_TTL_MS = 30 * 60 * 1000; // считаем job stale через полчаса
 const MAX_RESUME_ATTEMPTS = 3; // awaiting_ai → /yt-resume-ai retry cap до 'error'
+const YOUTUBE_SETTINGS_PATH = '/extension-settings/youtube';
+const SC_EXTENSION_ID = 'phnlfhkblebijojjnnlbcbklijgcijgf';
+
+function storageSyncGet(defaults) {
+  return new Promise(resolve => chrome.storage.sync.get(defaults, resolve));
+}
+
+function storageSyncSet(payload) {
+  return new Promise(resolve => chrome.storage.sync.set(payload, resolve));
+}
+
+function storageLocalGet(defaults) {
+  return new Promise(resolve => chrome.storage.local.get(defaults, resolve));
+}
+
+function storageLocalSet(payload) {
+  return new Promise(resolve => chrome.storage.local.set(payload, resolve));
+}
+
+async function clearSentYoutubePendingPatch(sentPatch) {
+  if (!sentPatch || !Object.keys(sentPatch).length) return;
+  const raw = await storageLocalGet({ __sc_yt_pending_desktop_patch: {} });
+  const current = raw.__sc_yt_pending_desktop_patch
+    && typeof raw.__sc_yt_pending_desktop_patch === 'object'
+    ? { ...raw.__sc_yt_pending_desktop_patch }
+    : {};
+  for (const [key, value] of Object.entries(sentPatch)) {
+    if (current[key] === value) delete current[key];
+  }
+  await storageLocalSet({ __sc_yt_pending_desktop_patch: current });
+}
+
+async function fetchBridgeJson(path, init = {}, timeoutMs = 1800) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(SC_BRIDGE + path, {
+      ...init,
+      headers: {
+        'X-SC-Extension-Id': SC_EXTENSION_ID,
+        ...(init.headers || {}),
+      },
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = new Error(data?.error || ('HTTP ' + response.status));
+      error.status = response.status;
+      error.incompatible = response.status === 409 || data?.incompatible === true;
+      throw error;
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalizeChatgptMode(mode) {
+  return mode === 'work' ? 'work' : 'chat';
+}
+
+// settings.json в desktop — canonical после bootstrap. На первом запуске
+// initialized=false означает, что реальные старые настройки пока есть только
+// в chrome.storage; сначала загружаем их в desktop, затем читаем canonical.
+let youtubeSettingsRefreshPromise = null;
+async function loadFreshYoutubeSettings() {
+  if (youtubeSettingsRefreshPromise) return youtubeSettingsRefreshPromise;
+  youtubeSettingsRefreshPromise = loadFreshYoutubeSettingsOnce();
+  try {
+    return await youtubeSettingsRefreshPromise;
+  } finally {
+    youtubeSettingsRefreshPromise = null;
+  }
+}
+
+async function loadFreshYoutubeSettingsOnce() {
+  const localRaw = await storageSyncGet({ __yt: YOUTUBE_DEFAULT_SETTINGS });
+  const pendingRaw = await storageLocalGet({ __sc_yt_pending_desktop_patch: {} });
+  const pending = pendingRaw.__sc_yt_pending_desktop_patch
+    && typeof pendingRaw.__sc_yt_pending_desktop_patch === 'object'
+    ? pendingRaw.__sc_yt_pending_desktop_patch
+    : {};
+  const local = sanitizeYoutubeSettings({ ...(localRaw.__yt || {}), ...pending });
+  try {
+    const remote = await fetchBridgeJson(YOUTUBE_SETTINGS_PATH);
+    const schemaVersion = Number(remote?.schemaVersion);
+    if (Number.isFinite(schemaVersion) && schemaVersion > YOUTUBE_SETTINGS_SCHEMA_VERSION) {
+      const error = new Error(`YouTube settings schema ${schemaVersion} is newer than extension schema ${YOUTUBE_SETTINGS_SCHEMA_VERSION}`);
+      error.incompatible = true;
+      throw error;
+    }
+    let merged = local;
+    if (remote?.initialized === false) {
+      const bootstrap = { ...local };
+      if (Array.isArray(remote.dirty_keys) && remote.settings && typeof remote.settings === 'object') {
+        for (const key of remote.dirty_keys) {
+          if (Object.prototype.hasOwnProperty.call(remote.settings, key)) bootstrap[key] = remote.settings[key];
+        }
+      }
+      const boot = await fetchBridgeJson(YOUTUBE_SETTINGS_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ patch: bootstrap }),
+      });
+      if (boot?.ok !== true || !boot.settings || typeof boot.settings !== 'object') {
+        throw new Error('desktop returned no settings after YouTube bootstrap');
+      }
+      merged = sanitizeYoutubeSettings({ ...bootstrap, ...boot.settings });
+    } else if (remote?.initialized === true && remote.settings && typeof remote.settings === 'object') {
+      if (Object.keys(pending).length) {
+        const saved = await fetchBridgeJson(YOUTUBE_SETTINGS_PATH, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ patch: pending }),
+        });
+        if (saved?.ok !== true || !saved.settings || typeof saved.settings !== 'object') {
+          throw new Error('desktop returned no settings after YouTube patch');
+        }
+        merged = sanitizeYoutubeSettings({ ...local, ...remote.settings, ...saved.settings });
+      } else {
+        merged = sanitizeYoutubeSettings({ ...local, ...remote.settings });
+      }
+    }
+    await storageSyncSet({ __yt: merged });
+    await clearSentYoutubePendingPatch(pending);
+    return merged;
+  } catch (error) {
+    scBgDbg('youtube.settings.fallback_local', { err: error?.message || String(error) });
+    return local;
+  }
+}
+
+function mergeYoutubeSettingsIntoJob(job, settings) {
+  const y = sanitizeYoutubeSettings(settings || {});
+  const mode = normalizeChatgptMode(y.chatgpt_mode);
+  return {
+    ...job,
+    target: normalizeYoutubeAiTarget(y.target || job.target),
+    engine: y.engine || job.engine || 'gemini',
+    modelTitle: y.model_title || job.modelTitle,
+    postModelTitle: y.post_model_title ?? job.postModelTitle,
+    systemInstruction: y.system_instruction ?? job.systemInstruction,
+    postSystemInstruction: y.post_system_instruction ?? job.postSystemInstruction,
+    claudeModel: y.claude_model || job.claudeModel,
+    claudeProject: y.claude_project ?? job.claudeProject,
+    claudePostProject: y.claude_post_project ?? job.claudePostProject,
+    claudeAdaptiveThinking: y.claude_adaptive_thinking !== false,
+    chatgptPrompt: y.chatgpt_prompt ?? job.chatgptPrompt,
+    chatgptMode: mode,
+    chatgptModel: y[`chatgpt_${mode}_model`] || y.chatgpt_model || job.chatgptModel || '5.5',
+    chatgptEffort: y[`chatgpt_${mode}_effort`] || y.chatgpt_effort || job.chatgptEffort || 'xhigh',
+  };
+}
+
+async function refreshYoutubeJobSettings(job) {
+  const settings = await loadFreshYoutubeSettings();
+  return mergeYoutubeSettingsIntoJob(job, settings);
+}
+
+// Service worker сам является точкой bootstrap: desktop увидит исторические
+// chrome.storage настройки без открытия popup и без первого YouTube-клика.
+// Только settings I/O — вкладки и окна этот вызов не активирует.
+loadFreshYoutubeSettings()
+  .then(settings => scBgDbg('youtube.settings.startup_synced', {
+    target: settings.target,
+    chatgptMode: settings.chatgpt_mode,
+  }))
+  .catch(error => scBgDbg('youtube.settings.startup_failed', {
+    err: error?.message || String(error),
+  }));
 
 // ── MCP visual mark (favicon + title prefix) ──────────────────────────
 // Yandex.Browser не позволяет программно управлять tab groups (см. research:
@@ -1122,6 +1294,13 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return false;
   }
 
+  if (req && req.__sc_get_fresh_youtube_settings === true) {
+    loadFreshYoutubeSettings()
+      .then(settings => sendResponse({ ok: true, settings }))
+      .catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
   // ── YouTube job tracker: youtube-content.js шлёт сюда ID job'а сразу
   // после успешного POST /yt-add. Мы кладём его в storage и поднимаем
   // alarm. Когда bridge скажет done — опционально открываем выбранный AI-target
@@ -1132,13 +1311,20 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     //  в storage.local, а session в Яндексе вообще ненадёжен. См.
     //  fact-yt-extension-bridge.md::Hot-reload.)
     scBgDbg('onMessage.track_job', { videoId: req.job.videoId, target: req.job.target, fromCache: !!req.job.fromCache, hasJob: true, senderTabId: sender?.tab?.id ?? null });
-    // Пробрасываем tabId из sender — это вкладка, на которой юзер кликнул.
-    // Notification.onClicked попытается её сфокусировать обратно.
-    const enriched = { ...req.job, tabId: sender?.tab?.id ?? null };
-    trackJob(enriched).then(() => {
-      scBgDbg('onMessage.track_job.DONE', { videoId: req.job.videoId });
+    // Пробрасываем tabId из sender и перед КАЖДЫМ handoff'ом перечитываем
+    // desktop canonical settings. Popup мог быть давно закрыт, а режим/model
+    // изменены в приложении уже после старта service worker.
+    (async () => {
+      const base = { ...req.job, tabId: sender?.tab?.id ?? null };
+      const enriched = await refreshYoutubeJobSettings(base);
+      await trackJob(enriched);
+      scBgDbg('onMessage.track_job.DONE', {
+        videoId: req.job.videoId,
+        target: enriched.target,
+        chatgptMode: enriched.chatgptMode || null,
+      });
       sendResponse({ ok: true });
-    }).catch(e => {
+    })().catch(e => {
       scBgDbg('onMessage.track_job.THREW', { err: e?.message || String(e), stack: (e?.stack || '').slice(0,200) });
       sendResponse({ ok: false, error: e?.message || String(e) });
     });
@@ -1155,6 +1341,18 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       .catch(e => console.warn('[SC-BG] aistudio_pasted handler failed', e));
     sendResponse({ ok: true });
     return false;
+  }
+  if (req && req.__sc_chatgpt_compose_claim === true && req.requestId) {
+    claimChatgptComposeTab(req.requestId, sender)
+      .then(result => sendResponse(result))
+      .catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+  if (req && req.__sc_chatgpt_compose_result === true && req.requestId) {
+    handleChatgptComposeResult(req.requestId, req, sender)
+      .then(result => sendResponse(result))
+      .catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
   }
   // aistudio-mcp.js шлёт __sc_aistudio_mcp_done когда job завершился
   // (status='done' либо 'error'). Снимаем вкладку из busy-set'а чтобы
@@ -1432,6 +1630,123 @@ async function handleAistudioPasted(requestId, ok, errorMsg) {
   if (usedKey) try { chrome.storage.local.remove(usedKey); } catch {}
 }
 
+async function handleChatgptComposeResult(requestId, result, sender) {
+  const senderUrl = sender?.tab?.url || sender?.url || '';
+  try {
+    const host = new URL(senderUrl).hostname;
+    if (host !== 'chatgpt.com' && host !== 'www.chatgpt.com') {
+      throw new Error('compose result rejected: unexpected sender');
+    }
+  } catch (error) {
+    if (senderUrl) throw error;
+  }
+
+  const key = CHATGPT_COMPOSE_JOB_PREFIX + requestId;
+  const got = await new Promise(resolve => chrome.storage.local.get(key, resolve));
+  const stored = got?.[key] || {};
+  return deliverChatgptComposeResult(requestId, result, stored);
+}
+
+async function claimChatgptComposeTab(requestId, sender) {
+  const tabId = sender?.tab?.id;
+  const senderUrl = sender?.tab?.url || sender?.url || '';
+  if (tabId == null) throw new Error('compose claim has no sender tab');
+  const host = new URL(senderUrl).hostname;
+  if (host !== 'chatgpt.com' && host !== 'www.chatgpt.com') {
+    throw new Error('compose claim rejected: unexpected sender');
+  }
+  const key = CHATGPT_COMPOSE_JOB_PREFIX + requestId;
+  const got = await chrome.storage.local.get(key);
+  const job = got?.[key];
+  if (!job || typeof job !== 'object') throw new Error('compose job not found');
+  if (job.tabId !== tabId) {
+    await chrome.storage.local.set({ [key]: { ...job, tabId } });
+  }
+  await ensureChatgptComposeWatchdog();
+  return { ok: true, tabId };
+}
+
+async function deliverChatgptComposeResult(requestId, result, stored = {}) {
+  const key = CHATGPT_COMPOSE_JOB_PREFIX + requestId;
+  // Route fields travel in the ACK as well. If SW processed success but its
+  // callback was lost, the content-script retries after the storage record
+  // has already been removed; the second ACK must remain idempotent.
+  const route = {
+    ytTabId: result.ytTabId ?? stored.ytTabId ?? null,
+    ytVideoId: result.ytVideoId || stored.ytVideoId || null,
+    ytTitle: result.ytTitle || stored.ytTitle || null,
+  };
+  if (route.ytTabId == null || !route.ytVideoId) {
+    throw new Error('compose result has no YouTube route');
+  }
+  const mode = normalizeChatgptMode(result.mode || stored.mode);
+  const targetLabel = youtubeAiTargetLabel('chatgpt', mode);
+  const ok = result.ok === true;
+  const terminalResult = {
+    ok,
+    error: result.error || null,
+    mode,
+    model: result.model || stored.model || null,
+    effort: result.effort || stored.effort || null,
+  };
+  // Terminal result становится durable ДО первой доставки в YouTube. Иначе
+  // respin SW в узком окне sendMessage потеряет реальную selector/login ошибку
+  // и watchdog позднее подменит её общим timeout.
+  stored = await markComposeTerminal(requestId, {
+    ...stored,
+    requestId,
+    ytTabId: route.ytTabId,
+    ytVideoId: route.ytVideoId,
+    ytTitle: route.ytTitle,
+    mode,
+    model: terminalResult.model,
+    effort: terminalResult.effort,
+    ts: stored.ts || Date.now(),
+  }, terminalResult);
+  scBgDbg('chatgpt.compose.result', {
+    requestId,
+    ok,
+    mode,
+    model: result.model || stored.model || null,
+    effort: result.effort || stored.effort || null,
+    ytVideoId: route.ytVideoId,
+  });
+
+  let delivery;
+  if (ok) {
+    delivery = await sendBtnState(route.ytTabId, {
+      videoId: route.ytVideoId,
+      state: 'pasted',
+      target: 'chatgpt',
+      targetLabel,
+      chatgptMode: mode,
+      title: `${route.ytTitle || 'YouTube-видео'} — ${targetLabel}: запрос отправлен`,
+    });
+  } else {
+    delivery = await sendBtnState(route.ytTabId, {
+      videoId: route.ytVideoId,
+      state: 'error',
+      target: 'chatgpt',
+      targetLabel,
+      chatgptMode: mode,
+      title: route.ytTitle || null,
+      error: `${targetLabel}: ${result.error || 'не удалось отправить запрос'}`,
+    });
+  }
+  if (!delivery?.appliedYoutubeTabIds?.length) {
+    scBgDbg('chatgpt.compose.result_delivery_pending', {
+      requestId,
+      ok,
+      ytTabId: route.ytTabId,
+      attemptedTabIds: delivery?.attemptedTabIds || [],
+    });
+    return { ok: false, accepted: ok, targetLabel, error: 'YouTube confirmation delivery pending' };
+  }
+  try { await chrome.storage.local.remove(key); } catch {}
+  clearChatgptComposeWatchdogIfIdle().catch(() => {});
+  return { ok: true, accepted: ok, targetLabel };
+}
+
 // ─────────── YouTube job tracker ───────────
 
 async function loadTracker() {
@@ -1457,8 +1772,10 @@ function normalizeYoutubeAiTarget(target) {
   return 'aistudio';
 }
 
-function youtubeAiTargetLabel(target) {
-  if (target === 'chatgpt') return 'ChatGPT';
+function youtubeAiTargetLabel(target, chatgptMode = 'chat') {
+  if (target === 'chatgpt') {
+    return 'ChatGPT · ' + (normalizeChatgptMode(chatgptMode) === 'work' ? 'Work' : 'Chat');
+  }
   if (target === 'claude') return 'Claude';
   return 'Gemini Studio';
 }
@@ -1536,6 +1853,155 @@ function buildChatgptYoutubePrompt(payload, transcriptText, commentsText) {
 }
 
 const CHATGPT_COMPOSE_JOB_PREFIX = '__sc_chatgpt_compose_job_';
+const CHATGPT_COMPOSE_WATCHDOG_ALARM = 'sc-chatgpt-compose-watchdog';
+const CHATGPT_COMPOSE_UNCLAIMED_TTL_MS = 90 * 1000;
+const CHATGPT_COMPOSE_SOFT_TTL_MS = 10 * 60 * 1000;
+const CHATGPT_COMPOSE_HARD_TTL_MS = 30 * 60 * 1000;
+
+async function listChatgptComposeJobs() {
+  const all = await chrome.storage.local.get(null);
+  return Object.entries(all)
+    .filter(([key, value]) => key.startsWith(CHATGPT_COMPOSE_JOB_PREFIX) && value && typeof value === 'object')
+    .map(([key, job]) => ({ key, requestId: key.slice(CHATGPT_COMPOSE_JOB_PREFIX.length), job }));
+}
+
+async function hasChatgptComposeRecordForVideo(videoId) {
+  if (!videoId) return false;
+  const entries = await listChatgptComposeJobs();
+  return entries.some(({ job }) => job.ytVideoId === videoId);
+}
+
+async function findChatgptComposeTabByMarker(requestId) {
+  const marker = 'sc-compose=' + encodeURIComponent(requestId);
+  const tabs = await chrome.tabs.query({ url: ['https://chatgpt.com/*', 'https://www.chatgpt.com/*'] });
+  return tabs.find(tab => typeof tab.url === 'string' && tab.url.includes(marker)) || null;
+}
+
+async function ensureChatgptComposeWatchdog() {
+  const existing = await chrome.alarms.get(CHATGPT_COMPOSE_WATCHDOG_ALARM);
+  if (!existing) chrome.alarms.create(CHATGPT_COMPOSE_WATCHDOG_ALARM, { periodInMinutes: 0.5 });
+}
+
+async function clearChatgptComposeWatchdogIfIdle() {
+  const jobs = await listChatgptComposeJobs();
+  if (!jobs.length) await chrome.alarms.clear(CHATGPT_COMPOSE_WATCHDOG_ALARM);
+}
+
+function composeTerminalResult(job, fallbackError = null) {
+  if (job?.terminalResult && typeof job.terminalResult === 'object') return job.terminalResult;
+  if (job?.submitAcceptedAt) {
+    return {
+      ok: true,
+      mode: job.acceptedMode || job.mode || 'chat',
+      model: job.acceptedModel || job.model || null,
+      effort: job.acceptedEffort || job.effort || null,
+    };
+  }
+  if (fallbackError) {
+    return {
+      ok: false,
+      error: fallbackError,
+      mode: job?.mode || 'chat',
+      model: job?.model || null,
+      effort: job?.effort || null,
+    };
+  }
+  return null;
+}
+
+async function markComposeTerminal(requestId, job, result) {
+  const key = CHATGPT_COMPOSE_JOB_PREFIX + requestId;
+  const next = {
+    ...job,
+    terminalResult: { ...result },
+    terminalAt: job?.terminalAt || Date.now(),
+  };
+  await chrome.storage.local.set({ [key]: next });
+  await ensureChatgptComposeWatchdog();
+  return next;
+}
+
+async function settleChatgptComposeRecord(requestId, job, fallbackError = null) {
+  let result = composeTerminalResult(job, fallbackError);
+  if (!result) return false;
+  if (!job.terminalResult) job = await markComposeTerminal(requestId, job, result);
+  const response = await deliverChatgptComposeResult(requestId, result, job);
+  if (response?.ok) {
+    if (job.tabId != null) detachFocusEmulation(job.tabId).catch(() => {});
+    return true;
+  }
+  return false;
+}
+
+async function sweepChatgptComposeJobs() {
+  const now = Date.now();
+  const entries = await listChatgptComposeJobs();
+  for (const { key, requestId, job: storedJob } of entries) {
+    let job = storedJob;
+    const age = now - Number(job.ts || now);
+    let fallbackError = null;
+    if (!job.terminalResult && !job.submitAcceptedAt && job.tabId == null) {
+      const markedTab = await findChatgptComposeTabByMarker(requestId).catch(() => null);
+      if (markedTab?.id != null) {
+        job = { ...job, tabId: markedTab.id };
+        await chrome.storage.local.set({ [key]: job });
+        attachFocusEmulation(markedTab.id).catch(() => {});
+        scBgDbg('chatgpt.compose.unclaimed_reconciled', { requestId, tabId: markedTab.id });
+      } else if (age >= CHATGPT_COMPOSE_UNCLAIMED_TTL_MS) {
+        fallbackError = 'не удалось открыть вкладку ChatGPT';
+      }
+    }
+    if (!job.terminalResult && !job.submitAcceptedAt && job.tabId != null) {
+      try { await chrome.tabs.get(job.tabId); }
+      catch { fallbackError = 'вкладка ChatGPT закрыта до отправки запроса'; }
+    }
+    if (!fallbackError && !job.terminalResult && !job.submitAcceptedAt && age >= CHATGPT_COMPOSE_SOFT_TTL_MS) {
+      fallbackError = 'таймаут отправки запроса в ChatGPT';
+    }
+    await settleChatgptComposeRecord(requestId, job, fallbackError);
+    if (age >= CHATGPT_COMPOSE_HARD_TTL_MS) {
+      const stillThere = await chrome.storage.local.get(key);
+      if (stillThere?.[key]) {
+        await chrome.storage.local.remove(key);
+        if (job.tabId != null) detachFocusEmulation(job.tabId).catch(() => {});
+        scBgDbg('chatgpt.compose.hard_ttl_cleanup', { requestId, tabId: job.tabId ?? null });
+      }
+    }
+  }
+  await clearChatgptComposeWatchdogIfIdle();
+}
+
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name !== CHATGPT_COMPOSE_WATCHDOG_ALARM) return;
+  sweepChatgptComposeJobs().catch(error => {
+    scBgDbg('chatgpt.compose.watchdog_failed', { err: error?.message || String(error) });
+  });
+});
+
+chrome.tabs.onRemoved.addListener(tabId => {
+  listChatgptComposeJobs().then(async entries => {
+    for (const { requestId, job } of entries) {
+      if (job.tabId !== tabId) continue;
+      const fallbackError = job.submitAcceptedAt
+        ? null
+        : 'вкладка ChatGPT закрыта до отправки запроса';
+      await settleChatgptComposeRecord(requestId, job, fallbackError);
+    }
+  }).catch(error => {
+    scBgDbg('chatgpt.compose.tab_removed_failed', { tabId, err: error?.message || String(error) });
+  });
+});
+
+// SW мог перезапуститься после Send, но до ACK. Persistent compose-record
+// сам восстанавливает watchdog и доставляет terminal result.
+listChatgptComposeJobs()
+  .then(entries => {
+    if (entries.length) {
+      ensureChatgptComposeWatchdog();
+      sweepChatgptComposeJobs();
+    }
+  })
+  .catch(() => {});
 
 async function createTabAsync(opts) {
   return await new Promise((resolve, reject) => {
@@ -1561,6 +2027,7 @@ async function openChatgptBackground(payload) {
   const job = {
     requestId,
     prompt,
+    mode: normalizeChatgptMode(payload.mode),
     model: payload.model || '5.5',
     effort: payload.effort || 'xhigh',
     ytTabId: payload.ytTabId ?? null,
@@ -1570,6 +2037,7 @@ async function openChatgptBackground(payload) {
   };
   scBgDbg('openChatgpt.enter', {
     requestId,
+    mode: job.mode,
     model: job.model,
     effort: job.effort,
     promptLen: prompt.length,
@@ -1578,11 +2046,23 @@ async function openChatgptBackground(payload) {
   await new Promise(resolve => {
     chrome.storage.local.set({ [CHATGPT_COMPOSE_JOB_PREFIX + requestId]: job }, resolve);
   });
-  const tab = await createTabAsync({
-    url: 'https://chatgpt.com/?sc-compose=' + encodeURIComponent(requestId) + '#sc-compose=' + encodeURIComponent(requestId),
-    active: false,
-  });
+  await ensureChatgptComposeWatchdog();
+  let tab;
+  try {
+    tab = await createTabAsync({
+      url: 'https://chatgpt.com/?sc-compose=' + encodeURIComponent(requestId) + '#sc-compose=' + encodeURIComponent(requestId),
+      active: false,
+    });
+  } catch (error) {
+    await chrome.storage.local.remove(CHATGPT_COMPOSE_JOB_PREFIX + requestId);
+    clearChatgptComposeWatchdogIfIdle().catch(() => {});
+    throw error;
+  }
   if (tab?.id != null) {
+    job.tabId = tab.id;
+    await new Promise(resolve => {
+      chrome.storage.local.set({ [CHATGPT_COMPOSE_JOB_PREFIX + requestId]: job }, resolve);
+    });
     attachFocusEmulation(tab.id).catch(e => {
       scBgDbg('openChatgpt.debugger_attach_fail', { requestId, tabId: tab.id, err: e?.message || String(e) });
     });
@@ -1600,6 +2080,7 @@ async function openTargetBackground(target, common, job) {
     return openChatgptBackground({
       ...common,
       prompt: job.chatgptPrompt,
+      mode: job.chatgptMode,
       model: job.chatgptModel,
       effort: job.chatgptEffort,
     });
@@ -1669,6 +2150,7 @@ async function openAistudioBackground(payload) {
 // просто проигнорирует. Активная — отрисует.
 async function sendBtnState(originalTabId, payload) {
   const targets = new Set();
+  const youtubeTargets = new Set();
   let activeYtTabId = null;
   try {
     const tabs = await chrome.tabs.query({
@@ -1676,13 +2158,25 @@ async function sendBtnState(originalTabId, payload) {
       lastFocusedWindow: true,
       url: ['*://www.youtube.com/*', '*://m.youtube.com/*'],
     });
-    if (tabs[0]?.id != null) { targets.add(tabs[0].id); activeYtTabId = tabs[0].id; }
+    if (tabs[0]?.id != null) {
+      targets.add(tabs[0].id);
+      youtubeTargets.add(tabs[0].id);
+      activeYtTabId = tabs[0].id;
+    }
   } catch {}
-  if (originalTabId != null) targets.add(originalTabId);
+  if (originalTabId != null) {
+    targets.add(originalTabId);
+    youtubeTargets.add(originalTabId);
+  }
   scBgDbg('sendBtnState.targets', { state: payload.state, vid: payload.videoId, originalTabId, activeYtTabId, targets: [...targets] });
   if (!targets.size) {
     scBgDbg('sendBtnState.NO_TARGETS', { state: payload.state, vid: payload.videoId });
-    return;
+    return {
+      attemptedTabIds: [],
+      deliveredTabIds: [],
+      deliveredYoutubeTabIds: [],
+      appliedYoutubeTabIds: [],
+    };
   }
   // Дополнительно шлём в AI Studio И claude.ai вкладки — там тоже свои
   // content-script'ы, показывают тот же тост (юзер хочет одинаковую
@@ -1693,19 +2187,32 @@ async function sendBtnState(originalTabId, payload) {
       for (const t of aiTabs) if (t.id != null) targets.add(t.id);
     } catch {}
   }
-  for (const tabId of targets) {
+  const results = await Promise.all([...targets].map(tabId => new Promise(resolve => {
     try {
-      chrome.tabs.sendMessage(tabId, { __sc_btn_state: true, ...payload }, () => {
-        if (chrome.runtime.lastError) {
-          scBgDbg('sendBtnState.DELIVER_FAIL', { tabId, state: payload.state, err: chrome.runtime.lastError.message });
+      chrome.tabs.sendMessage(tabId, { __sc_btn_state: true, ...payload }, response => {
+        const error = chrome.runtime.lastError;
+        if (error) {
+          scBgDbg('sendBtnState.DELIVER_FAIL', { tabId, state: payload.state, err: error.message });
+          resolve({ tabId, ok: false, applied: false });
         } else {
-          scBgDbg('sendBtnState.DELIVERED', { tabId, state: payload.state });
+          const applied = response?.ok === true && !response?.ignored;
+          scBgDbg('sendBtnState.DELIVERED', { tabId, state: payload.state, applied });
+          resolve({ tabId, ok: true, applied });
         }
       });
     } catch (e) {
       scBgDbg('sendBtnState.THREW', { tabId, err: e?.message || String(e) });
+      resolve({ tabId, ok: false, applied: false });
     }
-  }
+  })));
+  const deliveredTabIds = results.filter(item => item.ok).map(item => item.tabId);
+  const appliedTabIds = results.filter(item => item.applied).map(item => item.tabId);
+  return {
+    attemptedTabIds: [...targets],
+    deliveredTabIds,
+    deliveredYoutubeTabIds: deliveredTabIds.filter(tabId => youtubeTargets.has(tabId)),
+    appliedYoutubeTabIds: appliedTabIds.filter(tabId => youtubeTargets.has(tabId)),
+  };
 }
 
 // Лог в chrome.storage.local — читается из любой вкладки через
@@ -1754,33 +2261,76 @@ async function trackJob(job) {
   //   // Claude-side:
   //   claudeModel, claudeProject, claudePostProject, claudeAdaptiveThinking,
   //   // ChatGPT-side:
-  //   chatgptPrompt, chatgptModel, chatgptEffort,
+  //   chatgptPrompt, chatgptMode, chatgptModel, chatgptEffort,
   // }
   const map = await loadTracker();
   const target = normalizeYoutubeAiTarget(job.target);
-  scBgDbg('trackJob.enter', { jobId: job.jobId, videoId: job.videoId, fromCache: !!job.fromCache, autoAistudio: !!job.autoAistudio, target });
+  scBgDbg('trackJob.enter', {
+    jobId: job.jobId,
+    videoId: job.videoId,
+    fromCache: !!job.fromCache,
+    autoAistudio: !!job.autoAistudio,
+    target,
+    chatgptMode: target === 'chatgpt' ? normalizeChatgptMode(job.chatgptMode) : null,
+  });
 
   // fromCache=true → транскрипт уже на диске, поллить нечего. Сразу финал.
   if (job.fromCache) {
+    let finalTarget = target;
+    let finalChatgptMode = normalizeChatgptMode(job.chatgptMode);
     scBgDbg('trackJob.fromCache', { autoAistudio: !!job.autoAistudio, target });
     if (job.autoAistudio) {
-      sendBtnState(job.tabId, { videoId: job.videoId, state: 'opening', target });
+      // job уже получил fresh desktop snapshot в __sc_track_job. Дальше это
+      // выбор конкретного видео: смена default во время обработки относится
+      // только к следующему клику и не перенаправляет текущий handoff.
+      const effectiveJob = job;
+      const effectiveTarget = normalizeYoutubeAiTarget(effectiveJob.target);
+      finalTarget = effectiveTarget;
+      finalChatgptMode = normalizeChatgptMode(effectiveJob.chatgptMode);
+      const targetLabel = youtubeAiTargetLabel(effectiveTarget, effectiveJob.chatgptMode);
+      sendBtnState(job.tabId, {
+        videoId: job.videoId,
+        state: 'opening',
+        target: effectiveTarget,
+        targetLabel,
+        chatgptMode: effectiveJob.chatgptMode,
+      });
       try {
-        const requestId = await openTargetBackground(target, {
+        const requestId = await openTargetBackground(effectiveTarget, {
           cachedFilePath: job.cachedFilePath,
           cachedCommentsFilePath: job.cachedCommentsFilePath,
           ytTabId: job.tabId, ytVideoId: job.videoId, ytTitle: job.title,
-        }, job);
-        scBgDbg('trackJob.openTarget.OK', { target, requestId });
+        }, effectiveJob);
+        scBgDbg('trackJob.openTarget.OK', {
+          target: effectiveTarget,
+          targetLabel,
+          requestId,
+        });
       } catch (e) {
-        scBgDbg('trackJob.openTarget.THREW', { target, err: e?.message || String(e) });
-        sendBtnState(job.tabId, { videoId: job.videoId, state: 'error', target, error: 'open ' + youtubeAiTargetLabel(target) + ' failed: ' + (e?.message || e) });
+        scBgDbg('trackJob.openTarget.THREW', { target: effectiveTarget, err: e?.message || String(e) });
+        sendBtnState(job.tabId, {
+          videoId: job.videoId,
+          state: 'error',
+          target: effectiveTarget,
+          targetLabel,
+          chatgptMode: effectiveJob.chatgptMode,
+          error: 'open ' + targetLabel + ' failed: ' + (e?.message || e),
+        });
         return;
       }
+      // ChatGPT подтверждает terminal-success отдельным ACK только после
+      // принятого Send. До него кнопка остаётся в состоянии «Открываю…».
+      if (effectiveTarget === 'chatgpt') return;
     } else {
       scBgDbg('trackJob.SKIP_OPEN', { reason: 'autoAistudio=false' });
     }
-    sendBtnState(job.tabId, { videoId: job.videoId, state: 'done', target });
+    sendBtnState(job.tabId, {
+      videoId: job.videoId,
+      state: 'done',
+      target: finalTarget,
+      targetLabel: youtubeAiTargetLabel(finalTarget, finalChatgptMode),
+      chatgptMode: finalChatgptMode,
+    });
     return;
   }
 
@@ -1808,6 +2358,7 @@ async function trackJob(job) {
     claudeAdaptiveThinking: job.claudeAdaptiveThinking !== false,
     // ChatGPT-side
     chatgptPrompt: job.chatgptPrompt || '',
+    chatgptMode: normalizeChatgptMode(job.chatgptMode),
     chatgptModel: job.chatgptModel || '5.5',
     chatgptEffort: job.chatgptEffort || 'xhigh',
     engine: job.engine || 'gemini',   // для /yt-resume-ai при awaiting_ai
@@ -1820,7 +2371,13 @@ async function trackJob(job) {
   // Сразу подаём «searching» — bridge принял, sc-desktop сейчас гонит
   // yt-dlp+youtube-transcript-api. Real-time события приходят через
   // long-poll (см. startLongPoll), latency ~0 на смену state'а.
-  sendBtnState(job.tabId, { videoId: job.videoId, state: 'searching', target });
+  sendBtnState(job.tabId, {
+    videoId: job.videoId,
+    state: 'searching',
+    target,
+    targetLabel: youtubeAiTargetLabel(target, job.chatgptMode),
+    chatgptMode: normalizeChatgptMode(job.chatgptMode),
+  });
 
   startLongPoll(job.jobId).catch(() => {});
   // Alarm оставляем как safety-net: если SW убьют посреди long-poll'а,
@@ -1957,6 +2514,8 @@ async function processSnapshot(jobId, st) {
         state: stageEvent.state,
         engine: stageEvent.engine || null,
         target: job.target,
+        targetLabel: youtubeAiTargetLabel(job.target, job.chatgptMode),
+        chatgptMode: normalizeChatgptMode(job.chatgptMode),
       });
       job.lastSentState = stageEvent.state;
       map[key] = job;
@@ -1965,27 +2524,63 @@ async function processSnapshot(jobId, st) {
   }
 
   if (transcriptDone && commentsDone) {
+    let completedTarget = normalizeYoutubeAiTarget(job.aiOpenTarget || job.target);
+    let completedChatgptMode = normalizeChatgptMode(job.aiOpenChatgptMode || job.chatgptMode);
     if (job.autoAistudio) {
       // Idempotency-латч ПЕРЕД открытием вкладки. Между open'ом и финальным
       // 'done' SW может быть выгружен и разбужен alarm'ом; тогда он
       // перезапустит long-poll → processSnapshot снова увидит (transcriptDone
       // && commentsDone) и открыл бы ВТОРУЮ вкладку AI. Флаг aiOpenStarted
       // в storage (переживает respin SW) делает второй заход no-op'ом.
-      if (!job.aiOpenStarted) {
+      let shouldOpenTarget = !job.aiOpenStarted;
+      if (job.aiOpenStarted && completedTarget === 'chatgpt') {
+        const composeExists = await hasChatgptComposeRecordForVideo(job.videoId);
+        if (!composeExists) {
+          // SW мог перезапуститься после latch-save, но до первого compose
+          // storage.set. Записи нет — значит вкладка ещё не могла быть открыта,
+          // и повтор безопасен.
+          shouldOpenTarget = true;
+          scBgDbg('tracker.chatgpt_open_latch_recovered', {
+            jobId: job.jobId,
+            videoId: job.videoId,
+          });
+        }
+      }
+      if (shouldOpenTarget) {
+        // target/mode/model/effort зафиксированы fresh snapshot'ом в момент
+        // __sc_track_job; не перечитываем defaults спустя минуты обработки.
+        const effectiveJob = job;
+        completedTarget = normalizeYoutubeAiTarget(effectiveJob.target);
+        completedChatgptMode = normalizeChatgptMode(effectiveJob.chatgptMode);
         job.aiOpenStarted = true;
+        job.aiOpenTarget = completedTarget;
+        job.aiOpenChatgptMode = completedChatgptMode;
         map[key] = job;
         await saveTracker(map);
 
-        sendBtnState(job.tabId, { videoId: job.videoId, state: 'opening', target: job.target });
+        const targetLabel = youtubeAiTargetLabel(completedTarget, completedChatgptMode);
+        sendBtnState(job.tabId, {
+          videoId: job.videoId,
+          state: 'opening',
+          target: completedTarget,
+          targetLabel,
+          chatgptMode: completedChatgptMode,
+        });
         try {
-          await openTargetBackground(job.target || 'aistudio', {
+          await openTargetBackground(completedTarget, {
             cachedFilePath: st.file_path,
             cachedCommentsFilePath: commentsExpected ? st.comments_file_path : null,
             ytTabId: job.tabId, ytVideoId: job.videoId, ytTitle: job.title,
-          }, job);
+          }, effectiveJob);
         } catch (e) {
-          const label = youtubeAiTargetLabel(job.target);
-          sendBtnState(job.tabId, { videoId: job.videoId, state: 'error', target: job.target, error: 'open ' + label + ' failed' });
+          sendBtnState(job.tabId, {
+            videoId: job.videoId,
+            state: 'error',
+            target: completedTarget,
+            targetLabel,
+            chatgptMode: completedChatgptMode,
+            error: 'open ' + targetLabel + ' failed',
+          });
           // openTargetBackground упал — снимаем латч и удаляем job. storage-
           // запись __sc_aistudio_job_/__sc_claude_job_ пишется ВНУТРИ open'а
           // после tabs.create, так что при throw до неё орфана нет; если же
@@ -1996,7 +2591,24 @@ async function processSnapshot(jobId, st) {
         }
       }
     }
-    sendBtnState(job.tabId, { videoId: job.videoId, state: 'done', target: job.target });
+    if (job.autoAistudio && completedTarget === 'chatgpt') {
+      scBgDbg('tracker.await_chatgpt_send_ack', {
+        jobId: job.jobId,
+        videoId: job.videoId,
+        mode: completedChatgptMode,
+      });
+      // Compose payload has its own persistent route. Tracker can stop polling;
+      // terminal success/error now comes only from ChatGPT content-script.
+      delete map[key]; await saveTracker(map);
+      return true;
+    }
+    sendBtnState(job.tabId, {
+      videoId: job.videoId,
+      state: 'done',
+      target: completedTarget,
+      targetLabel: youtubeAiTargetLabel(completedTarget, completedChatgptMode),
+      chatgptMode: completedChatgptMode,
+    });
     delete map[key]; await saveTracker(map);
     return true;
   }

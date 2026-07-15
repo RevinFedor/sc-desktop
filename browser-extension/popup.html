@@ -428,6 +428,34 @@
       overflow-y: auto;
     }
 
+    .yt-mode-toggle {
+      display: flex;
+      width: 100%;
+      padding: 3px;
+      gap: 2px;
+      background: var(--bg-color);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+    }
+    .yt-mode-toggle button {
+      flex: 1;
+      padding: 7px 10px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text-secondary);
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .yt-mode-toggle button:hover:not([aria-checked="true"]) {
+      color: var(--text-primary);
+    }
+    .yt-mode-toggle button[aria-checked="true"] {
+      background: var(--accent-color);
+      color: white;
+    }
+
     /* Switch row внутри карточки — слева текст, справа toggle. */
     .field-row.with-switch {
       flex-direction: row;
@@ -688,6 +716,14 @@
           <!-- ── ChatGPT ── -->
           <div class="yt-card" id="cardChatgpt" hidden>
             <h3><span class="dot"></span>ChatGPT</h3>
+
+            <div class="field-group">
+              <div class="field-group-title">Режим ChatGPT</div>
+              <div class="yt-mode-toggle" role="radiogroup" aria-label="Режим ChatGPT для YouTube">
+                <button type="button" id="yt_chatgpt_mode_chat" role="radio" aria-checked="true">Chat</button>
+                <button type="button" id="yt_chatgpt_mode_work" role="radio" aria-checked="false">Work</button>
+              </div>
+            </div>
 
             <div class="field-group">
               <div class="field-row">

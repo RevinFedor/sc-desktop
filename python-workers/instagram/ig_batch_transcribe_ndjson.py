@@ -4,9 +4,9 @@
 Two backends, picked per-job by --backend (no auto-fallback — failures
 surface to the UI so the user decides):
 
-  --backend api   (default)  Free path: ig_api_core.get_media_info_by_
-                  shortcode(code) → video_url (no cookies needed for
-                  public reels) → curl → ffmpeg → Gemini.
+  --backend api   (default)  Free path. Known profile: anonymous
+                  clips/user/. Bare shortcode: authenticated media/<pk>/
+                  info/. Both return video_url → curl → ffmpeg → AI.
 
   --backend apify Cloud path: apify_apple_yang scraper → audioUrl
                   ($0.001/reel) → curl → ffmpeg → Gemini. Use when api
@@ -115,41 +115,57 @@ def _apify_token():
     return tok
 
 
-# Lazy-loaded singleton — instantiating IGAPIClient is cheap but generates
-# a few UUIDs / cookies per call, no need to do it for every reel.
-_ig_client = None
-def _get_ig_client():
-    global _ig_client
-    if _ig_client is not None:
-        return _ig_client
+# Keep anonymous and authenticated clients separate. Profile batches keep
+# using the cookies-free endpoint; bare links opt into the saved API session.
+_ig_clients = {}
+def _get_ig_client(use_session=False):
+    key = "session" if use_session else "anonymous"
+    if key in _ig_clients:
+        return _ig_clients[key]
     with silenced():
         from ig_api_core import IGAPIClient  # noqa: E402
-        _ig_client = IGAPIClient(skip_session=True)
-    return _ig_client
+        _ig_clients[key] = IGAPIClient(skip_session=not use_session)
+    return _ig_clients[key]
 
 
 def _api_get_video_url(shortcode, user_id, _cache):
-    """Resolve a public reel's video CDN URL via the cookies-free mobile
-    `clips/user/` endpoint. Returns (video_url, error).
+    """Resolve a reel CDN URL without a paid fallback.
 
-    Why not `media/info/`: that endpoint requires a logged-in `ds_user_id`
-    cookie (returns 401 otherwise). `clips/user/` works anonymously but
-    only knows about ONE user at a time. We:
-
-      1. cache the user's reel list per user_id (paginated lazily until
-         we find the requested shortcode);
-      2. read the freshly-paginated `video_url` (signed CDN, ~minutes TTL)
-         straight off the matching reel.
-
-    Caller MUST pass user_id — we don't try to resolve username here, the
-    job-runner already has it on the source row.
+    A known profile keeps the anonymous clips/user/ path. A bare link uses
+    the saved Android API cookie session and media/<pk>/info/.
     """
     if not user_id:
-        return None, ("api: need user_id of the profile (was the source "
-                      "fetched via ig_profile_ndjson?)")
+        try:
+            client = _get_ig_client(use_session=True)
+        except Exception as ex:
+            return None, f"Android API: не удалось загрузить Instagram-сессию ({ex})"
+        if not client.user_id:
+            return None, (
+                "Android API: Instagram-сессия не найдена. Выполни вход в "
+                "настройках Instagram и нажми «Проверить»."
+            )
+        try:
+            with silenced():
+                media = client.get_media_info_by_shortcode(shortcode)
+        except Exception as ex:
+            return None, f"Android API: запрос ролика завершился ошибкой ({type(ex).__name__}: {ex})"
+        if media and media.get("video_url"):
+            return media["video_url"], None
+
+        response = getattr(client, "last_response", None)
+        status = getattr(response, "status_code", None)
+        payload = client.last_json if isinstance(client.last_json, dict) else {}
+        message = payload.get("message") or payload.get("error_type")
+        if status in (401, 403) or "login" in str(message or "").lower():
+            return None, (
+                f"Android API: Instagram отклонил сохранённую сессию"
+                f"{f' (HTTP {status})' if status else ''}. Перелогинься и проверь сессию."
+            )
+        detail = f"HTTP {status}" if status else (message or "пустой ответ")
+        return None, f"Android API: Instagram не вернул ролик по этой ссылке ({detail})"
 
     try:
-        client = _get_ig_client()
+        client = _get_ig_client(use_session=False)
     except Exception as ex:
         return None, f"api: ig_api_core import failed ({ex})"
 
@@ -301,6 +317,9 @@ def process_one(i, n, shortcode, caption, args, token, totals, api_cache):
     # Resolve a media URL via the chosen backend. No auto-fallback —
     # the user picked the path, errors surface to the UI.
     if args.backend == "api":
+        emit({"type": "resolve_start", "i": i, "video_id": shortcode,
+              "backend": "api",
+              "mode": "profile_clips" if args.user_id else "shortcode_session"})
         media_url, err = _api_get_video_url(shortcode, args.user_id, api_cache)
     else:
         media_url, err = _apify_get_audio_url(shortcode, token)
@@ -393,9 +412,9 @@ def main(argv):
                     help="api: cookies-free mobile endpoint (default). "
                          "apify: apple_yang scraper (~$0.001/reel).")
     ap.add_argument("--user-id", default=None,
-                    help="profile pk (required for --backend api — used to "
-                         "paginate clips/user/ and find each shortcode's "
-                         "fresh signed video_url).")
+                    help="optional profile pk for the anonymous clips/user/ "
+                         "path; without it api resolves shortcode through "
+                         "the saved Instagram session.")
     ap.add_argument("--engine", default="gemini", choices=("gemini", "assemblyai"))
     args = ap.parse_args(argv)
 
@@ -409,10 +428,6 @@ def main(argv):
     # Token is mandatory for apify backend, irrelevant for api. Fail fast
     # so the user knows before any reels start downloading.
     token = _apify_token() if args.backend == "apify" else None
-    if args.backend == "api" and not args.user_id:
-        emit({"type": "error", "message":
-              "--user-id required for --backend api"})
-        return 2
     totals = {"saved": 0, "skipped": 0, "errors": 0, "cost_usd": 0.0}
     started = time.monotonic()
 

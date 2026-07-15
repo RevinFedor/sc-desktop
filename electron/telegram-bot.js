@@ -2,16 +2,39 @@ const fs = require('node:fs')
 const { processInstagramSingleReel, extractInstagramShortcode } = require('./instagram-reel-service')
 
 const POLL_TIMEOUT_SEC = 25
-const POLL_BACKOFF_MS = 5000
+const START_RETRY_BASE_MS = 2000
+const START_RETRY_MAX_MS = 60000
+const POLL_RETRY_BASE_MS = 1000
+const POLL_RETRY_MAX_MS = 30000
+const NOTIFICATION_RETRY_BASE_MS = 750
+const NOTIFICATION_RETRY_MAX_MS = 60000
+const NOTIFICATION_SEND_MAX_ATTEMPTS = 4
 const CHAT_ACTION_INTERVAL_MS = 8000
+const NOTIFICATION_DEDUPE_TTL_MS = 6 * 60 * 60 * 1000
+const NOTIFICATION_DEDUPE_MAX = 512
+const NOTIFICATION_DEDUPE_PREF_KEY = 'telegram.terminal_notification_deliveries'
 
-function createTelegramBotService({ readScSettings, writeScSettings, jobRunner, db }) {
+function createTelegramBotService({
+  readScSettings,
+  writeScSettings,
+  jobRunner,
+  db,
+  allowTerminalNotifications = false,
+}) {
   let running = false
   let abortController = null
   let offset = 0
   let activeTasks = 0
   let botToken = null
+  let shouldRun = false
+  let startRetryTimer = null
+  let startRetryCount = 0
+  let lifecycleGeneration = 0
+  let startupAttempt = null
+  let terminalNotificationQueue = Promise.resolve()
+  let notificationDeliveriesHydrated = false
   const listeners = new Set()
+  const notificationDeliveries = new Map()
   const state = {
     status: 'stopped',
     enabled: false,
@@ -42,6 +65,7 @@ function createTelegramBotService({ readScSettings, writeScSettings, jobRunner, 
     const allowedUserIds = Array.isArray(cfg.allowed_user_ids)
       ? cfg.allowed_user_ids.map(String)
       : []
+    const explicitNotificationChatId = String(cfg.notification_chat_id || '').trim()
     return {
       settings,
       cfg,
@@ -49,6 +73,7 @@ function createTelegramBotService({ readScSettings, writeScSettings, jobRunner, 
       enabled: cfg.enabled !== false && !!token,
       allowedChatIds,
       allowedUserIds,
+      notificationChatId: explicitNotificationChatId || (allowedChatIds.length === 1 ? allowedChatIds[0] : null),
       claimFirstChat: cfg.claim_first_chat !== false,
       instagramEngine: cfg.instagram_engine || settings.instagram?.engine || settings.instagram?.transcribe_engine || 'gemini',
     }
@@ -76,12 +101,18 @@ function createTelegramBotService({ readScSettings, writeScSettings, jobRunner, 
 
   async function api(method, payload = {}, { token = botToken, signal } = {}) {
     if (!token) throw new Error('Telegram bot token is not configured')
-    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal,
-    })
+    let res
+    try {
+      res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal,
+      })
+    } catch (err) {
+      if (err?.name !== 'AbortError') err.telegramNetworkError = true
+      throw err
+    }
     let data = null
     try { data = await res.json() } catch {}
     if (!res.ok || !data?.ok) {
@@ -89,9 +120,37 @@ function createTelegramBotService({ readScSettings, writeScSettings, jobRunner, 
       const err = new Error(description)
       err.httpStatus = res.status
       err.telegram = data
+      err.telegramErrorCode = Number(data?.error_code) || null
+      err.retryAfterSec = Number(data?.parameters?.retry_after) || null
       throw err
     }
     return data.result
+  }
+
+  async function apiWithTransientRetry(method, payload, {
+    token,
+    signal,
+    maxAttempts,
+    baseDelayMs,
+    maxDelayMs,
+  }) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await api(method, payload, { token, signal })
+      } catch (err) {
+        if (
+          err?.name === 'AbortError'
+          || !isTransientTelegramError(err)
+          || attempt >= maxAttempts
+        ) throw err
+
+        const delayMs = telegramRetryDelayMs(err, attempt - 1, baseDelayMs, maxDelayMs)
+        console.warn(`[TelegramBot] ${method} transient failure; retry ${attempt + 1}/${maxAttempts} in ${delayMs}ms: ${err?.message || err}`)
+        await sleep(delayMs, signal)
+        if (signal?.aborted) throw createAbortError()
+      }
+    }
+    throw new Error(`${method} retry loop exhausted`)
   }
 
   async function sendMessage(chatId, text, extra = {}) {
@@ -105,6 +164,171 @@ function createTelegramBotService({ readScSettings, writeScSettings, jobRunner, 
       }).catch(err => {
         console.warn(`[TelegramBot] sendMessage failed chat=${chatId}: ${err?.message || err}`)
       })
+    }
+  }
+
+  async function sendMessageStrict(chatId, text, extra = {}, token = botToken) {
+    const deliveries = []
+    const chunks = splitTelegramText(text)
+    for (const chunk of chunks) {
+      const result = await apiWithTransientRetry('sendMessage', {
+        chat_id: chatId,
+        text: chunk,
+        disable_web_page_preview: true,
+        ...extra,
+      }, {
+        token,
+        maxAttempts: NOTIFICATION_SEND_MAX_ATTEMPTS,
+        baseDelayMs: NOTIFICATION_RETRY_BASE_MS,
+        maxDelayMs: NOTIFICATION_RETRY_MAX_MS,
+      })
+      deliveries.push({ message_id: result?.message_id || null })
+    }
+    return deliveries
+  }
+
+  function pruneExpiredNotificationDeliveries(now = Date.now()) {
+    for (const [eventId, entry] of notificationDeliveries) {
+      if (entry.settled && entry.expiresAt <= now) notificationDeliveries.delete(eventId)
+    }
+  }
+
+  function reserveNotificationDeliverySlot() {
+    while (notificationDeliveries.size >= NOTIFICATION_DEDUPE_MAX) {
+      const oldestSettled = [...notificationDeliveries.entries()]
+        .find(([, entry]) => entry.settled)?.[0]
+      if (!oldestSettled) break
+      notificationDeliveries.delete(oldestSettled)
+    }
+  }
+
+  function hydrateNotificationDeliveries() {
+    if (notificationDeliveriesHydrated) return
+    notificationDeliveriesHydrated = true
+    if (typeof db?.getUiPreference !== 'function') return
+
+    try {
+      const stored = db.getUiPreference(NOTIFICATION_DEDUPE_PREF_KEY)
+      const entries = Array.isArray(stored) ? stored : stored?.entries
+      if (!Array.isArray(entries)) return
+
+      const now = Date.now()
+      for (const saved of entries.slice(-NOTIFICATION_DEDUPE_MAX)) {
+        const eventId = String(saved?.eventId || '').trim()
+        const expiresAt = Number(saved?.expiresAt)
+        if (!eventId || !Number.isFinite(expiresAt) || expiresAt <= now) continue
+        const deliveries = Array.isArray(saved?.deliveries)
+          ? saved.deliveries.map(item => ({ message_id: item?.message_id ?? null }))
+          : []
+        const result = { ok: true, eventId, deliveries }
+        notificationDeliveries.set(eventId, {
+          promise: Promise.resolve(result),
+          settled: true,
+          expiresAt,
+          result,
+        })
+      }
+    } catch (err) {
+      console.warn(`[TelegramBot] notification dedupe restore failed: ${err?.message || err}`)
+    }
+  }
+
+  function persistNotificationDeliveries() {
+    if (typeof db?.setUiPreference !== 'function') return
+    const now = Date.now()
+    pruneExpiredNotificationDeliveries(now)
+    const entries = [...notificationDeliveries.entries()]
+      .filter(([, entry]) => entry.settled && entry.expiresAt > now && entry.result)
+      .slice(-NOTIFICATION_DEDUPE_MAX)
+      .map(([eventId, entry]) => ({
+        eventId,
+        expiresAt: entry.expiresAt,
+        deliveries: Array.isArray(entry.result.deliveries) ? entry.result.deliveries : [],
+      }))
+    try {
+      const saved = db.setUiPreference(NOTIFICATION_DEDUPE_PREF_KEY, { version: 1, entries })
+      if (saved?.ok === false) {
+        console.warn(`[TelegramBot] notification dedupe persist failed: ${saved.error || 'unknown error'}`)
+      }
+    } catch (err) {
+      console.warn(`[TelegramBot] notification dedupe persist failed: ${err?.message || err}`)
+    }
+  }
+
+  function enqueueTerminalNotification(task) {
+    const delivery = terminalNotificationQueue.then(task)
+    terminalNotificationQueue = delivery.catch(() => {})
+    return delivery
+  }
+
+  async function notifyTerminalCompletion(event = {}) {
+    const eventId = String(event.eventId || '').trim()
+    if (!eventId) {
+      const err = new Error('eventId is required')
+      err.code = 'invalid_notification_event'
+      throw err
+    }
+
+    if (allowTerminalNotifications !== true) {
+      const err = new Error('Telegram terminal notifications are not allowed in this runtime')
+      err.code = 'telegram_notifications_not_allowed'
+      throw err
+    }
+
+    hydrateNotificationDeliveries()
+    pruneExpiredNotificationDeliveries()
+    const existing = notificationDeliveries.get(eventId)
+    if (existing) {
+      const result = await existing.promise
+      return { ...result, duplicate: true }
+    }
+    reserveNotificationDeliverySlot()
+
+    const deliveryPromise = enqueueTerminalNotification(async () => {
+      const config = readBotConfig()
+      if (!config.enabled) {
+        const err = new Error(config.token ? 'Telegram bot is disabled' : 'Telegram bot token is not configured')
+        err.code = config.token ? 'telegram_bot_disabled' : 'telegram_bot_not_configured'
+        throw err
+      }
+      if (!config.notificationChatId) {
+        const err = new Error('Telegram notification chat is not configured')
+        err.code = 'telegram_notification_chat_not_configured'
+        throw err
+      }
+
+      const tabName = String(event.tabName || 'Terminal').replace(/\s+/g, ' ').trim().slice(0, 160) || 'Terminal'
+      const deliveries = await sendMessageStrict(
+        config.notificationChatId,
+        `🔔 Вкладка завершилась\n${tabName}`,
+        {},
+        config.token,
+      )
+      console.log(`[TelegramBot] terminal completion sent event=${eventId.slice(0, 180)} deliveries=${deliveries.length}`)
+      return { ok: true, eventId, deliveries }
+    })
+
+    const deliveryEntry = {
+      promise: deliveryPromise,
+      settled: false,
+      expiresAt: Infinity,
+    }
+    notificationDeliveries.set(eventId, deliveryEntry)
+
+    try {
+      const result = await deliveryPromise
+      if (notificationDeliveries.get(eventId) === deliveryEntry) {
+        deliveryEntry.settled = true
+        deliveryEntry.expiresAt = Date.now() + NOTIFICATION_DEDUPE_TTL_MS
+        deliveryEntry.result = result
+        persistNotificationDeliveries()
+      }
+      return { ...result, duplicate: false }
+    } catch (err) {
+      if (notificationDeliveries.get(eventId) === deliveryEntry) {
+        notificationDeliveries.delete(eventId)
+      }
+      throw err
     }
   }
 
@@ -307,52 +531,154 @@ function createTelegramBotService({ readScSettings, writeScSettings, jobRunner, 
     return parts.join('\n')
   }
 
-  async function flushPendingUpdates(token, signal) {
-    try {
-      const updates = await api('getUpdates', {
-        timeout: 0,
-        limit: 100,
-        allowed_updates: ['message', 'edited_message'],
-      }, { token, signal })
-      if (!Array.isArray(updates) || updates.length === 0) return
-      offset = Math.max(...updates.map(u => Number(u.update_id) || 0)) + 1
-      console.log(`[TelegramBot] skipped pending updates count=${updates.length}`)
-    } catch (err) {
-      console.warn(`[TelegramBot] pending update flush failed: ${err?.message || err}`)
-    }
+  async function flushPendingUpdates(token, signal, isOwner) {
+    const updates = await api('getUpdates', {
+      timeout: 0,
+      limit: 100,
+      allowed_updates: ['message', 'edited_message'],
+    }, { token, signal })
+    if (!isOwner() || !Array.isArray(updates) || updates.length === 0) return
+    offset = Math.max(...updates.map(u => Number(u.update_id) || 0)) + 1
+    console.log(`[TelegramBot] skipped pending updates count=${updates.length}`)
   }
 
-  async function pollLoop(token, signal) {
-    while (running && token === botToken) {
+  function ownsStartupAttempt(attempt) {
+    return shouldRun
+      && startupAttempt === attempt
+      && lifecycleGeneration === attempt.generation
+      && abortController === attempt.controller
+  }
+
+  function ownsPollingRuntime(generation, controller) {
+    return shouldRun
+      && running
+      && lifecycleGeneration === generation
+      && abortController === controller
+  }
+
+  async function pollLoop(token, signal, generation, controller) {
+    let retryCount = 0
+    while (ownsPollingRuntime(generation, controller)) {
       try {
         const updates = await api('getUpdates', {
           timeout: POLL_TIMEOUT_SEC,
           offset,
           allowed_updates: ['message', 'edited_message'],
         }, { token, signal })
-        if (!running || token !== botToken) break
+        if (!ownsPollingRuntime(generation, controller)) break
+        retryCount = 0
         setState({ status: 'online', last_error: null })
         for (const update of updates || []) {
+          if (!ownsPollingRuntime(generation, controller)) break
           offset = Math.max(offset, (Number(update.update_id) || 0) + 1)
           void handleUpdate(update).catch(err => {
+            if (!ownsPollingRuntime(generation, controller)) return
             console.error(`[TelegramBot] update handler failed: ${err?.message || err}`)
             setState({ last_error: String(err?.message || err) })
           })
         }
       } catch (err) {
-        if (err?.name === 'AbortError') break
-        console.warn(`[TelegramBot] polling failed: ${err?.message || err}`)
+        if (err?.name === 'AbortError' || !ownsPollingRuntime(generation, controller)) break
+
+        if (!isTransientTelegramError(err)) {
+          running = false
+          abortController = null
+          console.warn(`[TelegramBot] polling stopped after permanent failure: ${err?.message || err}`)
+          setState({ status: 'error', last_error: String(err?.message || err) })
+          break
+        }
+
+        const delayMs = telegramRetryDelayMs(err, retryCount, POLL_RETRY_BASE_MS, POLL_RETRY_MAX_MS)
+        retryCount += 1
+        console.warn(`[TelegramBot] polling transient failure; retry in ${delayMs}ms: ${err?.message || err}`)
         setState({ status: 'error', last_error: String(err?.message || err) })
-        await sleep(POLL_BACKOFF_MS)
+        await sleep(delayMs, signal)
       }
     }
   }
 
-  async function start() {
+  function clearStartRetry() {
+    if (!startRetryTimer) return
+    clearTimeout(startRetryTimer)
+    startRetryTimer = null
+  }
+
+  function scheduleStartRetry(err, generation) {
+    if (!shouldRun || lifecycleGeneration !== generation || startRetryTimer) return
+    const delayMs = telegramRetryDelayMs(err, startRetryCount, START_RETRY_BASE_MS, START_RETRY_MAX_MS)
+    startRetryCount += 1
+    const timer = setTimeout(() => {
+      if (startRetryTimer !== timer) return
+      startRetryTimer = null
+      if (
+        shouldRun
+        && lifecycleGeneration === generation
+        && !running
+        && !startupAttempt
+      ) void start({ isRetry: true })
+    }, delayMs)
+    startRetryTimer = timer
+    timer.unref?.()
+    console.log(`[TelegramBot] startup retry scheduled in ${delayMs}ms`)
+  }
+
+  async function runStartupAttempt(attempt) {
+    const { token, controller, generation } = attempt
+    const isOwner = () => ownsStartupAttempt(attempt)
+
+    try {
+      const me = await api('getMe', {}, { token, signal: controller.signal })
+      if (!isOwner()) return snapshot()
+
+      await api('deleteWebhook', { drop_pending_updates: true }, { token, signal: controller.signal })
+      if (!isOwner()) return snapshot()
+      console.log('[TelegramBot] webhook disabled for desktop polling')
+
+      await flushPendingUpdates(token, controller.signal, isOwner)
+      if (!isOwner()) return snapshot()
+
+      running = true
+      startRetryCount = 0
+      setState({
+        status: 'online',
+        username: me?.username || null,
+        bot_id: me?.id || null,
+        last_error: null,
+      })
+      console.log(`[TelegramBot] started username=${me?.username || '-'} id=${me?.id || '-'}`)
+      void pollLoop(token, controller.signal, generation, controller)
+    } catch (err) {
+      if (!isOwner()) return snapshot()
+
+      running = false
+      abortController = null
+      if (err?.name === 'AbortError' && !shouldRun) return snapshot()
+
+      const transient = isTransientTelegramError(err)
+      console.warn(`[TelegramBot] start ${transient ? 'transiently' : 'permanently'} failed: ${err?.message || err}`)
+      setState({
+        status: 'error',
+        enabled: true,
+        last_error: String(err?.message || err),
+      })
+      if (transient) scheduleStartRetry(err, generation)
+    } finally {
+      if (startupAttempt === attempt) startupAttempt = null
+    }
+    return snapshot()
+  }
+
+  async function start({ isRetry = false } = {}) {
+    shouldRun = true
     if (running) return snapshot()
+    if (startupAttempt) return startupAttempt.promise
+    clearStartRetry()
+    if (!isRetry) startRetryCount = 0
     const config = readBotConfig()
     setAllowedCountFromConfig(config)
     if (!config.enabled) {
+      shouldRun = false
+      lifecycleGeneration += 1
       botToken = null
       setState({
         status: config.token ? 'disabled' : 'not_configured',
@@ -365,47 +691,37 @@ function createTelegramBotService({ readScSettings, writeScSettings, jobRunner, 
       return snapshot()
     }
 
-    botToken = config.token
-    running = true
-    abortController = new AbortController()
+    const attempt = {
+      generation: lifecycleGeneration + 1,
+      controller: new AbortController(),
+      token: config.token,
+      promise: null,
+    }
+    lifecycleGeneration = attempt.generation
+    botToken = attempt.token
+    abortController = attempt.controller
+    startupAttempt = attempt
     setState({
       status: 'starting',
       enabled: true,
       started_at: Math.floor(Date.now() / 1000),
       last_error: null,
     })
-
-    try {
-      const me = await api('getMe', {}, { token: botToken, signal: abortController.signal })
-      setState({
-        status: 'online',
-        username: me?.username || null,
-        bot_id: me?.id || null,
-        last_error: null,
-      })
-      console.log(`[TelegramBot] started username=${me?.username || '-'} id=${me?.id || '-'}`)
-      await api('deleteWebhook', { drop_pending_updates: true }, { token: botToken, signal: abortController.signal })
-      console.log('[TelegramBot] webhook disabled for desktop polling')
-      await flushPendingUpdates(botToken, abortController.signal)
-      void pollLoop(botToken, abortController.signal)
-    } catch (err) {
-      running = false
-      abortController = null
-      console.warn(`[TelegramBot] start failed: ${err?.message || err}`)
-      setState({
-        status: 'error',
-        enabled: true,
-        last_error: String(err?.message || err),
-      })
-    }
-    return snapshot()
+    attempt.promise = runStartupAttempt(attempt)
+    return attempt.promise
   }
 
   function stop() {
+    shouldRun = false
+    lifecycleGeneration += 1
+    clearStartRetry()
+    startRetryCount = 0
     running = false
-    if (abortController) {
-      try { abortController.abort() } catch {}
-      abortController = null
+    const controller = abortController
+    abortController = null
+    startupAttempt = null
+    if (controller) {
+      try { controller.abort() } catch {}
     }
     if (state.status !== 'not_configured') {
       setState({ status: 'stopped', enabled: false })
@@ -428,6 +744,7 @@ function createTelegramBotService({ readScSettings, writeScSettings, jobRunner, 
     start,
     stop,
     restart,
+    notifyTerminalCompletion,
     getState: snapshot,
     subscribe,
   }
@@ -547,10 +864,57 @@ function splitCodeBlockContent(text, maxEscapedLen = 3600) {
   return chunks.length ? chunks : ['']
 }
 
-function sleep(ms) {
+function telegramErrorStatus(err) {
+  const telegramCode = Number(err?.telegramErrorCode || err?.telegram?.error_code)
+  if (Number.isFinite(telegramCode) && telegramCode > 0) return telegramCode
+  const httpStatus = Number(err?.httpStatus)
+  return Number.isFinite(httpStatus) && httpStatus > 0 ? httpStatus : null
+}
+
+function isTransientTelegramError(err) {
+  if (!err || err.name === 'AbortError') return false
+  if (err.telegramNetworkError === true) return true
+  const status = telegramErrorStatus(err)
+  return status === 408
+    || status === 409
+    || status === 425
+    || status === 429
+    || (status != null && status >= 500)
+}
+
+function telegramRetryDelayMs(err, retryIndex, baseDelayMs, maxDelayMs) {
+  const exponent = Math.max(0, Math.min(16, Number(retryIndex) || 0))
+  const exponentialMs = Math.min(maxDelayMs, baseDelayMs * (2 ** exponent))
+  const retryAfterSec = Number(err?.retryAfterSec || err?.telegram?.parameters?.retry_after)
+  const retryAfterMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+    ? retryAfterSec * 1000
+    : 0
+  return Math.ceil(Math.min(maxDelayMs, Math.max(exponentialMs, retryAfterMs)))
+}
+
+function createAbortError() {
+  const err = new Error('The operation was aborted')
+  err.name = 'AbortError'
+  return err
+}
+
+function sleep(ms, signal) {
   return new Promise(resolve => {
-    const t = setTimeout(resolve, ms)
+    if (signal?.aborted) {
+      resolve()
+      return
+    }
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(t)
+      signal?.removeEventListener('abort', finish)
+      resolve()
+    }
+    const t = setTimeout(finish, ms)
     t.unref?.()
+    signal?.addEventListener('abort', finish, { once: true })
   })
 }
 

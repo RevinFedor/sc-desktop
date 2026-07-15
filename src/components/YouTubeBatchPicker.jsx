@@ -172,6 +172,17 @@ const YouTubeBatchPicker = forwardRef(function YouTubeBatchPicker({
   const [copyToast, setCopyToast] = useState(null)
   const lastClickedRef = useRef(null)        // for shift-click range select
 
+  useEffect(() => {
+    let alive = true
+    window.api?.appSettingsGet?.().then(settings => {
+      if (!alive) return
+      const yt = settings?.youtube || {}
+      if (typeof yt.preferred_lang === 'string' && yt.preferred_lang) setLang(yt.preferred_lang)
+      if (yt.engine === 'gemini' || yt.engine === 'assemblyai') setEngine(yt.engine)
+    }).catch(() => {})
+    return () => { alive = false }
+  }, [])
+
   // Load videos from DB if not provided (channel-source path).
   // Search mode skips this — providedVideos comes from the search form.
   useEffect(() => {

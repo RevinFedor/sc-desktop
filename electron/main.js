@@ -35,8 +35,26 @@ const {
   clearTelegramAutoSessionBlock,
 } = require('./telegram-auto')
 const { createTelegramBotService } = require('./telegram-bot')
+const {
+  publicAppSettings,
+  patchAppSettings,
+} = require('./app-settings')
 
 const isDev = process.env.NODE_ENV === 'development'
+const allowTelegramBotRuntime = !isDev || process.env.SC_TELEGRAM_BOT_DEV === '1'
+const isPrimaryInstance = isDev || app.requestSingleInstanceLock()
+if (!isPrimaryInstance) {
+  console.log('[Startup] Another production SC Desktop instance owns the app lock; exiting')
+  app.quit()
+} else if (!isDev) {
+  app.on('second-instance', () => {
+    const win = BrowserWindow.getAllWindows().find(candidate => !candidate.isDestroyed())
+    if (!win) return
+    if (win.isMinimized()) win.restore()
+    win.show()
+    win.focus()
+  })
+}
 
 // Pick the right icon. In dev: teal "DEV" variant so it's distinguishable
 // from the production purple one (and from gt-editor / custom-terminal).
@@ -255,7 +273,9 @@ function stopAistudioBroadcast() {
   if (aistudioBroadcastTimer) { clearInterval(aistudioBroadcastTimer); aistudioBroadcastTimer = null }
 }
 app.on('window-all-closed', () => stopAistudioBroadcast())
-app.whenReady().then(() => { startAistudioBroadcast() })
+app.whenReady().then(() => {
+  if (isPrimaryInstance) startAistudioBroadcast()
+})
 
 // ─── Telegram sessions / settings ─────────────────────────────────
 //
@@ -275,22 +295,52 @@ function readScSettings() {
   }
 }
 
-function writeScSettings(next) {
+function readScSettingsStrict() {
   try {
+    const parsed = JSON.parse(fs.readFileSync(SC_SETTINGS_PATH, 'utf8'))
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('settings root must be a JSON object')
+    }
+    return parsed
+  } catch (err) {
+    if (err.code === 'ENOENT') return {}
+    throw new Error(`Unable to read shared settings: ${err?.message || err}`)
+  }
+}
+
+function writeScSettings(next) {
+  let tempPath = null
+  try {
+    if (!next || typeof next !== 'object' || Array.isArray(next)) {
+      throw new Error('settings root must be a JSON object')
+    }
     fs.mkdirSync(path.dirname(SC_SETTINGS_PATH), { recursive: true })
-    fs.writeFileSync(SC_SETTINGS_PATH, JSON.stringify(next, null, 2) + '\n', 'utf8')
+    tempPath = `${SC_SETTINGS_PATH}.${process.pid}.${Date.now()}.tmp`
+    let mode = 0o600
+    try { mode = fs.statSync(SC_SETTINGS_PATH).mode & 0o777 } catch {}
+    fs.writeFileSync(tempPath, JSON.stringify(next, null, 2) + '\n', { encoding: 'utf8', mode })
+    fs.renameSync(tempPath, SC_SETTINGS_PATH)
     return { ok: true }
   } catch (err) {
+    if (tempPath) {
+      try { fs.unlinkSync(tempPath) } catch {}
+    }
     console.error('[Settings] write failed', err)
     return { ok: false, error: String(err) }
   }
 }
 
+ipcMain.handle('appSettings:get', () => publicAppSettings(readScSettingsStrict()))
+ipcMain.handle('appSettings:patch', (_evt, payload) => (
+  patchAppSettings(readScSettingsStrict, writeScSettings, payload)
+))
+
 const telegramBot = createTelegramBotService({
-  readScSettings,
+  readScSettings: readScSettingsStrict,
   writeScSettings,
   jobRunner,
   db,
+  allowTerminalNotifications: allowTelegramBotRuntime,
 })
 
 telegramBot.subscribe(state => {
@@ -305,7 +355,7 @@ ipcMain.handle('telegramBot:restart', () => telegramBot.restart())
 async function listTelegramSessionsSnapshot() {
   const events = await jobRunner.runTgSessionsCommand(['list'])
   const sessions = events.filter(e => e.type === 'session')
-  const settings = readScSettings()
+  const settings = readScSettingsStrict()
   const active   = (settings.telegram && settings.telegram.session) || null
   return { sessions, active }
 }
@@ -351,7 +401,7 @@ ipcMain.handle('tg:listSessions', async () => {
 })
 
 ipcMain.handle('tg:setActiveSession', (_evt, name) => {
-  const settings = readScSettings()
+  const settings = readScSettingsStrict()
   settings.telegram = { ...(settings.telegram || {}), session: name }
   return writeScSettings(settings)
 })
@@ -385,15 +435,21 @@ ipcMain.handle('tg:loginFinish', async (_evt, { phone, hash, code, password, nam
 })
 
 ipcMain.handle('tg:deleteSession', async (_evt, name) => {
+  // Validate the shared file before deleting the session. Otherwise a broken
+  // JSON file could make us delete the account and then lose the active-session
+  // update as a second, unrelated failure.
+  readScSettingsStrict()
   const events = await jobRunner.runTgSessionsCommand(['delete', '--name', name])
   const errEv = events.find(e => e.type === 'error')
   if (errEv) return { ok: false, error: errEv.message }
   // If the deleted session was active, clear that field — otherwise the
-  // next fetch would point at a missing file.
-  const settings = readScSettings()
+  // next fetch would point at a missing file. Re-read after the async worker:
+  // settings for another app may have changed while the session was deleting.
+  const settings = readScSettingsStrict()
   if (settings.telegram?.session === name) {
     settings.telegram.session = null
-    writeScSettings(settings)
+    const saved = writeScSettings(settings)
+    if (!saved.ok) return saved
   }
   return { ok: true }
 })
@@ -794,10 +850,10 @@ const APIFY_LEGACY_PATH = path.join(require('node:os').homedir(), '.config', 'sc
 // public profiles).
 function _readIgBackends(ig) {
   const legacy = ig.backend
-  const legacyMapped = legacy === 'android' ? 'api' : (legacy || null)
+  const legacyMapped = legacy === 'apify' ? 'apify' : (legacy ? 'api' : null)
   return {
-    metadata_backend:   ig.metadata_backend   || legacyMapped || 'api',
-    transcribe_backend: ig.transcribe_backend || 'api',
+    metadata_backend:   ig.metadata_backend === 'apify' ? 'apify' : (ig.metadata_backend ? 'api' : (legacyMapped || 'api')),
+    transcribe_backend: ig.transcribe_backend === 'apify' ? 'apify' : 'api',
   }
 }
 
@@ -844,7 +900,7 @@ function _checkApifyToken(token) {
 }
 
 ipcMain.handle('ig:getSettings', async () => {
-  const s = readScSettings()
+  const s = readScSettingsStrict()
   const ig = s.instagram || {}
   let legacyToken = null
   try {
@@ -873,8 +929,14 @@ ipcMain.handle('ig:setBackend', (_evt, payload) => {
   if (!['api', 'apify'].includes(backend)) {
     return { ok: false, error: `unknown backend: ${backend}` }
   }
-  const settings = readScSettings()
-  const ig = { ...(settings.instagram || {}) }
+  const settings = readScSettingsStrict()
+  const currentIg = settings.instagram || {}
+  const resolved = _readIgBackends(currentIg)
+  const ig = {
+    ...currentIg,
+    metadata_backend: resolved.metadata_backend,
+    transcribe_backend: resolved.transcribe_backend,
+  }
   ig[`${which}_backend`] = backend
   // Drop the legacy `ig.backend` key once we've split — keeps settings.json tidy.
   delete ig.backend
@@ -884,7 +946,7 @@ ipcMain.handle('ig:setBackend', (_evt, payload) => {
 
 ipcMain.handle('ig:setApifyToken', (_evt, token) => {
   const clean = (token || '').trim() || null
-  const settings = readScSettings()
+  const settings = readScSettingsStrict()
   settings.instagram = { ...(settings.instagram || {}), apify_token: clean }
   const r = writeScSettings(settings)
   if (!r.ok) return r
@@ -901,6 +963,20 @@ ipcMain.handle('ig:setApifyToken', (_evt, token) => {
 ipcMain.handle('ig:listSessions', async () => {
   const events = await jobRunner.runIgSessionsCommand(['list', '--check'])
   return { sessions: events.filter(e => e.type === 'session') }
+})
+
+ipcMain.handle('ig:login', async () => {
+  try {
+    const events = await jobRunner.runIgLogin()
+    const error = events.find(e => e.type === 'error')
+    const loggedIn = events.find(e => e.type === 'logged_in')
+    return error
+      ? { ok: false, error: error.message || error.code || 'Instagram login failed', events }
+      : { ok: !!loggedIn, account: loggedIn?.username || null, events }
+  } catch (err) {
+    console.error('[InstagramLogin] IPC failed', err)
+    return { ok: false, error: String(err?.message || err), events: [] }
+  }
 })
 
 ipcMain.handle('ig:deleteSession', async (_evt, kind) => {
@@ -1073,9 +1149,9 @@ ipcMain.handle('ig:batchTranscribe', (_evt, params) => {
   const backends = _readIgBackends(ig)
   const backend = (params && params.backend) || backends.transcribe_backend || 'api'
 
-  // For api backend we need the profile's user_id (= sources.external_id
-  // for IG sources) so the Python side can paginate clips/user/ to find
-  // each shortcode's fresh signed video_url.
+  // Known sources pass their profile id and use anonymous clips/user/.
+  // Bare links intentionally keep user_id empty so Python resolves the
+  // shortcode through the saved authenticated Android API session.
   let user_id = params?.user_id || null
   if (backend === 'api' && !user_id && params?.source_id) {
     try {
@@ -1928,6 +2004,7 @@ function registerAssetProtocol() {
 }
 
 app.whenReady().then(() => {
+  if (!isPrimaryInstance) return
   registerAssetProtocol()
   createWindow()
   app.on('activate', () => {
@@ -1938,12 +2015,24 @@ app.whenReady().then(() => {
   // ломает приложение — расширение просто покажет «sc-desktop не запущен».
   try {
     const { startServer } = require('./browser-bridge')
-    startServer({ jobRunner })
+    startServer({
+      jobRunner,
+      notificationService: telegramBot,
+      settingsAccess: { readScSettings: readScSettingsStrict, writeScSettings },
+    })
   } catch (err) {
     console.log(`[BrowserBridge] failed to start: ${err?.message || err}`)
   }
-  startTelegramAutoScheduler({ db, jobRunner, indexJob })
-  telegramBot.start()
+  try {
+    startTelegramAutoScheduler({ db, jobRunner, indexJob })
+  } catch (err) {
+    console.warn(`[TelegramAuto] failed to start scheduler: ${err?.message || err}`)
+  }
+  if (allowTelegramBotRuntime) {
+    void telegramBot.start()
+  } else {
+    console.log('[TelegramBot] dev auto-start skipped; use the status pill or SC_TELEGRAM_BOT_DEV=1')
+  }
 })
 
 app.on('before-quit', () => {

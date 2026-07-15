@@ -8,7 +8,7 @@ import {
 } from '../lib/jobs'
 import { formatBytes } from '../lib/formatTokens'
 import { backendLabel } from '../lib/instagram'
-import { pushScreen } from '../lib/store'
+import { openSettings, pushScreen } from '../lib/store'
 import PlatformLogo from './PlatformLogo'
 
 const ENGINES = [
@@ -78,20 +78,15 @@ const InstagramSingleReelForm = forwardRef(function InstagramSingleReelForm({ ur
   const apifyOk = !!settings?.apify_token_check?.ok
 
   function plannedBackend() {
-    if (configuredBackend === 'apify') return 'apify'
-    if (hasLocalOwner) return 'api'
-    return 'apify'
+    return configuredBackend === 'apify' ? 'apify' : 'api'
   }
 
   function blockedReason(backend = plannedBackend()) {
     if (!shortcode) return 'Не удалось распознать shortcode reels'
-    if (backend === 'api' && !hasLocalOwner) {
-      return 'android-api может транскрибировать одиночный reels только если профиль уже есть в базе'
-    }
     if (backend === 'apify' && !apifyOk) {
       return settings?.apify_token_set
         ? 'Apify-токен не прошёл проверку'
-        : 'Для голой ссылки нужен Apify-токен или сначала профильный парсинг'
+        : 'Для выбранного Apify backend нужен действующий токен'
     }
     return null
   }
@@ -125,8 +120,11 @@ const InstagramSingleReelForm = forwardRef(function InstagramSingleReelForm({ ur
         engine,
         backend,
         target: url,
+        ...(backend === 'api' ? {
+          api_resolution: hasLocalOwner ? 'profile_clips' : 'shortcode_session',
+        } : {}),
       }
-      if (backend === 'api') {
+      if (backend === 'api' && hasLocalOwner) {
         params.source_id = cached.source_id
         params.user_id = String(cached.source_external_id)
       }
@@ -249,7 +247,6 @@ const InstagramSingleReelForm = forwardRef(function InstagramSingleReelForm({ ur
 
   const backend = plannedBackend()
   const blocked = blockedReason(backend)
-  const usesApifyBecauseBareUrl = configuredBackend === 'api' && backend === 'apify' && !hasLocalOwner
 
   return (
     <Shell>
@@ -257,14 +254,11 @@ const InstagramSingleReelForm = forwardRef(function InstagramSingleReelForm({ ur
       <div className="space-y-2">
         <div className="text-zinc-400" style={{ fontSize: '14px' }}>
           {hasLocalOwner
-            ? `Профиль уже есть в базе: @${cached.source_handle}. Можно использовать android-api.`
-            : 'Профиль этого reels не найден в базе. Для голой ссылки нужен Apify, либо сначала спарсить профиль.'}
+            ? `Android API получит ролик через сохранённый профиль @${cached.source_handle}.`
+            : backend === 'api'
+              ? 'Android API получит ролик напрямую по ссылке через сохранённую Instagram-сессию.'
+              : 'Для этой ссылки будет запущен выбранный Apify backend.'}
         </div>
-        {usesApifyBecauseBareUrl && (
-          <div className="px-3 py-2 rounded-md border border-amber-900/60 bg-amber-950/30 text-amber-200" style={{ fontSize: '14px' }}>
-            В настройках выбран android-api, но без владельца ролика он не умеет получить video_url. Кнопка ниже явно запустит Apify.
-          </div>
-        )}
       </div>
 
       <div className="flex items-center gap-3 flex-wrap">
@@ -366,7 +360,7 @@ function ActionRow({ onCopy, path }) {
 function SettingsButton() {
   return (
     <button
-      onClick={() => pushScreen('ig-settings')}
+      onClick={() => openSettings('instagram')}
       className="px-3 py-1.5 rounded-md text-sm text-zinc-300 hover:bg-zinc-900 inline-flex items-center gap-1.5"
     ><Settings size={14} />Настройки</button>
   )

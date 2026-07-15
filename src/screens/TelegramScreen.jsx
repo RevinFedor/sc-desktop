@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { Settings, RotateCw, Plus, Image, Video, Mic, FileText, Copy, Trash2, X, TriangleAlert, UserRound, Loader2, Cpu, ChevronDown } from 'lucide-react'
-import { pushScreen, useStore } from '../lib/store'
+import { openSettings, pushScreen, useStore } from '../lib/store'
 import { useSources, refreshSources } from '../lib/sources'
 import { useJobs } from '../lib/jobs'
 import { useInvalidator, invalidate } from '../lib/dataBus'
@@ -813,8 +813,8 @@ export default function TelegramScreen({ payload }) {
               className={`text-zinc-500 hover:text-zinc-200 ${refreshing ? 'animate-spin' : ''} disabled:text-zinc-700`}
             ><RotateCw size={16} /></button>
             <button
-              onClick={() => pushScreen('tg-settings')}
-              title="Настройки Telegram (сессии)"
+              onClick={() => openSettings('telegram')}
+              title="Настройки Telegram"
               className="text-zinc-500 hover:text-zinc-200"
             ><Settings size={18} /></button>
           </span>

@@ -169,6 +169,61 @@
     });
   }
 
+  function requestFreshYoutubeSettings(timeoutMs = 4500) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error('fresh YouTube settings timeout'));
+      }, timeoutMs);
+      try {
+        chrome.runtime.sendMessage({ __sc_get_fresh_youtube_settings: true }, response => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          const lastError = chrome.runtime.lastError;
+          if (lastError) {
+            reject(new Error(lastError.message));
+            return;
+          }
+          if (!response?.ok || !response.settings) {
+            reject(new Error(response?.error || 'fresh YouTube settings failed'));
+            return;
+          }
+          resolve(response.settings);
+        });
+      } catch (error) {
+        clearTimeout(timer);
+        settled = true;
+        reject(error);
+      }
+    });
+  }
+
+  // Desktop может изменить язык/comments/target пока YouTube-вкладка уже
+  // открыта. Перед первым /yt-add SW сначала дожимает pending offline-patch,
+  // затем отдаёт canonical snapshot; старый кэш CS решением не является.
+  async function refreshYoutubeSettingsBeforeSend() {
+    try {
+      const fresh = sanitizeYoutubeSettings({
+        ...ytSettings,
+        ...await requestFreshYoutubeSettings(),
+      });
+      ytSettings = fresh;
+      try { chrome.storage.sync.set({ __yt: fresh }); } catch {}
+      dbg('settings.fresh_before_send', {
+        target: fresh.target,
+        withComments: fresh.with_comments,
+        lang: fresh.preferred_lang,
+        chatgptMode: fresh.chatgpt_mode,
+      });
+    } catch (error) {
+      dbg('settings.fresh_before_send_fallback', { err: error?.message || String(error) });
+    }
+    return ytSettings;
+  }
+
   // ─────────── Кнопка ───────────
 
   // Pill-кнопка в стиле Яндекс «Пересказать», рядом с которым она живёт.
@@ -176,9 +231,13 @@
   // Маркер меняется в зависимости от toggle «Автоскрапинг нейронки»:
   //   off → "sc"      (только скачать в sc-desktop)
   //   on  → "sc · AI" (скачать + дальше Gemini Studio)
-  function ytTargetLabel(target) {
+  function ytTargetLabel(target, chatgptMode = ytSettings.chatgpt_mode, explicitLabel = '') {
+    if (explicitLabel) return explicitLabel;
+    if (target === 'chatgpt') {
+      return 'ChatGPT · ' + (chatgptMode === 'work' ? 'Work' : 'Chat');
+    }
     return (typeof YOUTUBE_TARGET_LABELS === 'object' && YOUTUBE_TARGET_LABELS?.[target])
-      || (target === 'chatgpt' ? 'ChatGPT' : target === 'claude' ? 'Claude' : 'Gemini Studio');
+      || (target === 'claude' ? 'Claude' : 'Gemini Studio');
   }
   function buttonLabel(autoAistudio) {
     return autoAistudio ? '⬇ sc · AI' : '⬇ sc';
@@ -246,12 +305,17 @@
       const auto = opts.autoAistudio != null ? opts.autoAistudio : prev.autoAistudio;
       const title = opts.title != null ? opts.title : prev.title;
       const target = opts.target != null ? opts.target : prev.target;
+      const chatgptMode = opts.chatgptMode != null ? opts.chatgptMode : (prev.chatgptMode || ytSettings.chatgpt_mode);
+      const targetLabel = opts.targetLabel != null ? opts.targetLabel : prev.targetLabel;
       // engine приходит из background.js на стадии 'transcribing'; на
       // 'searching' bridge ещё не знает какой engine (subs могут найтись
       // и AI вообще не понадобится). Сохраняем prev.engine чтобы при
       // переходе searching→transcribing не потерять уже известный engine.
       const engine = opts.engine != null ? opts.engine : prev.engine;
-      videoStateMap.set(videoId, { state, engine, error: opts.error, title, target, autoAistudio: auto });
+      videoStateMap.set(videoId, {
+        state, engine, error: opts.error, title, target, chatgptMode, targetLabel,
+        autoAistudio: auto,
+      });
       // Авто-удаление done/error/pasted через TTL.
       const t = stateTimers.get(videoId);
       if (t) clearTimeout(t);
@@ -291,6 +355,8 @@
       error: entry?.error,
       engine: entry?.engine,
       target: entry?.target,
+      chatgptMode: entry?.chatgptMode,
+      targetLabel: entry?.targetLabel,
       autoAistudio: entry?.autoAistudio != null ? entry.autoAistudio : ytSettings.auto_aistudio,
     });
   }
@@ -342,8 +408,8 @@
         title = 'sc-desktop обрабатывает видео';
         break;
       case 'opening':
-        label = '🤖 ' + ytTargetLabel(opts.target || ytSettings.target) + '…';
-        title = 'Открываю ' + ytTargetLabel(opts.target || ytSettings.target) + ' в фоне';
+        label = '🤖 ' + ytTargetLabel(opts.target || ytSettings.target, opts.chatgptMode, opts.targetLabel) + '…';
+        title = 'Открываю ' + ytTargetLabel(opts.target || ytSettings.target, opts.chatgptMode, opts.targetLabel) + ' в фоне';
         break;
       case 'idle':
       default:
@@ -378,7 +444,7 @@
           break;
         }
         case 'working':      label = '⏳ Транскрипция…';   title = 'sc-desktop обрабатывает видео'; break;
-        case 'opening':      label = '🤖 ' + ytTargetLabel(opts.target || ytSettings.target) + '…'; title = 'Открываю ' + ytTargetLabel(opts.target || ytSettings.target) + ' в фоне'; break;
+        case 'opening':      label = '🤖 ' + ytTargetLabel(opts.target || ytSettings.target, opts.chatgptMode, opts.targetLabel) + '…'; title = 'Открываю ' + ytTargetLabel(opts.target || ytSettings.target, opts.chatgptMode, opts.targetLabel) + ' в фоне'; break;
         default:             label = uiState;              title = uiState;
       }
       // Скрываем половины, показываем overlay-метку.
@@ -682,7 +748,7 @@
       return vid ? `https://www.youtube.com/watch?v=${vid}` : null;
     };
     const left = mkHalf(copyIcon, 'copy', 'Скопировать в sc-desktop',
-      () => { const u = resolveUrl(); if (u) handleClick(u, wrap, false, false); },
+      () => { const u = resolveUrl(); if (u) handleClick(u, wrap, false, null); },
       { role: 'copy' });
     const divider = document.createElement('div');
     divider.style.cssText = `
@@ -694,7 +760,7 @@
     // как у copy — единый стиль, только divider визуально разделяет
     // зоны клика.
     const right = mkHalf(aiIcon, 'ai', 'Скопировать + открыть выбранный AI',
-      () => { const u = resolveUrl(); if (u) handleClick(u, wrap, true, false); },
+      () => { const u = resolveUrl(); if (u) handleClick(u, wrap, true, null); },
       { role: 'ai' });
 
     wrap.append(left, divider, right);
@@ -1023,20 +1089,25 @@
 
   // withCommentsOverride: explicit boolean. null = читать из ytSettings.
   async function sendVideo(url, withCommentsOverride = null) {
+    const freshSettings = await refreshYoutubeSettingsBeforeSend();
     const withComments = withCommentsOverride != null
       ? !!withCommentsOverride
-      : !!ytSettings.with_comments;
+      : !!freshSettings.with_comments;
     const r = await fetch(SC_ENDPOINT_BASE + '/yt-add', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, withComments }),
+      body: JSON.stringify({
+        url,
+        withComments,
+        lang: freshSettings.preferred_lang || 'ru',
+      }),
     });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       throw new Error(err.error || ('HTTP ' + r.status));
     }
     const data = await r.json();
-    return { ...data, settings: ytSettings };
+    return { ...data, settings: freshSettings };
   }
 
   function pageVideoTitle() {
@@ -1072,7 +1143,11 @@
     }
     const titleSnapshot = pickCardTitleForVideo(videoId, btn) || pageVideoTitle();
     const initialTarget = ytSettings.target || 'aistudio';
-    setVideoState(videoId, 'sending', { title: titleSnapshot, target: initialTarget });
+    setVideoState(videoId, 'sending', {
+      title: titleSnapshot,
+      target: initialTarget,
+      chatgptMode: ytSettings.chatgpt_mode,
+    });
     try {
       if (!await pingBridge()) {
         setVideoState(videoId, 'error', { error: 'sc-desktop не запущен', title: titleSnapshot, target: initialTarget });
@@ -1093,7 +1168,14 @@
         : !!settings.auto_aistudio;
 
       const chosenTarget = settings.target || 'aistudio';
-      dbg('handleClick.track_job', { target: chosenTarget, fromCache: !!fromCache, autoAistudio, claudeProject: settings.claude_project, claudeModel: settings.claude_model });
+      dbg('handleClick.track_job', {
+        target: chosenTarget,
+        fromCache: !!fromCache,
+        autoAistudio,
+        claudeProject: settings.claude_project,
+        claudeModel: settings.claude_model,
+        chatgptMode: settings.chatgpt_mode,
+      });
 
       // Передаём job трекеру в SW. КРИТИЧНО: с callback + проверкой
       // chrome.runtime.lastError. Раньше это был fire-and-forget в `catch {}`,
@@ -1132,6 +1214,7 @@
               claudeAdaptiveThinking: settings.claude_adaptive_thinking !== false,
               // ChatGPT-side
               chatgptPrompt: settings.chatgpt_prompt || '',
+              chatgptMode: settings.chatgpt_mode || 'chat',
               chatgptModel: settings.chatgpt_model || '5.5',
               chatgptEffort: settings.chatgpt_effort || 'xhigh',
             },
@@ -1152,11 +1235,21 @@
           error: 'трекер недоступен — перезапустите расширение' + (trackResp.error ? ': ' + trackResp.error : ''),
           title: titleSnapshot,
           target: chosenTarget,
+          chatgptMode: settings.chatgpt_mode,
         });
         return;
       }
 
-      setVideoState(videoId, 'working', { title: titleSnapshot, autoAistudio, target: chosenTarget });
+      // Cache-hit может успеть прислать opening/pasted до callback трекера.
+      // Не откатываем более свежую стадию обратно в общий «working».
+      if (getVideoState(videoId)?.state === 'sending') {
+        setVideoState(videoId, 'working', {
+          title: titleSnapshot,
+          autoAistudio,
+          target: chosenTarget,
+          chatgptMode: settings.chatgpt_mode,
+        });
+      }
     } catch (e) {
       console.warn('[SC-YT] send failed', e);
       setVideoState(videoId, 'error', { error: e.message || String(e), title: titleSnapshot, target: initialTarget });
@@ -1273,11 +1366,9 @@
         const vid = pill.dataset.videoId;
         if (!vid) return;
         const url = `https://www.youtube.com/watch?v=${vid}`;
-        // Явный withComments=false: plain copy/+ai НЕ тянут комменты.
-        // Комменты — только через Cmd-row (+ субтитры). Без этого 4-го
-        // аргумента он падал в null → бралось ytSettings.with_comments,
-        // и overlay-плашки расходились с dock-FAB (BUG: comments divergence).
-        handleClick(url, pill, role === 'ai', false);
+        // Обычный copy/+ai читает with_comments из свежих desktop-настроек;
+        // Cmd-row остаётся явным shortcut'ом варианта с комментариями.
+        handleClick(url, pill, role === 'ai', null);
       });
       half.replaceWith(newBtn);
     }
@@ -1440,6 +1531,8 @@
               error: entry?.error,
               engine: entry?.engine,
               target: entry?.target,
+              chatgptMode: entry?.chatgptMode,
+              targetLabel: entry?.targetLabel,
               autoAistudio: entry?.autoAistudio != null ? entry.autoAistudio : ytSettings.auto_aistudio,
             });
             refreshed++;
@@ -1473,9 +1566,8 @@
             const currentVid = btn.dataset.videoId;
             if (!currentVid) return;
             const url = `https://www.youtube.com/watch?v=${currentVid}`;
-            // Явный withComments=false (см. singleton выше) — комменты только
-            // через Cmd-row, плашка не должна молча тянуть их по настройке.
-            handleClick(url, btn, role === 'ai', false);
+            // Обычный клик читает with_comments из свежих desktop-настроек.
+            handleClick(url, btn, role === 'ai', null);
           });
           half.replaceWith(newBtn);
         }
@@ -1540,6 +1632,8 @@
             error: entry?.error,
             engine: entry?.engine,
             target: entry?.target,
+            chatgptMode: entry?.chatgptMode,
+            targetLabel: entry?.targetLabel,
             autoAistudio: entry?.autoAistudio != null ? entry.autoAistudio : ytSettings.auto_aistudio,
           });
           refreshed++;
@@ -1578,9 +1672,9 @@
           if (!currentVid) return;
           // Нормализуем в watch-форму — у sc-desktop единый кэш для shorts/watch.
           const url = `https://www.youtube.com/watch?v=${currentVid}`;
-          // Явный withComments=false (см. singleton/per-card) — комменты
-          // только через Cmd-row.
-          handleClick(url, btn, role === 'ai', false);
+          // Обычный клик читает with_comments из свежих desktop-настроек;
+          // Cmd-row по-прежнему явно форсирует вариант с комментариями.
+          handleClick(url, btn, role === 'ai', null);
         });
         half.replaceWith(newBtn);
       }
@@ -1604,6 +1698,8 @@
         error: entry?.error,
         engine: entry?.engine,
         target: entry?.target,
+        chatgptMode: entry?.chatgptMode,
+        targetLabel: entry?.targetLabel,
         autoAistudio: entry?.autoAistudio != null ? entry.autoAistudio : ytSettings.auto_aistudio,
       });
     }
@@ -2050,6 +2146,8 @@
       error: entry?.error,
       engine: entry?.engine,
       target: entry?.target,
+      chatgptMode: entry?.chatgptMode,
+      targetLabel: entry?.targetLabel,
       autoAistudio: entry?.autoAistudio != null ? entry.autoAistudio : ytSettings.auto_aistudio,
     });
   }
@@ -2276,7 +2374,7 @@
     // вкладка скрыта (race: tab активной была в момент chrome.tabs.query,
     // юзер успел переключиться до доставки sendMessage). Юзер увидит
     // только последующие event'ы — старые не реплеим.
-    chrome.runtime.onMessage.addListener((req) => {
+    chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
       if (!req || req.__sc_btn_state !== true) return;
       const vid = req.videoId;
       if (!vid) return;
@@ -2285,9 +2383,25 @@
       // он вернётся, должен увидеть финал «Вставлено в Gemini Studio».
       // Промежуточные состояния (`searching`/`transcribing`/`opening`)
       // на скрытой вкладке смысла не имеют — они быстро устаревают.
-      const persistOnHidden = (req.state === 'pasted' || req.state === 'done');
-      if (document.visibilityState !== 'visible' && !persistOnHidden) return;
-      setVideoState(vid, req.state, { engine: req.engine, error: req.error, title: req.title, target: req.target });
+      const persistOnHidden = (
+        req.state === 'pasted'
+        || req.state === 'done'
+        || (req.state === 'error' && req.target === 'chatgpt')
+      );
+      if (document.visibilityState !== 'visible' && !persistOnHidden) {
+        sendResponse({ ok: true, ignored: 'hidden-intermediate-state' });
+        return false;
+      }
+      setVideoState(vid, req.state, {
+        engine: req.engine,
+        error: req.error,
+        title: req.title,
+        target: req.target,
+        targetLabel: req.targetLabel,
+        chatgptMode: req.chatgptMode,
+      });
+      sendResponse({ ok: true });
+      return false;
     });
 
     // На возврат на вкладку — выкидываем «протухшие» done/error из
@@ -2299,7 +2413,21 @@
       if (document.visibilityState !== 'visible') return;
       let touched = false;
       for (const [vid, e] of videoStateMap) {
-        if (e.state === 'done' || e.state === 'error') {
+        if (e.state === 'error' && e.target === 'chatgpt' && !stateTimers.has(vid)) {
+          // Ошибка именно handoff'а в ChatGPT содержит конкретную причину
+          // (режим/модель/логин). Если она пришла в фоне, показываем при
+          // возврате и только затем запускаем короткий TTL.
+          const id = setTimeout(() => {
+            stateTimers.delete(vid);
+            videoStateMap.delete(vid);
+            renderPillForCurrentVideo();
+            renderToasts();
+            renderFabFromState();
+            renderPerCardFromState();
+          }, 4000);
+          stateTimers.set(vid, id);
+          touched = true;
+        } else if (e.state === 'done' || e.state === 'error') {
           // «Готово» / «Ошибка» — стираем при возврате (они не несут
           // ценной информации в момент возврата, юзер уже знает что
           // job завершился; новый он начинать будет с idle).

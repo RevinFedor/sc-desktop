@@ -1,11 +1,13 @@
 import React, { useRef, useState } from 'react'
 import { Settings, Activity, History, Plus, Bot } from 'lucide-react'
-import { useStore, goHome, pushScreen, toggleActivity, closeActivity } from '../lib/store'
+import { useStore, pushScreen, toggleScreen, openSettings, toggleActivity, closeActivity } from '../lib/store'
+import { SETTINGS_SECTIONS } from '../lib/settingsSections'
 import { useJobs } from '../lib/jobs'
 import { useAistudioJobs } from '../lib/aistudioJobs'
 import { useTelegramBotState } from '../lib/telegramBot'
 import McpRunningPopover from './McpRunningPopover'
 import RequestsRunningPopover from './RequestsRunningPopover'
+import PlatformLogo from './PlatformLogo'
 import { isActiveRequestJob, isVisibleRequestJob } from './ActivityPanel'
 
 export default function TitleBar({
@@ -20,6 +22,7 @@ export default function TitleBar({
     arr.filter(j => j.status === 'running' || j.status === 'pending').length
   )
   const isHome = screen.name === 'paste'
+  const isSettings = screen.name === 'settings'
 
   // Popover текущих MCP — открывается по клику на основную часть кнопки
   // (не по стикеру "История").
@@ -43,16 +46,18 @@ export default function TitleBar({
     <div className="titlebar h-10 border-b border-zinc-800 flex items-stretch select-none relative">
       <div className="flex items-center px-3 gap-2 leading-none">
         <button
-          onClick={goHome}
-          disabled={isHome}
-          className={`no-drag px-2 py-1 rounded text-sm font-medium transition-colors ${
-            isHome
-              ? 'text-zinc-300 cursor-default'
-              : 'text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800'
-          }`}
-          title={isHome ? 'Главная' : 'Назад на Главную'}
+          type="button"
+          onClick={() => pushScreen('paste', {
+            focusComposer: true,
+            focusRequestId: Date.now(),
+          })}
+          className={`no-drag px-2.5 py-1 rounded-md border inline-flex items-center gap-1.5 text-sm transition-colors ${
+            isHome ? 'border-zinc-600 bg-zinc-800' : 'border-zinc-800 hover:border-zinc-700'
+          } ${isHome ? 'text-zinc-100' : 'text-zinc-300 hover:text-zinc-100 hover:bg-zinc-800'}`}
+          title="Главная · новый запрос"
         >
-          Главная
+          <span>Главная</span>
+          <Plus size={14} />
         </button>
         <TelegramBotPill />
       </div>
@@ -156,13 +161,54 @@ export default function TitleBar({
           </button>
         </div>
 
-        <button
-          onClick={() => pushScreen('settings')}
-          className="no-drag px-2 py-1 rounded text-sm text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800"
-          title="Настройки"
-        >
-          <Settings size={14} />
-        </button>
+        <div className="no-drag relative group flex h-full items-center">
+          <button
+            type="button"
+            onClick={() => {
+              openOnly('settings')
+              toggleScreen('settings')
+            }}
+            className={`px-2 py-1 rounded text-sm hover:text-zinc-200 hover:bg-zinc-800 ${
+              isSettings ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400'
+            }`}
+            title={isSettings ? 'Закрыть настройки' : 'Настройки'}
+            aria-label={isSettings ? 'Закрыть настройки' : 'Открыть настройки'}
+          >
+            <Settings size={14} />
+          </button>
+
+          <div className="absolute right-0 top-full z-50 pt-1 invisible opacity-0 pointer-events-none group-hover:visible group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity">
+            <div
+              className="flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-950 p-1 shadow-xl"
+              role="menu"
+              aria-label="Быстрый переход к настройкам"
+            >
+              {SETTINGS_SECTIONS.map(section => (
+                <button
+                  key={section.id}
+                  type="button"
+                  role="menuitem"
+                  data-settings-shortcut={section.id}
+                  onClick={() => {
+                    openOnly('settings')
+                    openSettings(section.id)
+                  }}
+                  className={`w-8 h-8 rounded flex items-center justify-center transition-colors ${
+                    isSettings && (screen.payload?.section || 'main') === section.id
+                      ? 'bg-zinc-700 text-zinc-100'
+                      : 'text-zinc-500 hover:text-zinc-100 hover:bg-zinc-800'
+                  }`}
+                  title={section.label}
+                  aria-label={`Настройки ${section.label}`}
+                >
+                  {section.platform
+                    ? <PlatformLogo platform={section.platform} size={16} />
+                    : <Settings size={16} />}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
 
       <McpRunningPopover

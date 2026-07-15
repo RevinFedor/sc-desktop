@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from 'react'
 import { Trash2 } from 'lucide-react'
-import PlatformLogo from '../components/PlatformLogo'
 
 /**
  * Telegram session management. Lists existing *.session files in the CLI
@@ -35,27 +34,32 @@ export default function TelegramSettings() {
   useEffect(() => { refresh() }, [])
 
   async function pickActive(name) {
-    const r = await window.api.tgSetActiveSession(name)
-    if (r.ok) setActive(name)
-    else setErr(r.error || 'failed to set active')
+    setErr(null)
+    try {
+      const r = await window.api.tgSetActiveSession(name)
+      if (r.ok) setActive(name)
+      else setErr(r.error || 'failed to set active')
+    } catch (e) {
+      setErr(String(e?.message || e))
+    }
   }
 
   async function deleteSession(name) {
     if (!window.confirm(`Удалить сессию «${name}»? Файл будет стёрт с диска.`)) return
-    const r = await window.api.tgDeleteSession(name)
-    if (!r.ok) { setErr(r.error || 'delete failed'); return }
-    if (active === name) setActive(null)
-    refresh()
+    setErr(null)
+    try {
+      const r = await window.api.tgDeleteSession(name)
+      if (!r.ok) { setErr(r.error || 'delete failed'); return }
+      if (active === name) setActive(null)
+      await refresh()
+    } catch (e) {
+      setErr(String(e?.message || e))
+    }
   }
 
   return (
-    <div className="h-full flex flex-col">
-      <div className="flex-1 overflow-auto px-8 py-6">
-        <div className="max-w-3xl">
-          <div className="mb-6 flex items-center gap-3">
-            <PlatformLogo platform="telegram" size={20} />
-            <span className="text-xl font-semibold text-zinc-100">Telegram · сессии</span>
-          </div>
+    <div>
+          <div className="text-zinc-200 font-medium mb-2">Сессии</div>
           <div className="text-zinc-400 mb-6" style={{ fontSize: '14px' }}>
             Каждая сессия — отдельный аккаунт. Активная используется для всех
             будущих парсингов. Если сессия отозвана Telegram — войдите в неё
@@ -114,8 +118,6 @@ export default function TelegramSettings() {
               }}
             />
           )}
-        </div>
-      </div>
     </div>
   )
 }

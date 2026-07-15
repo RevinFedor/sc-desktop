@@ -1,5 +1,5 @@
 import React, {
-  forwardRef, useImperativeHandle, useState, useRef,
+  forwardRef, useEffect, useImperativeHandle, useState, useRef,
 } from 'react'
 import { watchJob } from '../lib/jobs'
 import { pushScreen } from '../lib/store'
@@ -25,6 +25,15 @@ const RedditSearchForm = forwardRef(function RedditSearchForm({ initialQuery, on
   const [job, setJob] = useState(null)
   const [err, setErr] = useState(null)
   const navRef = useRef(false)
+
+  useEffect(() => {
+    let alive = true
+    window.api?.appSettingsGet?.().then(settings => {
+      const value = settings?.reddit?.backend
+      if (alive && ['api', 'auto', 'apify'].includes(value)) setBackend(value)
+    }).catch(() => {})
+    return () => { alive = false }
+  }, [])
 
   useImperativeHandle(ref, () => ({
     async trigger() { await start() },

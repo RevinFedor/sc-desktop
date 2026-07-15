@@ -45,9 +45,20 @@ const path = require('node:path')
 const os = require('node:os')
 const crypto = require('node:crypto')
 const researchState = require('./research-state')
+const {
+  ensureNotificationToken,
+  matchesBearerToken,
+} = require('./local-notification-auth')
+const {
+  EXTENSION_YOUTUBE_SCHEMA_VERSION,
+  extensionYoutubeFromSettings,
+  extensionYoutubeSchemaState,
+  patchExtensionYoutubeSettings,
+} = require('./app-settings')
 
 const BODY_LIMITS = {
   default: 64 * 1024,
+  terminalNotification: 16 * 1024,
   researchStart: 2 * 1024 * 1024,
   researchState: 5 * 1024 * 1024,
   researchArtifactJson: 30 * 1024 * 1024,
@@ -202,6 +213,27 @@ function isAllowedOrigin(origin) {
   return false
 }
 
+// The manifest contains a fixed public key, so the extension ID is stable in
+// both Chrome and Yandex. Settings contain prompts/project names and must not
+// be exposed to every unrelated installed extension.
+const SC_BROWSER_EXTENSION_ID = 'phnlfhkblebijojjnnlbcbklijgcijgf'
+const SC_BROWSER_EXTENSION_ORIGIN = `chrome-extension://${SC_BROWSER_EXTENSION_ID}`
+function isExtensionOrigin(origin) {
+  return origin === SC_BROWSER_EXTENSION_ORIGIN
+}
+
+function isExtensionSettingsRequest(req) {
+  const origin = req.headers.origin || ''
+  if (isExtensionOrigin(origin)) return true
+  // Yandex's MV3 service worker omits Origin on loopback fetches. Sec-Fetch-*
+  // headers cannot be set by a web page, and the explicit extension id keeps
+  // ordinary origin-less requests out of the settings route.
+  return !origin &&
+    req.headers['x-sc-extension-id'] === SC_BROWSER_EXTENSION_ID &&
+    req.headers['sec-fetch-site'] === 'none' &&
+    req.headers['sec-fetch-mode'] === 'cors'
+}
+
 function setCors(req, res) {
   const origin = req.headers.origin || ''
   if (isAllowedOrigin(origin)) {
@@ -209,7 +241,7 @@ function setCors(req, res) {
     res.setHeader('Vary', 'Origin')
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-SC-Extension-Id')
   res.setHeader('Access-Control-Max-Age', '600')
   // Chrome PNA (Private Network Access, начиная с Chrome 104+): fetch с
   // публичного origin (https://claude.ai) на private IP (127.0.0.1) требует
@@ -394,7 +426,49 @@ function safeReadFile(fp, maxBytes = 4 * 1024 * 1024) {
   } catch { return null }
 }
 
-function startServer({ jobRunner }) {
+function requiredNotificationString(value, field, maxLength) {
+  if (typeof value !== 'string') throw new Error(`${field} must be a string`)
+  const normalized = value.trim()
+  if (!normalized) throw new Error(`${field} is required`)
+  if (normalized.length > maxLength) throw new Error(`${field} is too long`)
+  if (/[\u0000-\u001f\u007f]/.test(normalized)) throw new Error(`${field} contains control characters`)
+  return normalized
+}
+
+function normalizeTerminalCompletionEvent(body = {}) {
+  if (body.kind !== 'terminal-completion') throw new Error('kind must be terminal-completion')
+  const firedAt = Number(body.firedAt)
+  if (!Number.isSafeInteger(firedAt) || firedAt <= 0) throw new Error('firedAt must be a positive epoch-ms integer')
+  const mode = body.mode === 'persistent' ? 'persistent' : body.mode === 'oneshot' ? 'oneshot' : null
+  if (!mode) throw new Error('mode must be oneshot or persistent')
+  if (typeof body.unread !== 'boolean') throw new Error('unread must be a boolean')
+  const event = {
+    kind: 'terminal-completion',
+    eventId: requiredNotificationString(body.eventId, 'eventId', 320),
+    projectId: requiredNotificationString(body.projectId, 'projectId', 512),
+    tabId: requiredNotificationString(body.tabId, 'tabId', 512),
+    tabName: requiredNotificationString(body.tabName, 'tabName', 160).replace(/\s+/g, ' '),
+    firedAt,
+    mode,
+    unread: body.unread,
+  }
+  if (event.eventId !== `${event.tabId}:${event.firedAt}`) {
+    throw new Error('eventId must match tabId:firedAt')
+  }
+  return event
+}
+
+function startServer({ jobRunner, notificationService, settingsAccess }) {
+  let notificationAuthToken = null
+  try {
+    const auth = ensureNotificationToken()
+    notificationAuthToken = auth.token
+    console.log(`[BrowserBridge] terminal notification auth ready path=${auth.tokenPath}`)
+  } catch (err) {
+    console.warn(`[BrowserBridge] terminal notification auth unavailable: ${err?.message || err}`)
+  }
+  const notificationRequestTimes = []
+
   const server = http.createServer(async (req, res) => {
     setCors(req, res)
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return }
@@ -406,6 +480,144 @@ function startServer({ jobRunner }) {
     try {
       if (req.method === 'GET' && url.pathname === '/healthz') {
         return sendJson(res, 200, { ok: true, version: 1 })
+      }
+
+      // Desktop Settings and the browser popup share one YouTube parsing
+      // configuration. Only the installed extension may use this route;
+      // ordinary allowed web pages must not be able to change preferences.
+      if (url.pathname === '/extension-settings/youtube') {
+        if (!isExtensionSettingsRequest(req)) {
+          console.warn(
+            `[BrowserBridge] youtube settings rejected origin=${req.headers.origin || 'none'} fetch_site=${req.headers['sec-fetch-site'] || 'none'} fetch_mode=${req.headers['sec-fetch-mode'] || 'none'}`,
+          )
+          return sendJson(res, 403, { ok: false, error: 'extension origin required' })
+        }
+        if (typeof settingsAccess?.readScSettings !== 'function' ||
+            typeof settingsAccess?.writeScSettings !== 'function') {
+          return sendJson(res, 503, { ok: false, error: 'settings service is unavailable' })
+        }
+        if (req.method === 'GET') {
+          const rawSettings = settingsAccess.readScSettings()
+          const schema = extensionYoutubeSchemaState(rawSettings)
+          if (schema.incompatible) {
+            return sendJson(res, 409, {
+              ok: false,
+              incompatible: true,
+              error: 'extension settings were written by a newer version',
+              schemaVersion: schema.version,
+              supportedSchemaVersion: EXTENSION_YOUTUBE_SCHEMA_VERSION,
+            })
+          }
+          const initialized = schema.initialized
+          const settings = extensionYoutubeFromSettings(rawSettings)
+          const dirtyKeys = initialized
+            ? []
+            : Object.keys(rawSettings?.browser_extension?.youtube_desktop_pending || {})
+          console.log(
+            `[BrowserBridge] youtube settings read initialized=${initialized} schema=${schema.version ?? 'none'} dirty=${dirtyKeys.length}`,
+          )
+          return sendJson(res, 200, {
+            ok: true,
+            initialized,
+            schemaVersion: schema.version ?? EXTENSION_YOUTUBE_SCHEMA_VERSION,
+            supportedSchemaVersion: EXTENSION_YOUTUBE_SCHEMA_VERSION,
+            dirty_keys: dirtyKeys,
+            settings,
+          })
+        }
+        if (req.method === 'POST') {
+          const schema = extensionYoutubeSchemaState(settingsAccess.readScSettings())
+          if (schema.incompatible) {
+            return sendJson(res, 409, {
+              ok: false,
+              incompatible: true,
+              error: 'extension settings were written by a newer version',
+              schemaVersion: schema.version,
+              supportedSchemaVersion: EXTENSION_YOUTUBE_SCHEMA_VERSION,
+            })
+          }
+          const body = await readBody(req)
+          const patch = body?.patch && typeof body.patch === 'object' ? body.patch : body
+          console.log(
+            `[BrowserBridge] youtube settings write keys=${Object.keys(patch || {}).sort().join(',') || 'none'}`,
+          )
+          const settings = patchExtensionYoutubeSettings(
+            settingsAccess.readScSettings,
+            settingsAccess.writeScSettings,
+            patch,
+          )
+          return sendJson(res, 200, {
+            ok: true,
+            schemaVersion: EXTENSION_YOUTUBE_SCHEMA_VERSION,
+            supportedSchemaVersion: EXTENSION_YOUTUBE_SCHEMA_VERSION,
+            settings,
+          })
+        }
+        return sendJson(res, 405, { ok: false, error: 'method not allowed' })
+      }
+
+      if (req.method === 'POST' && url.pathname === '/notifications/terminal-completion') {
+        if (req.headers.origin) {
+          return sendJson(res, 403, { ok: false, error: 'browser origins are not allowed' })
+        }
+        if (!notificationAuthToken) {
+          return sendJson(res, 503, { ok: false, error: 'notification bridge authentication is unavailable' })
+        }
+        if (!matchesBearerToken(req.headers.authorization, notificationAuthToken)) {
+          return sendJson(res, 401, { ok: false, error: 'invalid notification bridge credentials' })
+        }
+        if (typeof notificationService?.notifyTerminalCompletion !== 'function') {
+          return sendJson(res, 503, { ok: false, error: 'notification service is unavailable' })
+        }
+
+        const now = Date.now()
+        while (notificationRequestTimes.length && notificationRequestTimes[0] <= now - 60_000) {
+          notificationRequestTimes.shift()
+        }
+        if (notificationRequestTimes.length >= 30) {
+          res.setHeader('Retry-After', '60')
+          return sendJson(res, 429, { ok: false, error: 'terminal notification rate limit exceeded' })
+        }
+        notificationRequestTimes.push(now)
+
+        let body
+        try {
+          body = await readBody(req, BODY_LIMITS.terminalNotification)
+        } catch (err) {
+          const status = err?.code === 'BODY_TOO_LARGE' ? 413 : 400
+          return sendJson(res, status, { ok: false, error: err?.message || 'invalid JSON body' })
+        }
+
+        let event
+        try {
+          event = normalizeTerminalCompletionEvent(body)
+        } catch (err) {
+          return sendJson(res, 400, { ok: false, error: err?.message || 'invalid terminal completion event' })
+        }
+
+        try {
+          const result = await notificationService.notifyTerminalCompletion(event)
+          return sendJson(res, 200, {
+            ok: true,
+            eventId: event.eventId,
+            duplicate: result?.duplicate === true,
+            deliveries: Array.isArray(result?.deliveries) ? result.deliveries : [],
+          })
+        } catch (err) {
+          const unavailable = new Set([
+            'telegram_bot_disabled',
+            'telegram_bot_not_configured',
+            'telegram_notification_chat_not_configured',
+            'telegram_notifications_not_allowed',
+          ])
+          const status = unavailable.has(err?.code) ? 503 : 502
+          console.warn(`[BrowserBridge] terminal notification failed code=${err?.code || 'telegram_delivery_failed'} error=${err?.message || err}`)
+          return sendJson(res, status, {
+            ok: false,
+            code: err?.code || 'telegram_delivery_failed',
+            error: err?.message || 'Telegram delivery failed',
+          })
+        }
       }
 
       // Hot-reload endpoint для browser-extension'а: возвращает max mtime

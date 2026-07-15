@@ -73,6 +73,18 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
     setStage('idle'); setErr(null); setJob(null); setCache(null); setVideoMeta(null)
 
     ;(async () => {
+      let nextLang = 'ru'
+      let nextEngine = 'gemini'
+      try {
+        const appSettings = await window.api?.appSettingsGet?.()
+        const yt = appSettings?.youtube || {}
+        if (typeof yt.preferred_lang === 'string' && yt.preferred_lang) nextLang = yt.preferred_lang
+        if (yt.engine === 'gemini' || yt.engine === 'assemblyai') nextEngine = yt.engine
+      } catch {}
+      if (!alive) return
+      setLang(nextLang)
+      setEngine(nextEngine)
+
       const c = await lookupYoutubeCache(videoId)
       if (!alive) return
       if (c) {
@@ -81,7 +93,7 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
         const r = await copyCachedYoutubeFile(c.file_path)
         if (alive && r.ok) setToast(`Скопировано из кэша · ${formatBytes(r.bytes)}`)
       } else {
-        kickOff()                      // no cache → start subs check
+        kickOff({ langOverride: nextLang }) // no cache → start subs check
       }
     })()
 
@@ -89,7 +101,7 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, videoId])
 
-  async function kickOff({ withCurrentSettings = false } = {}) {
+  async function kickOff({ withCurrentSettings = false, langOverride = lang } = {}) {
     if (!videoId) {
       setErr('Не удалось распознать ID видео в URL')
       setStage('error')
@@ -98,7 +110,7 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
     setStage('searching'); setErr(null); setBusy(true)
     try {
       const id = await startYoutubeSingle({
-        url, lang, withTs,
+        url, lang: langOverride, withTs,
       })
       if (id == null) {
         setErr('Электрон-IPC недоступен')

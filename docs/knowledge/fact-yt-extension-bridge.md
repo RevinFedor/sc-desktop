@@ -17,6 +17,7 @@
 | GET | `/yt-status?id=…&comments_id=…&wait=N` | polling job'а; ответ содержит `status`, `file_path`, `yt_stage` (`searching`/`subs_found`/`awaiting_ai`/`transcribing`), `yt_engine` (`gemini`/`assemblyai`), `transcript_text` на done. `wait=ms` (1..25000) включает long-poll — см. секцию ниже |
 | POST | `/yt-resume-ai` | `{id, engine?}` — фоновый resume для job'а зависшего в `awaiting_ai` (subs_missing pause). Расширение дёргает автоматически, see Auto-resume |
 | GET | `/yt-fetch?path=…` | sync read готового файла из LIB_ROOT (path-traversal защита) |
+| GET / POST | `/extension-settings/youtube` | общий контракт настроек YouTube для desktop и popup расширения |
 
 ## 🎯 Почему loopback HTTP, а не чище
 
@@ -59,6 +60,28 @@ ALLOWED_ORIGINS = new Set([
 дыру (теоретическую, allowlist выше), и Electron-сервер прочитал бы и
 отдал. С проверкой — даже при компрометации origin'а отдаём только
 файлы Library.
+
+## ⚙️ Настройки YouTube: desktop ↔ extension
+
+После первого подключения расширение и desktop читают один канонический набор
+YouTube-настроек. До первого подключения старые значения из `chrome.storage`
+импортируются, но уже сохранённые в desktop язык субтитров и движок остаются
+авторитетными; явные правки desktop, сделанные до bootstrap, выигрывают только
+по своим ключам. Так первая синхронизация не стирает ни старые настройки popup,
+ни более свежую настройку пользователя в приложении.
+
+Версия схемы не понижается молча: более новая версия даёт понятный отказ на
+чтение и запись, пока не обновится другая сторона. Это лучше «безопасного»
+сброса к дефолтам — он незаметно поменял бы выбранный режим ChatGPT, модель или
+дорогой движок. После bootstrap изменения расширения сохраняются обратно в
+desktop, поэтому следующая YouTube-кнопка читает уже тот же выбор.
+
+Обычный CORS origin не подходит для Yandex MV3: service worker при запросе к
+loopback может не прислать `Origin`. Для этого маршрута допустим только точный
+идентификатор установленного расширения вместе с браузерными признаками
+extension-fetch; любой другой origin-less запрос получает 403. Не расширять
+allow-list до всех запросов без Origin: так веб-страница смогла бы менять
+настройки desktop через localhost.
 
 ## 🎯 Cache-first логика `/yt-add`
 

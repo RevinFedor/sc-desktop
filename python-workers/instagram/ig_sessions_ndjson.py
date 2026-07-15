@@ -18,6 +18,8 @@ This script never logs in. Login is done by ig_login_ndjson.py.
 import sys
 import json
 import argparse
+import contextlib
+import io
 import time
 from pathlib import Path
 
@@ -61,6 +63,7 @@ def _network_check(cookies):
             headers=headers,
             cookies=cookies,
             timeout=15,
+            allow_redirects=False,
         )
     except Exception as ex:
         return {
@@ -112,6 +115,44 @@ def _network_check(cookies):
     }
 
 
+def _android_network_check():
+    """Verify the API file against a real authenticated Android endpoint."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            from ig_api_core import IGAPIClient
+            client = IGAPIClient()
+            payload = client._request("discover/media_metadata/", params={"media_id": "1"}) \
+                if client.user_id else None
+    except Exception as ex:
+        return {
+            "status": "error",
+            "ok": False,
+            "message": f"{type(ex).__name__}: {ex}",
+        }
+
+    response = getattr(client, "last_response", None)
+    http_status = getattr(response, "status_code", None)
+    payload = payload if isinstance(payload, dict) else (
+        client.last_json if isinstance(client.last_json, dict) else {}
+    )
+    if http_status == 200 and payload.get("status") == "ok":
+        web_health = _network_check(client.cookies)
+        return {
+            "status": "valid",
+            "ok": True,
+            "http_status": http_status,
+            "username": web_health.get("username") if web_health.get("ok") else None,
+            "message": "Android API session accepted",
+        }
+    return {
+        "status": "invalid",
+        "ok": False,
+        "http_status": http_status,
+        "message": payload.get("message") or payload.get("error_type")
+                   or (f"HTTP {http_status}" if http_status else "empty Android API response"),
+    }
+
+
 def _file_meta(path):
     try:
         st = path.stat()
@@ -144,15 +185,14 @@ def _read_playwright(path, check=False):
 
 
 def _read_api(path, check=False):
-    """Returns (authorized, username, error). API session is a flat dict
-    saved by ig_api_core.py — {cookies: {name: value, ...}}."""
+    """Returns (authorized, username, error) for cookies + device state."""
     try:
         data = json.loads(path.read_text("utf-8"))
         cookies = data.get("cookies") or {}
         sessionid = cookies.get("sessionid")
         if not sessionid:
             return False, None, "no sessionid cookie", {}
-        health = _network_check(cookies) if check else {"status": "unchecked", "ok": None}
+        health = _android_network_check() if check else {"status": "unchecked", "ok": None}
         return True, _extract_username(cookies), None, health
     except FileNotFoundError:
         return False, None, "file not found", {}

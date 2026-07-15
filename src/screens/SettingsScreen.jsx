@@ -1,81 +1,74 @@
 import React from 'react'
+import PlatformLogo from '../components/PlatformLogo'
+import { pushScreen } from '../lib/store'
+import { SETTINGS_SECTIONS } from '../lib/settingsSections'
+import TelegramSettings from './TelegramSettings'
+import YouTubeSettings from './YouTubeSettings'
+import InstagramSettings from './InstagramSettings'
+import RedditSettings from './RedditSettings'
+import TikTokSettings from './TikTokSettings'
+import TwitterSettings from './TwitterSettings'
 
-const SECTIONS = [
-  {
-    id: 'general', title: 'General',
-    rows: [
-      { label: 'Library path',   value: '~/Library/Application Support/sc-desktop', kind: 'path' },
-      { label: 'Auto-delete mp4 after transcribe', value: 'No', kind: 'toggle' },
-      { label: 'Disk quota warning', value: '20 GB', kind: 'text' },
-    ],
-  },
-  {
-    id: 'platforms', title: 'Platforms',
-    rows: [
-      { label: 'Instagram backend',   value: 'auto · api → apify → browser', kind: 'select' },
-      { label: 'Instagram session',   value: 'vaito_xr · last login 23h ago', kind: 'text' },
-      { label: 'Telegram session',    value: 'connected',                    kind: 'text' },
-      { label: 'YouTube cookies',     value: 'firefox',                      kind: 'select' },
-    ],
-  },
-  {
-    id: 'engines', title: 'Engines',
-    rows: [
-      { label: 'Default transcribe engine', value: 'Gemini 2.5 Flash', kind: 'select' },
-      { label: 'Long-form fallback',        value: 'AssemblyAI',       kind: 'select' },
-      { label: 'AI vision (photos)',        value: 'Gemini 2.0 Flash-Lite', kind: 'select' },
-    ],
-  },
-  {
-    id: 'api', title: 'API keys',
-    rows: [
-      { label: 'GEMINI_API_KEY',     value: '●●●●●●●●', kind: 'secret' },
-      { label: 'ASSEMBLYAI_API_KEY', value: '●●●●●●●●', kind: 'secret' },
-      { label: 'OPENAI_API_KEY',     value: '(not set)', kind: 'secret' },
-      { label: 'Apify token',        value: '●●●●●●●●', kind: 'secret' },
-    ],
-  },
-]
+const CONTENT = {
+  main: MainSettings,
+  telegram: TelegramSettings,
+  youtube: YouTubeSettings,
+  instagram: InstagramSettings,
+  reddit: RedditSettings,
+  tiktok: TikTokSettings,
+  twitter: TwitterSettings,
+}
 
-export default function SettingsScreen() {
+export default function SettingsScreen({ payload }) {
+  const selected = CONTENT[payload?.section] ? payload.section : 'main'
+  const Content = CONTENT[selected]
+
   return (
-    <div className="h-full flex flex-col">
-      <div className="flex-1 overflow-auto px-8 py-6">
-        <div className="max-w-2xl mx-auto">
-          <div className="mb-6">
-            <span className="text-xl font-semibold text-zinc-100">Settings</span>
-          </div>
-          {SECTIONS.map(s => (
-            <Section key={s.id} title={s.title} rows={s.rows} />
-          ))}
-          <div className="text-xs text-zinc-600 mt-8">
-            Stored in <code className="text-zinc-500">~/.config/sc/settings.json</code> (shared with the <code className="text-zinc-500">sc</code> CLI).
-          </div>
+    <div className="h-full overflow-auto" style={{ scrollbarGutter: 'stable' }}>
+      <div className="max-w-5xl mx-auto px-8 pt-5 pb-12">
+        <nav
+          aria-label="Разделы настроек"
+          className="h-10 flex items-center gap-1 overflow-x-auto border-b border-zinc-800 mb-7"
+        >
+          {SETTINGS_SECTIONS.map(section => {
+            const active = selected === section.id
+            return (
+              <button
+                key={section.id}
+                type="button"
+                data-settings-section={section.id}
+                aria-current={active ? 'page' : undefined}
+                onClick={() => {
+                  if (!active) pushScreen('settings', { section: section.id })
+                }}
+                className={`h-9 px-3 rounded-t-md inline-flex items-center gap-2 whitespace-nowrap text-sm border-b-2 ${
+                  active
+                    ? 'bg-zinc-900 text-zinc-100 border-emerald-500'
+                    : 'text-zinc-500 border-transparent hover:text-zinc-200 hover:bg-zinc-900/60'
+                }`}
+              >
+                {section.platform && <PlatformLogo platform={section.platform} size={15} />}
+                {section.label}
+              </button>
+            )
+          })}
+        </nav>
+
+        <div className="max-w-3xl">
+          <Content />
         </div>
       </div>
     </div>
   )
 }
 
-function Section({ title, rows }) {
+function MainSettings() {
   return (
-    <div className="mb-8">
-      <div className="text-xs uppercase tracking-wider text-zinc-500 mb-3">{title}</div>
-      <div className="rounded-md border border-zinc-800 divide-y divide-zinc-800 bg-zinc-950">
-        {rows.map(r => <Row key={r.label} {...r} />)}
+    <div className="rounded-md border border-zinc-800 bg-zinc-950 px-5 py-4">
+      <div className="text-zinc-200 text-sm font-medium">Общих параметров пока нет</div>
+      <div className="text-zinc-500 text-sm mt-1">
+        Настройки, которые реально влияют на работу, находятся в разделах приложений.
       </div>
-    </div>
-  )
-}
-
-function Row({ label, value, kind }) {
-  return (
-    <div className="flex items-center px-4 py-3 gap-4">
-      <div className="text-sm text-zinc-300 flex-1">{label}</div>
-      <div className="text-sm text-zinc-500 max-w-[280px] truncate">{value}</div>
-      <button className="text-xs text-zinc-500 hover:text-zinc-300 ml-2">
-        {kind === 'toggle' ? 'Toggle' : 'Edit'}
-      </button>
     </div>
   )
 }

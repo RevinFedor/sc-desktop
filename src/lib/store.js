@@ -13,8 +13,8 @@ import { getSources } from './sources'
 // stale). 'source-detail', 'telegram', 'job-detail' are deterministic
 // reads of DB state — re-rendering them is safe.
 const RESTORABLE_SCREENS = new Set([
-  'telegram', 'source-detail', 'job-detail',
-  'tg-settings', 'ig-settings', 'settings', 'notes',
+  'telegram', 'youtube', 'instagram', 'reddit', 'tiktok', 'twitter',
+  'source-detail', 'job-detail', 'settings', 'notes',
   'aistudio-job',
 ])
 const SCREEN_KEY = 'sc-current-screen'
@@ -42,6 +42,10 @@ const initial = {
   // Right-side Activity panel — collapsed by default, opened from TitleBar.
   // Closes on any click in the central content area.
   activityOpen: false,
+  // Ephemeral return point for two-click navigation. This intentionally is
+  // not persisted: after a reload we can restore the visible canonical
+  // route, but must not pretend that it was opened by a click in this run.
+  navigationReturn: null,
 }
 
 let state = initial
@@ -82,17 +86,56 @@ export function useStore(selector = s => s) {
 // «Home › AI Studio Job › Telegram fetch» (clicked from the Activity panel
 // while a research page was open). The entity hierarchy is deterministic:
 //
-//   source-detail → Home › [Telegram] › чат        (platform screen only
-//                                                    exists for Telegram)
-//   job-detail    → Home › [Telegram] › чат › job  (source resolved from
+//   source-detail → Home › платформа › источник
+//   job-detail    → Home › платформа › источник › job  (source resolved from
 //                                                    job.source_id / handle;
 //                    sourceless one-shots → Home › job — YouTube paste-flow
 //                    runs straight from the Home screen)
-//   telegram / settings / configs / research → Home › X
+//   platform / settings / configs / research → Home › X
 //
-// Screens NOT listed here keep plain stacking (notes on top of source-detail,
-// tg-settings on top of telegram — Home › Telegram › Сессии).
+// Screens NOT listed here keep plain stacking (notes on top of source-detail).
 const HOME_ENTRY = { name: 'paste', payload: null }
+const PLATFORM_SCREENS = new Set(['telegram', 'youtube', 'instagram', 'reddit', 'tiktok', 'twitter'])
+
+// A toggle destination is slightly broader than a literal {name, payload}:
+// - every settings section belongs to the same open Settings surface, so a
+//   chip switch cannot erase the page from which Settings was opened;
+// - a platform stays the same destination when its local payload changes;
+// - source-detail is identified by sourceId, not by incidental payload fields.
+function toggleDestination(name, payload) {
+  if (name === 'settings') {
+    return { key: 'settings', kind: 'screen', name: 'settings' }
+  }
+  if (PLATFORM_SCREENS.has(name)) {
+    return { key: `platform:${name}`, kind: 'screen', name }
+  }
+  if (name === 'source-detail' && payload?.sourceId != null) {
+    return {
+      key: `source-detail:${String(payload.sourceId)}`,
+      kind: 'source',
+      name,
+      sourceId: String(payload.sourceId),
+    }
+  }
+  const payloadKey = JSON.stringify(payload ?? null)
+  return { key: `${name}:${payloadKey}`, kind: 'exact', name, payloadKey }
+}
+
+function destinationContains(destination, screen) {
+  if (!destination || !screen || screen.name !== destination.name) return false
+  if (destination.kind === 'screen') return true
+  if (destination.kind === 'source') {
+    return String(screen.payload?.sourceId) === destination.sourceId
+  }
+  return JSON.stringify(screen.payload ?? null) === destination.payloadKey
+}
+
+function retainedNavigationReturn(nextScreen) {
+  const current = state.navigationReturn
+  return current && destinationContains(current.destination, nextScreen)
+    ? current
+    : null
+}
 
 // Resolve the library source a job belongs to. Mirrors ActivityPanel's
 // matching: prefer source_id; tg_* jobs fall back to handle (live tg_fetch
@@ -118,8 +161,8 @@ function canonicalTrail(name, payload) {
     case 'source-detail': {
       const src = getSources().find(s => s.id === payload?.sourceId)
       const platform = payload?.platform || src?.platform
-      return platform === 'telegram'
-        ? [HOME_ENTRY, { name: 'telegram', payload: null }]
+      return PLATFORM_SCREENS.has(platform)
+        ? [HOME_ENTRY, { name: platform, payload: null }]
         : [HOME_ENTRY]
     }
     case 'job-detail': {
@@ -127,7 +170,7 @@ function canonicalTrail(name, payload) {
       const src = sourceForJob(job)
       if (src) {
         const trail = [HOME_ENTRY]
-        if (src.platform === 'telegram') trail.push({ name: 'telegram', payload: null })
+        if (PLATFORM_SCREENS.has(src.platform)) trail.push({ name: src.platform, payload: null })
         trail.push({ name: 'source-detail', payload: { sourceId: src.id, platform: src.platform } })
         return trail
       }
@@ -141,12 +184,21 @@ function canonicalTrail(name, payload) {
     case 'tg-config':
     case 'yt-config':
     case 'ig-config':
-    case 'ig-settings':
     case 'telegram':
-    case 'settings':
+    case 'youtube':
+    case 'instagram':
+    case 'reddit':
+    case 'tiktok':
+    case 'twitter':
     case 'aistudio-job':
     case 'new-research':
       return [HOME_ENTRY]
+    case 'settings': {
+      const section = payload?.section || 'main'
+      return section === 'main'
+        ? [HOME_ENTRY]
+        : [HOME_ENTRY, { name: 'settings', payload: { section: 'main' } }]
+    }
     default:
       return null
   }
@@ -154,27 +206,95 @@ function canonicalTrail(name, payload) {
 
 export function pushScreen(name, payload = null) {
   const canonical = canonicalTrail(name, payload)
+  const nextScreen = { name, payload }
+  const navigationReturn = retainedNavigationReturn(nextScreen)
   if (canonical) {
     state = {
       ...state,
       history: canonical,
-      screen: { name, payload },
+      screen: nextScreen,
+      navigationReturn,
     }
   } else if (state.screen.name === name) {
     // Same screen type as current → replace, don't stack. Prevents trail
     // from growing when user clicks notes → notes for another source.
     state = {
       ...state,
-      screen: { name, payload },
+      screen: nextScreen,
+      navigationReturn,
     }
   } else {
     state = {
       ...state,
       history: [...state.history, state.screen],
-      screen: { name, payload },
+      screen: nextScreen,
+      navigationReturn,
     }
   }
   emit()
+}
+
+/**
+ * Two-click navigation used by persistent destinations such as Library
+ * platform buttons, source rows and the global Settings button.
+ *
+ * First click opens the canonical destination and remembers the complete
+ * current route. A second click on that same destination restores both the
+ * exact source screen and its breadcrumb history. Settings sections form one
+ * destination, so switching settings chips keeps the original return point.
+ */
+export function toggleScreen(name, payload = null) {
+  const destination = toggleDestination(name, payload)
+  const activeReturn = state.navigationReturn
+
+  if (
+    activeReturn?.destination.key === destination.key
+    && destinationContains(destination, state.screen)
+  ) {
+    state = {
+      ...state,
+      screen: activeReturn.screen,
+      history: activeReturn.history,
+      navigationReturn: null,
+    }
+    emit()
+    return
+  }
+
+  // The screen may have been restored after reload or reached through a
+  // breadcrumb. There is no truthful click-origin to return to in that case.
+  if (destinationContains(destination, state.screen)) return
+
+  const returnPoint = {
+    screen: state.screen,
+    history: state.history,
+  }
+  const canonical = canonicalTrail(name, payload)
+  state = {
+    ...state,
+    history: canonical || [...state.history, state.screen],
+    screen: { name, payload },
+    navigationReturn: {
+      destination,
+      ...returnPoint,
+    },
+  }
+  emit()
+}
+
+/**
+ * Open a concrete Settings section without losing the screen that launched
+ * Settings. Switching chips while already inside Settings is ordinary
+ * in-surface navigation; entering from anywhere else starts a two-click
+ * toggle that the global gear can close back to the exact origin.
+ */
+export function openSettings(section = 'main') {
+  const payload = { section }
+  if (state.screen.name === 'settings') {
+    pushScreen('settings', payload)
+    return
+  }
+  toggleScreen('settings', payload)
 }
 
 export function popScreen() {
@@ -184,12 +304,18 @@ export function popScreen() {
     ...state,
     history: state.history.slice(0, -1),
     screen: prev,
+    navigationReturn: retainedNavigationReturn(prev),
   }
   emit()
 }
 
 export function goHome() {
-  state = { ...state, history: [], screen: { name: 'paste', payload: null } }
+  state = {
+    ...state,
+    history: [],
+    screen: { name: 'paste', payload: null },
+    navigationReturn: null,
+  }
   emit()
 }
 
@@ -208,6 +334,7 @@ export function navigateTo(index) {
     ...state,
     history: state.history.slice(0, index),
     screen: target,
+    navigationReturn: retainedNavigationReturn(target),
   }
   emit()
 }
