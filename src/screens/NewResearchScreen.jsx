@@ -25,26 +25,47 @@ const PROVIDERS = [
 ]
 
 // ChatGPT — модели (зеркало chatgpt-research.js::MODELS). Default GPT-5.5.
+const CHATGPT_MODES = [
+  { id: 'chat', label: 'Chat' },
+  { id: 'work', label: 'Work' },
+]
+
 const CHATGPT_MODELS = [
-  { id: '5.5', label: 'GPT-5.5' },
-  { id: '5.4', label: 'GPT-5.4' },
-  { id: '5.3', label: 'GPT-5.3' },
-  { id: '5.2', label: 'GPT-5.2' },
-  { id: '4.5', label: 'GPT-4.5' },
-  { id: 'o3',  label: 'o3' },
+  { id: '5.6', label: 'GPT-5.6 Sol', modes: ['chat', 'work'] },
+  { id: '5.5', label: 'GPT-5.5',     modes: ['chat', 'work'] },
+  { id: '5.4', label: 'GPT-5.4',     modes: ['chat'] },
+  { id: '5.3', label: 'GPT-5.3',     modes: ['chat'] },
+  { id: 'o3',  label: 'o3',          modes: ['chat'] },
 ]
 
 // ChatGPT — уровни интеллекта (зеркало chatgpt-research.js::EFFORTS).
 // «Очень высокий» = xhigh из Codex CLI (дефолт). Pro стандартный/расширенный —
 // больше compute (тариф Pro $200), pro-extended — самый глубокий и медленный.
 const CHATGPT_EFFORTS = [
+  { id: 'low',          label: 'Low' },
   { id: 'xhigh',        label: 'Очень высокий',    hint: 'xhigh, default' },
   { id: 'high',         label: 'High' },
   { id: 'medium',       label: 'Medium' },
   { id: 'instant',      label: 'Instant',          hint: 'без thinking' },
   { id: 'pro',          label: 'Pro стандартный',  hint: 'мин. 10+ мин' },
-  { id: 'pro-extended', label: 'Pro расширенный',  hint: 'самый глубокий, десятки минут' },
+  { id: 'pro-extended', label: 'Pro усиленный',    hint: 'самый глубокий, десятки минут' },
+  { id: 'max',          label: 'Max' },
+  { id: 'ultra',        label: 'Ultra',             hint: 'быстрее расходует квоту' },
 ]
+
+function chatgptEffortOptions(mode, model) {
+  const byId = Object.fromEntries(CHATGPT_EFFORTS.map(x => [x.id, x]))
+  if (mode === 'work') {
+    const ids = ['low', 'medium', 'high', 'xhigh']
+    if (model === '5.6') ids.push('max', 'ultra')
+    return ids.map(id => byId[id])
+  }
+  const ids = ['instant', 'medium', 'high', 'xhigh', 'pro']
+  if (model !== '5.6') ids.push('pro-extended')
+  return ids.map(id => id === 'pro' && model === '5.6'
+    ? { ...byId[id], label: 'Pro' }
+    : byId[id])
+}
 
 // Claude — модели + их effort/thinking вариации (зеркало claude-research.js::
 // CLAUDE_MODELS, снято с живого DOM). efforts:null → у модели нет Effort-подменю;
@@ -81,6 +102,7 @@ export default function NewResearchScreen() {
   const [pplxMode, setPplxMode] = useState('deep')
   const [pplxModel, setPplxModel] = useState('gemini')
   const [aiModel, setAiModel] = useState('pro')
+  const [gptMode, setGptMode] = useState('chat')
   const [gptModel, setGptModel] = useState('5.5')
   const [gptEffort, setGptEffort] = useState('xhigh')
   const [gptSources, setGptSources] = useState(false)
@@ -118,6 +140,17 @@ export default function NewResearchScreen() {
     { id: 'sonnet', label: 'Claude Sonnet 4.6' },
     { id: 'kimi',   label: 'Kimi K2.6' },
   ]
+  // Списки зависят сразу от режима и модели. В Work сейчас есть только 5.5 и
+  // 5.6; Max/Ultra — только у 5.6. В Chat у 5.6 единый Pro, а у 5.4/5.5 —
+  // Pro стандартный/усиленный. Скрытый старый state никогда не отправляем.
+  const gptModelOptions = CHATGPT_MODELS.filter(x => x.modes.includes(gptMode))
+  const gptModelValue = gptModelOptions.some(x => x.id === gptModel)
+    ? gptModel
+    : '5.5'
+  const gptEffortOptions = chatgptEffortOptions(gptMode, gptModelValue)
+  const gptEffortValue = gptEffortOptions.some(x => x.id === gptEffort)
+    ? gptEffort
+    : 'xhigh'
 
   async function submit() {
     if (stage === 'sending' || !prompt.trim()) return
@@ -134,7 +167,7 @@ export default function NewResearchScreen() {
         : { mode: pplxMode }
     }
     if (provider === 'aistudio')   body.options = { model: aiModel }
-    if (provider === 'chatgpt')    body.options = { model: gptModel, effort: gptEffort, sources: gptSources }
+    if (provider === 'chatgpt')    body.options = { mode: gptMode, model: gptModelValue, effort: gptEffortValue, sources: gptSources }
     if (provider === 'claude') {
       // «Авто» — model/effort/thinking не шлём вовсе: CS трактует отсутствие
       // как «не трогать селектор» (модель/уровень аккаунта sticky).
@@ -182,18 +215,19 @@ export default function NewResearchScreen() {
     }
   }
 
-  // Short-poll первые ~12с: если джоб быстро упал (pplx_daily_limit,
-  // pplx_model_locked, mode_switch_failed) — показать ошибку прямо в форме,
-  // чтобы юзер не шёл искать её в Истории.
+  // Следим за конфигурацией до 35с: ChatGPT делает до двух проверяемых попыток
+  // выбора режима/модели/интеллекта, поэтому ошибка может прийти позже 12с.
+  // status=running означает и «ещё настраиваем страницу» — это не повод
+  // прекращать наблюдение; терминальные состояния только done/error.
   async function watchEarlyError(id) {
     const t0 = Date.now()
-    while (Date.now() - t0 < 12000) {
+    while (Date.now() - t0 < 35000) {
       try {
         const j = await window.api.researchStatus({ id, wait: 4000 })
         if (j.status === 'error') {
           setStage('error'); setErr(humanError(j.error || 'ошибка запуска')); return
         }
-        if (j.status === 'running' || j.status === 'done') return  // успешно поехал
+        if (j.status === 'done') return
       } catch { return }
     }
   }
@@ -204,6 +238,8 @@ export default function NewResearchScreen() {
     if (/pplx_daily_limit/.test(s)) return 'Лимит «Глубокого исследования» исчерпан (месячный/дневной). Переключись на режим «Поиск» — он без лимита.'
     if (/pplx_model_locked/.test(s)) return 'Эта модель недоступна на текущем тарифе (Max). Выбери другую.'
     if (/pplx_mode_switch_failed/.test(s)) return 'Не удалось переключить режим Perplexity — UI мог измениться.'
+    if (/chatgpt_mode_select_failed/.test(s)) return 'Не удалось переключить ChatGPT между Chat и Work. Запрос не отправлен.'
+    if (/chatgpt_effort_select_failed/.test(s)) return 'Не удалось выбрать запрошенный уровень интеллекта ChatGPT. Запрос не отправлен с другим уровнем.'
     // Модель не выбралась — общий контракт fatal-if-explicit (claude/chatgpt/pplx).
     if (/_model_select_failed/.test(s)) return 'Не удалось выбрать запрошенную модель на странице (UI мог измениться). Повтори или открой вкладку и проверь.'
     if (/claude_model_select_failed|chatgpt_model_select_failed|pplx_model_select_failed/.test(s)) return 'Модель не переключилась — повтори запуск.'
@@ -341,18 +377,24 @@ export default function NewResearchScreen() {
             )
           })()}
           {provider === 'chatgpt' && (
-            <div className="flex items-end gap-3">
-              <div className="flex-1 min-w-0">
-                <label className="block text-xs text-zinc-500 mb-1">Модель</label>
-                <Select value={gptModel} onChange={setGptModel} options={CHATGPT_MODELS} compact hideHint />
-              </div>
-              <div className="flex-1 min-w-0">
-                <label className="block text-xs text-zinc-500 mb-1">Интеллект</label>
-                <Select value={gptEffort} onChange={setGptEffort} options={CHATGPT_EFFORTS} compact hideHint />
+            <div className="space-y-2">
+              <div className="flex items-end gap-3">
+                <div className="flex-1 min-w-0">
+                  <label className="block text-xs text-zinc-500 mb-1">Режим</label>
+                  <Select value={gptMode} onChange={setGptMode} options={CHATGPT_MODES} compact hideHint />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <label className="block text-xs text-zinc-500 mb-1">Модель</label>
+                  <Select value={gptModelValue} onChange={setGptModel} options={gptModelOptions} compact hideHint />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <label className="block text-xs text-zinc-500 mb-1">Интеллект</label>
+                  <Select value={gptEffortValue} onChange={setGptEffort} options={gptEffortOptions} compact hideHint />
+                </div>
               </div>
               {/* Источники парсятся всегда; чекбокс решает, включать ли их
                   блоком в текст ответа (default: чистый текст). */}
-              <label className="flex items-center gap-2 h-8 text-xs text-zinc-400 cursor-pointer select-none shrink-0">
+              <label className="flex items-center gap-2 h-6 text-xs text-zinc-400 cursor-pointer select-none w-fit">
                 <input
                   type="checkbox"
                   checked={gptSources}

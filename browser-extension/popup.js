@@ -163,15 +163,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     opt.value = m; opt.textContent = m;
     ytInputs.claude_model.appendChild(opt);
   }
-  for (const m of CHATGPT_AVAILABLE_MODELS) {
-    const opt = document.createElement('option');
-    opt.value = m.id; opt.textContent = m.label;
-    ytInputs.chatgpt_model.appendChild(opt);
+  function replaceChatgptOptions(select, options, value) {
+    select.replaceChildren();
+    for (const item of options) {
+      const opt = document.createElement('option');
+      opt.value = item.id; opt.textContent = item.label;
+      select.appendChild(opt);
+    }
+    select.value = value;
   }
-  for (const e of CHATGPT_AVAILABLE_EFFORTS) {
-    const opt = document.createElement('option');
-    opt.value = e.id; opt.textContent = e.label;
-    ytInputs.chatgpt_effort.appendChild(opt);
+
+  function renderVisibleChatgptPair() {
+    const mode = CHATGPT_MODES.includes(currentChatgptMode) ? currentChatgptMode : 'chat';
+    const modelKey = `chatgpt_${mode}_model`;
+    const effortKey = `chatgpt_${mode}_effort`;
+    const models = chatgptModelsForMode(mode);
+    const model = models.some(m => m.id === youtubeState[modelKey]) ? youtubeState[modelKey] : '5.5';
+    const efforts = chatgptEffortsFor(mode, model);
+    const effort = efforts.some(e => e.id === youtubeState[effortKey]) ? youtubeState[effortKey] : 'xhigh';
+    replaceChatgptOptions(ytInputs.chatgpt_model, models, model);
+    replaceChatgptOptions(ytInputs.chatgpt_effort, efforts, effort);
   }
 
   function saveVisibleChatgptPair() {
@@ -192,8 +203,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     for (const [id, btn] of Object.entries(ytChatgptModeButtons)) {
       btn.setAttribute('aria-checked', String(id === nextMode));
     }
-    ytInputs.chatgpt_model.value = youtubeState[`chatgpt_${nextMode}_model`];
-    ytInputs.chatgpt_effort.value = youtubeState[`chatgpt_${nextMode}_effort`];
+    renderVisibleChatgptPair();
   }
 
   for (const [mode, btn] of Object.entries(ytChatgptModeButtons)) {
@@ -603,7 +613,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   ytInputs.claude_model.addEventListener('change', () => { persistYoutube(); });
   ytInputs.claude_adaptive_thinking.addEventListener('change', () => { persistYoutube(); });
   ytInputs.chatgpt_prompt.addEventListener('input', () => { persistYoutube({ syncNow: false }); });
-  ytInputs.chatgpt_model.addEventListener('change', () => { persistYoutube(); });
+  ytInputs.chatgpt_model.addEventListener('change', () => {
+    const previousState = youtubeState;
+    const modelKey = `chatgpt_${currentChatgptMode}_model`;
+    youtubeState = sanitizeYoutubeSettings({ ...youtubeState, [modelKey]: String(ytInputs.chatgpt_model.value || '') });
+    renderVisibleChatgptPair();
+    persistYoutube({ previousState });
+  });
   ytInputs.chatgpt_effort.addEventListener('change', () => { persistYoutube(); });
 
   async function loadSettings() {

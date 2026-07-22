@@ -3,8 +3,16 @@ const YOUTUBE_MODELS = new Set([
   'Gemini 3.1 Pro Preview',
 ])
 const CLAUDE_MODELS = new Set(['Opus 4.7', 'Sonnet 4.6', 'Haiku 4.5'])
-const CHATGPT_MODELS = new Set(['5.5', '5.4', '5.3', '5.2', '4.5', 'o3'])
-const CHATGPT_EFFORTS = new Set(['xhigh', 'high', 'medium', 'instant', 'pro', 'pro-extended'])
+const CHATGPT_MODELS = new Set(['5.6', '5.5', '5.4', '5.3', 'o3'])
+const CHATGPT_CHAT_MODELS = new Set(['5.6', '5.5', '5.4', '5.3', 'o3'])
+const CHATGPT_WORK_MODELS = new Set(['5.6', '5.5'])
+const CHATGPT_EFFORTS = new Set([
+  'low', 'xhigh', 'high', 'medium', 'instant', 'pro', 'pro-extended', 'max', 'ultra',
+])
+const CHATGPT_CHAT_EFFORTS = new Set(['instant', 'medium', 'high', 'xhigh', 'pro', 'pro-extended'])
+const CHATGPT_CHAT_56_EFFORTS = new Set(['instant', 'medium', 'high', 'xhigh', 'pro'])
+const CHATGPT_WORK_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh'])
+const CHATGPT_WORK_56_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
 const EXTENSION_YOUTUBE_SCHEMA_VERSION = 1
 
 const EXTENSION_YOUTUBE_DEFAULTS = Object.freeze({
@@ -48,11 +56,28 @@ function booleanValue(value, fallback) {
   return typeof value === 'boolean' ? value : fallback
 }
 
+function chatgptModelsForMode(mode) {
+  return mode === 'work' ? CHATGPT_WORK_MODELS : CHATGPT_CHAT_MODELS
+}
+
+function chatgptEffortsFor(mode, model) {
+  if (mode === 'work') return model === '5.6' ? CHATGPT_WORK_56_EFFORTS : CHATGPT_WORK_EFFORTS
+  return model === '5.6' ? CHATGPT_CHAT_56_EFFORTS : CHATGPT_CHAT_EFFORTS
+}
+
 function sanitizeExtensionYoutube(raw = {}) {
   const input = isPlainObject(raw) ? raw : {}
-  const legacyModel = enumValue(input.chatgpt_model, CHATGPT_MODELS, '5.5')
-  const legacyEffort = enumValue(input.chatgpt_effort, CHATGPT_EFFORTS, 'xhigh')
   const mode = enumValue(input.chatgpt_mode, new Set(['chat', 'work']), 'chat')
+  // The legacy flat pair predates Work and therefore migrates into Chat.
+  // Validate each stored pair against its own mode/model capability matrix:
+  // Chat and Work expose different models, while Max/Ultra exist only in
+  // Work on GPT-5.6.
+  const legacyModel = enumValue(input.chatgpt_model, CHATGPT_CHAT_MODELS, '5.5')
+  const chatModel = enumValue(input.chatgpt_chat_model, CHATGPT_CHAT_MODELS, legacyModel)
+  const legacyEffort = enumValue(input.chatgpt_effort, chatgptEffortsFor('chat', chatModel), 'xhigh')
+  const chatEffort = enumValue(input.chatgpt_chat_effort, chatgptEffortsFor('chat', chatModel), legacyEffort)
+  const workModel = enumValue(input.chatgpt_work_model, CHATGPT_WORK_MODELS, '5.5')
+  const workEffort = enumValue(input.chatgpt_work_effort, chatgptEffortsFor('work', workModel), 'xhigh')
   const result = {
     ...EXTENSION_YOUTUBE_DEFAULTS,
     auto_aistudio: booleanValue(input.auto_aistudio, false),
@@ -72,12 +97,12 @@ function sanitizeExtensionYoutube(raw = {}) {
     claude_adaptive_thinking: booleanValue(input.claude_adaptive_thinking, true),
     chatgpt_mode: mode,
     chatgpt_prompt: stringValue(input.chatgpt_prompt, 'перескажи кратко', 4000),
-    chatgpt_chat_model: enumValue(input.chatgpt_chat_model, CHATGPT_MODELS, legacyModel),
-    chatgpt_chat_effort: enumValue(input.chatgpt_chat_effort, CHATGPT_EFFORTS, legacyEffort),
+    chatgpt_chat_model: chatModel,
+    chatgpt_chat_effort: chatEffort,
     // The legacy flat pair belonged to ordinary Chat. Work did not exist yet,
     // so its first migration starts from explicit Work defaults.
-    chatgpt_work_model: enumValue(input.chatgpt_work_model, CHATGPT_MODELS, '5.5'),
-    chatgpt_work_effort: enumValue(input.chatgpt_work_effort, CHATGPT_EFFORTS, 'xhigh'),
+    chatgpt_work_model: workModel,
+    chatgpt_work_effort: workEffort,
   }
   result.chatgpt_model = mode === 'work' ? result.chatgpt_work_model : result.chatgpt_chat_model
   result.chatgpt_effort = mode === 'work' ? result.chatgpt_work_effort : result.chatgpt_chat_effort

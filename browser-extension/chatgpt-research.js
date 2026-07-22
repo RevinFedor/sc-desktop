@@ -402,58 +402,163 @@
   }
 
   const CHATGPT_MODES = Object.freeze(['chat', 'work']);
+  const CHATGPT_MODE_CONTROL_SELECTOR = '[role="radio"], [role="tab"], button, [role="button"]';
   function resolveChatgptMode(value) {
     return String(value || '').trim().toLowerCase() === 'work' ? 'work' : 'chat';
   }
   function chatgptModeLabel(mode) {
     return resolveChatgptMode(mode) === 'work' ? 'Work' : 'Chat';
   }
-  function modeFromRadioText(value) {
-    const text = String(value || '').trim();
-    if (/^Work$/i.test(text)) return 'work';
-    if (/^Chat$/i.test(text)) return 'chat';
+  function normalizeModeControlLabel(value) {
+    return String(value || '')
+      .normalize('NFKC')
+      .replace(/[\s\u00a0]+/g, ' ')
+      .replace(/[·•|:—–-]+/g, ' ')
+      .trim()
+      .toLowerCase()
+      .replace(/^(?:chatgpt|режим|mode)\s+/u, '')
+      .replace(/\s+(?:режим|mode)$/u, '')
+      .trim();
+  }
+  function modeFromControlText(value) {
+    const text = normalizeModeControlLabel(value);
+    if (/^(?:work|работа|для работы|рабочие чаты|чаты для работы|чаты работы)$/u.test(text)) return 'work';
+    if (/^(?:chat|chats|чат|чаты)$/u.test(text)) return 'chat';
     return null;
   }
-  function isModeRadioChecked(el) {
+  function modeFromControl(el) {
+    const labels = [
+      el?.getAttribute?.('aria-label'),
+      el?.getAttribute?.('title'),
+      nodeText(el),
+    ];
+    for (const label of labels) {
+      const mode = modeFromControlText(label);
+      if (mode) return mode;
+    }
+    return null;
+  }
+  function isModeControlChecked(el) {
     if (!el) return false;
     const dataState = String(el.getAttribute('data-state') || '').toLowerCase();
     return el.getAttribute('aria-checked') === 'true'
+      || el.getAttribute('aria-selected') === 'true'
+      || el.getAttribute('aria-pressed') === 'true'
+      || ['true', 'page'].includes(String(el.getAttribute('aria-current') || '').toLowerCase())
+      || ['true', 'active', 'selected', 'checked', 'on'].includes(String(el.getAttribute('data-active') || '').toLowerCase())
+      || ['true', 'active', 'selected', 'checked', 'on'].includes(String(el.getAttribute('data-selected') || '').toLowerCase())
       || dataState === 'checked'
       || dataState === 'active'
-      || dataState === 'on';
+      || dataState === 'selected'
+      || dataState === 'on'
+      || /(?:^|\s)(?:active|selected|checked)(?:\s|$)/i.test(el.getAttribute('class') || '');
   }
-  function chatgptModeRadios() {
-    return visibleAll('[role="radio"]')
-      .map(el => ({ el, mode: modeFromRadioText(nodeText(el)) }))
-      .filter(item => item.mode)
-      .sort((a, b) => a.el.getBoundingClientRect().top - b.el.getBoundingClientRect().top);
+  function commonAncestor(a, b) {
+    const ancestors = new Set();
+    for (let el = a; el; el = el.parentElement) ancestors.add(el);
+    for (let el = b; el; el = el.parentElement) {
+      if (ancestors.has(el)) return el;
+    }
+    return null;
+  }
+  function ancestorDistance(el, ancestor) {
+    let distance = 0;
+    for (let current = el; current && current !== ancestor; current = current.parentElement) distance++;
+    return distance;
+  }
+  function modePairScore(a, b) {
+    const groupA = a.el.closest?.('[role="radiogroup"], [role="tablist"], [role="group"]');
+    const groupB = b.el.closest?.('[role="radiogroup"], [role="tablist"], [role="group"]');
+    if (groupA && groupA === groupB) return 0;
+    if (a.el.parentElement && a.el.parentElement === b.el.parentElement) return 10;
+
+    const common = commonAncestor(a.el, b.el);
+    if (!common || Math.max(ancestorDistance(a.el, common), ancestorDistance(b.el, common)) > 4) return Infinity;
+    const ar = a.el.getBoundingClientRect();
+    const br = b.el.getBoundingClientRect();
+    const sameRow = Math.abs((ar.top + ar.height / 2) - (br.top + br.height / 2)) <= Math.max(24, ar.height, br.height);
+    if (!sameRow) return Infinity;
+    return 20 + Math.abs((ar.left + ar.width / 2) - (br.left + br.width / 2)) / 1000;
+  }
+  function allModeControlCandidates() {
+    return visibleAll(CHATGPT_MODE_CONTROL_SELECTOR)
+      .map(el => ({ el, mode: modeFromControl(el) }))
+      .filter(item => item.mode);
+  }
+  function chatgptModeControls() {
+    const candidates = allModeControlCandidates();
+    const pairs = [];
+    for (const chat of candidates.filter(item => item.mode === 'chat')) {
+      for (const work of candidates.filter(item => item.mode === 'work')) {
+        const score = modePairScore(chat, work);
+        if (Number.isFinite(score)) pairs.push({ chat, work, score });
+      }
+    }
+    pairs.sort((a, b) => a.score - b.score
+      || a.chat.el.getBoundingClientRect().top - b.chat.el.getBoundingClientRect().top);
+    const pair = pairs[0];
+    return pair ? [pair.chat, pair.work] : [];
   }
   function currentChatgptMode() {
-    const radios = chatgptModeRadios();
-    const selected = radios.find(item => isModeRadioChecked(item.el));
+    const controls = chatgptModeControls();
+    const selected = controls.find(item => isModeControlChecked(item.el));
+    if (selected) return selected.mode;
+
+    // Стандартный tablist иногда кодирует выбор только roving tabindex:
+    // активная вкладка имеет 0, соседняя -1.
+    const tabbable = controls.filter(item => item.el.getAttribute('tabindex') === '0');
+    const untabbable = controls.filter(item => item.el.getAttribute('tabindex') === '-1');
+    if (tabbable.length === 1 && untabbable.length >= 1) return tabbable[0].mode;
     return selected?.mode || null;
   }
   function chatgptModeSnapshot() {
-    return chatgptModeRadios().map(({ el, mode }) => ({
+    return chatgptModeControls().map(({ el, mode }) => ({
       mode,
       text: nodeText(el),
+      ariaLabel: el.getAttribute('aria-label'),
+      role: el.getAttribute('role') || el.tagName?.toLowerCase() || null,
       ariaChecked: el.getAttribute('aria-checked'),
+      ariaSelected: el.getAttribute('aria-selected'),
+      ariaPressed: el.getAttribute('aria-pressed'),
       dataState: el.getAttribute('data-state'),
       top: Math.round(el.getBoundingClientRect().top),
     }));
   }
+  function chatgptModeDiagnosticSnapshot() {
+    return visibleAll('[role="radio"], [role="tab"], [role="radiogroup"], [role="tablist"], button[aria-pressed], button[data-state]')
+      .map(el => ({
+        text: nodeText(el).slice(0, 100),
+        ariaLabel: String(el.getAttribute('aria-label') || '').slice(0, 100),
+        role: el.getAttribute('role') || el.tagName?.toLowerCase() || null,
+        ariaChecked: el.getAttribute('aria-checked'),
+        ariaSelected: el.getAttribute('aria-selected'),
+        ariaPressed: el.getAttribute('aria-pressed'),
+        dataState: el.getAttribute('data-state'),
+      }))
+      .filter(item => item.text || item.ariaLabel)
+      .slice(0, 30);
+  }
   async function ensureChatgptModeSelected(requestedMode) {
     const mode = resolveChatgptMode(requestedMode);
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const target = await waitFor(
-        () => chatgptModeRadios().find(item => item.mode === mode)?.el || null,
-        `ChatGPT ${chatgptModeLabel(mode)} radio`,
-        15000,
-        200,
-      );
+      let target = null;
+      try {
+        target = await waitFor(
+          () => chatgptModeControls().find(item => item.mode === mode)?.el || null,
+          `ChatGPT ${chatgptModeLabel(mode)} toggle`,
+          15000,
+          200,
+        );
+      } catch (e) {
+        const data = { mode, attempt, err: e?.message, controls: chatgptModeDiagnosticSnapshot() };
+        log('mode.controls_not_found', data);
+        bridgeLog('gpt.mode.controls_not_found', data, getRequestId() || getComposeId(), null);
+        return false;
+      }
       const before = currentChatgptMode();
-      if (before === mode && isModeRadioChecked(target)) {
+      if (before === mode && isModeControlChecked(target)) {
         log('mode.already_set', { mode, attempt, radios: chatgptModeSnapshot() });
+        bridgeLog('gpt.mode.already_set', { mode, attempt, radios: chatgptModeSnapshot() }, getRequestId() || getComposeId(), null);
         return true;
       }
       nativeMouseClick(target);
@@ -472,10 +577,17 @@
         before,
         radios: chatgptModeSnapshot(),
       });
+      bridgeLog(ok ? 'gpt.mode.selected' : 'gpt.mode.verify_failed', {
+        mode,
+        attempt,
+        before,
+        radios: chatgptModeSnapshot(),
+      }, getRequestId() || getComposeId(), null);
       if (ok) return true;
       await sleep(300);
     }
     log('mode.select_failed', { mode, radios: chatgptModeSnapshot() });
+    bridgeLog('gpt.mode.select_failed', { mode, radios: chatgptModeSnapshot() }, getRequestId() || getComposeId(), null);
     return false;
   }
 
@@ -1386,12 +1498,15 @@
   // xhigh — дефолт (юзер: «по умолчанию 5.5, режим очень высокий»;
   // «Очень высокий» в вебе = xhigh из Codex CLI).
   const EFFORTS = [
-    { key: 'instant',      match: /^Instant$/i,                          sub: false, aliases: ['instant'] },
-    { key: 'medium',       match: /^Medium$/i,                           sub: false, aliases: ['medium', 'mid'] },
-    { key: 'high',         match: /^High$/i,                             sub: false, aliases: ['high'] },
+    { key: 'low',          match: /^(Low|Низкий)$/i,                     sub: false, aliases: ['low', 'низкий'] },
+    { key: 'instant',      match: /^(Instant|Мгновенный)(?:\s*\d+(?:\.\d+)?)?$/i, sub: false, aliases: ['instant', 'мгновенный'] },
+    { key: 'medium',       match: /^(Medium|Средний)$/i,                 sub: false, aliases: ['medium', 'mid', 'средний'] },
+    { key: 'high',         match: /^(High|Высокий)$/i,                   sub: false, aliases: ['high', 'высокий'] },
     { key: 'xhigh',        match: /^(Очень высокий|Very\s*high|Extra\s*high)$/i, sub: false, aliases: ['xhigh', 'x-high', 'extra high', 'очень высокий', 'very high'] },
-    { key: 'pro',          match: /^(Pro стандартный|Pro standard)$/i,   sub: true,  aliases: ['pro', 'pro-standard', 'pro стандартный'] },
-    { key: 'pro-extended', match: /^(Pro расширенный|Pro extended)$/i,   sub: true,  aliases: ['pro-extended', 'pro-ext', 'extended', 'pro расширенный'] },
+    { key: 'pro',          match: /^(Pro стандартный|Pro Стандартный|Pro standard)$/i, sub: true, aliases: ['pro', 'pro-standard', 'pro стандартный'] },
+    { key: 'pro-extended', match: /^(Pro усиленный|Pro расширенный|Pro extended)$/i, sub: true, aliases: ['pro-extended', 'pro-ext', 'extended', 'pro усиленный', 'pro расширенный'] },
+    { key: 'max',          match: /^(Max|Максимальный)$/i,               sub: false, aliases: ['max', 'максимальный'] },
+    { key: 'ultra',        match: /^(Ultra|Ультра)/i,                    sub: false, aliases: ['ultra', 'ультра'] },
   ];
   const DEFAULT_EFFORT = 'xhigh';
   function resolveEffort(input) {
@@ -1403,8 +1518,8 @@
     return hit ? hit.key : DEFAULT_EFFORT;
   }
   function effortLabel(key) {
-    return ({ instant: 'Instant', medium: 'Medium', high: 'High', xhigh: 'Очень высокий',
-              pro: 'Pro стандартный', 'pro-extended': 'Pro расширенный' })[key] || key;
+    return ({ low: 'Low', instant: 'Instant', medium: 'Medium', high: 'High', xhigh: 'Очень высокий',
+              pro: 'Pro стандартный', 'pro-extended': 'Pro усиленный', max: 'Max', ultra: 'Ultra' })[key] || key;
   }
 
   // ── Реестр моделей. В меню composer-pill'а текущая модель раскрывает
@@ -1413,6 +1528,7 @@
   // ChatGPT запоминает выбор per-аккаунт — поэтому модель ВСЕГДА верифицируем,
   // не «скип если дефолт»: прошлый job мог оставить другую модель.
   const MODELS = [
+    { key: '5.6', aliases: ['5.6', 'gpt-5.6', 'gpt5.6', 'gpt 5.6', 'gpt-5.6 sol'] },
     { key: '5.5', aliases: ['5.5', 'gpt-5.5', 'gpt5.5', 'gpt 5.5'] },
     { key: '5.4', aliases: ['5.4', 'gpt-5.4', 'gpt5.4'] },
     { key: '5.3', aliases: ['5.3', 'gpt-5.3', 'gpt5.3'] },
@@ -1447,13 +1563,19 @@
     return visibleAll('[role="menuitemradio"]')
       .find(el => eff.match.test(nodeText(el)));
   }
+  // Work хранит уровни во вложенном пункте «Уровень → …», тогда как Chat
+  // показывает те же radio сразу в корневом меню composer-pill'а.
+  function findEffortSubTrigger() {
+    return visibleAll('[role="menuitem"][aria-haspopup="menu"]')
+      .find(el => /^(Уровень|Level)/i.test(nodeText(el))) || null;
+  }
   function findProMainItem() {
     return visibleAll('[role="menuitemradio"]')
       .find(el => /^Pro$/i.test(nodeText(el)));
   }
   function findAnyProDetailItem() {
     return visibleAll('[role="menuitemradio"]')
-      .find(el => /^(Pro стандартный|Pro standard|Pro расширенный|Pro extended)$/i.test(nodeText(el)));
+      .find(el => /^(Pro стандартный|Pro standard|Pro усиленный|Pro расширенный|Pro extended)$/i.test(nodeText(el)));
   }
   function effortMenuSnapshot() {
     return visibleAll('[role="menuitemradio"], [role="menuitem"]')
@@ -1476,7 +1598,7 @@
   function modelKeyFromText(text) {
     const label = String(text || '').replace(/\s+/g, ' ').trim();
     if (/^o3(?:\b|$)/i.test(label)) return 'o3';
-    const gpt = label.match(/\bGPT[\s-]*(\d+(?:\.\d+)?)(?=\D|$)/i);
+    const gpt = label.match(/(?:GPT|Model|Модель)[\s-]*(\d+(?:\.\d+)?)(?=\D|$)/i);
     if (gpt) return gpt[1];
     const bare = label.match(/^(\d+(?:\.\d+)?)$/);
     return bare ? bare[1] : null;
@@ -1583,6 +1705,20 @@
     }
     return trigger;
   }
+  async function openEffortItemsMenu(eff) {
+    await openEffortMenu();
+    const direct = findEffortItem(eff);
+    if (direct) return direct;
+
+    const sub = await waitFor(() => findEffortSubTrigger(), 'effort submenu trigger (Level / Уровень)', 8000);
+    nativeHover(sub);
+    await sleep(500);
+    if (!findEffortItem(eff)) {
+      nativeMouseClick(sub);
+      await sleep(700);
+    }
+    return await waitFor(() => findEffortItem(eff), 'effort item: ' + eff.key, 8000);
+  }
   async function openProSubmenu() {
     const sub = await waitFor(() => findProSubTrigger(), 'pro submenu trigger', 8000);
     nativeHover(sub);
@@ -1616,6 +1752,17 @@
 
   async function ensureProDetailSelected(eff, attempt) {
     await openEffortMenu();
+    // GPT-5.6 Chat сейчас имеет единый Pro без подуровней. У 5.4/5.5 рядом
+    // появляется отдельная кнопка с Pro Стандартный / Pro Усиленный.
+    // Для generic `pro` отсутствие кнопки означает уже полностью выбранный
+    // уровень; `pro-extended` без кнопки остаётся недоступной комбинацией.
+    if (!findProSubTrigger()) {
+      const top = findProMainItem();
+      return {
+        ok: eff.key === 'pro' && !!top && top.getAttribute('aria-checked') === 'true',
+        changed: false,
+      };
+    }
     await openProSubmenu();
     const item = await waitFor(() => findEffortItem(eff), 'pro detail item: ' + eff.key, 8000);
     if (item.getAttribute('aria-checked') === 'true') return { ok: true, changed: false };
@@ -1637,9 +1784,9 @@
 
   // Выбор уровня + verify-and-retry. Меню закрывается на radio-select —
   // verify через ПОВТОРНОЕ открытие и чтение aria-checked (pill-текст лагает,
-  // живой probe: после клика Instant pill ещё показывал «Pro»). Не-фатально:
-  // при провале логируем effort_select_failed и продолжаем на дефолте аккаунта
-  // (лучше research на неточном уровне, чем убитый job).
+  // живой probe: после клика Instant pill ещё показывал «Pro»). Вызывающий
+  // flow обязан считать false фатальным: sticky-уровень аккаунта может не
+  // совпадать с явно выбранным юзером.
   async function ensureEffortSelected(effortKey) {
     const eff = EFFORTS.find(e => e.key === effortKey);
     if (!eff) { log('effort.unknown', { effortKey }); return false; }
@@ -1660,8 +1807,7 @@
           }
           return true;
         }
-        await openEffortMenu();
-        const item = await waitFor(() => findEffortItem(eff), 'effort item: ' + eff.key, 8000);
+        const item = await openEffortItemsMenu(eff);
         if (item.getAttribute('aria-checked') === 'true') {
           log('effort.already_set', { effort: eff.key });
           bridgeLog('gpt.effort.already_set', { effort: eff.key }, getRequestId(), null);
@@ -1671,8 +1817,7 @@
         nativeMouseClick(item);
         await sleep(600);
         // verify: меню после select закрыто — переоткрываем и читаем checked.
-        await openEffortMenu();
-        const after = findEffortItem(eff);
+        const after = await openEffortItemsMenu(eff);
         const ok = after && after.getAttribute('aria-checked') === 'true';
         pressEscape(); await sleep(200);
         if (ok) {
@@ -1680,9 +1825,13 @@
           bridgeLog('gpt.effort.selected', { effort: eff.key, attempt }, getRequestId(), null);
           return true;
         }
-        log('effort.verify_failed', { effort: eff.key, attempt });
+        const data = { effort: eff.key, attempt, items: effortMenuSnapshot() };
+        log('effort.verify_failed', data);
+        bridgeLog('gpt.effort.verify_failed', data, getRequestId(), null);
       } catch (e) {
-        log('effort.attempt_threw', { attempt, err: e?.message });
+        const data = { effort: eff.key, attempt, err: e?.message, items: effortMenuSnapshot() };
+        log('effort.attempt_threw', data);
+        bridgeLog('gpt.effort.attempt_threw', data, getRequestId(), null);
         pressEscape(); await sleep(200);
       }
     }
@@ -2623,6 +2772,7 @@
     // options.model и options.effort — разные оси: модель (5.5/5.4/…/o3) и
     // уровень интеллекта. Раньше effort фолбэчился на options.model — теперь
     // model занят настоящей моделью, фолбэк убран.
+    const mode = resolveChatgptMode(job.options?.mode);
     const effortKey = resolveEffort(job.options?.effort);
     const modelKey = resolveModel(job.options?.model);
     const wantSourcesInText = !!job.options?.sources;
@@ -2632,7 +2782,7 @@
     // MCP-плашка (общий research-badge.js) — юзер видит «вкладка под job'ом».
     try {
       window.scResearchBadge?.show({
-        jobId: id, providerLabel: 'ChatGPT',
+        jobId: id, providerLabel: `ChatGPT · ${chatgptModeLabel(mode)}`,
         modelTitle: modelDisplay(modelKey) + ' · ' + effortLabel(effortKey),
         prompt: job.prompt || '',
       });
@@ -2648,26 +2798,37 @@
       if (!isReloadRestart) {
         await postState(id, { status: 'running', stage: 'configuring',
           ...(typeof myTabId === 'number' ? { tabId: myTabId } : {}) });
-        // Модель ПЕРЕД уровнем: набор уровней зависит от модели (у o3/4.5
-        // другой состав пунктов), выбор модели может сбросить уровень.
-        // Модель — fatal: ChatGPT помнит выбор per-аккаунт, и при провале
-        // verify job молча ответил бы прошлой sticky-моделью (o3 вместо
-        // запрошенной 5.5). Контракт тот же, что у claude/submit-verify:
-        // ответ чужой моделью хуже ошибки. Effort — non-fatal (неточный
-        // уровень терпим, едет на текущем). Вкладку при error не закрываем.
-        const okModel = await ensureModelSelected(modelKey);
-        if (!okModel) {
+        const failConfiguration = async (error) => {
           const ok = await postTerminalState(id, {
             status: 'error', stage: 'configuring',
-            url: location.href, title: document.title,
-            error: `chatgpt_model_select_failed: не удалось выбрать модель ${modelDisplay(modelKey)} (ChatGPT помнит модель per-аккаунт — мог ответить прошлой)`,
+            url: location.href, title: document.title, error,
           });
           stopHb();
           if (ok) stopKeepAlive(); // не подтвердилось → порт живой, fallback вооружён
           try { window.scResearchBadge?.hide(); } catch {}
+        };
+
+        // Режим выбирается первым: переключение Chat/Work может пересобрать
+        // composer и вернуть sticky-модель/уровень этого режима. После него
+        // отдельно верифицируем модель и интеллект. Любое несовпадение fatal:
+        // ответ на другом режиме/модели/уровне хуже явной ошибки.
+        const okMode = await ensureChatgptModeSelected(mode);
+        if (!okMode) {
+          await failConfiguration(`chatgpt_mode_select_failed: не удалось выбрать ChatGPT · ${chatgptModeLabel(mode)}`);
           return;
         }
-        await ensureEffortSelected(effortKey);
+        await waitFor(() => findComposer(), 'composer after Chat/Work selection', 15000);
+
+        const okModel = await ensureModelSelected(modelKey);
+        if (!okModel) {
+          await failConfiguration(`chatgpt_model_select_failed: не удалось выбрать модель ${modelDisplay(modelKey)} (ChatGPT помнит модель per-аккаунт — мог ответить прошлой)`);
+          return;
+        }
+        const okEffort = await ensureEffortSelected(effortKey);
+        if (!okEffort) {
+          await failConfiguration(`chatgpt_effort_select_failed: не удалось выбрать интеллект ${effortLabel(effortKey)} (запрос не отправлен с другим sticky-уровнем)`);
+          return;
+        }
         if (attachmentMetas.length) {
           await postState(id, { stage: 'uploading' });
           await uploadAttachments(id, attachmentMetas);

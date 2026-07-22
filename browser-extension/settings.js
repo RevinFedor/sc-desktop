@@ -160,21 +160,23 @@ const CLAUDE_AVAILABLE_MODELS = Object.freeze([
 ]);
 
 const CHATGPT_AVAILABLE_MODELS = Object.freeze([
-  { id: '5.5', label: 'GPT-5.5' },
-  { id: '5.4', label: 'GPT-5.4' },
-  { id: '5.3', label: 'GPT-5.3' },
-  { id: '5.2', label: 'GPT-5.2' },
-  { id: '4.5', label: 'GPT-4.5' },
-  { id: 'o3', label: 'o3' },
+  { id: '5.6', label: 'GPT-5.6 Sol', modes: ['chat', 'work'] },
+  { id: '5.5', label: 'GPT-5.5',     modes: ['chat', 'work'] },
+  { id: '5.4', label: 'GPT-5.4',     modes: ['chat'] },
+  { id: '5.3', label: 'GPT-5.3',     modes: ['chat'] },
+  { id: 'o3',  label: 'o3',          modes: ['chat'] },
 ]);
 
 const CHATGPT_AVAILABLE_EFFORTS = Object.freeze([
+  { id: 'low', label: 'Low' },
   { id: 'xhigh', label: 'Очень высокий' },
   { id: 'high', label: 'High' },
   { id: 'medium', label: 'Medium' },
   { id: 'instant', label: 'Instant' },
   { id: 'pro', label: 'Pro стандартный' },
-  { id: 'pro-extended', label: 'Pro расширенный' },
+  { id: 'pro-extended', label: 'Pro усиленный' },
+  { id: 'max', label: 'Max' },
+  { id: 'ultra', label: 'Ultra' },
 ]);
 
 const CHATGPT_MODES = Object.freeze(['chat', 'work']);
@@ -182,6 +184,25 @@ const CHATGPT_MODE_LABELS = Object.freeze({
   chat: 'Chat',
   work: 'Work',
 });
+
+function chatgptModelsForMode(mode) {
+  const normalized = CHATGPT_MODES.includes(mode) ? mode : 'chat';
+  return CHATGPT_AVAILABLE_MODELS.filter(model => model.modes.includes(normalized));
+}
+
+function chatgptEffortsFor(mode, model) {
+  const byId = Object.fromEntries(CHATGPT_AVAILABLE_EFFORTS.map(effort => [effort.id, effort]));
+  if (mode === 'work') {
+    const ids = ['low', 'medium', 'high', 'xhigh'];
+    if (model === '5.6') ids.push('max', 'ultra');
+    return ids.map(id => byId[id]);
+  }
+  const ids = ['instant', 'medium', 'high', 'xhigh', 'pro'];
+  if (model !== '5.6') ids.push('pro-extended');
+  return ids.map(id => id === 'pro' && model === '5.6'
+    ? { ...byId[id], label: 'Pro' }
+    : byId[id]);
+}
 
 // Куда отправляется транскрипт после клика «+ ai» на YouTube-карточке.
 // Один target за раз — выбор Gemini, Claude или ChatGPT. Раздельные настройки
@@ -293,21 +314,21 @@ function sanitizeYoutubeSettings(raw = {}) {
   if (typeof raw.chatgpt_mode === 'string' && CHATGPT_MODES.includes(raw.chatgpt_mode)) {
     s.chatgpt_mode = raw.chatgpt_mode;
   }
-  const validChatgptModel = value => typeof value === 'string'
-    && CHATGPT_AVAILABLE_MODELS.some(m => m.id === value);
-  const validChatgptEffort = value => typeof value === 'string'
-    && CHATGPT_AVAILABLE_EFFORTS.some(e => e.id === value);
+  const validChatgptModel = (mode, value) => typeof value === 'string'
+    && chatgptModelsForMode(mode).some(m => m.id === value);
+  const validChatgptEffort = (mode, model, value) => typeof value === 'string'
+    && chatgptEffortsFor(mode, model).some(e => e.id === value);
 
   // До появления Chat/Work существовала одна пара chatgpt_model/effort.
   // Она относилась к обычному Chat, поэтому переносим её именно туда.
-  const legacyModel = validChatgptModel(raw.chatgpt_model) ? raw.chatgpt_model : null;
-  const legacyEffort = validChatgptEffort(raw.chatgpt_effort) ? raw.chatgpt_effort : null;
-  if (validChatgptModel(raw.chatgpt_chat_model)) s.chatgpt_chat_model = raw.chatgpt_chat_model;
+  const legacyModel = validChatgptModel('chat', raw.chatgpt_model) ? raw.chatgpt_model : null;
+  if (validChatgptModel('chat', raw.chatgpt_chat_model)) s.chatgpt_chat_model = raw.chatgpt_chat_model;
   else if (legacyModel) s.chatgpt_chat_model = legacyModel;
-  if (validChatgptEffort(raw.chatgpt_chat_effort)) s.chatgpt_chat_effort = raw.chatgpt_chat_effort;
+  const legacyEffort = validChatgptEffort('chat', s.chatgpt_chat_model, raw.chatgpt_effort) ? raw.chatgpt_effort : null;
+  if (validChatgptEffort('chat', s.chatgpt_chat_model, raw.chatgpt_chat_effort)) s.chatgpt_chat_effort = raw.chatgpt_chat_effort;
   else if (legacyEffort) s.chatgpt_chat_effort = legacyEffort;
-  if (validChatgptModel(raw.chatgpt_work_model)) s.chatgpt_work_model = raw.chatgpt_work_model;
-  if (validChatgptEffort(raw.chatgpt_work_effort)) s.chatgpt_work_effort = raw.chatgpt_work_effort;
+  if (validChatgptModel('work', raw.chatgpt_work_model)) s.chatgpt_work_model = raw.chatgpt_work_model;
+  if (validChatgptEffort('work', s.chatgpt_work_model, raw.chatgpt_work_effort)) s.chatgpt_work_effort = raw.chatgpt_work_effort;
 
   // Совместимые flat aliases: desktop и старые content-script'ы видят
   // модель/интеллект текущего режима, не теряя отдельные пары.

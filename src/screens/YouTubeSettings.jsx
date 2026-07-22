@@ -31,22 +31,38 @@ const TARGETS = [
 ]
 
 const GPT_MODELS = [
-  { id: '5.5', label: 'GPT-5.5' },
-  { id: '5.4', label: 'GPT-5.4' },
-  { id: '5.3', label: 'GPT-5.3' },
-  { id: '5.2', label: 'GPT-5.2' },
-  { id: '4.5', label: 'GPT-4.5' },
-  { id: 'o3', label: 'o3' },
+  { id: '5.6', label: 'GPT-5.6 Sol', modes: ['chat', 'work'] },
+  { id: '5.5', label: 'GPT-5.5',     modes: ['chat', 'work'] },
+  { id: '5.4', label: 'GPT-5.4',     modes: ['chat'] },
+  { id: '5.3', label: 'GPT-5.3',     modes: ['chat'] },
+  { id: 'o3',  label: 'o3',          modes: ['chat'] },
 ]
 
 const GPT_EFFORTS = [
+  { id: 'low', label: 'Low' },
   { id: 'xhigh', label: 'Очень высокий' },
   { id: 'high', label: 'Высокий' },
   { id: 'medium', label: 'Средний' },
   { id: 'instant', label: 'Мгновенный' },
   { id: 'pro', label: 'Pro стандартный' },
-  { id: 'pro-extended', label: 'Pro расширенный' },
+  { id: 'pro-extended', label: 'Pro усиленный' },
+  { id: 'max', label: 'Max' },
+  { id: 'ultra', label: 'Ultra' },
 ]
+
+function gptEffortsFor(mode, model) {
+  const byId = Object.fromEntries(GPT_EFFORTS.map(x => [x.id, x]))
+  if (mode === 'work') {
+    const ids = ['low', 'medium', 'high', 'xhigh']
+    if (model === '5.6') ids.push('max', 'ultra')
+    return ids.map(id => byId[id])
+  }
+  const ids = ['instant', 'medium', 'high', 'xhigh', 'pro']
+  if (model !== '5.6') ids.push('pro-extended')
+  return ids.map(id => id === 'pro' && model === '5.6'
+    ? { ...byId[id], label: 'Pro' }
+    : byId[id])
+}
 
 export default function YouTubeSettings() {
   const state = useAppSettingsSection('youtube')
@@ -66,6 +82,14 @@ export default function YouTubeSettings() {
   const gptMode = settings.chatgpt_mode === 'work' ? 'work' : 'chat'
   const modelKey = gptMode === 'work' ? 'chatgpt_work_model' : 'chatgpt_chat_model'
   const effortKey = gptMode === 'work' ? 'chatgpt_work_effort' : 'chatgpt_chat_effort'
+  const gptModelOptions = GPT_MODELS.filter(x => x.modes.includes(gptMode))
+  const gptModelValue = gptModelOptions.some(x => x.id === settings[modelKey])
+    ? settings[modelKey]
+    : '5.5'
+  const gptEffortOptions = gptEffortsFor(gptMode, gptModelValue)
+  const gptEffortValue = gptEffortOptions.some(x => x.id === settings[effortKey])
+    ? settings[effortKey]
+    : 'xhigh'
 
   return (
     <div>
@@ -159,8 +183,18 @@ export default function YouTubeSettings() {
               </div>
             </div>
             <TextSetting label="Промпт перед транскриптом" value={settings.chatgpt_prompt} onChange={v => setLocal('chatgpt_prompt', v)} onBlur={() => saveText('chatgpt_prompt')} rows={4} />
-            <SelectSetting settingId="chatgpt-model" label={`Модель · ${gptMode === 'work' ? 'Work' : 'Chat'}`} value={settings[modelKey]} onChange={v => state.patch({ [modelKey]: v })} options={GPT_MODELS} />
-            <SelectSetting settingId="chatgpt-effort" label={`Интеллект · ${gptMode === 'work' ? 'Work' : 'Chat'}`} value={settings[effortKey]} onChange={v => state.patch({ [effortKey]: v })} options={GPT_EFFORTS} />
+            <SelectSetting
+              settingId="chatgpt-model"
+              label={`Модель · ${gptMode === 'work' ? 'Work' : 'Chat'}`}
+              value={gptModelValue}
+              onChange={v => {
+                const efforts = gptEffortsFor(gptMode, v)
+                const nextEffort = efforts.some(x => x.id === settings[effortKey]) ? settings[effortKey] : 'xhigh'
+                state.patch({ [modelKey]: v, [effortKey]: nextEffort })
+              }}
+              options={gptModelOptions}
+            />
+            <SelectSetting settingId="chatgpt-effort" label={`Интеллект · ${gptMode === 'work' ? 'Work' : 'Chat'}`} value={gptEffortValue} onChange={v => state.patch({ [effortKey]: v })} options={gptEffortOptions} />
           </TargetCard>
         )}
       </Section>
