@@ -168,12 +168,12 @@ function listAllForUi() {
     const endTs = j.doneAt || Date.now()
     const elapsedSec = j.createdAt ? Math.max(0, Math.round((endTs - j.createdAt) / 1000)) : null
     // Модель: для perplexity — из options.model (что юзер выбрал), для chatgpt —
-    // модель + уровень интеллекта («5.4 · pro»), для claude — модель/effort из
+    // модель + уровень интеллекта, для claude — модель/effort из
     // options («opus-4.8 · max · Research») либо просто Research если авто.
     const modelLabel = j.provider === 'perplexity'
       ? (j.options?.model ? String(j.options.model) : 'default')
       : j.provider === 'chatgpt'
-        ? `${j.options?.model || '5.5'} · ${j.options?.effort || 'xhigh'}`
+        ? chatgptModelLabel(j.options)
         : claudeModelLabel(j.options)
     out.push({
       kind: 'research',
@@ -334,6 +334,19 @@ function claudeModelLabel(options) {
   return parts.join(' · ')
 }
 
+function chatgptModelLabel(options) {
+  const model = String(options?.model || '5.6-sol')
+  const labels = {
+    '5.5': 'GPT-5.5 Instant',
+    '5.6': 'GPT-5.6 Sol',
+    '5.6-sol': 'GPT-5.6 Sol',
+    '5.6-terra': 'GPT-5.6 Terra',
+    '5.6-luna': 'GPT-5.6 Luna',
+  }
+  const modelLabel = labels[model] || (/^\d/.test(model) ? `GPT-${model}` : model)
+  return `${modelLabel} · ${options?.effort || 'xhigh'}`
+}
+
 // Очистка старья: research занимает <30 мин, но на дебаг (зависшие jobs)
 // держим 24h чтобы post-mortem из логов можно было сверить с RAM-state'ом.
 // После — drop. На каждый GC sweep логируем кого выкинули и кого оставили.
@@ -356,4 +369,4 @@ function gc() {
 }
 setInterval(gc, 5 * 60 * 1000).unref?.()
 
-module.exports = { create, recreate, get, findByTabId, failAllByTabId, update, subscribe, publicSnapshot, listAllForUi, newRequestId, claudeModelLabel }
+module.exports = { create, recreate, get, findByTabId, failAllByTabId, update, subscribe, publicSnapshot, listAllForUi, newRequestId, claudeModelLabel, chatgptModelLabel }

@@ -171,8 +171,9 @@ function mergeYoutubeSettingsIntoJob(job, settings) {
     claudePostProject: y.claude_post_project ?? job.claudePostProject,
     claudeAdaptiveThinking: y.claude_adaptive_thinking !== false,
     chatgptPrompt: y.chatgpt_prompt ?? job.chatgptPrompt,
+    chatgptShowInTextField: y.chatgpt_show_in_text_field !== false,
     chatgptMode: mode,
-    chatgptModel: y[`chatgpt_${mode}_model`] || y.chatgpt_model || job.chatgptModel || '5.5',
+    chatgptModel: y[`chatgpt_${mode}_model`] || y.chatgpt_model || job.chatgptModel || '5.6-sol',
     chatgptEffort: y[`chatgpt_${mode}_effort`] || y.chatgpt_effort || job.chatgptEffort || 'xhigh',
   };
 }
@@ -1837,21 +1838,6 @@ async function fetchYoutubeArtifactText(filePath) {
   return String(data?.text || '');
 }
 
-function buildChatgptYoutubePrompt(payload, transcriptText, commentsText) {
-  const instruction = String(payload.prompt || '').trim();
-  const parts = [];
-  if (instruction) parts.push(instruction);
-  if (transcriptText && transcriptText.trim()) {
-    parts.push('Текст YouTube-видео:\n\n' + transcriptText.trim());
-  }
-  if (commentsText && commentsText.trim()) {
-    parts.push('Комментарии к видео:\n\n' + commentsText.trim());
-  }
-  const prompt = parts.join('\n\n---\n\n').trim();
-  if (!prompt) throw new Error('ChatGPT prompt is empty: no transcript text');
-  return prompt;
-}
-
 const CHATGPT_COMPOSE_JOB_PREFIX = '__sc_chatgpt_compose_job_';
 const CHATGPT_COMPOSE_WATCHDOG_ALARM = 'sc-chatgpt-compose-watchdog';
 const CHATGPT_COMPOSE_UNCLAIMED_TTL_MS = 90 * 1000;
@@ -2014,21 +2000,23 @@ async function createTabAsync(opts) {
 }
 
 // YouTube → ChatGPT это не MCP/research job. Здесь нужен только reusable
-// compose-layer: открыть ChatGPT, выбрать модель/effort, вставить длинный
-// текст и нажать Send. Ответ остаётся в обычном ChatGPT-чате; sources/parser/
-// MCP-badge не запускаются.
+// compose-layer: открыть ChatGPT, выбрать модель/effort, загрузить транскрипт
+// отдельным документом, ввести instruction в composer и нажать Send. Ответ
+// остаётся в обычном ChatGPT-чате; sources/parser/MCP-badge не запускаются.
 async function openChatgptBackground(payload) {
   const transcriptText = await fetchYoutubeArtifactText(payload.cachedFilePath);
   const commentsText = payload.cachedCommentsFilePath
     ? await fetchYoutubeArtifactText(payload.cachedCommentsFilePath)
     : '';
-  const prompt = buildChatgptYoutubePrompt(payload, transcriptText, commentsText);
+  const composeContent = buildYoutubeChatgptComposeContent(payload, transcriptText, commentsText);
   const requestId = newRequestId();
   const job = {
     requestId,
-    prompt,
+    prompt: composeContent.prompt,
+    document: composeContent.document,
+    showInTextField: payload.showInTextField !== false,
     mode: normalizeChatgptMode(payload.mode),
-    model: payload.model || '5.5',
+    model: payload.model || '5.6-sol',
     effort: payload.effort || 'xhigh',
     ytTabId: payload.ytTabId ?? null,
     ytVideoId: payload.ytVideoId || null,
@@ -2040,7 +2028,10 @@ async function openChatgptBackground(payload) {
     mode: job.mode,
     model: job.model,
     effort: job.effort,
-    promptLen: prompt.length,
+    promptLen: job.prompt.length,
+    documentChars: job.document.text.length,
+    documentName: job.document.name,
+    showInTextField: job.showInTextField,
     hasComments: !!commentsText,
   });
   await new Promise(resolve => {
@@ -2080,6 +2071,7 @@ async function openTargetBackground(target, common, job) {
     return openChatgptBackground({
       ...common,
       prompt: job.chatgptPrompt,
+      showInTextField: job.chatgptShowInTextField !== false,
       mode: job.chatgptMode,
       model: job.chatgptModel,
       effort: job.chatgptEffort,
@@ -2261,7 +2253,7 @@ async function trackJob(job) {
   //   // Claude-side:
   //   claudeModel, claudeProject, claudePostProject, claudeAdaptiveThinking,
   //   // ChatGPT-side:
-  //   chatgptPrompt, chatgptMode, chatgptModel, chatgptEffort,
+  //   chatgptPrompt, chatgptShowInTextField, chatgptMode, chatgptModel, chatgptEffort,
   // }
   const map = await loadTracker();
   const target = normalizeYoutubeAiTarget(job.target);
@@ -2358,8 +2350,9 @@ async function trackJob(job) {
     claudeAdaptiveThinking: job.claudeAdaptiveThinking !== false,
     // ChatGPT-side
     chatgptPrompt: job.chatgptPrompt || '',
+    chatgptShowInTextField: job.chatgptShowInTextField !== false,
     chatgptMode: normalizeChatgptMode(job.chatgptMode),
-    chatgptModel: job.chatgptModel || '5.5',
+    chatgptModel: job.chatgptModel || '5.6-sol',
     chatgptEffort: job.chatgptEffort || 'xhigh',
     engine: job.engine || 'gemini',   // для /yt-resume-ai при awaiting_ai
     resumeRequested: false,

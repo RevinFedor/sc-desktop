@@ -93,6 +93,7 @@
         "https://chatgpt.com/*"
       ],
       "js": [
+        "settings.js",
         "research-badge.js",
         "chatgpt-research.js"
       ],

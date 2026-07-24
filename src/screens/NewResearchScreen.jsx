@@ -31,24 +31,22 @@ const CHATGPT_MODES = [
 ]
 
 const CHATGPT_MODELS = [
-  { id: '5.6', label: 'GPT-5.6 Sol', modes: ['chat', 'work'] },
-  { id: '5.5', label: 'GPT-5.5',     modes: ['chat', 'work'] },
-  { id: '5.4', label: 'GPT-5.4',     modes: ['chat'] },
-  { id: '5.3', label: 'GPT-5.3',     modes: ['chat'] },
-  { id: 'o3',  label: 'o3',          modes: ['chat'] },
+  { id: '5.5',       label: 'GPT-5.5 Instant', modes: ['chat'] },
+  { id: '5.6-sol',   label: 'GPT-5.6 Sol',     modes: ['chat', 'work'] },
+  { id: '5.6-terra', label: 'GPT-5.6 Terra',   modes: ['work'] },
+  { id: '5.6-luna',  label: 'GPT-5.6 Luna',    modes: ['work'] },
 ]
 
 // ChatGPT — уровни интеллекта (зеркало chatgpt-research.js::EFFORTS).
-// «Очень высокий» = xhigh из Codex CLI (дефолт). Pro стандартный/расширенный —
-// больше compute (тариф Pro $200), pro-extended — самый глубокий и медленный.
+// «Очень высокий» = xhigh. В обычном Chat уровни выше Instant используют Sol;
+// Work предлагает Low..Ultra отдельно для Sol, Terra и Luna.
 const CHATGPT_EFFORTS = [
   { id: 'low',          label: 'Low' },
   { id: 'xhigh',        label: 'Очень высокий',    hint: 'xhigh, default' },
   { id: 'high',         label: 'High' },
   { id: 'medium',       label: 'Medium' },
   { id: 'instant',      label: 'Instant',          hint: 'без thinking' },
-  { id: 'pro',          label: 'Pro стандартный',  hint: 'мин. 10+ мин' },
-  { id: 'pro-extended', label: 'Pro усиленный',    hint: 'самый глубокий, десятки минут' },
+  { id: 'pro',          label: 'Pro',               hint: 'самый глубокий' },
   { id: 'max',          label: 'Max' },
   { id: 'ultra',        label: 'Ultra',             hint: 'быстрее расходует квоту' },
 ]
@@ -56,15 +54,14 @@ const CHATGPT_EFFORTS = [
 function chatgptEffortOptions(mode, model) {
   const byId = Object.fromEntries(CHATGPT_EFFORTS.map(x => [x.id, x]))
   if (mode === 'work') {
-    const ids = ['low', 'medium', 'high', 'xhigh']
-    if (model === '5.6') ids.push('max', 'ultra')
-    return ids.map(id => byId[id])
+    return ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(id => byId[id])
   }
-  const ids = ['instant', 'medium', 'high', 'xhigh', 'pro']
-  if (model !== '5.6') ids.push('pro-extended')
-  return ids.map(id => id === 'pro' && model === '5.6'
-    ? { ...byId[id], label: 'Pro' }
-    : byId[id])
+  if (model === '5.5') return [byId.instant]
+  return ['medium', 'high', 'xhigh', 'pro'].map(id => byId[id])
+}
+
+function defaultChatgptEffort(mode, model) {
+  return mode === 'chat' && model === '5.5' ? 'instant' : 'xhigh'
 }
 
 // Claude — модели + их effort/thinking вариации (зеркало claude-research.js::
@@ -103,7 +100,7 @@ export default function NewResearchScreen() {
   const [pplxModel, setPplxModel] = useState('gemini')
   const [aiModel, setAiModel] = useState('pro')
   const [gptMode, setGptMode] = useState('chat')
-  const [gptModel, setGptModel] = useState('5.5')
+  const [gptModel, setGptModel] = useState('5.6-sol')
   const [gptEffort, setGptEffort] = useState('xhigh')
   const [gptSources, setGptSources] = useState(false)
   const [clModel, setClModel] = useState('auto')
@@ -140,17 +137,17 @@ export default function NewResearchScreen() {
     { id: 'sonnet', label: 'Claude Sonnet 4.6' },
     { id: 'kimi',   label: 'Kimi K2.6' },
   ]
-  // Списки зависят сразу от режима и модели. В Work сейчас есть только 5.5 и
-  // 5.6; Max/Ultra — только у 5.6. В Chat у 5.6 единый Pro, а у 5.4/5.5 —
-  // Pro стандартный/усиленный. Скрытый старый state никогда не отправляем.
+  // В обычном Chat доступны 5.5 Instant и 5.6 Sol. Work предлагает три
+  // независимых tier'а 5.6: Sol, Terra и Luna. Скрытый старый state никогда
+  // не отправляем.
   const gptModelOptions = CHATGPT_MODELS.filter(x => x.modes.includes(gptMode))
   const gptModelValue = gptModelOptions.some(x => x.id === gptModel)
     ? gptModel
-    : '5.5'
+    : '5.6-sol'
   const gptEffortOptions = chatgptEffortOptions(gptMode, gptModelValue)
   const gptEffortValue = gptEffortOptions.some(x => x.id === gptEffort)
     ? gptEffort
-    : 'xhigh'
+    : defaultChatgptEffort(gptMode, gptModelValue)
 
   async function submit() {
     if (stage === 'sending' || !prompt.trim()) return

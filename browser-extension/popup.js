@@ -113,6 +113,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     claude_adaptive_thinking:    document.getElementById('yt_claude_adaptive_thinking'),
     // ChatGPT-side
     chatgpt_prompt:              document.getElementById('yt_chatgpt_prompt'),
+    chatgpt_show_in_text_field:  document.getElementById('yt_chatgpt_show_in_text_field'),
     chatgpt_model:               document.getElementById('yt_chatgpt_model'),
     chatgpt_effort:              document.getElementById('yt_chatgpt_effort'),
   };
@@ -178,9 +179,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const modelKey = `chatgpt_${mode}_model`;
     const effortKey = `chatgpt_${mode}_effort`;
     const models = chatgptModelsForMode(mode);
-    const model = models.some(m => m.id === youtubeState[modelKey]) ? youtubeState[modelKey] : '5.5';
+    const model = models.some(m => m.id === youtubeState[modelKey]) ? youtubeState[modelKey] : '5.6-sol';
     const efforts = chatgptEffortsFor(mode, model);
-    const effort = efforts.some(e => e.id === youtubeState[effortKey]) ? youtubeState[effortKey] : 'xhigh';
+    const effort = efforts.some(e => e.id === youtubeState[effortKey])
+      ? youtubeState[effortKey]
+      : defaultChatgptEffort(mode, model);
     replaceChatgptOptions(ytInputs.chatgpt_model, models, model);
     replaceChatgptOptions(ytInputs.chatgpt_effort, efforts, effort);
   }
@@ -420,6 +423,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       claude_adaptive_thinking: !!ytInputs.claude_adaptive_thinking.checked,
       // ChatGPT-side
       chatgpt_prompt:           String(ytInputs.chatgpt_prompt.value || ''),
+      chatgpt_show_in_text_field: !!ytInputs.chatgpt_show_in_text_field.checked,
       chatgpt_mode:             currentChatgptMode,
       [`chatgpt_${currentChatgptMode}_model`]: String(ytInputs.chatgpt_model.value || ''),
       [`chatgpt_${currentChatgptMode}_effort`]: String(ytInputs.chatgpt_effort.value || ''),
@@ -613,10 +617,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   ytInputs.claude_model.addEventListener('change', () => { persistYoutube(); });
   ytInputs.claude_adaptive_thinking.addEventListener('change', () => { persistYoutube(); });
   ytInputs.chatgpt_prompt.addEventListener('input', () => { persistYoutube({ syncNow: false }); });
+  ytInputs.chatgpt_show_in_text_field.addEventListener('change', () => { persistYoutube(); });
   ytInputs.chatgpt_model.addEventListener('change', () => {
     const previousState = youtubeState;
     const modelKey = `chatgpt_${currentChatgptMode}_model`;
-    youtubeState = sanitizeYoutubeSettings({ ...youtubeState, [modelKey]: String(ytInputs.chatgpt_model.value || '') });
+    const effortKey = `chatgpt_${currentChatgptMode}_effort`;
+    const model = String(ytInputs.chatgpt_model.value || '');
+    const availableEfforts = chatgptEffortsFor(currentChatgptMode, model);
+    const effort = availableEfforts.some(item => item.id === youtubeState[effortKey])
+      ? youtubeState[effortKey]
+      : defaultChatgptEffort(currentChatgptMode, model);
+    youtubeState = sanitizeYoutubeSettings({
+      ...youtubeState,
+      [modelKey]: model,
+      [effortKey]: effort,
+    });
     renderVisibleChatgptPair();
     persistYoutube({ previousState });
   });
@@ -672,6 +687,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     ytInputs.claude_model.value                 = y.claude_model;
     ytInputs.claude_adaptive_thinking.checked   = y.claude_adaptive_thinking;
     ytInputs.chatgpt_prompt.value               = y.chatgpt_prompt;
+    ytInputs.chatgpt_show_in_text_field.checked = y.chatgpt_show_in_text_field;
     applyChatgptMode(y.chatgpt_mode, { captureCurrent: false });
     applyTargetUi(y.target);
     applyExportTab(currentExportTab);

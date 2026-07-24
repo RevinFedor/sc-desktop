@@ -3,15 +3,20 @@ const YOUTUBE_MODELS = new Set([
   'Gemini 3.1 Pro Preview',
 ])
 const CLAUDE_MODELS = new Set(['Opus 4.7', 'Sonnet 4.6', 'Haiku 4.5'])
-const CHATGPT_MODELS = new Set(['5.6', '5.5', '5.4', '5.3', 'o3'])
-const CHATGPT_CHAT_MODELS = new Set(['5.6', '5.5', '5.4', '5.3', 'o3'])
-const CHATGPT_WORK_MODELS = new Set(['5.6', '5.5'])
+const CHATGPT_CHAT_MODELS = new Set(['5.5', '5.6-sol'])
+const CHATGPT_WORK_MODELS = new Set(['5.6-sol', '5.6-terra', '5.6-luna'])
+const CHATGPT_RETIRED_MODELS = new Set(['5.4', '5.3', '5.2', '4.5', 'o3'])
+const CHATGPT_KNOWN_MODELS = new Set([
+  ...CHATGPT_CHAT_MODELS,
+  ...CHATGPT_WORK_MODELS,
+  '5.6',
+  ...CHATGPT_RETIRED_MODELS,
+])
 const CHATGPT_EFFORTS = new Set([
   'low', 'xhigh', 'high', 'medium', 'instant', 'pro', 'pro-extended', 'max', 'ultra',
 ])
-const CHATGPT_CHAT_EFFORTS = new Set(['instant', 'medium', 'high', 'xhigh', 'pro', 'pro-extended'])
-const CHATGPT_CHAT_56_EFFORTS = new Set(['instant', 'medium', 'high', 'xhigh', 'pro'])
-const CHATGPT_WORK_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh'])
+const CHATGPT_CHAT_55_EFFORTS = new Set(['instant'])
+const CHATGPT_CHAT_56_EFFORTS = new Set(['medium', 'high', 'xhigh', 'pro'])
 const CHATGPT_WORK_56_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
 const EXTENSION_YOUTUBE_SCHEMA_VERSION = 1
 
@@ -31,12 +36,13 @@ const EXTENSION_YOUTUBE_DEFAULTS = Object.freeze({
   claude_adaptive_thinking: true,
   chatgpt_mode: 'chat',
   chatgpt_prompt: 'перескажи кратко',
-  chatgpt_chat_model: '5.5',
+  chatgpt_show_in_text_field: true,
+  chatgpt_chat_model: '5.6-sol',
   chatgpt_chat_effort: 'xhigh',
-  chatgpt_work_model: '5.5',
+  chatgpt_work_model: '5.6-sol',
   chatgpt_work_effort: 'xhigh',
   // Compatibility aliases. They always mirror the currently selected mode.
-  chatgpt_model: '5.5',
+  chatgpt_model: '5.6-sol',
   chatgpt_effort: 'xhigh',
 })
 
@@ -61,23 +67,43 @@ function chatgptModelsForMode(mode) {
 }
 
 function chatgptEffortsFor(mode, model) {
-  if (mode === 'work') return model === '5.6' ? CHATGPT_WORK_56_EFFORTS : CHATGPT_WORK_EFFORTS
-  return model === '5.6' ? CHATGPT_CHAT_56_EFFORTS : CHATGPT_CHAT_EFFORTS
+  if (mode === 'work') return CHATGPT_WORK_56_EFFORTS
+  return model === '5.5' ? CHATGPT_CHAT_55_EFFORTS : CHATGPT_CHAT_56_EFFORTS
+}
+
+function defaultChatgptEffort(mode, model) {
+  return mode === 'chat' && model === '5.5' ? 'instant' : 'xhigh'
+}
+
+function normalizeChatgptPair(mode, rawModel, rawEffort) {
+  let model = typeof rawModel === 'string' ? rawModel : '5.6-sol'
+  let effort = typeof rawEffort === 'string' ? rawEffort : ''
+
+  if (model === '5.6') model = '5.6-sol'
+  if (effort === 'pro-extended') effort = 'pro'
+  if (mode === 'work') {
+    if (model === '5.5' || CHATGPT_RETIRED_MODELS.has(model)) model = '5.6-sol'
+  } else {
+    if (CHATGPT_RETIRED_MODELS.has(model)) model = effort === 'instant' ? '5.5' : '5.6-sol'
+    if (model === '5.5' && effort && effort !== 'instant') model = '5.6-sol'
+  }
+
+  if (!chatgptModelsForMode(mode).has(model)) model = '5.6-sol'
+  if (!chatgptEffortsFor(mode, model).has(effort)) effort = defaultChatgptEffort(mode, model)
+  return { model, effort }
 }
 
 function sanitizeExtensionYoutube(raw = {}) {
   const input = isPlainObject(raw) ? raw : {}
   const mode = enumValue(input.chatgpt_mode, new Set(['chat', 'work']), 'chat')
   // The legacy flat pair predates Work and therefore migrates into Chat.
-  // Validate each stored pair against its own mode/model capability matrix:
-  // Chat and Work expose different models, while Max/Ultra exist only in
-  // Work on GPT-5.6.
-  const legacyModel = enumValue(input.chatgpt_model, CHATGPT_CHAT_MODELS, '5.5')
-  const chatModel = enumValue(input.chatgpt_chat_model, CHATGPT_CHAT_MODELS, legacyModel)
-  const legacyEffort = enumValue(input.chatgpt_effort, chatgptEffortsFor('chat', chatModel), 'xhigh')
-  const chatEffort = enumValue(input.chatgpt_chat_effort, chatgptEffortsFor('chat', chatModel), legacyEffort)
-  const workModel = enumValue(input.chatgpt_work_model, CHATGPT_WORK_MODELS, '5.5')
-  const workEffort = enumValue(input.chatgpt_work_effort, chatgptEffortsFor('work', workModel), 'xhigh')
+  const legacyPair = normalizeChatgptPair('chat', input.chatgpt_model, input.chatgpt_effort)
+  const chatPair = normalizeChatgptPair(
+    'chat',
+    input.chatgpt_chat_model ?? legacyPair.model,
+    input.chatgpt_chat_effort ?? legacyPair.effort,
+  )
+  const workPair = normalizeChatgptPair('work', input.chatgpt_work_model, input.chatgpt_work_effort)
   const result = {
     ...EXTENSION_YOUTUBE_DEFAULTS,
     auto_aistudio: booleanValue(input.auto_aistudio, false),
@@ -97,12 +123,13 @@ function sanitizeExtensionYoutube(raw = {}) {
     claude_adaptive_thinking: booleanValue(input.claude_adaptive_thinking, true),
     chatgpt_mode: mode,
     chatgpt_prompt: stringValue(input.chatgpt_prompt, 'перескажи кратко', 4000),
-    chatgpt_chat_model: chatModel,
-    chatgpt_chat_effort: chatEffort,
+    chatgpt_show_in_text_field: booleanValue(input.chatgpt_show_in_text_field, true),
+    chatgpt_chat_model: chatPair.model,
+    chatgpt_chat_effort: chatPair.effort,
     // The legacy flat pair belonged to ordinary Chat. Work did not exist yet,
     // so its first migration starts from explicit Work defaults.
-    chatgpt_work_model: workModel,
-    chatgpt_work_effort: workEffort,
+    chatgpt_work_model: workPair.model,
+    chatgpt_work_effort: workPair.effort,
   }
   result.chatgpt_model = mode === 'work' ? result.chatgpt_work_model : result.chatgpt_chat_model
   result.chatgpt_effort = mode === 'work' ? result.chatgpt_work_effort : result.chatgpt_chat_effort
@@ -147,11 +174,11 @@ const FORWARD_ENUM_VALUES = Object.freeze({
   post_model_title: new Set(['', ...YOUTUBE_MODELS]),
   claude_model: CLAUDE_MODELS,
   chatgpt_mode: new Set(['chat', 'work']),
-  chatgpt_model: CHATGPT_MODELS,
+  chatgpt_model: CHATGPT_KNOWN_MODELS,
   chatgpt_effort: CHATGPT_EFFORTS,
-  chatgpt_chat_model: CHATGPT_MODELS,
+  chatgpt_chat_model: CHATGPT_KNOWN_MODELS,
   chatgpt_chat_effort: CHATGPT_EFFORTS,
-  chatgpt_work_model: CHATGPT_MODELS,
+  chatgpt_work_model: CHATGPT_KNOWN_MODELS,
   chatgpt_work_effort: CHATGPT_EFFORTS,
 })
 

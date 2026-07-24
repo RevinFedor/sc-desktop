@@ -609,12 +609,15 @@ function providerTitle(job) {
   return modelTitle(job.modelId)
 }
 // Поле Model: research-perplexity показывает выбранную модель, chatgpt —
-// GPT-5.5 + уровень интеллекта (effort), claude — модель/effort из options
+// ChatGPT-модель + уровень интеллекта (effort), claude — модель/effort из options
 // («opus-4.8 · max · Research») либо «Claude · Research» если авто.
 function modelField(job) {
   if (job.kind === 'research') {
     if (job.provider === 'perplexity') return job.modelId === 'default' ? 'Gemini 3.1 Pro' : job.modelId
-    if (job.provider === 'chatgpt') return `GPT ${job.modelId || '5.5 · xhigh'}`
+    if (job.provider === 'chatgpt') {
+      const model = job.modelId || 'GPT-5.6 Sol · xhigh'
+      return /^GPT(?:-|\s)/.test(model) ? model : `GPT ${model}`
+    }
     if (job.provider === 'claude') return job.modelId && job.modelId !== 'Research' ? job.modelId : 'Claude · Research'
     return 'Claude'
   }

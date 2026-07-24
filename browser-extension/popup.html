@@ -410,6 +410,14 @@
     .field-row .ta-input {
       margin-top: 0;
     }
+    .field-pair {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 8px;
+    }
+    .field-pair .field-row {
+      min-width: 0;
+    }
     .field-note {
       color: var(--text-secondary);
       opacity: 0.75;
@@ -729,17 +737,26 @@
               <div class="field-row">
                 <textarea id="yt_chatgpt_prompt" class="ta-input prompt-textarea" rows="1" spellcheck="false" placeholder="Промпт для пересказа"></textarea>
               </div>
+              <div class="field-row with-switch">
+                <label title="После длинной вставки автоматически нажать «Показать в текстовом поле». Выключено — загрузить расшифровку отдельным .txt.">Показывать в текстовом поле</label>
+                <label class="switch">
+                  <input type="checkbox" id="yt_chatgpt_show_in_text_field">
+                  <span class="slider"></span>
+                </label>
+              </div>
             </div>
 
             <div class="field-group">
-              <div class="field-group-title">Модель</div>
-              <div class="field-row">
-                <label>Для пересказа</label>
-                <select id="yt_chatgpt_model" class="ta-input" style="min-height: auto; font-family: inherit; padding: 6px 8px;"></select>
-              </div>
-              <div class="field-row">
-                <label>Интеллект</label>
-                <select id="yt_chatgpt_effort" class="ta-input" style="min-height: auto; font-family: inherit; padding: 6px 8px;"></select>
+              <div class="field-group-title">Для пересказа</div>
+              <div class="field-pair">
+                <div class="field-row">
+                  <label>Модель</label>
+                  <select id="yt_chatgpt_model" class="ta-input" style="min-height: auto; font-family: inherit; padding: 6px 8px;"></select>
+                </div>
+                <div class="field-row">
+                  <label>Effort</label>
+                  <select id="yt_chatgpt_effort" class="ta-input" style="min-height: auto; font-family: inherit; padding: 6px 8px;"></select>
+                </div>
               </div>
             </div>
           </div>

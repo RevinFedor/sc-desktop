@@ -4,7 +4,9 @@
 //   • ?sc-research=<requestId> — MCP/research job: submit → watcher →
 //     extract answer/images/sources → POST /research-state.
 //   • ?sc-compose=<requestId> — одноразовый handoff для YouTube +AI:
-//     submit prompt и оставить обычный ChatGPT-чат без MCP-badge/sources.
+//     быстрый режим разворачивает Pasted text в composer; fallback загружает
+//     транскрипт как .txt и вводит prompt отдельно. Обычный ChatGPT-чат
+//     остаётся без MCP-badge/sources.
 //
 // requestId для research живёт в bridge'е (GET /research-job). requestId
 // для compose живёт в chrome.storage.local (__sc_chatgpt_compose_job_*).
@@ -16,7 +18,8 @@
 //      instant/medium/high/xhigh (default) — плоские пункты;
 //      pro/pro-extended — сначала radio «Pro», потом стандартный/расширенный
 //      в сабменю composer-intelligence-pro-thinking-effort-trigger.
-//      Модель выбирается перед effort: GPT-5.5 / 5.4 / 5.3 / 5.2 / 4.5 / o3.
+//      Модель выбирается перед effort: GPT-5.5 Instant или GPT-5.6 Sol;
+//      в Work также доступны GPT-5.6 Terra и Luna.
 //   3. Paste prompt (ClipboardEvent + DataTransfer — ProseMirror его принимает,
 //      как Lexical у Perplexity).
 //   4. Click [data-testid="send-button"].
@@ -167,16 +170,44 @@
     return null;
   }
 
+  function normalizeComposeDocument(value) {
+    if (!value || typeof value !== 'object') return null;
+    const text = typeof value.text === 'string' ? value.text : '';
+    if (!text.trim()) return null;
+    const rawName = typeof value.name === 'string' ? value.name.trim() : '';
+    const name = ((rawName || 'youtube-transcript.txt')
+      .replace(/[\u0000-\u001f<>:"/\\|?*]/g, '_')
+      .replace(/^[. ]+|[. ]+$/g, '')
+      .slice(0, 180)) || 'youtube-transcript.txt';
+    const mime = typeof value.mime === 'string' && value.mime.trim()
+      ? value.mime.trim()
+      : 'text/plain;charset=utf-8';
+    return { name, mime, text };
+  }
+
+  function normalizeComposeJobPayload(job, id = '') {
+    if (!job || typeof job !== 'object') {
+      throw new Error('compose_job_missing_or_empty: ' + id);
+    }
+    const prompt = typeof job.prompt === 'string' ? job.prompt.trim() : '';
+    const composeDocument = normalizeComposeDocument(job.document);
+    if (!prompt && !composeDocument) {
+      throw new Error('compose_job_missing_or_empty: ' + id);
+    }
+    return {
+      ...job,
+      prompt,
+      document: composeDocument,
+      showInTextField: job.showInTextField === true,
+    };
+  }
+
   async function fetchComposeJob(id) {
     const key = COMPOSE_JOB_PREFIX + id;
     const got = await new Promise(resolve => {
       chrome.storage.local.get(key, resolve);
     });
-    const job = got?.[key];
-    if (!job || typeof job.prompt !== 'string' || !job.prompt.trim()) {
-      throw new Error('compose_job_missing_or_empty: ' + id);
-    }
-    return job;
+    return normalizeComposeJobPayload(got?.[key], id);
   }
 
   async function removeComposeJob(id) {
@@ -1495,8 +1526,7 @@
   // Плоские уровни — menuitemradio прямо в меню композер-pill'а;
   // pro-уровни: верхнеуровневый radio «Pro» включает режим, а стандартный/
   // расширенный выбирается в сабменю. match покрывает RU («Очень высокий») и EN.
-  // xhigh — дефолт (юзер: «по умолчанию 5.5, режим очень высокий»;
-  // «Очень высокий» в вебе = xhigh из Codex CLI).
+  // xhigh — дефолт для reasoning-моделей; GPT-5.5 поддерживает только Instant.
   const EFFORTS = [
     { key: 'low',          match: /^(Low|Низкий)$/i,                     sub: false, aliases: ['low', 'низкий'] },
     { key: 'instant',      match: /^(Instant|Мгновенный)(?:\s*\d+(?:\.\d+)?)?$/i, sub: false, aliases: ['instant', 'мгновенный'] },
@@ -1528,15 +1558,12 @@
   // ChatGPT запоминает выбор per-аккаунт — поэтому модель ВСЕГДА верифицируем,
   // не «скип если дефолт»: прошлый job мог оставить другую модель.
   const MODELS = [
-    { key: '5.6', aliases: ['5.6', 'gpt-5.6', 'gpt5.6', 'gpt 5.6', 'gpt-5.6 sol'] },
-    { key: '5.5', aliases: ['5.5', 'gpt-5.5', 'gpt5.5', 'gpt 5.5'] },
-    { key: '5.4', aliases: ['5.4', 'gpt-5.4', 'gpt5.4'] },
-    { key: '5.3', aliases: ['5.3', 'gpt-5.3', 'gpt5.3'] },
-    { key: '5.2', aliases: ['5.2', 'gpt-5.2', 'gpt5.2'] },
-    { key: '4.5', aliases: ['4.5', 'gpt-4.5', 'gpt4.5'] },
-    { key: 'o3',  aliases: ['o3', 'gpt-o3'] },
+    { key: '5.6-terra', label: 'GPT-5.6 Terra', aliases: ['5.6-terra', 'gpt-5.6 terra', 'gpt-5.6-terra', 'terra'] },
+    { key: '5.6-luna',  label: 'GPT-5.6 Luna',  aliases: ['5.6-luna', 'gpt-5.6 luna', 'gpt-5.6-luna', 'luna'] },
+    { key: '5.6-sol',   label: 'GPT-5.6 Sol',   aliases: ['5.6-sol', 'gpt-5.6 sol', 'gpt-5.6-sol', 'sol', '5.6', 'gpt-5.6', 'gpt5.6', 'gpt 5.6'] },
+    { key: '5.5',       label: 'GPT-5.5 Instant', aliases: ['5.5', 'gpt-5.5', 'gpt5.5', 'gpt 5.5', 'gpt-5.5 instant'] },
   ];
-  const DEFAULT_MODEL = '5.5';
+  const DEFAULT_MODEL = '5.6-sol';
   function resolveModel(input) {
     if (!input) return DEFAULT_MODEL;
     const q = String(input).trim().toLowerCase();
@@ -1545,7 +1572,7 @@
              || MODELS.find(m => m.aliases.some(a => q.includes(a)));
     return hit ? hit.key : DEFAULT_MODEL;
   }
-  function modelDisplay(key) { return key === 'o3' ? 'o3' : 'GPT-' + key; }
+  function modelDisplay(key) { return MODELS.find(model => model.key === key)?.label || key; }
 
   // Composer-pill — триггер меню интеллекта. Класс __composer-pill +
   // aria-haspopup="menu"; текст = текущий уровень (короткий: Pro / High / …).
@@ -1556,7 +1583,7 @@
     return pills.find(b => (b.className || '').includes('__composer-pill'))
         || pills.find(b => {
              const t = nodeText(b);
-             return t.length < 30 && /^(Pro|Instant|Medium|High|Очень высокий|Very\s*high|Extra\s*high|Auto)/i.test(t);
+             return t.length < 30 && /^(Pro|Instant|Low|Medium|High|Max|Ultra|Очень высокий|Very\s*high|Extra\s*high|Auto)/i.test(t);
            });
   }
   function findEffortItem(eff) {
@@ -1591,17 +1618,18 @@
   function findProSubTrigger() {
     return visibleAll('[data-testid="composer-intelligence-pro-thinking-effort-trigger"]')[0] || null;
   }
-  // ChatGPT меняет полную подпись модели независимо от её идентификатора:
-  // «GPT-5.6 Sol», «GPT-5.4 Доступна до ...», старое короткое «5.5». Для
-  // выбора важен только токен версии; по отображаемому полному тексту и
-  // позиции в меню матчить нельзя.
+  // В Work три модели одного поколения, поэтому одного номера 5.6 уже
+  // недостаточно: Sol, Terra и Luna должны сохраняться как разные ключи.
   function modelKeyFromText(text) {
     const label = String(text || '').replace(/\s+/g, ' ').trim();
-    if (/^o3(?:\b|$)/i.test(label)) return 'o3';
+    const tier = label.match(/\b(Sol|Terra|Luna)\b/i)?.[1]?.toLowerCase() || null;
     const gpt = label.match(/(?:GPT|Model|Модель)[\s-]*(\d+(?:\.\d+)?)(?=\D|$)/i);
-    if (gpt) return gpt[1];
+    if (gpt?.[1] === '5.6') return `5.6-${tier || 'sol'}`;
+    if (gpt?.[1] === '5.5') return '5.5';
+    if (tier && /^(?:Sol|Terra|Luna)$/i.test(label)) return `5.6-${tier}`;
     const bare = label.match(/^(\d+(?:\.\d+)?)$/);
-    return bare ? bare[1] : null;
+    if (bare?.[1] === '5.6') return '5.6-sol';
+    return bare?.[1] === '5.5' ? '5.5' : null;
   }
   function modelMenuSnapshot() {
     return visibleAll('[role="menuitem"], [role="menuitemradio"]')
@@ -1752,10 +1780,8 @@
 
   async function ensureProDetailSelected(eff, attempt) {
     await openEffortMenu();
-    // GPT-5.6 Chat сейчас имеет единый Pro без подуровней. У 5.4/5.5 рядом
-    // появляется отдельная кнопка с Pro Стандартный / Pro Усиленный.
-    // Для generic `pro` отсутствие кнопки означает уже полностью выбранный
-    // уровень; `pro-extended` без кнопки остаётся недоступной комбинацией.
+    // GPT-5.6 Chat имеет единый Pro без подуровней. Поддержка старого
+    // pro-extended остаётся только для восстановления уже созданных jobs.
     if (!findProSubTrigger()) {
       const top = findProMainItem();
       return {
@@ -1854,6 +1880,114 @@
     ed.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }));
   }
 
+  function inlineControlText(el) {
+    return compactText([
+      nodeText(el),
+      el?.getAttribute?.('aria-label'),
+      el?.getAttribute?.('title'),
+      el?.getAttribute?.('data-testid'),
+    ].filter(Boolean).join(' '));
+  }
+
+  function isShowInTextFieldLabel(value) {
+    const text = compactText(value);
+    return /(?:показать|вставить|перенести).{0,32}(?:в текстовом поле|в поле ввода|как текст)/i.test(text)
+      || /(?:show|insert|move).{0,32}(?:in (?:the )?text field|in (?:the )?composer|as text|into (?:the )?input|into (?:the )?textarea)/i.test(text);
+  }
+
+  function findShowInTextFieldControl() {
+    return visibleAll('button, [role="button"], [role="menuitem"], [role="option"]')
+      .find(el => isShowInTextFieldLabel(inlineControlText(el))) || null;
+  }
+
+  function isPastedTextChipLabel(value) {
+    return /(?:pasted text|вставленн(?:ый|ого|ому|ым)? текст|вставка текста)/i.test(compactText(value));
+  }
+
+  function findPastedTextChip() {
+    const root = composerRoot();
+    const candidates = Array.from(root.querySelectorAll([
+      '[data-testid*="attachment"]',
+      '[data-testid*="file"]',
+      '[class*="attachment"]',
+      'button',
+      '[role="button"]',
+    ].join(','))).filter(isVisible);
+    return candidates.find(el => isPastedTextChipLabel(inlineControlText(el))) || null;
+  }
+
+  function composerContainsInlineText(expectedText) {
+    const ed = findComposer();
+    if (!ed) return false;
+    const expected = compactText(expectedText);
+    const actual = compactText(ed.innerText || ed.textContent);
+    if (!expected || !actual) return false;
+    if (expected.length <= 320) return actual.includes(expected);
+    const start = expected.slice(0, 180);
+    const end = expected.slice(-180);
+    return actual.includes(start)
+      && actual.includes(end)
+      && actual.length >= Math.min(1200, Math.floor(expected.length * 0.6));
+  }
+
+  async function showPastedTextInComposer(id, inlineText, timeoutMs = 45000) {
+    const t0 = performance.now();
+    let showClicked = false;
+    let chipOpened = false;
+    let lastState = '';
+
+    while (performance.now() - t0 < timeoutMs) {
+      const chip = findPastedTextChip();
+      if (composerContainsInlineText(inlineText) && !chip) {
+        const result = {
+          method: showClicked ? 'show_in_text_field' : 'direct_paste',
+          waitedMs: Math.round(performance.now() - t0),
+          chars: inlineText.length,
+        };
+        log('compose.inline_ready', result);
+        bridgeLog('gpt.compose.inline_ready', result, id, null);
+        return result;
+      }
+
+      const showControl = findShowInTextFieldControl();
+      const state = `${showControl ? 1 : 0}|${chip ? 1 : 0}|${showClicked ? 1 : 0}|${chipOpened ? 1 : 0}`;
+      if (state !== lastState) {
+        lastState = state;
+        const data = {
+          waitedMs: Math.round(performance.now() - t0),
+          showControl: !!showControl,
+          pastedTextChip: !!chip,
+          showClicked,
+          chipOpened,
+        };
+        log('compose.inline_wait', data);
+        bridgeLog('gpt.compose.inline_wait', data, id, null);
+      }
+
+      if (showControl && !showClicked) {
+        showClicked = true;
+        nativeMouseClick(showControl);
+        log('compose.inline_show_clicked', { waitedMs: Math.round(performance.now() - t0) });
+        bridgeLog('gpt.compose.inline_show_clicked', {
+          waitedMs: Math.round(performance.now() - t0),
+        }, id, null);
+      } else if (chip) {
+        nativeHover(chip);
+        if (!chipOpened && performance.now() - t0 > 2500) {
+          chipOpened = true;
+          nativeMouseClick(chip);
+          log('compose.inline_chip_opened', { waitedMs: Math.round(performance.now() - t0) });
+          bridgeLog('gpt.compose.inline_chip_opened', {
+            waitedMs: Math.round(performance.now() - t0),
+          }, id, null);
+        }
+      }
+      await sleep(250);
+    }
+
+    throw new Error('chatgpt_show_in_text_field_failed: control or inline text did not become ready');
+  }
+
   function isDisabled(el) {
     if (!el) return true;
     return !!el.disabled
@@ -1862,7 +1996,7 @@
       || el.closest('[aria-disabled="true"]');
   }
 
-  function composerBusySnapshot() {
+  function composerBusySnapshot(ignoredTexts = []) {
     const root = composerRoot();
     const ed = findComposer();
     const send = findSendBtn();
@@ -1880,7 +2014,15 @@
     ].join(',');
     const busyNodes = Array.from(root.querySelectorAll(busySelectors)).filter(isVisible);
     const rootText = compactText(root.textContent).slice(0, 500);
-    const busyText = /(?:uploading|loading|processing|attaching|загруз|обработ|прикреп|подождите|please wait)/i.test(rootText);
+    let statusText = rootText;
+    for (const value of ignoredTexts) {
+      const ignored = compactText(value);
+      if (!ignored) continue;
+      const visiblePart = ignored.slice(0, 500);
+      if (visiblePart.length >= 3) statusText = statusText.split(visiblePart).join(' ');
+      if (ignored.length <= 500) statusText = statusText.split(ignored).join(' ');
+    }
+    const busyText = /(?:uploading|loading|processing|attaching|загруз|обработ|прикреп|подождите|please wait)/i.test(statusText);
     const composerDisabled = isDisabled(ed)
       || ed?.getAttribute('contenteditable') === 'false'
       || ed?.getAttribute('aria-disabled') === 'true';
@@ -1897,7 +2039,7 @@
     };
   }
 
-  function waitComposerReadyAfterPaste(id, timeoutMs = 120000) {
+  function waitComposerReadyAfterPaste(id, timeoutMs = 120000, ignoredTexts = []) {
     const t0 = performance.now();
     return new Promise((resolve, reject) => {
       let done = false;
@@ -1906,7 +2048,7 @@
       let lastSig = '';
       const observer = new MutationObserver(scheduleCheck);
       const timer = setTimeout(() => {
-        const snap = composerBusySnapshot();
+        const snap = composerBusySnapshot(ignoredTexts);
         finish(null, new Error('chatgpt_composer_not_ready_after_paste: ' + JSON.stringify({
           sendVisible: snap.sendVisible,
           sendDisabled: snap.sendDisabled,
@@ -1955,7 +2097,7 @@
         verifyingReady = true;
         requestAnimationFrame(() => {
           verifyingReady = false;
-          const snap = composerBusySnapshot();
+          const snap = composerBusySnapshot(ignoredTexts);
           if (!snap.ready) {
             emitWaitLog(snap);
             return;
@@ -1967,7 +2109,7 @@
       }
       function checkNow() {
         if (done) return;
-        const snap = composerBusySnapshot();
+        const snap = composerBusySnapshot(ignoredTexts);
         if (snap.ready) verifyReadyNextFrame(snap);
         else emitWaitLog(snap);
       }
@@ -2037,44 +2179,88 @@
       type: data.mime || meta.mime || 'application/octet-stream',
     });
   }
+
+  function composeDocumentFile(composeDocument) {
+    return new File([composeDocument.text], composeDocument.name, {
+      type: composeDocument.mime,
+    });
+  }
+
+  function composerFilePreviewState(files) {
+    const root = composerRoot();
+    const names = files.map(file => file?.name).filter(Boolean);
+    const text = root.textContent || '';
+    const previewSelector = [
+      '[data-testid*="attachment"]:not(input)',
+      '[data-testid*="file"]:not(input)',
+      '[aria-label*="Удалить"]',
+      '[aria-label*="Remove"]',
+      '[aria-label*="preview" i]',
+    ].join(',');
+    return {
+      named: names.some(name => text.includes(name)),
+      candidateCount: root.querySelectorAll(previewSelector).length,
+      imageCount: files.some(file => String(file?.type || '').startsWith('image/'))
+        ? root.querySelectorAll('img').length
+        : 0,
+    };
+  }
+
+  function composerHasFilePreview(files, baseline) {
+    const current = composerFilePreviewState(files);
+    if (current.named) return true;
+    if (!baseline) return current.candidateCount > 0 || current.imageCount > 0;
+    return current.candidateCount > baseline.candidateCount
+      || current.imageCount > baseline.imageCount;
+  }
+
+  async function uploadFiles(id, files, options = {}) {
+    if (!files.length) return [];
+    const eventPrefix = options.eventPrefix || 'attachments';
+    const previewBaseline = composerFilePreviewState(files);
+    const input = await waitFor(() => findUploadInputFor(files[0]), 'upload file input', 15000, 250);
+    const dt = new DataTransfer();
+    for (const file of files) dt.items.add(file);
+    input.files = dt.files;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    log(eventPrefix + '.change_dispatched', { count: files.length, names: files.map(file => file.name) });
+    bridgeLog('gpt.' + eventPrefix + '.change_dispatched', {
+      count: files.length,
+      names: files.map(file => file.name),
+    }, id, null);
+
+    const ok = await (async () => {
+      const t0 = performance.now();
+      while (performance.now() - t0 < 60000) {
+        if (composerHasFilePreview(files, previewBaseline)) return true;
+        await sleep(500);
+      }
+      return false;
+    })();
+    log(eventPrefix + '.preview_wait_done', { ok, count: files.length });
+    bridgeLog('gpt.' + eventPrefix + '.preview_wait_done', { ok, count: files.length }, id, null);
+    if (!ok && options.requirePreview) {
+      throw new Error('chatgpt_attachment_preview_missing: ' + files.map(file => file.name).join(', '));
+    }
+    return {
+      files,
+      hasPreview: () => composerHasFilePreview(files, previewBaseline),
+    };
+  }
+
   async function uploadAttachments(id, metas) {
     const list = Array.isArray(metas) ? metas : [];
     if (!list.length) return [];
     const files = [];
     for (const meta of list) files.push(await fetchAttachmentFile(id, meta));
-    const input = await waitFor(() => findUploadInputFor(files[0]), 'upload file input', 15000, 250);
-    const dt = new DataTransfer();
-    for (const f of files) dt.items.add(f);
-    input.files = dt.files;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    log('attachments.change_dispatched', { count: files.length, names: files.map(f => f.name) });
-    bridgeLog('gpt.attachments.change_dispatched', { count: files.length, names: files.map(f => f.name) }, id, null);
-
-    // ChatGPT рендерит attachment-preview внутри composer form. Точные
-    // testid менялись; для image-flow достаточно дождаться любого локального
-    // preview/img или имени файла. Если селектор снова поменяется, не зависаем:
-    // через 60с продолжаем, clickSend сам проверит принятие prompt'а.
-    const names = files.map(f => f.name).filter(Boolean);
-    const ok = await (async () => {
-      const t0 = performance.now();
-      while (performance.now() - t0 < 60000) {
-        const root = composerRoot();
-        const txt = root.textContent || '';
-        if (names.some(n => txt.includes(n))) return true;
-        if (root.querySelector('img, [data-testid*="attachment"], [data-testid*="file"], [aria-label*="Удалить"], [aria-label*="Remove"], [aria-label*="preview" i]')) return true;
-        await sleep(500);
-      }
-      return false;
-    })();
-    log('attachments.preview_wait_done', { ok, count: files.length });
-    bridgeLog('gpt.attachments.preview_wait_done', { ok, count: files.length }, id, null);
+    await uploadFiles(id, files);
     return files;
   }
 
   async function clickSend() {
-    // Send-button рендерится только когда композер непустой (вместо него в
-    // idle — кнопка голосового режима). Появление = paste принят.
+    // Send-button рендерится только когда composer содержит текст или файл
+    // (в idle вместо него кнопка голосового режима).
     const btn = await waitEnabledSendButton();
     btn.click();
     if (await waitSubmitAccepted()) return;
@@ -2644,6 +2830,13 @@
       const mode = resolveChatgptMode(job.mode);
       const effortKey = resolveEffort(job.effort);
       const modelKey = resolveModel(job.model);
+      log('compose.payload', {
+        id,
+        promptLen: job.prompt.length,
+        documentName: job.document?.name || null,
+        documentChars: job.document?.text.length || 0,
+        showInTextField: job.showInTextField,
+      });
 
       // Background уже принял terminal result, но не смог доставить его в
       // YouTube (например, SW перезапустился между сообщениями). После F5
@@ -2678,8 +2871,38 @@
       if (!okModel) throw new Error(`chatgpt_model_select_failed: не удалось выбрать модель ${modelDisplay(modelKey)}`);
       const okEffort = await ensureEffortSelected(effortKey);
       if (!okEffort) throw new Error(`chatgpt_effort_select_failed: не удалось выбрать интеллект ${effortLabel(effortKey)}`);
-      pasteIntoComposer(job.prompt);
-      await waitComposerReadyAfterPaste(id);
+
+      let uploadedDocument = null;
+      let documentUpload = null;
+      let inlineText = null;
+      let delivery = 'prompt_only';
+      if (job.document && job.showInTextField) {
+        if (typeof buildYoutubeChatgptInlineText !== 'function') {
+          throw new Error('chatgpt_inline_builder_missing');
+        }
+        inlineText = buildYoutubeChatgptInlineText(job.prompt, job.document.text);
+        pasteIntoComposer(inlineText);
+        await showPastedTextInComposer(id, inlineText);
+        delivery = 'inline';
+      } else if (job.document) {
+        uploadedDocument = composeDocumentFile(job.document);
+        documentUpload = await uploadFiles(id, [uploadedDocument], {
+          eventPrefix: 'compose.document',
+          requirePreview: true,
+        });
+        await sleep(800);
+        if (job.prompt) pasteIntoComposer(job.prompt);
+        delivery = 'file';
+      } else if (job.prompt) {
+        pasteIntoComposer(job.prompt);
+      }
+      await waitComposerReadyAfterPaste(id, 120000, [
+        inlineText || job.prompt,
+        uploadedDocument?.name || '',
+      ]);
+      if (uploadedDocument && !documentUpload?.hasPreview()) {
+        throw new Error('chatgpt_attachment_disappeared_before_submit: ' + uploadedDocument.name);
+      }
       await clickSend();
       submitted = true;
       job = await updateComposeJob(id, {
@@ -2694,6 +2917,8 @@
         model: modelKey,
         effort: effortKey,
         promptLen: job.prompt.length,
+        documentChars: job.document?.text.length || 0,
+        delivery,
       });
       const acknowledged = await reportComposeResult(id, job, {
         ok: true,
@@ -2769,9 +2994,9 @@
       return;
     }
 
-    // options.model и options.effort — разные оси: модель (5.5/5.4/…/o3) и
-    // уровень интеллекта. Раньше effort фолбэчился на options.model — теперь
-    // model занят настоящей моделью, фолбэк убран.
+    // options.model и options.effort — разные оси: tier модели и уровень
+    // рассуждения. Раньше effort фолбэчился на options.model — теперь model
+    // занят настоящей моделью, фолбэк убран.
     const mode = resolveChatgptMode(job.options?.mode);
     const effortKey = resolveEffort(job.options?.effort);
     const modelKey = resolveModel(job.options?.model);
@@ -2829,14 +3054,18 @@
           await failConfiguration(`chatgpt_effort_select_failed: не удалось выбрать интеллект ${effortLabel(effortKey)} (запрос не отправлен с другим sticky-уровнем)`);
           return;
         }
+        let uploadedAttachmentFiles = [];
         if (attachmentMetas.length) {
           await postState(id, { stage: 'uploading' });
-          await uploadAttachments(id, attachmentMetas);
+          uploadedAttachmentFiles = await uploadAttachments(id, attachmentMetas);
           await sleep(800);
         }
         await postState(id, { stage: 'submitting' });
         pasteIntoComposer(job.prompt);
-        await waitComposerReadyAfterPaste(id);
+        await waitComposerReadyAfterPaste(id, 120000, [
+          job.prompt,
+          ...uploadedAttachmentFiles.map(file => file.name),
+        ]);
         await clickSend();
         await postState(id, { stage: 'running' });
       } else {

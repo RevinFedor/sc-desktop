@@ -79,7 +79,7 @@ function persistResearchJob(snap) {
     db()?.upsertResearchJob({
       jobId: snap.id, kind: 'research', provider: snap.provider,
       modelId: snap.provider === 'chatgpt'
-        ? `${snap.options?.model || '5.5'} · ${snap.options?.effort || 'xhigh'}`
+        ? researchState.chatgptModelLabel(snap.options)
         : snap.provider === 'claude'
           ? researchState.claudeModelLabel(snap.options)
           : (snap.options?.model || (snap.provider === 'perplexity' ? 'default' : null)),

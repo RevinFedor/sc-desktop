@@ -1214,8 +1214,9 @@
               claudeAdaptiveThinking: settings.claude_adaptive_thinking !== false,
               // ChatGPT-side
               chatgptPrompt: settings.chatgpt_prompt || '',
+              chatgptShowInTextField: settings.chatgpt_show_in_text_field !== false,
               chatgptMode: settings.chatgpt_mode || 'chat',
-              chatgptModel: settings.chatgpt_model || '5.5',
+              chatgptModel: settings.chatgpt_model || '5.6-sol',
               chatgptEffort: settings.chatgpt_effort || 'xhigh',
             },
           }, (resp) => {
