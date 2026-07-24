@@ -135,9 +135,11 @@ API-session сохраняет device/app UUID и Android ID между worker-�
 private API-запросов старая сессия была отозвана сервером, но точную server-side
 причину текущие логи не установили.
 
-## 🎬 Одиночный reel из paste-flow
+## 🎬 Одиночный Reel/Post
 
-Inline-форма для `https://www.instagram.com/reel/<shortcode>/...` больше не должна показывать CLI-заглушку. Поток такой:
+Desktop inline-форма для `https://www.instagram.com/reel/<shortcode>/...` и
+внешний SC Desk mobile API используют один single-item service, а не отдельные
+Instagram реализации. Поток такой:
 
 1. Сначала `ig:lookupReel` ищет уже готовый текст: `items.external_id = 'reel:<shortcode>'` для source-attached reels, затем sourceless `ig_batch_transcribe` jobs по `parameters_json.shortcodes` + `file_path`. Cache-hit сразу показывает «Уже есть транскрипт» и копирует combined-файл без нового network/AI job.
 2. Если shortcode привязан к source с числовым owner, Android API использует
@@ -147,11 +149,16 @@ Inline-форма для `https://www.instagram.com/reel/<shortcode>/...` бол
    фиктивный профиль/items и требует валидную API-session.
 4. Если пользователь явно выбрал Apify, форма проверяет его token и запускает
    только Apify. Невалидная Android session не является разрешением потратить
-   деньги через автоматический fallback.
+   деньги через автоматический fallback. Обратное тоже обязательно: при
+   выбранном Android API отсутствие нерелевантного Apify token не блокирует
+   запуск и не должно участвовать в preflight.
 
-Тот же service вызывается Telegram-ботом, поэтому cache/backend/error contract
-не расходится между paste-flow и сообщением. Формат и lifecycle бота описаны в
-`fact-telegram-bot.md`.
+Mobile API дополнительно принимает direct `/p/<shortcode>` и сохраняет
+`mediaKind=post`. Video/audio Post проходит тот же resolve/download/transcribe
+pipeline; image-only Post завершается явной ошибкой отсутствия
+транскрибируемого media и не превращается автоматически в vision/OCR flow.
+SC Desk не добавляет profile timeline или batch-посты: одна ссылка остаётся
+одним import. Внешний REST/SSE lifecycle — `fact-sc-desk.md`.
 
 ---
 

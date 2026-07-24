@@ -68,11 +68,13 @@ yt-dlp на flat-playlist по умолчанию возвращает `timestam
 
 ```
 Stage 1: yt_single_ndjson.py <url> --out-dir ...
-   → emit: video, subs_racing, subs_found | subs_missing, saved (если subs), done
+   → emit: metadata_start, video, subs_racing, subs_found | subs_missing,
+           save_start, saved (если subs), done
    → если subs не нашлись: status='awaiting_ai', child exited cleanly
 
 Stage 2 (опционально): тот же скрипт + --ai --engine gemini|assemblyai
-   → emit: transcribe_start, transcribe_done, saved, done
+   → emit: audio_download_start, audio_download_done,
+           transcribe_start, transcribe_done, save_start, saved, done
 ```
 
 Stage 1 начинается с `fetch_meta()` — yt-dlp metadata pull. Он **изредка
@@ -85,6 +87,14 @@ nsig-прогрев) и раньше дед-эндил весь клик без�
 - Stage 1 эфемерен (1-3 сек). Если subs нашлись — задача закрыта, никакого AI и оплаты.
 - Если subs нет — `awaiting_ai` это **состояние без alive child**: процесс exited 0, мы ждём решения юзера. Можно сидеть в этом состоянии хоть час, никто не висит. Cancel = просто `status='cancelled'` без kill (см. `cancelJob` в job-runner).
 - Resumable через тот же jobId — Activity Recent видит **одну** строку, а не две.
+
+SC Desk mobile API проецирует тот же job в одну внешнюю history-row. До
+`awaiting_ai` видны `fetching_metadata → searching_subtitles →
+saving_subtitles`; после явного Resume AI та же запись расширяется до
+`downloading_audio → preparing_audio → transcribing → saving`. Каждая смена
+пользовательской стадии обязана сразу вызвать `emit(job)`, иначе iPhone
+застынет на прежнем шаге при реально работающем worker. Внешний REST/SSE
+contract и restart recovery — `fact-sc-desk.md`.
 
 ### Single-paste = source + items (architectural shift)
 

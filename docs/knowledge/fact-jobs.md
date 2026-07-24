@@ -197,6 +197,11 @@ JobDetail → ожидает читаемый текст, а не сериали
 (не только на close), это поле **должно** быть добавлено и в `snapshot()`.
 Без этого renderer видит прогресс только после round-trip через DB-restore
 при следующей mount — то есть «оно появляется только если уйти и вернуться».
+Но присутствия поля в snapshot недостаточно: если изменение обозначает новую
+пользовательскую стадию, сразу после mutation нужен `emit(job)`. Иначе следующий
+snapshot технически был бы правильным, но ни renderer, ни mobile SSE не получат
+его до случайного позднего события. Симптом тот же: worker работает, а step-row
+замёрзла на старой стадии и прыгает прямо в terminal status.
 
 **Симптом до фикса.** Юзер запустил `tg_fetch mode='single' --include-comments`.
 В step-row UI «Получаем комментарии» вечно `pending` (или `running` без счётчика),
@@ -205,12 +210,14 @@ JobDetail → ожидает читаемый текст, а не сериали
 `has_discussion`, и `onJobUpdate`-events приходили в renderer без этих полей.
 
 **Чек-лист при добавлении поля в job:**
-1. Добавил `job.foo = …` в backend? Найди `function snapshot(j)` и допиши
+1. Стадия/счётчик изменились и это должен увидеть пользователь сейчас? Вызови
+   `emit(job)` на этой event-boundary, не только на `saved`/`close`.
+2. Добавил `job.foo = …` в backend? Найди `function snapshot(j)` и допиши
    `foo: j.foo || null`.
-2. Поле должно пережить рестарт? Добавь и в `params` snapshotting на close
+3. Поле должно пережить рестарт? Добавь и в `params` snapshotting на close
    (`job.params = { ..., foo: job.foo }`) — иначе после рестарта DB-restore
    восстановит null. См. `Persistence-only поля` ниже.
-3. Поле читается из `params` при historic-snapshot? Допиши `rowToTgSingleSnapshot`
+4. Поле читается из `params` при historic-snapshot? Допиши `rowToTgSingleSnapshot`
    (или соответствующий `rowToXxxSnapshot`) маппинг `p?.foo → snapshot.foo`.
 
 Подробнее общий принцип — `methodology/переносимый-дизайн.md::Live snapshot должен
@@ -618,6 +625,14 @@ Job имеет **два** integer-id, идущих из независимых �
 
 Они **не совпадают**. На `nextId=1` SQLite уже мог быть на `last_id=403` —
 in-memory id=1 ≠ DB row id=403 для одного и того же job'а.
+
+SC Desk mobile-history добавляет долговечный UUID import, но связанный `jobId`
+остаётся именно `j.id` текущего процесса. Его нельзя восстанавливать с диска:
+после restart новый unrelated job снова получит `1`, и старая mobile-запись
+начнёт присваивать его snapshots. При загрузке `mobile-imports.json` jobId
+всегда очищается; готовность восстанавливается по существующему result-file или
+YouTube cache, активная незавершённая запись становится `interrupted`. См.
+`fact-sc-desk.md::Рестарт`.
 
 **Симптом расхождения.** Кнопка Stop в Activity (передаёт `j.id` =
 in-memory) работала, ровно та же Stop в SourceDetail History (передаёт

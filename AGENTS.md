@@ -37,7 +37,7 @@
 
 # SC Desktop — Electron GUI с локальными Python workers
 
-Electron + React + better-sqlite3 — desktop-приложение для парсинга/транскрипции медиа из Telegram, YouTube, Instagram, TikTok. Python-часть, нужная desktop'у, живёт в локальном `python-workers/`; внешний `cli-tools` / `SaliTools` больше не является runtime-зависимостью.
+Electron + React + better-sqlite3 — desktop-приложение для парсинга/транскрипции медиа из Telegram, YouTube, Instagram, TikTok. Python-часть, нужная desktop'у, живёт в локальном `python-workers/`; внешний `cli-tools` / `SaliTools` больше не является runtime-зависимостью. Нативный iOS SC Desk использует тот же job engine через authenticated mobile API, а не отдельного бота/pipeline.
 
 <instructions>
 - **НЕ обновляй документацию без ЯВНОГО приказа пользователя.** Файлы `docs/knowledge/`, `docs/methodology/`, `fact-*`, `fix-*` — не создавать и не редактировать, пока пользователь прямо не попросил («обнови доки» и т.п.). Закончил фичу/фикс → остановись, не пиши доки «заодно» / «по итогам» / на каждой итерации. Причина: пользователь сначала сам проверяет код; документация по непроверенной итерации = мусор, который придётся откатывать. Это отдельный явный шаг. (Правило «новые UX-правила писать прямо в `переносимый-дизайн.md`» ниже относится к тому, КУДА писать, когда уже получен приказ — а не к тому, что писать можно без приказа.)
@@ -78,7 +78,7 @@ E2E-тесты — глобальный skill `electron-e2e-testing` (`~/.claude
 
 **Что отсутствует и считаем «не написано»:** если в `python-workers/` нет реализации нужного backend'а, пишем её прямо там через нормальные API/requests, не пытаемся опираться на CLI-only функции из старых папок.
 
-## Три process-границы
+## Process-границы и внешний mobile-вход
 ```
 ┌─────────────────────────────┐
 │ Electron Main (Node)        │  job-runner.js, logger.js, IPC handlers
@@ -102,6 +102,12 @@ spawn ──▶│ Python subprocess         │  ~/Desktop/sc-desktop/python-wo
          └───────────────────────────┘
 ```
 
+Четвёртая граница не идёт через renderer: iPhone → `https://sc.f9922.tech` → nginx на VPS →
+reverse SSH tunnel → `127.0.0.1:7898` → `electron/mobile-api-server.js` в Electron main.
+Mobile API только проецирует обычные Instagram/YouTube jobs в REST/SSE и отдельную
+`mobile-imports.json` history; источником обработки остаётся job-runner. Listener не открывать
+в LAN, токен не логировать. Полный контракт — `docs/knowledge/fact-sc-desk.md`.
+
 ## Документация
 Вся документация в `docs/knowledge/` — единая плоская структура (`fact-*` факты, `fix-*` шрамы). Семантический поиск через `docs_search` MCP — выбирает релевантные файлы по симптомам, не по названиям. Каталога ссылок здесь нет.
 
@@ -114,6 +120,7 @@ Python worker runtime — см. `docs/knowledge/fact-python-воркеры.md`.
 - ❌ **Не делать HTTP-sidecar на Python.** Каждый job — отдельный subprocess, чище для cancel/exit/error tracking.
 - ❌ **Не emit'ить per-item events** в `job:update` без throttle. Контракт сейчас — throttled emit раз в 250 мс на job + всегда на page-границе. Без throttle: 5000 IPC frames на больших чатах = scroll-storm. Только on-page (как было раньше): между двумя page-boundaries Activity замёрзает на 10-20 сек, юзер думает «job повис». См. `fact-ipc.md::Per-item events: throttle, не silence`.
 - ❌ **Не хранить items в job-snapshot** после `close`. Они flush'атся в JSON и `delete` из памяти. Иначе утечка при больших чатах.
+- ❌ **Не сохранять process-local `jobId` как identity mobile import после рестарта.** Новый Electron-процесс снова начинает счётчик с 1, и старая запись подхватит snapshots чужого job. При чтении mobile-history id всегда очищается; durable identity — UUID import / `clientRequestId`. См. `fact-sc-desk.md::Рестарт`.
 - ❌ **Не использовать `console.log('msg')`** без `[Tag]`. Лог не попадёт в файл, останется только в stdout.
 - ❌ **Не ждать что Vite hmr подхватит правки в `electron/main.js`/`preload.js`.** Hmr только для renderer. Любая правка в main process требует **полного kill всех Electron-процессов + npm run dev заново**. Иначе видишь старый код, IPC-handler «No handler registered for X» и подобное.
 - ❌ **Не забыть `npm run rebuild` при смене Electron версии.** `better-sqlite3` (и любой native module) собирается под конкретный ABI. Симптом: `NODE_MODULE_VERSION 132 vs 141` в логе. См. `fact-database.md`.
