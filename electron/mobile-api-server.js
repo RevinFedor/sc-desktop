@@ -173,6 +173,7 @@ function reconcilePersistedRequest(item) {
     item.status = 'done'
     item.stage = 'done'
     item.progress = 1
+    item.errorCode = null
     item.error = null
     if (Number.isFinite(item.stepTotal)) item.stepIndex = item.stepTotal
     return 'restored'
@@ -180,8 +181,24 @@ function reconcilePersistedRequest(item) {
   if (item?.status === 'queued' || item?.status === 'running' || item?.status === 'awaiting_ai') {
     item.status = 'error'
     item.stage = 'interrupted'
+    item.errorCode = 'interrupted'
     item.error = 'SC Desktop был перезапущен во время обработки. Запустите ссылку ещё раз.'
     return 'interrupted'
+  }
+  // One-time normalization for records written before `audio_no_text`
+  // existed. The old parser exposed its missing `content.parts` KeyError as
+  // the literal "'parts'"; this exact terminal signature occurred only after
+  // Instagram audio had already been downloaded and submitted to Gemini.
+  if (
+    item?.platform === 'instagram'
+    && item?.status === 'error'
+    && item?.error === "transcribe failed: 'parts'"
+    && Number(item?.stepIndex) >= 5
+  ) {
+    item.stage = 'audio_no_text'
+    item.errorCode = 'audio_no_text'
+    item.error = 'Аудиодорожка есть, но распознанного текста нет.'
+    return 'normalized'
   }
   return 'unchanged'
 }
@@ -274,11 +291,22 @@ function publicRequest(item) {
     engine: item.engine || null,
     stepIndex: Number.isFinite(item.stepIndex) ? item.stepIndex : null,
     stepTotal: Number.isFinite(item.stepTotal) ? item.stepTotal : null,
+    errorCode: item.errorCode || null,
     error: item.error || null,
     resultReady: item.status === 'done' && !!item.resultFile,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
   }
+}
+
+function applyImportFailure(item, result = {}) {
+  const code = String(result.code || '').trim() || null
+  item.status = 'error'
+  item.stage = code === 'audio_no_text' ? 'audio_no_text' : 'error'
+  item.errorCode = code
+  item.error = result.error || 'Не удалось обработать ссылку'
+  item.jobId = null
+  return item
 }
 
 function readJson(req) {
@@ -379,6 +407,7 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
       engine: null,
       stepIndex: 1,
       stepTotal: classified.platform === 'instagram' ? 7 : 3,
+      errorCode: null,
       error: null,
       resultFile: null,
       jobId: null,
@@ -396,6 +425,7 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
     if (!filePath || !fs.existsSync(filePath)) {
       item.status = 'error'
       item.stage = 'error'
+      item.errorCode = 'result_file_missing'
       item.error = 'Транскрипт завершён, но файл результата не найден'
     } else {
       item.status = 'done'
@@ -404,6 +434,7 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
       item.stepIndex = item.stepTotal || 1
       item.resultFile = filePath
       item.title = title || item.title
+      item.errorCode = null
       item.error = null
     }
     emit(item)
@@ -461,17 +492,17 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
       if (result?.ok && result?.file_path) {
         finishWithFile(item, result.file_path, result.title)
       } else {
-        item.status = 'error'
-        item.stage = 'error'
-        item.error = result?.error || 'Не удалось обработать Instagram-ссылку'
-        item.jobId = null
+        applyImportFailure(item, {
+          code: result?.code,
+          error: result?.error || 'Не удалось обработать Instagram-ссылку',
+        })
         emit(item)
       }
     } catch (err) {
-      item.status = 'error'
-      item.stage = 'error'
-      item.error = String(err?.message || err)
-      item.jobId = null
+      applyImportFailure(item, {
+        code: 'internal_error',
+        error: String(err?.message || err),
+      })
       emit(item)
     }
   }
@@ -676,6 +707,7 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
 }
 
 module.exports = {
+  applyImportFailure,
   HOST,
   PORT,
   TOKEN_PATH,
@@ -684,6 +716,7 @@ module.exports = {
   firstHttpUrl,
   instagramPathParts,
   isInstagramHost,
+  publicRequest,
   reconcilePersistedRequest,
   resolveInstagramShareUrl,
   startMobileApiServer,

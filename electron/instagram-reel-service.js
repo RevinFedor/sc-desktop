@@ -287,7 +287,7 @@ async function processInstagramSingleReel({ db, jobRunner, readScSettings, url, 
 
   return {
     ok: false,
-    code: snap?.status || 'job_failed',
+    code: snap?.error_code || snap?.status || 'job_failed',
     error: snap?.error || `Instagram job finished without transcript file (${snap?.status || 'unknown'})`,
     shortcode: plan.shortcode,
     job: snap,

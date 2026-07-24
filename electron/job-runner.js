@@ -2775,6 +2775,7 @@ function rowToHistoricSnapshot(row) {
     items_done:   row.items_done || 0,
     items_total:  row.items_total != null ? row.items_total : null,
     error:        row.error || null,
+    error_code:   params?._error_code || null,
     // Empty-result diagnostic stuffed into params on close — recover it so the
     // historic JobDetail still explains a 0-item fetch after Electron restart.
     warning:      params?._warning || null,
@@ -6109,6 +6110,7 @@ function startInstagramBatchTranscribe(params) {
       if (code !== 0) job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
     }
     job.finished_at = Math.floor(Date.now() / 1000)
+    if (job.error_code) job.params._error_code = job.error_code
 
     // Combined transcript sidecar — automatic for Instagram because every
     // saved reel is a paid AI transcript (no free subs path), so a job-
@@ -6248,10 +6250,20 @@ function handleInstagramBatchEvent(job, evt) {
       break
     case 'item_error':
       b.errors += 1
-      job.error = job.error || evt.message || 'Instagram item failed'
+      b.cost_usd += evt.cost_usd || 0
+      if (!job.error) {
+        job.error = evt.message || 'Instagram item failed'
+        job.error_code = evt.code || null
+      }
       job.items_done = (b.saved + b.skipped + b.errors)
-      b.log.push({ video_id: evt.video_id, kind: 'error', message: evt.message })
-      console.warn(`[Jobs] ig_batch item_error #${job.id} video=${evt.video_id || '-'} message=${String(evt.message || '-').replace(/\s+/g, ' ').slice(0, 600)}`)
+      b.log.push({
+        video_id: evt.video_id,
+        kind: 'error',
+        code: evt.code || null,
+        message: evt.message,
+        cost_usd: evt.cost_usd || 0,
+      })
+      console.warn(`[Jobs] ig_batch item_error #${job.id} video=${evt.video_id || '-'} code=${evt.code || '-'} message=${String(evt.message || '-').replace(/\s+/g, ' ').slice(0, 600)}`)
       emit(job)
       break
     case 'done':

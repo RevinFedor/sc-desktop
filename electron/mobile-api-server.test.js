@@ -2,10 +2,12 @@ const assert = require('node:assert/strict')
 const test = require('node:test')
 
 const {
+  applyImportFailure,
   classifyUrl,
   firstHttpUrl,
   instagramPathParts,
   isInstagramHost,
+  publicRequest,
   reconcilePersistedRequest,
   resolveInstagramShareUrl,
   youtubeCacheTitle,
@@ -129,6 +131,56 @@ test('marks only unfinished imports without a result as interrupted', () => {
   assert.equal(reconcilePersistedRequest(item), 'interrupted')
   assert.equal(item.status, 'error')
   assert.equal(item.stage, 'interrupted')
+  assert.equal(item.errorCode, 'interrupted')
+  assert.equal(item.jobId, null)
+})
+
+test('normalizes the legacy missing-parts Instagram failure', () => {
+  const item = {
+    platform: 'instagram',
+    status: 'error',
+    stage: 'error',
+    stepIndex: 5,
+    error: "transcribe failed: 'parts'",
+    jobId: null,
+  }
+
+  assert.equal(reconcilePersistedRequest(item), 'normalized')
+  assert.equal(item.status, 'error')
+  assert.equal(item.stage, 'audio_no_text')
+  assert.equal(item.errorCode, 'audio_no_text')
+  assert.equal(item.error, 'Аудиодорожка есть, но распознанного текста нет.')
+})
+
+test('exposes audio-without-text as a stable mobile terminal outcome', () => {
+  const item = {
+    id: 'import-1',
+    clientRequestId: 'request-1',
+    platform: 'instagram',
+    url: 'https://www.instagram.com/reel/NoSpeech123/',
+    externalId: 'NoSpeech123',
+    mediaKind: 'reel',
+    status: 'running',
+    stage: 'transcribing',
+    progress: 4 / 6,
+    stepIndex: 5,
+    stepTotal: 7,
+    createdAt: '2026-07-24T18:53:56.082Z',
+    updatedAt: '2026-07-24T18:53:59.118Z',
+    jobId: 12,
+  }
+
+  applyImportFailure(item, {
+    code: 'audio_no_text',
+    error: 'Аудиодорожка есть, но распознанного текста нет.',
+  })
+  const result = publicRequest(item)
+
+  assert.equal(result.status, 'error')
+  assert.equal(result.stage, 'audio_no_text')
+  assert.equal(result.errorCode, 'audio_no_text')
+  assert.equal(result.error, 'Аудиодорожка есть, но распознанного текста нет.')
+  assert.equal(result.resultReady, false)
   assert.equal(item.jobId, null)
 })
 

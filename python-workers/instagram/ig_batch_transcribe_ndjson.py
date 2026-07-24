@@ -65,6 +65,8 @@ import settings as cfg
 
 APIFY_BASE      = "https://api.apify.com/v2"
 APIFY_AUDIO_ACT = "apple_yang~instagram-transcripts-scraper"
+AUDIO_NO_TEXT_CODE = "audio_no_text"
+AUDIO_NO_TEXT_MESSAGE = "Аудиодорожка есть, но распознанного текста нет."
 
 
 def emit(ev):
@@ -308,6 +310,29 @@ def _download_and_convert(audio_url, mp3_path):
     return True, None
 
 
+def _transcription_failure(text, error, empty_text_error, cost_usd=0.0):
+    """Return a stable worker error payload after media was prepared.
+
+    A successful audio conversion followed by an empty model response is a
+    valid media outcome, not a JSON parser crash. Keep the human message and
+    machine code separate so Electron/iOS never need to match strings.
+    """
+    payload = {
+        "cost_usd": round(float(cost_usd or 0), 6),
+    }
+    if not text and (not error or error == empty_text_error):
+        payload.update({
+            "code": AUDIO_NO_TEXT_CODE,
+            "message": AUDIO_NO_TEXT_MESSAGE,
+        })
+        return payload
+    payload.update({
+        "code": None,
+        "message": f"transcribe failed: {error or 'empty result'}",
+    })
+    return payload
+
+
 def process_one(i, n, shortcode, caption, args, token, totals, api_cache):
     reel_url = f"https://www.instagram.com/reel/{shortcode}/"
     emit({"type": "item_start", "i": i, "n": n,
@@ -366,9 +391,24 @@ def process_one(i, n, shortcode, caption, args, token, totals, api_cache):
         except Exception: pass
 
     if terr or not text:
-        emit({"type": "item_error", "i": i, "video_id": shortcode,
-              "message": f"transcribe failed: {terr or 'empty result'}"})
+        failure = _transcription_failure(
+            text,
+            terr,
+            gemini_utils.EMPTY_TEXT_ERROR,
+            cost_usd=cost,
+        )
+        event = {
+            "type": "item_error",
+            "i": i,
+            "video_id": shortcode,
+            "message": failure["message"],
+            "cost_usd": failure["cost_usd"],
+        }
+        if failure["code"]:
+            event["code"] = failure["code"]
+        emit(event)
         totals["errors"] += 1
+        totals["cost_usd"] += failure["cost_usd"]
         return
 
     cost_r = round(float(cost or 0), 6)

@@ -40,6 +40,12 @@ log = logging.getLogger("sc")
 # Лимит для inline_data (20MB), выше — File API
 INLINE_SIZE_LIMIT = 20 * 1024 * 1024
 
+# Stable internal sentinel for a successful Gemini response that contains no
+# textual output. Callers that know the input modality can turn this into a
+# domain-specific machine code instead of exposing a parser KeyError such as
+# "'parts'" to the user.
+EMPTY_TEXT_ERROR = "Model returned no text"
+
 try:
     from PIL import Image
     HAS_PIL = True
@@ -927,7 +933,12 @@ class GeminiClient:
                 if finish_reason == "SAFETY":
                     return None, "⚠️ Blocked by Safety Filters (censorship)"
 
-                parts = candidate["content"]["parts"]
+                content = candidate.get("content")
+                parts = content.get("parts") if isinstance(content, dict) else None
+                if not parts:
+                    if finish_reason == "STOP":
+                        return None, EMPTY_TEXT_ERROR
+                    return None, f"No response parts (finishReason: {finish_reason or 'unknown'})"
                 text = "".join([p.get("text", "") for p in parts if not p.get("thought")])
                 text = self._strip_repetition_loop(text)
 
