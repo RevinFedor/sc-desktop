@@ -351,6 +351,7 @@ def stage_subs(url, lang, with_ts, out_dir, meta):
     if not text:
         return None
     emit({"type": "subs_found", "lang": lang, "with_ts": bool(with_ts), "chars": len(text)})
+    emit({"type": "save_start", "kind": "subs"})
     fpath = write_text_file(out_dir, meta["id"], meta["title"], meta["channel"],
                             meta["webpage_url"], text, lang=lang, with_ts=with_ts)
     emit({"type": "saved", "file_path": fpath, "kind": "subs", "chars": len(text)})
@@ -365,7 +366,7 @@ def stage_ai(url, engine, out_dir, meta):
     except Exception:
         pass
 
-    emit({"type": "transcribe_start", "engine": engine})
+    emit({"type": "audio_download_start", "engine": engine})
 
     cmd = [
         "yt-dlp",
@@ -394,6 +395,9 @@ def stage_ai(url, engine, out_dir, meta):
         emit({"type": "error", "message": "audio file missing after download"})
         return None
 
+    emit({"type": "audio_download_done", "engine": engine,
+          "bytes": os.path.getsize(audio_tmp)})
+    emit({"type": "transcribe_start", "engine": engine})
     text, err, cost = None, None, 0.0
     try:
         with silenced():
@@ -414,6 +418,7 @@ def stage_ai(url, engine, out_dir, meta):
 
     cost_r = round(float(cost or 0), 6)
     emit({"type": "transcribe_done", "engine": engine, "chars": len(text), "cost_usd": cost_r})
+    emit({"type": "save_start", "kind": "ai"})
     fpath = write_text_file(out_dir, meta["id"], meta["title"], meta["channel"],
                             meta["webpage_url"], text, engine=engine)
     emit({"type": "saved", "file_path": fpath, "kind": "ai", "chars": len(text), "cost_usd": cost_r})
@@ -439,6 +444,7 @@ def main(argv):
         emit({"type": "error", "message": f"Cannot extract video id from {args.url}"})
         return 2
 
+    emit({"type": "metadata_start"})
     with silenced():
         meta, meta_err = fetch_meta(args.url)
     if not meta or not meta.get("id"):

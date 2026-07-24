@@ -68,7 +68,7 @@ function checkApifyToken(token) {
   })
 }
 
-async function getInstagramSettings(readScSettings) {
+async function getInstagramSettings(readScSettings, { transcribeOnly = false } = {}) {
   const s = readScSettings()
   const ig = s.instagram || {}
   let legacyToken = null
@@ -79,7 +79,10 @@ async function getInstagramSettings(readScSettings) {
   } catch {}
   const backends = readIgBackends(ig)
   const token = ig.apify_token || legacyToken || null
-  const apifyTokenCheck = await checkApifyToken(token)
+  const needsApifyCheck = !transcribeOnly || backends.transcribe_backend === 'apify'
+  const apifyTokenCheck = needsApifyCheck
+    ? await checkApifyToken(token)
+    : { status: 'not_needed', ok: true, message: 'Android API selected' }
   return {
     metadata_backend:   backends.metadata_backend,
     transcribe_backend: backends.transcribe_backend,
@@ -198,7 +201,7 @@ async function planInstagramSingleReel({ db, readScSettings, url, engine = 'gemi
   }
 
   const [settings, cached] = await Promise.all([
-    getInstagramSettings(readScSettings),
+    getInstagramSettings(readScSettings, { transcribeOnly: true }),
     Promise.resolve().then(() => lookupInstagramReel(db, { url, shortcode })),
   ])
 

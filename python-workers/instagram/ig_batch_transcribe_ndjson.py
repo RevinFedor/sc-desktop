@@ -316,10 +316,12 @@ def process_one(i, n, shortcode, caption, args, token, totals, api_cache):
 
     # Resolve a media URL via the chosen backend. No auto-fallback —
     # the user picked the path, errors surface to the UI.
+    resolve_mode = (
+        "profile_clips" if args.user_id else "shortcode_session"
+    ) if args.backend == "api" else "apify"
+    emit({"type": "resolve_start", "i": i, "video_id": shortcode,
+          "backend": args.backend, "mode": resolve_mode})
     if args.backend == "api":
-        emit({"type": "resolve_start", "i": i, "video_id": shortcode,
-              "backend": "api",
-              "mode": "profile_clips" if args.user_id else "shortcode_session"})
         media_url, err = _api_get_video_url(shortcode, args.user_id, api_cache)
     else:
         media_url, err = _apify_get_audio_url(shortcode, token)
@@ -330,7 +332,10 @@ def process_one(i, n, shortcode, caption, args, token, totals, api_cache):
         totals["errors"] += 1
         return
 
+    emit({"type": "resolve_done", "i": i, "video_id": shortcode,
+          "backend": args.backend, "mode": resolve_mode})
     mp3 = f"/tmp/ig_batch_{shortcode}.mp3"
+    emit({"type": "download_start", "i": i, "video_id": shortcode})
     ok, derr = _download_and_convert(media_url, mp3)
     if not ok:
         emit({"type": "item_error", "i": i, "video_id": shortcode,
@@ -338,6 +343,8 @@ def process_one(i, n, shortcode, caption, args, token, totals, api_cache):
         totals["errors"] += 1
         return
 
+    emit({"type": "download_done", "i": i, "video_id": shortcode,
+          "bytes": os.path.getsize(mp3) if os.path.exists(mp3) else 0})
     emit({"type": "transcribe_start", "i": i, "video_id": shortcode, "engine": args.engine})
 
     text, terr, cost = None, None, 0.0
@@ -368,6 +375,7 @@ def process_one(i, n, shortcode, caption, args, token, totals, api_cache):
     emit({"type": "transcribe_done", "i": i, "video_id": shortcode,
           "engine": args.engine, "chars": len(text), "cost_usd": cost_r})
 
+    emit({"type": "save_start", "i": i, "video_id": shortcode})
     fpath = write_text_file(args.out_dir, shortcode, caption, reel_url, text, engine=args.engine)
     emit({"type": "saved", "i": i, "video_id": shortcode,
           "file_path": fpath, "kind": "ai", "chars": len(text),

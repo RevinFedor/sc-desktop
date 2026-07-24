@@ -4448,6 +4448,10 @@ function attachYoutubeStreams(job, child) {
 function handleYoutubeEvent(job, evt) {
   emitEvent(job, evt)
   switch (evt.type) {
+    case 'metadata_start':
+      job.yt = { ...(job.yt || {}), stage: 'fetching_metadata' }
+      emit(job)
+      break
     case 'video':
       job.entity_title = evt.title
       job.entity_kind  = 'youtube_video'
@@ -4488,12 +4492,21 @@ function handleYoutubeEvent(job, evt) {
       break
     case 'subs_found':
       job.yt = { ...(job.yt || {}), stage: 'subs_found', lang: evt.lang, with_ts: !!evt.with_ts }
+      emit(job)
       break
     case 'subs_missing':
       job.yt = { ...(job.yt || {}), stage: 'awaiting_ai',
                  est_cost_usd: evt.est_cost_usd, duration_sec: evt.duration_sec }
       job.status = 'awaiting_ai'
       // 'done' will arrive too; we already set the terminal-for-stage-1 state
+      emit(job)
+      break
+    case 'audio_download_start':
+      job.yt = { ...(job.yt || {}), stage: 'downloading_audio', engine: evt.engine }
+      emit(job)
+      break
+    case 'audio_download_done':
+      job.yt = { ...(job.yt || {}), stage: 'audio_ready', engine: evt.engine, audio_bytes: evt.bytes }
       emit(job)
       break
     case 'transcribe_start':
@@ -4504,6 +4517,11 @@ function handleYoutubeEvent(job, evt) {
       job.yt = { ...(job.yt || {}), stage: 'transcribed',
                  chars: evt.chars, cost_usd: evt.cost_usd }
       job.cost_usd = (job.cost_usd || 0) + (evt.cost_usd || 0)
+      emit(job)
+      break
+    case 'save_start':
+      job.yt = { ...(job.yt || {}), stage: evt.kind === 'subs' ? 'subs_found' : 'saving' }
+      emit(job)
       break
     case 'saved':
       job.file_path = evt.file_path
@@ -6165,13 +6183,48 @@ function handleInstagramBatchEvent(job, evt) {
       emit(job)
       break
     case 'resolve_start':
+      if (b.current) {
+        b.current.stage = 'resolving'
+        b.current.backend = evt.backend
+        b.current.mode = evt.mode
+      }
       console.log(`[Jobs] ig_batch resolve #${job.id} video=${evt.video_id || '-'} backend=${evt.backend || '-'} mode=${evt.mode || '-'}`)
+      emit(job)
+      break
+    case 'resolve_done':
+      if (b.current) {
+        b.current.stage = 'resolved'
+        b.current.backend = evt.backend || b.current.backend
+        b.current.mode = evt.mode || b.current.mode
+      }
+      emit(job)
+      break
+    case 'download_start':
+      if (b.current) b.current.stage = 'downloading'
+      emit(job)
+      break
+    case 'download_done':
+      if (b.current) {
+        b.current.stage = 'audio_ready'
+        b.current.bytes = evt.bytes || null
+      }
+      emit(job)
       break
     case 'transcribe_start':
       if (b.current) { b.current.stage = 'transcribing'; b.current.engine = evt.engine }
+      emit(job)
       break
     case 'transcribe_done':
       b.cost_usd += evt.cost_usd || 0
+      if (b.current) {
+        b.current.stage = 'saving'
+        b.current.engine = evt.engine || b.current.engine
+      }
+      emit(job)
+      break
+    case 'save_start':
+      if (b.current) b.current.stage = 'saving'
+      emit(job)
       break
     case 'saved':
       b.saved += 1
