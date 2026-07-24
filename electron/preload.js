@@ -41,15 +41,6 @@ contextBridge.exposeInMainWorld('api', {
   tgLoginFinish:       (payload)  => ipcRenderer.invoke('tg:loginFinish', payload),
   tgDeleteSession:     (name)     => ipcRenderer.invoke('tg:deleteSession', name),
 
-  // Telegram Bot API bridge. State snapshots never include the bot token.
-  telegramBotState:   () => ipcRenderer.invoke('telegramBot:state'),
-  telegramBotRestart: () => ipcRenderer.invoke('telegramBot:restart'),
-  onTelegramBotUpdate: (fn) => {
-    const handler = (_evt, state) => fn(state)
-    ipcRenderer.on('telegramBot:update', handler)
-    return () => ipcRenderer.removeListener('telegramBot:update', handler)
-  },
-
   // Instagram settings + session inventory + profile fetch.
   igGetSettings:    ()         => ipcRenderer.invoke('ig:getSettings'),
   igSetBackend:     (payload)  => ipcRenderer.invoke('ig:setBackend', payload),

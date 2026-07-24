@@ -34,14 +34,13 @@ const {
   stopTelegramAutoScheduler,
   clearTelegramAutoSessionBlock,
 } = require('./telegram-auto')
-const { createTelegramBotService } = require('./telegram-bot')
+const { startMobileApiServer } = require('./mobile-api-server')
 const {
   publicAppSettings,
   patchAppSettings,
 } = require('./app-settings')
 
 const isDev = process.env.NODE_ENV === 'development'
-const allowTelegramBotRuntime = !isDev || process.env.SC_TELEGRAM_BOT_DEV === '1'
 const isPrimaryInstance = isDev || app.requestSingleInstanceLock()
 if (!isPrimaryInstance) {
   console.log('[Startup] Another production SC Desktop instance owns the app lock; exiting')
@@ -335,22 +334,7 @@ ipcMain.handle('appSettings:patch', (_evt, payload) => (
   patchAppSettings(readScSettingsStrict, writeScSettings, payload)
 ))
 
-const telegramBot = createTelegramBotService({
-  readScSettings: readScSettingsStrict,
-  writeScSettings,
-  jobRunner,
-  db,
-  allowTerminalNotifications: allowTelegramBotRuntime,
-})
-
-telegramBot.subscribe(state => {
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (!win.isDestroyed()) win.webContents.send('telegramBot:update', state)
-  }
-})
-
-ipcMain.handle('telegramBot:state', () => telegramBot.getState())
-ipcMain.handle('telegramBot:restart', () => telegramBot.restart())
+let mobileApiServer = null
 
 async function listTelegramSessionsSnapshot() {
   const events = await jobRunner.runTgSessionsCommand(['list'])
@@ -2017,7 +2001,6 @@ app.whenReady().then(() => {
     const { startServer } = require('./browser-bridge')
     startServer({
       jobRunner,
-      notificationService: telegramBot,
       settingsAccess: { readScSettings: readScSettingsStrict, writeScSettings },
     })
   } catch (err) {
@@ -2028,16 +2011,21 @@ app.whenReady().then(() => {
   } catch (err) {
     console.warn(`[TelegramAuto] failed to start scheduler: ${err?.message || err}`)
   }
-  if (allowTelegramBotRuntime) {
-    void telegramBot.start()
-  } else {
-    console.log('[TelegramBot] dev auto-start skipped; use the status pill or SC_TELEGRAM_BOT_DEV=1')
+  try {
+    mobileApiServer = startMobileApiServer({
+      db,
+      jobRunner,
+      readScSettings: readScSettingsStrict,
+    })
+  } catch (err) {
+    console.warn(`[MobileAPI] failed to start: ${err?.message || err}`)
   }
 })
 
 app.on('before-quit', () => {
   stopTelegramAutoScheduler()
-  telegramBot.stop()
+  mobileApiServer?.close()
+  mobileApiServer = null
 })
 
 app.on('window-all-closed', () => {

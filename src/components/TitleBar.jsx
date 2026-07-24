@@ -1,10 +1,9 @@
 import React, { useRef, useState } from 'react'
-import { Settings, Activity, History, Plus, Bot } from 'lucide-react'
+import { Settings, Activity, History, Plus } from 'lucide-react'
 import { useStore, pushScreen, toggleScreen, openSettings, toggleActivity, closeActivity } from '../lib/store'
 import { SETTINGS_SECTIONS } from '../lib/settingsSections'
 import { useJobs } from '../lib/jobs'
 import { useAistudioJobs } from '../lib/aistudioJobs'
-import { useTelegramBotState } from '../lib/telegramBot'
 import McpRunningPopover from './McpRunningPopover'
 import RequestsRunningPopover from './RequestsRunningPopover'
 import PlatformLogo from './PlatformLogo'
@@ -59,7 +58,6 @@ export default function TitleBar({
           <span>Главная</span>
           <Plus size={14} />
         </button>
-        <TelegramBotPill />
       </div>
 
       {/* drag spacer */}
@@ -224,73 +222,4 @@ export default function TitleBar({
       />
     </div>
   )
-}
-
-function TelegramBotPill() {
-  const state = useTelegramBotState()
-  const status = state?.status || 'unknown'
-  const active = Number(state?.active_tasks || 0)
-  const meta = telegramBotStatusMeta(status)
-  const label = state?.username ? `@${state.username}` : 'Бот'
-  const titleParts = [
-    `Telegram-бот: ${meta.title}`,
-    state?.username ? `@${state.username}` : null,
-    active > 0 ? `активных задач: ${active}` : null,
-    state?.allowed_chat_count ? `разрешений: ${state.allowed_chat_count}` : null,
-    state?.last_error ? `ошибка: ${state.last_error}` : null,
-    'Клик — перезапустить',
-  ].filter(Boolean)
-
-  return (
-    <button
-      type="button"
-      onClick={() => window.api?.telegramBotRestart?.()}
-      className={`no-drag h-7 px-2 rounded-md border inline-flex items-center gap-1.5 text-xs transition-colors ${
-        meta.className
-      }`}
-      title={titleParts.join('\n')}
-      aria-label="Статус Telegram-бота"
-    >
-      <Bot size={13} />
-      <span className={`w-1.5 h-1.5 rounded-full ${meta.dotClass} ${active > 0 ? 'animate-pulse' : ''}`} />
-      <span className="max-w-[110px] truncate">{label}</span>
-      {active > 0 && <span className="tabular-nums text-emerald-300">{active}</span>}
-    </button>
-  )
-}
-
-function telegramBotStatusMeta(status) {
-  if (status === 'online') {
-    return {
-      title: 'онлайн',
-      className: 'border-emerald-900/50 text-emerald-200 bg-emerald-950/20 hover:bg-emerald-950/35',
-      dotClass: 'bg-emerald-400',
-    }
-  }
-  if (status === 'starting') {
-    return {
-      title: 'запускается',
-      className: 'border-amber-900/50 text-amber-200 bg-amber-950/20 hover:bg-amber-950/35',
-      dotClass: 'bg-amber-400 animate-pulse',
-    }
-  }
-  if (status === 'error') {
-    return {
-      title: 'ошибка',
-      className: 'border-red-900/50 text-red-200 bg-red-950/20 hover:bg-red-950/35',
-      dotClass: 'bg-red-400',
-    }
-  }
-  if (status === 'not_configured' || status === 'disabled') {
-    return {
-      title: status === 'disabled' ? 'выключен' : 'не настроен',
-      className: 'border-zinc-800 text-zinc-500 bg-zinc-950 hover:bg-zinc-900',
-      dotClass: 'bg-zinc-600',
-    }
-  }
-  return {
-    title: 'неизвестно',
-    className: 'border-zinc-800 text-zinc-500 bg-zinc-950 hover:bg-zinc-900',
-    dotClass: 'bg-zinc-600',
-  }
 }

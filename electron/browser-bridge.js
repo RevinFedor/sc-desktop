@@ -46,10 +46,6 @@ const os = require('node:os')
 const crypto = require('node:crypto')
 const researchState = require('./research-state')
 const {
-  ensureNotificationToken,
-  matchesBearerToken,
-} = require('./local-notification-auth')
-const {
   EXTENSION_YOUTUBE_SCHEMA_VERSION,
   extensionYoutubeFromSettings,
   extensionYoutubeSchemaState,
@@ -58,7 +54,6 @@ const {
 
 const BODY_LIMITS = {
   default: 64 * 1024,
-  terminalNotification: 16 * 1024,
   researchStart: 2 * 1024 * 1024,
   researchState: 5 * 1024 * 1024,
   researchArtifactJson: 30 * 1024 * 1024,
@@ -426,48 +421,7 @@ function safeReadFile(fp, maxBytes = 4 * 1024 * 1024) {
   } catch { return null }
 }
 
-function requiredNotificationString(value, field, maxLength) {
-  if (typeof value !== 'string') throw new Error(`${field} must be a string`)
-  const normalized = value.trim()
-  if (!normalized) throw new Error(`${field} is required`)
-  if (normalized.length > maxLength) throw new Error(`${field} is too long`)
-  if (/[\u0000-\u001f\u007f]/.test(normalized)) throw new Error(`${field} contains control characters`)
-  return normalized
-}
-
-function normalizeTerminalCompletionEvent(body = {}) {
-  if (body.kind !== 'terminal-completion') throw new Error('kind must be terminal-completion')
-  const firedAt = Number(body.firedAt)
-  if (!Number.isSafeInteger(firedAt) || firedAt <= 0) throw new Error('firedAt must be a positive epoch-ms integer')
-  const mode = body.mode === 'persistent' ? 'persistent' : body.mode === 'oneshot' ? 'oneshot' : null
-  if (!mode) throw new Error('mode must be oneshot or persistent')
-  if (typeof body.unread !== 'boolean') throw new Error('unread must be a boolean')
-  const event = {
-    kind: 'terminal-completion',
-    eventId: requiredNotificationString(body.eventId, 'eventId', 320),
-    projectId: requiredNotificationString(body.projectId, 'projectId', 512),
-    tabId: requiredNotificationString(body.tabId, 'tabId', 512),
-    tabName: requiredNotificationString(body.tabName, 'tabName', 160).replace(/\s+/g, ' '),
-    firedAt,
-    mode,
-    unread: body.unread,
-  }
-  if (event.eventId !== `${event.tabId}:${event.firedAt}`) {
-    throw new Error('eventId must match tabId:firedAt')
-  }
-  return event
-}
-
-function startServer({ jobRunner, notificationService, settingsAccess }) {
-  let notificationAuthToken = null
-  try {
-    const auth = ensureNotificationToken()
-    notificationAuthToken = auth.token
-    console.log(`[BrowserBridge] terminal notification auth ready path=${auth.tokenPath}`)
-  } catch (err) {
-    console.warn(`[BrowserBridge] terminal notification auth unavailable: ${err?.message || err}`)
-  }
-  const notificationRequestTimes = []
+function startServer({ jobRunner, settingsAccess }) {
 
   const server = http.createServer(async (req, res) => {
     setCors(req, res)
@@ -554,70 +508,6 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           })
         }
         return sendJson(res, 405, { ok: false, error: 'method not allowed' })
-      }
-
-      if (req.method === 'POST' && url.pathname === '/notifications/terminal-completion') {
-        if (req.headers.origin) {
-          return sendJson(res, 403, { ok: false, error: 'browser origins are not allowed' })
-        }
-        if (!notificationAuthToken) {
-          return sendJson(res, 503, { ok: false, error: 'notification bridge authentication is unavailable' })
-        }
-        if (!matchesBearerToken(req.headers.authorization, notificationAuthToken)) {
-          return sendJson(res, 401, { ok: false, error: 'invalid notification bridge credentials' })
-        }
-        if (typeof notificationService?.notifyTerminalCompletion !== 'function') {
-          return sendJson(res, 503, { ok: false, error: 'notification service is unavailable' })
-        }
-
-        const now = Date.now()
-        while (notificationRequestTimes.length && notificationRequestTimes[0] <= now - 60_000) {
-          notificationRequestTimes.shift()
-        }
-        if (notificationRequestTimes.length >= 30) {
-          res.setHeader('Retry-After', '60')
-          return sendJson(res, 429, { ok: false, error: 'terminal notification rate limit exceeded' })
-        }
-        notificationRequestTimes.push(now)
-
-        let body
-        try {
-          body = await readBody(req, BODY_LIMITS.terminalNotification)
-        } catch (err) {
-          const status = err?.code === 'BODY_TOO_LARGE' ? 413 : 400
-          return sendJson(res, status, { ok: false, error: err?.message || 'invalid JSON body' })
-        }
-
-        let event
-        try {
-          event = normalizeTerminalCompletionEvent(body)
-        } catch (err) {
-          return sendJson(res, 400, { ok: false, error: err?.message || 'invalid terminal completion event' })
-        }
-
-        try {
-          const result = await notificationService.notifyTerminalCompletion(event)
-          return sendJson(res, 200, {
-            ok: true,
-            eventId: event.eventId,
-            duplicate: result?.duplicate === true,
-            deliveries: Array.isArray(result?.deliveries) ? result.deliveries : [],
-          })
-        } catch (err) {
-          const unavailable = new Set([
-            'telegram_bot_disabled',
-            'telegram_bot_not_configured',
-            'telegram_notification_chat_not_configured',
-            'telegram_notifications_not_allowed',
-          ])
-          const status = unavailable.has(err?.code) ? 503 : 502
-          console.warn(`[BrowserBridge] terminal notification failed code=${err?.code || 'telegram_delivery_failed'} error=${err?.message || err}`)
-          return sendJson(res, status, {
-            ok: false,
-            code: err?.code || 'telegram_delivery_failed',
-            error: err?.message || 'Telegram delivery failed',
-          })
-        }
       }
 
       // Hot-reload endpoint для browser-extension'а: возвращает max mtime
