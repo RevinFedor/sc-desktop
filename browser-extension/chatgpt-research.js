@@ -416,6 +416,25 @@
       el.dispatchEvent(new MouseEvent(t, { bubbles:true, cancelable:true, view:window, clientX:x, clientY:y }));
     });
   }
+  async function trustedHover(el) {
+    if (!el) return { ok: false, err: 'no element' };
+    const r = el.getBoundingClientRect();
+    const left = Number.isFinite(r.x) ? r.x : r.left;
+    const top = Number.isFinite(r.y) ? r.y : r.top;
+    const x = left + r.width / 2;
+    const y = top + r.height / 2;
+    if (![x, y].every(Number.isFinite)) return { ok: false, err: 'invalid coordinates' };
+    return await new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage({ __sc_trusted_hover: true, x, y }, response => {
+          const error = chrome.runtime.lastError;
+          resolve(error ? { ok: false, err: error.message } : (response || { ok: false, err: 'no response' }));
+        });
+      } catch (error) {
+        resolve({ ok: false, err: error?.message || String(error) });
+      }
+    });
+  }
   function pressEscape() {
     document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', code:'Escape', keyCode:27, which:27, bubbles:true }));
     document.dispatchEvent(new KeyboardEvent('keyup',   { key:'Escape', code:'Escape', keyCode:27, which:27, bubbles:true }));
@@ -1868,10 +1887,20 @@
   }
 
   // ── Paste + submit ──────────────────────────────────────────────────
-  function pasteIntoComposer(text) {
+  function pasteIntoComposer(text, { append = false } = {}) {
     const ed = findComposer();
     if (!ed) throw new Error('no composer');
     ed.focus();
+    if (append) {
+      try {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(ed);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } catch (_) {}
+    }
     // ProseMirror принимает синтетический ClipboardEvent с DataTransfer —
     // тот же путь что Lexical у Perplexity (execCommand из isolated world
     // ProseMirror тоже игнорирует).
@@ -1904,6 +1933,12 @@
     return /(?:pasted text|вставленн(?:ый|ого|ому|ым)? текст|вставка текста)/i.test(compactText(value));
   }
 
+  function isPastedTextTooLongLabel(value) {
+    const text = compactText(value);
+    return /(?:превышает длину|слишком длин).{0,100}(?:текстов[а-яё]*\s+пол|пол[а-яё]*\s+ввода)/i.test(text)
+      || /(?:exceeds? (?:the )?(?:length|character)(?: limit)?|too long).{0,100}(?:text field|composer|input)/i.test(text);
+  }
+
   function findPastedTextChip() {
     const root = composerRoot();
     const candidates = Array.from(root.querySelectorAll([
@@ -1914,6 +1949,16 @@
       '[role="button"]',
     ].join(','))).filter(isVisible);
     return candidates.find(el => isPastedTextChipLabel(inlineControlText(el))) || null;
+  }
+
+  function inlineControlsSnapshot() {
+    const nodes = visibleAll('button, [role="button"], [role="menuitem"], [role="option"]');
+    const labels = nodes
+      .map(el => inlineControlText(el))
+      .filter(text => text && text.length <= 100)
+      .filter(text => /(?:text|текст|field|input|поле|show|insert|move|показ|встав|перенес|pasted)/i.test(text))
+      .slice(0, 12);
+    return { interactiveCount: nodes.length, labels };
   }
 
   function composerContainsInlineText(expectedText) {
@@ -1930,9 +1975,11 @@
       && actual.length >= Math.min(1200, Math.floor(expected.length * 0.6));
   }
 
-  async function showPastedTextInComposer(id, inlineText, timeoutMs = 45000) {
+  async function showPastedTextInComposer(id, inlineText, promptText = '', timeoutMs = 45000) {
     const t0 = performance.now();
     let showClicked = false;
+    let hoverAttempted = false;
+    let hoverOk = false;
     let chipOpened = false;
     let lastState = '';
 
@@ -1949,8 +1996,24 @@
         return result;
       }
 
+      const chipLabel = chip ? inlineControlText(chip) : '';
+      if (chip && isPastedTextTooLongLabel(chipLabel)) {
+        if (promptText && !composerContainsInlineText(promptText)) {
+          throw new Error('chatgpt_pasted_text_prompt_missing_before_submit');
+        }
+        const result = {
+          method: 'pasted_text_attachment',
+          waitedMs: Math.round(performance.now() - t0),
+          chars: inlineText.length,
+          reason: 'too_long_for_text_field',
+        };
+        log('compose.pasted_text_attachment_ready', result);
+        bridgeLog('gpt.compose.pasted_text_attachment_ready', result, id, null);
+        return result;
+      }
+
       const showControl = findShowInTextFieldControl();
-      const state = `${showControl ? 1 : 0}|${chip ? 1 : 0}|${showClicked ? 1 : 0}|${chipOpened ? 1 : 0}`;
+      const state = `${showControl ? 1 : 0}|${chip ? 1 : 0}|${showClicked ? 1 : 0}|${hoverAttempted ? 1 : 0}|${hoverOk ? 1 : 0}|${chipOpened ? 1 : 0}`;
       if (state !== lastState) {
         lastState = state;
         const data = {
@@ -1958,6 +2021,8 @@
           showControl: !!showControl,
           pastedTextChip: !!chip,
           showClicked,
+          hoverAttempted,
+          hoverOk,
           chipOpened,
         };
         log('compose.inline_wait', data);
@@ -1971,14 +2036,30 @@
         bridgeLog('gpt.compose.inline_show_clicked', {
           waitedMs: Math.round(performance.now() - t0),
         }, id, null);
+      } else if (chip && !hoverAttempted) {
+        hoverAttempted = true;
+        const hovered = await trustedHover(chip);
+        hoverOk = hovered?.ok === true;
+        if (!hoverOk) nativeHover(chip);
+        const data = {
+          waitedMs: Math.round(performance.now() - t0),
+          ok: hoverOk,
+          err: hovered?.err || null,
+          controls: inlineControlsSnapshot(),
+        };
+        log('compose.inline_chip_hovered', data);
+        bridgeLog('gpt.compose.inline_chip_hovered', data, id, null);
       } else if (chip) {
-        nativeHover(chip);
-        if (!chipOpened && performance.now() - t0 > 2500) {
+        if (!chipOpened && performance.now() - t0 > (hoverOk ? 4000 : 2500)) {
           chipOpened = true;
           nativeMouseClick(chip);
-          log('compose.inline_chip_opened', { waitedMs: Math.round(performance.now() - t0) });
-          bridgeLog('gpt.compose.inline_chip_opened', {
+          const data = {
             waitedMs: Math.round(performance.now() - t0),
+            controls: inlineControlsSnapshot(),
+          };
+          log('compose.inline_chip_opened', data);
+          bridgeLog('gpt.compose.inline_chip_opened', {
+            ...data,
           }, id, null);
         }
       }
@@ -2875,15 +2956,27 @@
       let uploadedDocument = null;
       let documentUpload = null;
       let inlineText = null;
+      let requirePastedTextChip = false;
       let delivery = 'prompt_only';
       if (job.document && job.showInTextField) {
-        if (typeof buildYoutubeChatgptInlineText !== 'function') {
+        if (typeof buildYoutubeChatgptInlineParts !== 'function') {
           throw new Error('chatgpt_inline_builder_missing');
         }
-        inlineText = buildYoutubeChatgptInlineText(job.prompt, job.document.text);
-        pasteIntoComposer(inlineText);
-        await showPastedTextInComposer(id, inlineText);
-        delivery = 'inline';
+        const inlineParts = buildYoutubeChatgptInlineParts(job.prompt, job.document.text);
+        inlineText = inlineParts.combinedText;
+        if (inlineParts.promptText) {
+          pasteIntoComposer(inlineParts.promptText);
+          await waitFor(
+            () => composerContainsInlineText(inlineParts.promptText),
+            'ChatGPT prompt in composer before Pasted Text',
+            5000,
+          );
+        }
+        const sourcePasteText = (inlineParts.promptText ? '\n\n' : '') + inlineParts.sourceText;
+        pasteIntoComposer(sourcePasteText, { append: true });
+        const inlineResult = await showPastedTextInComposer(id, inlineText, inlineParts.promptText);
+        requirePastedTextChip = inlineResult.method === 'pasted_text_attachment';
+        delivery = requirePastedTextChip ? 'pasted_text_attachment' : 'inline';
       } else if (job.document) {
         uploadedDocument = composeDocumentFile(job.document);
         documentUpload = await uploadFiles(id, [uploadedDocument], {
@@ -2902,6 +2995,9 @@
       ]);
       if (uploadedDocument && !documentUpload?.hasPreview()) {
         throw new Error('chatgpt_attachment_disappeared_before_submit: ' + uploadedDocument.name);
+      }
+      if (requirePastedTextChip && !findPastedTextChip()) {
+        throw new Error('chatgpt_pasted_text_attachment_disappeared_before_submit');
       }
       await clickSend();
       submitted = true;

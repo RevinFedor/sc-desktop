@@ -10,7 +10,7 @@ Events:
   {"type": "page",     "loaded": 100, "limit": 500}
   {"type": "item",     "data": {id, date, text, type, sender, has_media, duration, ...}}
   {"type": "warning",  "code": "no_new_messages|empty_result", "message": "..."}
-  {"type": "error",    "message": "..."}
+  {"type": "error",    "message": "...", "code": "optional_machine_code"}
   {"type": "done",     "items_total": N, "duration_sec": 4.2}
 
 `warning` is NON-fatal: the job still completes `done`. It exists to turn an
@@ -172,6 +172,51 @@ def _bump_session_busy_timeout(client, timeout_ms=30000):
 def emit(event):
     sys.stdout.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
     sys.stdout.flush()
+
+
+# Access failures that describe the peer itself rather than the network or
+# the Telegram session.  Electron persists this machine code on the saved
+# source and pauses background pulls until a manual/live probe succeeds.
+# Keep the human message free to evolve; JS never matches its text.
+_SOURCE_UNAVAILABLE_ERROR_NAMES = {
+    "ChannelPrivateError",
+    "ChannelInvalidError",
+    "ChannelPublicGroupNaError",
+    "ChatAdminRequiredError",
+    "InputUserDeactivatedError",
+    "PeerIdInvalidError",
+    "UserBannedInChannelError",
+    "UserDeactivatedError",
+}
+
+
+def _source_unavailable_code(ex, numeric_missing=False):
+    if type(ex).__name__ in _SOURCE_UNAVAILABLE_ERROR_NAMES:
+        return "telegram_source_unavailable"
+    # After a *complete* iter_dialogs walk, ValueError from get_entity(int)
+    # means this stable id is not present for the bound account.  A ValueError
+    # on an arbitrary username is deliberately not classified this way — the
+    # username may simply have been renamed.
+    if numeric_missing and isinstance(ex, ValueError):
+        return "telegram_source_unavailable"
+    return None
+
+
+def _emit_source_resolution_error(target, ex, numeric_missing=False):
+    code = _source_unavailable_code(ex, numeric_missing=numeric_missing)
+    if code:
+        emit({
+            "type": "error",
+            "code": code,
+            "message": (
+                f"Telegram больше не отдаёт сохранённый чат {target} выбранному аккаунту. "
+                f"Он удалён, стал приватным или аккаунт потерял доступ "
+                f"({type(ex).__name__}: {ex})."
+            ),
+        })
+    else:
+        emit({"type": "error",
+              "message": f"Cannot resolve chat_id {target}: {type(ex).__name__}: {ex}"})
 
 
 # Sets of msg_id (as strings) that already have transcribe_status='done' in
@@ -877,9 +922,14 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
             try:
                 async for _ in client.iter_dialogs():
                     pass
+            except Exception as walk_ex:
+                _emit_source_resolution_error(target, walk_ex)
+                await client.disconnect()
+                return 2
+            try:
                 entity = await client.get_entity(int(handle))
             except Exception as ex:
-                emit({"type": "error", "message": f"Cannot resolve chat_id {target}: {ex}"})
+                _emit_source_resolution_error(target, ex, numeric_missing=True)
                 await client.disconnect()
                 return 2
         else:
@@ -1663,7 +1713,16 @@ def main():
         emit({"type": "error", "message": "interrupted"})
         sys.exit(130)
     except Exception as ex:
-        emit({"type": "error", "message": f"{type(ex).__name__}: {ex}"})
+        event = {"type": "error", "message": f"{type(ex).__name__}: {ex}"}
+        code = _source_unavailable_code(ex)
+        if code:
+            event["code"] = code
+            event["message"] = (
+                "Telegram больше не отдаёт этот сохранённый чат выбранному аккаунту. "
+                "Он удалён, стал приватным или аккаунт потерял доступ "
+                f"({type(ex).__name__}: {ex})."
+            )
+        emit(event)
         sys.exit(1)
 
 

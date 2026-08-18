@@ -82,6 +82,24 @@ export async function copyCachedYoutubeFile(filePath) {
   return await window.api.ytCopyCachedFile(filePath)
 }
 
+// ─── Rutube single-video transcript ──────────────────────────────────
+export async function startRutubeSingle(params) {
+  if (!window.api?.rutubeSingle) return null
+  return await window.api.rutubeSingle(params)
+}
+export async function resumeRutubeAi(jobId, engine) {
+  if (!window.api?.rutubeResumeAi) return null
+  return await window.api.rutubeResumeAi({ jobId, engine })
+}
+export async function lookupRutubeCache(videoId) {
+  if (!window.api?.rutubeLookupCache) return null
+  return await window.api.rutubeLookupCache(videoId)
+}
+export async function copyCachedRutubeFile(filePath) {
+  if (!window.api?.rutubeCopyCachedFile) return { ok: false }
+  return await window.api.rutubeCopyCachedFile(filePath)
+}
+
 // ─── YouTube comments ───────────────────────────────────────────────
 export async function startYoutubeComments(params) {
   if (!window.api?.ytComments) return null
@@ -156,6 +174,28 @@ export async function copyCachedTiktokFile(filePath) {
 export async function startLocalTranscribe(params) {
   if (!window.api?.localTranscribe) return null
   return await window.api.localTranscribe(params)
+}
+
+// ─── Boosty single video ──────────────────────────────────────────────
+export async function startBoostySingle(params) {
+  if (!window.api?.boostySingle) return null
+  return await window.api.boostySingle(params)
+}
+export async function lookupBoostyChannel(payload) {
+  if (!window.api?.boostyChannelLookup) return null
+  return await window.api.boostyChannelLookup(payload)
+}
+export async function startBoostyChannelFetch(params) {
+  if (!window.api?.boostyChannelFetch) return null
+  return await window.api.boostyChannelFetch(params)
+}
+export async function previewBoostyPost(params) {
+  if (!window.api?.boostyPostPreview) return null
+  return await window.api.boostyPostPreview(params)
+}
+export async function startBoostyBatchTranscribe(params) {
+  if (!window.api?.boostyBatchTranscribe) return null
+  return await window.api.boostyBatchTranscribe(params)
 }
 
 // ─── Instagram ────────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { FolderOpen, Brain } from 'lucide-react'
+import { FolderOpen, Brain, TriangleAlert } from 'lucide-react'
 import { useInvalidator } from '../lib/dataBus'
 
 // Compact distribution chart for content types in the source.
@@ -54,7 +54,7 @@ const TYPE_COLORS = {
 export default function CoverageBars({
   sourceId = null,
   typeBreakdown = [], totalItems = 0, platform = 'telegram', indexed = 0,
-  commentsCount = 0,
+  commentsCount = 0, analysisOnly = false, analyzedAt = null,
 }) {
   if (!typeBreakdown.length || !totalItems) return null
 
@@ -78,6 +78,18 @@ export default function CoverageBars({
 
   return (
     <div className="rounded-md border border-zinc-800 bg-zinc-950 p-4">
+      {analysisOnly && (
+        <div
+          className="mb-3 flex items-center gap-2 text-amber-300/90"
+          style={{ fontSize: '13px' }}
+          title={analyzedAt
+            ? `Последний анализ: ${new Date(analyzedAt * 1000).toLocaleString('ru-RU')}`
+            : 'Результат последнего анализа канала'}
+        >
+          <TriangleAlert size={14} className="shrink-0" />
+          <span>Найдено анализом в Telegram, но ещё не сохранено</span>
+        </div>
+      )}
       <div className="flex h-3 rounded overflow-hidden border border-zinc-800/50">
         {sorted.map(row => {
           const pct = (row.count / totalItems) * 100
@@ -112,7 +124,7 @@ export default function CoverageBars({
       )}
 
       {/* Semantic index progress — Telegram only (others don't index yet). */}
-      {platform === 'telegram' && (
+      {platform === 'telegram' && !analysisOnly && (
         <div className="mt-3 pt-3 border-t border-zinc-800/60">
           <div className="flex items-center gap-3 text-sm">
             <span className="text-zinc-400 inline-flex items-center gap-1.5"><Brain size={14} /> Семантический индекс</span>
@@ -135,7 +147,7 @@ export default function CoverageBars({
           message type (a photo's caption is text-in-DB; the photo file is
           media-on-disk). Telegram only for now — YT/IG store transcripts the
           same way but the per-type warnings above are TG-shaped. */}
-      {sourceId != null && platform === 'telegram' && (
+      {sourceId != null && platform === 'telegram' && !analysisOnly && (
         <StorageRow sourceId={sourceId} />
       )}
     </div>
@@ -236,10 +248,17 @@ function Legend({ row, platform }) {
   const isStreaming = platform === 'youtube' || platform === 'instagram'
   const isPoll = row.type === 'poll'
   const hasExpectedPipeline = TYPES_WITH_EXPECTED_MEDIA.has(row.type)
+  const analysisMissing = Math.max(0, Number(row.analysis_missing) || 0)
   const transcribed = row.processed || row.transcribed || 0
-  const stillNeeded = isPoll ? (row.with_caption || 0) : (row.with_media + transcribed)
-  const missing = !isStreaming && hasExpectedPipeline && stillNeeded < row.count
-  const missingCount = row.count - stillNeeded
+  const stillNeeded = isPoll
+    ? (row.with_caption || 0)
+    : ((Number(row.with_media) || 0) + transcribed)
+  const localMissing = !isStreaming && hasExpectedPipeline && stillNeeded < row.count
+  const missing = analysisMissing > 0 || localMissing
+  const missingCount = analysisMissing > 0 ? analysisMissing : row.count - stillNeeded
+  const missingTitle = analysisMissing > 0
+    ? `${missingCount} ${TYPE_LABELS[row.type] || row.type}: найдены анализом в Telegram, но ещё не сохранены`
+    : `${missingCount} ${TYPE_LABELS[row.type] || row.type}: только метаданные, файл/текст не загружены`
   return (
     <div className="flex items-center gap-2">
       <span
@@ -251,10 +270,11 @@ function Legend({ row, platform }) {
       {missing && (
         <span
           style={{ fontSize: '14px' }}
-          className="text-amber-400 tabular-nums"
-          title={`${missingCount} ${TYPE_LABELS[row.type] || row.type}: только метаданные, файл/текст не загружены`}
+          className="text-amber-400 tabular-nums inline-flex items-center gap-1"
+          title={missingTitle}
         >
-          ⚠ {missingCount.toLocaleString()}
+          <TriangleAlert size={13} className="shrink-0" />
+          {missingCount.toLocaleString()}
         </span>
       )}
     </div>

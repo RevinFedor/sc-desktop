@@ -32,18 +32,26 @@ const BRIDGE_PATH = resolve(__dirname, 'bridge.js');
 const BRIDGE_LOG = '/tmp/hh-extension-bridge.log';
 
 let bridgeSpawnAttempted = false;
+let bridgeProbe = null;
+let shuttingDown = false;
 
 // Probe localhost:3458. If nothing is listening, spawn bridge.js detached so it
 // survives this Claude session. Multiple sessions race-safe: only the first
 // wins the port, the rest get EADDRINUSE and silently exit; all sessions then
 // connect to the single surviving bridge.
 function ensureBridgeRunning() {
-  if (bridgeSpawnAttempted) return;
+  if (bridgeSpawnAttempted || shuttingDown) return;
   bridgeSpawnAttempted = true;
 
   const probe = net.createConnection({ port: BRIDGE_PORT, host: '127.0.0.1' });
-  probe.once('connect', () => probe.destroy()); // bridge already running
+  bridgeProbe = probe;
+  probe.once('connect', () => {
+    bridgeProbe = null;
+    probe.destroy();
+  }); // bridge already running
   probe.once('error', () => {
+    bridgeProbe = null;
+    if (shuttingDown) return;
     if (!existsSync(BRIDGE_PATH)) {
       console.error(`[MCP] bridge.js not found at ${BRIDGE_PATH}`);
       return;
@@ -69,26 +77,34 @@ let pendingCommands = new Map();
 let commandId = 0;
 let reconnectScheduled = false;
 let reconnectAttempts = 0;
+let reconnectTimer = null;
 const MAX_RECONNECT_BACKOFF = 60000; // cap exponential backoff at 1 min
 
 function scheduleReconnect() {
-  if (reconnectScheduled) return; // dedupe close+error firing both
+  if (shuttingDown || reconnectScheduled) return; // dedupe close+error firing both
   reconnectScheduled = true;
   reconnectAttempts++;
   // Exponential backoff: 3s, 6s, 12s, 24s, ..., capped at 60s.
   // Without backoff a dead bridge produces 20 reconnects/min × hours = 80K zombie sockets.
   const delay = Math.min(RECONNECT_INTERVAL * Math.pow(2, Math.min(reconnectAttempts - 1, 5)), MAX_RECONNECT_BACKOFF);
-  setTimeout(() => {
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
     reconnectScheduled = false;
+    if (shuttingDown) return;
     connectBridge();
   }, delay);
 }
 
 function connectBridge() {
+  if (shuttingDown) return;
   try {
     const ws = new WebSocket(BRIDGE_URL);
 
     ws.on('open', () => {
+      if (shuttingDown) {
+        try { ws.removeAllListeners(); ws.terminate(); } catch {}
+        return;
+      }
       console.error('[MCP] Connected to bridge');
       bridgeWs = ws;
       reconnectAttempts = 0;
@@ -1252,6 +1268,55 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  let shutdownPromise = null;
+  const shutdown = (reason) => {
+    if (shutdownPromise) return shutdownPromise;
+
+    shuttingDown = true;
+    shutdownPromise = (async () => {
+      console.error(`[MCP] Session closed (${reason}); shutting down`);
+
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      reconnectScheduled = false;
+
+      if (bridgeProbe) {
+        try { bridgeProbe.destroy(); } catch {}
+        bridgeProbe = null;
+      }
+
+      if (bridgeWs) {
+        try { bridgeWs.removeAllListeners(); bridgeWs.terminate(); } catch {}
+        bridgeWs = null;
+      }
+
+      const error = new Error('MCP session closed');
+      for (const pending of pendingCommands.values()) pending.reject(error);
+      pendingCommands.clear();
+
+      try {
+        await server.close();
+      } catch (err) {
+        console.error('[MCP] Shutdown error:', err.message);
+      }
+    })();
+
+    return shutdownPromise;
+  };
+
+  const finish = (reason) => {
+    void shutdown(reason).finally(() => process.exit(0));
+  };
+
+  process.stdin.once('end', () => finish('stdin end'));
+  process.stdin.once('close', () => finish('stdin close'));
+  process.once('SIGINT', () => finish('SIGINT'));
+  process.once('SIGTERM', () => finish('SIGTERM'));
+  process.once('SIGHUP', () => finish('SIGHUP'));
+
   console.error('[MCP] Server running on stdio');
 }
 

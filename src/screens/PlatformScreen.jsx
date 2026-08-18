@@ -1,11 +1,12 @@
-import React from 'react'
-import { ChevronRight, Settings } from 'lucide-react'
+import React, { useCallback, useEffect, useState } from 'react'
+import { ChevronRight, FolderOpen, Settings, Trash2 } from 'lucide-react'
 import PlatformLogo from '../components/PlatformLogo'
 import { openSettings, pushScreen } from '../lib/store'
 import { useSources, useSourcesLoaded } from '../lib/sources'
 
 const PLATFORM_META = {
   youtube:   { label: 'YouTube', settings: true },
+  boosty:    { label: 'Boosty', settings: false },
   instagram: { label: 'Instagram', settings: true },
   reddit:    { label: 'Reddit', settings: true },
   tiktok:    { label: 'TikTok', settings: true },
@@ -16,6 +17,38 @@ export default function PlatformScreen({ platform }) {
   const meta = PLATFORM_META[platform] || { label: platform, settings: false }
   const sources = useSources(platform)
   const loaded = useSourcesLoaded()
+  const [boostyStorage, setBoostyStorage] = useState(null)
+  const [storageBusy, setStorageBusy] = useState(false)
+
+  const reloadBoostyStorage = useCallback(async () => {
+    if (platform !== 'boosty' || !window.api?.boostyPlatformStorage) return
+    try {
+      const result = await window.api.boostyPlatformStorage()
+      if (result?.ok) setBoostyStorage(result)
+    } catch {}
+  }, [platform])
+
+  useEffect(() => {
+    if (loaded) reloadBoostyStorage()
+  }, [loaded, sources.length, reloadBoostyStorage])
+
+  async function deleteAllBoostyAudio() {
+    const bytes = Number(boostyStorage?.audio?.bytes || 0)
+    const files = Number(boostyStorage?.audio?.present || 0)
+    if (!bytes || !files || storageBusy) return
+    if (!window.confirm(
+      `Удалить всё локальное аудио Boosty (${files} файлов, ${fmtSize(bytes)})?\n\n` +
+      'Посты, обложки, метаданные, расшифровки и SRT останутся. Аудио можно скачать заново.'
+    )) return
+    setStorageBusy(true)
+    try {
+      const result = await window.api?.boostyDeletePlatformAudio?.()
+      await reloadBoostyStorage()
+      if (!result?.ok) window.alert(result?.error || 'Часть аудиофайлов удалить не удалось')
+    } finally {
+      setStorageBusy(false)
+    }
+  }
 
   return (
     <div className="h-full overflow-auto">
@@ -33,6 +66,35 @@ export default function PlatformScreen({ platform }) {
             ><Settings size={18} /></button>
           )}
         </div>
+
+        {platform === 'boosty' && boostyStorage && (
+          <div className="mb-6 rounded-lg border border-zinc-800 bg-zinc-950 px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+            <span className="text-zinc-500">На диске</span>
+            <StorageMetric label="Аудио" bytes={boostyStorage.audio?.bytes} count={boostyStorage.audio?.present} />
+            <StorageMetric label="Обложки" bytes={boostyStorage.thumbnails?.bytes} />
+            <StorageMetric label="Расшифровки" bytes={boostyStorage.transcripts?.bytes} />
+            {Number(boostyStorage.text?.bytes || 0) > 0 && <StorageMetric label="Текст" bytes={boostyStorage.text.bytes} />}
+            {Number(boostyStorage.index?.bytes || 0) > 0 && <StorageMetric label="Индекс" bytes={boostyStorage.index.bytes} />}
+            <span className="text-zinc-700">·</span>
+            <span className="text-zinc-400">всего <span className="text-zinc-100 font-medium tabular-nums">{fmtSize(boostyStorage.total_bytes)}</span></span>
+            {Number(boostyStorage.audio?.bytes || 0) > 0 && (
+              <button
+                type="button"
+                onClick={deleteAllBoostyAudio}
+                disabled={storageBusy}
+                className="ml-auto h-8 px-2.5 rounded text-red-300 hover:bg-red-950/40 disabled:text-zinc-600 inline-flex items-center gap-1.5"
+              >
+                <Trash2 size={14} /> {storageBusy ? 'Удаляю…' : `Освободить ${fmtSize(boostyStorage.audio.bytes)}`}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => window.api?.storageOpenRoot?.(boostyStorage.root)}
+              title="Открыть хранилище"
+              className={`${Number(boostyStorage.audio?.bytes || 0) > 0 ? '' : 'ml-auto'} p-1.5 rounded text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800`}
+            ><FolderOpen size={15} /></button>
+          </div>
+        )}
 
         <div className="text-sm text-zinc-500 mb-3">Источники</div>
         <div className="rounded-lg border border-zinc-800 bg-zinc-950 divide-y divide-zinc-900 overflow-hidden">
@@ -54,9 +116,13 @@ export default function PlatformScreen({ platform }) {
                   <div className="text-zinc-600 text-sm truncate mt-0.5">{sourceSubtitle(source)}</div>
                 )}
               </div>
-              <span className="text-zinc-600 text-sm tabular-nums shrink-0">
-                {Number(source.items_count || 0).toLocaleString('ru-RU')}
-              </span>
+              {platform === 'boosty' ? (
+                <BoostySourceMetrics source={source} storage={boostyStorage?.per_source?.[String(source.id)]} />
+              ) : (
+                <span className="text-zinc-600 text-sm tabular-nums shrink-0">
+                  {Number(source.items_count || 0).toLocaleString('ru-RU')}
+                </span>
+              )}
               <ChevronRight size={16} className="text-zinc-700 group-hover:text-zinc-400 shrink-0" />
             </button>
           ))}
@@ -64,6 +130,43 @@ export default function PlatformScreen({ platform }) {
       </div>
     </div>
   )
+}
+
+function BoostySourceMetrics({ source, storage }) {
+  return (
+    <span className="text-zinc-600 text-sm tabular-nums shrink-0 text-right">
+      <span className="block">
+        <span className="text-zinc-400">{Number(source.items_count || 0).toLocaleString('ru-RU')} постов</span>
+        <span className="mx-1.5">·</span>
+        {Number(source.boosty_videos_count || 0).toLocaleString('ru-RU')} видео
+        <span className="mx-1.5">·</span>
+        {Number(source.boosty_transcribed_count || 0).toLocaleString('ru-RU')} готово
+      </span>
+      {Number(storage?.audio_bytes || 0) > 0 && (
+        <span className="block text-xs text-zinc-500 mt-0.5">
+          аудио {fmtSize(storage.audio_bytes)} · {Number(storage.audio_files || 0).toLocaleString('ru-RU')} файлов
+        </span>
+      )}
+    </span>
+  )
+}
+
+function StorageMetric({ label, bytes = 0, count = null }) {
+  return (
+    <span className="text-zinc-400">
+      {label} <span className="text-zinc-200 tabular-nums">{fmtSize(bytes)}</span>
+      {count != null && Number(count) > 0 && <span className="text-zinc-600 tabular-nums"> · {Number(count).toLocaleString('ru-RU')}</span>}
+    </span>
+  )
+}
+
+function fmtSize(value) {
+  const n = Number(value || 0)
+  if (!n) return '0 Б'
+  if (n < 1024) return `${n} Б`
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} КБ`
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} МБ`
+  return `${(n / 1024 ** 3).toFixed(2)} ГБ`
 }
 
 function Empty({ text }) {

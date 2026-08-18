@@ -87,6 +87,8 @@ function crumbFor(screen, sources, folders) {
       return { label: 'Telegram' }
     case 'youtube':
       return { label: 'YouTube' }
+    case 'boosty':
+      return { label: 'Boosty' }
     case 'instagram':
       return { label: 'Instagram' }
     case 'reddit':
@@ -160,6 +162,9 @@ function crumbFor(screen, sources, folders) {
         ig_profile_fetch:     'Instagram профиль',
         ig_batch_transcribe:  'Instagram batch',
         local_transcribe:     'Локальный файл',
+        boosty_transcribe:    'Boosty · видео',
+        boosty_channel_fetch: 'Boosty · каталог',
+        boosty_batch_transcribe: 'Boosty · пакет',
       }
       const typed = TYPE_LABEL[job?.type]
       if (typed) return { label: num ? `${typed} · ${num}` : typed }

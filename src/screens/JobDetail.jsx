@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { Brain, Copy, FileText, FolderOpen, Save, Play, Trash2 } from 'lucide-react'
+import { Brain, Captions, Copy, FileAudio, FileText, FolderOpen, Save, Play, Trash2 } from 'lucide-react'
 import { popScreen, pushScreen } from '../lib/store'
 import PlatformLogo from '../components/PlatformLogo'
 import JobProgress, { cleanErrorMessage } from '../components/JobProgress'
@@ -132,6 +132,7 @@ export default function JobDetail({ payload }) {
   const isYoutubeComments      = job.type === 'yt_comments'
   const isYoutubeBatchComments = job.type === 'yt_batch_comments'
   const isYoutube              = isYoutubeSingle || isYoutubeChannel || isYoutubeBatch || isYoutubeComments || isYoutubeBatchComments
+  const isRutube         = job.type === 'rutube_transcribe'
   const isTiktokSingle   = job.type === 'tk_transcribe'
   const isTiktokChannel  = job.type === 'tk_channel_fetch'
   const isTiktokBatch    = job.type === 'tk_batch_transcribe'
@@ -145,11 +146,16 @@ export default function JobDetail({ payload }) {
   const isTgReplyBackfill = job.type === 'tg_reply_backfill'
   const isTgIndex        = job.type === 'tg_index'
   const isLocal          = job.type === 'local_transcribe'
+  const isBoostySingle   = job.type === 'boosty_transcribe'
+  const isBoostyChannel  = job.type === 'boosty_channel_fetch'
+  const isBoostyBatch    = job.type === 'boosty_batch_transcribe'
+  const isBoosty         = isBoostySingle || isBoostyChannel || isBoostyBatch
   const headerLabel      = isYoutubeSingle        ? 'YouTube · транскрипт'
                          : isYoutubeComments      ? 'YouTube комментарии'
                          : isYoutubeBatchComments ? 'YouTube комментарии (пакет)'
                          : isYoutubeChannel       ? 'YouTube · канал'
                          : isYoutubeBatch         ? 'YouTube · пакетная транскрипция'
+                         : isRutube         ? 'Rutube · расшифровка'
                          : isTiktokSingle   ? 'TikTok · транскрипт'
                          : isTiktokChannel  ? 'TikTok · канал'
                          : isTiktokBatch    ? 'TikTok · пакетная транскрипция'
@@ -160,11 +166,16 @@ export default function JobDetail({ payload }) {
                          : isTgFolderRefresh ? 'Telegram · обновление папок'
                          : isTgReplyBackfill ? 'Telegram · reply backfill'
                          : isTgIndex        ? 'Семантический индекс'
+                         : isBoostyChannel  ? 'Boosty · каталог'
+                         : isBoostyBatch    ? 'Boosty · пакетная обработка'
+                         : isBoostySingle   ? 'Boosty · видео'
                          : isLocal          ? 'Локальный файл'
                          : 'Telegram · парсинг'
   const headerPlatform   = isYoutube   ? 'youtube'
+                         : isRutube    ? 'rutube'
                          : isTiktok    ? 'tiktok'
                          : isInstagram ? 'instagram'
+                         : isBoosty   ? 'boosty'
                          : isLocal     ? 'local'
                          : 'telegram'
   const isTelegramFetch = job.type === 'tg_fetch'
@@ -201,7 +212,7 @@ export default function JobDetail({ payload }) {
           : 'Включить автозапуск RAG-индексации Gemini после завершения парсинга'
 
   async function deleteJob() {
-    if (!window.confirm(isYoutubeSingle
+    if (!window.confirm(isYoutubeSingle || isRutube
       ? 'Удалить транскрипт из истории? Файл .txt останется на диске.'
       : 'Удалить запись из истории? Видео и транскрипты остаются.'
     )) return
@@ -306,6 +317,7 @@ export default function JobDetail({ payload }) {
           {isYoutubeChannel       && <YoutubeChannelBody job={job} />}
           {isYoutubeBatch         && <YoutubeBatchBody   job={job} />}
           {isYoutubeBatchComments && <YoutubeBatchCommentsBody job={job} />}
+          {isRutube && <YoutubeBody job={mirrorRutubeToYt(job)} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
           {/* TikTok jobs share the YT body shape (entity_title, file_path,
               yt vs tk fields). Bodies read both job.tk and job.yt — we
               normalise via mirrorTkToYt so the YT renderer just works. */}
@@ -319,8 +331,11 @@ export default function JobDetail({ payload }) {
           {isTgFolderRefresh && <TelegramFolderRefreshBody job={job} />}
           {isTgIndex        && <TelegramIndexBody job={job} />}
           {isTgReplyBackfill && <TelegramReplyBackfillBody job={job} />}
+          {isBoostySingle  && <BoostyBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
+          {isBoostyChannel && <BoostyChannelBody job={job} />}
+          {isBoostyBatch   && <BoostyBatchBody job={job} />}
           {isLocal          && <LocalBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
-          {!isYoutube && !isTiktok && !isInstagram && !isTgPreview && !isTgFolderFetch && !isTgFolderRefresh && !isTgIndex && !isTgReplyBackfill && !isLocal && <TelegramBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
+          {!isYoutube && !isRutube && !isTiktok && !isInstagram && !isTgPreview && !isTgFolderFetch && !isTgFolderRefresh && !isTgIndex && !isTgReplyBackfill && !isBoosty && !isLocal && <TelegramBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
 
           {window.api && (
             <div className="mt-12 pt-6 border-t border-zinc-900">
@@ -351,6 +366,11 @@ function mirrorTkToYt(job) {
     yt_channel: job.yt_channel ?? job.tk_channel ?? null,
     yt_batch:   job.yt_batch   ?? job.tk_batch   ?? null,
   }
+}
+
+function mirrorRutubeToYt(job) {
+  if (!job) return job
+  return { ...job, yt: job.rutube || null }
 }
 
 function TelegramPreviewBody({ job }) {
@@ -928,6 +948,260 @@ function LocalBody({ job, busy, toast, copyFile, openIn, reveal }) {
       {local.srt_path && <LocalTimedFilesCard job={job} local={local} />}
     </>
   )
+}
+
+function BoostyBody({ job, busy, toast, copyFile, openIn, reveal }) {
+  const boosty = job.boosty || job.params?._boosty || {}
+  const resultFiles = boosty.result_files || job.params?.result_files || {}
+  const pathList = [
+    job.target ? `Boosty: ${job.target}` : null,
+    job.file_path ? `Текст: ${job.file_path}` : null,
+    (boosty.srt_path || resultFiles.srt) ? `SRT: ${boosty.srt_path || resultFiles.srt}` : null,
+    (boosty.audio_path || resultFiles.audio) ? `Аудио: ${boosty.audio_path || resultFiles.audio}` : null,
+  ].filter(Boolean).join('\n')
+
+  return (
+    <>
+      <div
+        onClick={() => window.api?.openUrl?.(boosty.canonical_url || job.target)}
+        role="button"
+        title="Открыть на Boosty"
+        className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 mb-6 flex items-center gap-4 hover:border-zinc-600 transition-colors"
+      >
+        <PlatformLogo platform="boosty" size={36} />
+        <div className="flex-1 min-w-0">
+          <div className="font-medium truncate">{boosty.title || job.entity_title || 'Видео Boosty'}</div>
+          <div className="text-zinc-500 truncate" style={{ fontSize: '14px' }}>
+            {boosty.author || boosty.author_handle || 'Boosty'}
+          </div>
+          <div className="text-zinc-600 truncate mt-1" style={{ fontSize: '13px' }}>
+            {boosty.canonical_url || job.target}
+          </div>
+        </div>
+      </div>
+
+      {job.status === 'running' && (
+        <Section title="Сейчас">
+          <KV k="Этап" v={boostyStageLabel(boosty)} />
+          {boosty.stage === 'downloading' && (
+            <>
+              <KV k="Скачано" v={`${fmtBytes(boosty.downloaded_bytes || 0)}${boosty.total_bytes ? ` / ${fmtBytes(boosty.total_bytes)}` : ''}`} />
+              {boosty.percent != null && <KV k="Прогресс" v={`${Number(boosty.percent).toFixed(1)}%`} />}
+              {boosty.speed_bps > 0 && <KV k="Скорость" v={`${fmtBytes(boosty.speed_bps)}/с`} />}
+            </>
+          )}
+          {boosty.stage === 'transcribing' && boosty.aai_elapsed_sec != null && (
+            <KV k="AssemblyAI" v={`${fmtSecs(boosty.aai_elapsed_sec)} прошло`} />
+          )}
+        </Section>
+      )}
+
+      <Section title="Результат">
+        <KV k="Движок" v="AssemblyAI" />
+        {boosty.duration_sec > 0 && <KV k="Видео" v={fmtSecs(boosty.duration_sec)} />}
+        {boosty.audio_bytes != null && <KV k="Аудио" v={fmtBytes(boosty.audio_bytes)} />}
+        {boosty.chars != null && <KV k="Текст" v={`${Number(boosty.chars).toLocaleString('ru-RU')} символов`} />}
+        {(boosty.srt_path || resultFiles.srt) && <KV k="Титры" v="SRT готов" />}
+        <KV k="Запущено" v={job.started_at ? formatTs(job.started_at) : '—'} />
+        <KV k="Закончено" v={job.finished_at ? formatTs(job.finished_at) : '—'} />
+        {job.error && <KV k="Ошибка" v={<span className="text-red-400">{job.error}</span>} />}
+      </Section>
+
+      <FileCard job={job} busy={busy} toast={toast} copyFile={copyFile} openIn={openIn} reveal={reveal} />
+
+      {(boosty.audio_path || resultFiles.audio || boosty.srt_path || resultFiles.srt) && (
+        <Section title="Файлы">
+          {(boosty.audio_path || resultFiles.audio) && (
+            <div className="text-xs text-zinc-500 break-all font-mono mb-2">
+              Аудио: {boosty.audio_path || resultFiles.audio}
+            </div>
+          )}
+          {(boosty.srt_path || resultFiles.srt) && (
+            <div className="text-xs text-zinc-500 break-all font-mono mb-3">
+              SRT: {boosty.srt_path || resultFiles.srt}
+            </div>
+          )}
+          <div className="flex gap-2 flex-wrap">
+            <Button onClick={() => window.api?.copyText?.(pathList)}>
+              <span className="inline-flex items-center gap-1.5"><Copy size={14} />Копировать пути</span>
+            </Button>
+            {(boosty.audio_path || resultFiles.audio) && (
+              <Button onClick={() => window.api?.revealInFinder?.(boosty.audio_path || resultFiles.audio)} variant="ghost">
+                <span className="inline-flex items-center gap-1.5"><FileAudio size={14} />Аудио в Finder</span>
+              </Button>
+            )}
+            {(boosty.srt_path || resultFiles.srt) && (
+              <Button onClick={() => window.api?.openExternal?.(boosty.srt_path || resultFiles.srt)} variant="ghost">
+                <span className="inline-flex items-center gap-1.5"><Captions size={14} />Открыть SRT</span>
+              </Button>
+            )}
+          </div>
+        </Section>
+      )}
+    </>
+  )
+}
+
+function BoostyChannelBody({ job }) {
+  const channel = job.boosty_channel || job.params?._boosty_channel || {}
+  return (
+    <>
+      <EntityCard platform="boosty" target={job.target} sourceId={job.source_id} title={channel.title || job.entity_title} kind="boosty_channel" />
+      <Section title="Каталог">
+        <KV k="Постов" v={Number(channel.posts_total ?? job.items_done ?? 0).toLocaleString('ru-RU')} />
+        <KV k="Видеопостов" v={Number(channel.video_posts || 0).toLocaleString('ru-RU')} />
+        <KV k="Видео" v={Number(channel.videos_total || 0).toLocaleString('ru-RU')} />
+        <KV k="Доступно" v={Number(channel.accessible_posts || 0).toLocaleString('ru-RU') + ' постов'} />
+        <KV k="Охват" v={channel.catalog_complete ? 'Вся лента' : 'Частичный каталог'} />
+        <KV k="Запущено" v={job.started_at ? formatTs(job.started_at) : '—'} />
+        <KV k="Закончено" v={job.finished_at ? formatTs(job.finished_at) : '—'} />
+        {job.error && <KV k="Ошибка" v={<span className="text-red-400">{job.error}</span>} />}
+      </Section>
+    </>
+  )
+}
+
+function BoostyBatchBody({ job }) {
+  const batch = job.boosty_batch || job.params?._boosty_batch || {}
+  const current = batch.current || null
+  const [notice, setNotice] = useState(null)
+  const [videoState, setVideoState] = useState(null)
+  const log = Array.isArray(batch.log) ? batch.log : []
+  useEffect(() => {
+    if (!job.source_id || !window.api?.boostyPosts) return
+    let alive = true
+    window.api.boostyPosts({ source_id: job.source_id }).then(result => {
+      if (!alive || !result?.ok) return
+      const rows = (result.posts || []).flatMap(post => post.videos || [])
+      setVideoState(Object.fromEntries(rows.map(video => [String(video.external_id), video])))
+    }).catch(() => {})
+    return () => { alive = false }
+  }, [job.source_id, job.status])
+  const resolvedLog = log.map(row => {
+    const state = row?.video_id ? videoState?.[String(row.video_id)] : null
+    if (!state) return row
+    return {
+      ...row,
+      file_path: state.transcript_present ? state.transcript_path : null,
+      srt_path: state.srt_present ? state.srt_path : null,
+      audio_path: state.media_present ? state.media_path : null,
+      audio_bytes: state.media_present ? state.media_bytes : null,
+      audio_removed: !!row.audio_path && !state.media_present,
+    }
+  })
+  const files = resolvedLog.filter(row => row && row.kind !== 'error' && (row.file_path || row.srt_path || row.audio_path || row.audio_removed))
+  const errors = resolvedLog.filter(row => row?.kind === 'error')
+  const transcriptPaths = [...new Set(files.map(row => row.file_path).filter(Boolean))]
+
+  async function copyAllTranscripts() {
+    if (!transcriptPaths.length || !window.api?.copyCombined) return
+    const result = await window.api.copyCombined(transcriptPaths)
+    setNotice(result?.ok
+      ? formatCopyToast({ bytes: result.bytes })
+      : `Ошибка: ${result?.error || 'не удалось скопировать'}`)
+    setTimeout(() => setNotice(null), 2600)
+  }
+
+  return (
+    <>
+      <EntityCard platform="boosty" target={job.target} sourceId={job.source_id} title={job.entity_title || 'Видео Boosty'} kind="boosty_channel" />
+      {job.status === 'running' && current && (
+        <Section title="Сейчас">
+          <KV k="Видео" v={current.title || current.video_id || '—'} />
+          <KV k="Этап" v={boostyBatchStageLabel(current.stage)} />
+          {current.total_bytes > 0 && <KV k="Скачано" v={`${fmtBytes(current.downloaded_bytes || 0)} / ${fmtBytes(current.total_bytes)}`} />}
+        </Section>
+      )}
+      <Section title={batch.mode === 'download' ? 'Загрузка аудио' : 'Расшифровка'}>
+        <KV k="Выбрано" v={Number(job.items_total || 0).toLocaleString('ru-RU')} />
+        <KV k="Готово" v={Number(batch.saved ?? job.items_done ?? 0).toLocaleString('ru-RU')} />
+        <KV k="Из кэша" v={Number(batch.cached || 0).toLocaleString('ru-RU')} />
+        <KV k="Ошибок" v={Number(batch.errors || 0).toLocaleString('ru-RU')} />
+        {batch.mode !== 'download' && <KV k="Движок" v="AssemblyAI" />}
+        <KV k="Запущено" v={job.started_at ? formatTs(job.started_at) : '—'} />
+        <KV k="Закончено" v={job.finished_at ? formatTs(job.finished_at) : '—'} />
+        {job.error && <KV k="Ошибка" v={<span className="text-red-400">{job.error}</span>} />}
+      </Section>
+
+      {files.length > 0 && (
+        <Section title={`Готовые файлы · ${files.length}`}>
+          {transcriptPaths.length > 0 && (
+            <div className="mb-3 flex items-center gap-2">
+              <Button onClick={copyAllTranscripts} flash={notice && !notice.startsWith('Ошибка:')}>
+                {notice && !notice.startsWith('Ошибка:')
+                  ? `✓ ${notice}`
+                  : <span className="inline-flex items-center gap-1.5"><Copy size={14} />Копировать все расшифровки</span>}
+              </Button>
+              {notice?.startsWith('Ошибка:') && <span className="text-xs text-red-400">{notice}</span>}
+            </div>
+          )}
+          <div className="rounded-md border border-zinc-800 divide-y divide-zinc-900 max-h-96 overflow-auto">
+            {files.map((row, index) => (
+              <div key={`${row.video_id || 'file'}-${index}`} className="px-3 py-2.5 flex items-center gap-3 text-sm">
+                <FileAudio size={14} className="text-zinc-600 shrink-0" />
+                <span className="min-w-0 flex-1 truncate text-zinc-300" title={row.title || row.video_id}>
+                  {row.title || row.video_id || `Видео ${index + 1}`}
+                </span>
+                {row.file_path && (
+                  <button type="button" onClick={() => window.api?.openExternal?.(row.file_path)} className="px-2 py-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 inline-flex items-center gap-1.5">
+                    <FileText size={13} /> Текст
+                  </button>
+                )}
+                {row.srt_path && (
+                  <button type="button" onClick={() => window.api?.openExternal?.(row.srt_path)} className="px-2 py-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 inline-flex items-center gap-1.5">
+                    <Captions size={13} /> SRT
+                  </button>
+                )}
+                {row.audio_path && (
+                  <button type="button" onClick={() => window.api?.revealInFinder?.(row.audio_path)} className="px-2 py-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 inline-flex items-center gap-1.5">
+                    <FolderOpen size={13} /> MP3{row.audio_bytes ? ` · ${fmtBytes(row.audio_bytes)}` : ''}
+                  </button>
+                )}
+                {row.audio_removed && <span className="text-xs text-zinc-600">MP3 удалён</span>}
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
+
+      {errors.length > 0 && (
+        <Section title={`Не удалось · ${errors.length}`}>
+          <div className="space-y-2">
+            {errors.map((row, index) => (
+              <div key={`${row.video_id || 'error'}-${index}`} className="rounded-md border border-red-950/70 bg-red-950/10 px-3 py-2 text-sm">
+                <div className="text-red-300">{row.title || row.video_id || `Видео ${index + 1}`}</div>
+                <div className="text-zinc-500 mt-0.5 break-words">{row.message || 'Неизвестная ошибка'}</div>
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
+    </>
+  )
+}
+
+function boostyBatchStageLabel(stage) {
+  if (stage === 'resolving') return 'Читаем пост'
+  if (stage === 'downloading') return 'Скачиваем аудио'
+  if (stage === 'extracting') return 'Собираем MP3'
+  if (stage === 'transcribing') return 'Расшифровываем в AssemblyAI'
+  if (stage === 'saving') return 'Сохраняем'
+  return stage || 'Обработка'
+}
+
+function boostyStageLabel(boosty) {
+  if (boosty.stage === 'authorizing') return 'Получаем доступ из браузера'
+  if (boosty.stage === 'resolving') return 'Читаем пост Boosty'
+  if (boosty.stage === 'downloading') return 'Скачиваем аудио'
+  if (boosty.stage === 'extracting') return 'Собираем MP3'
+  if (boosty.stage === 'saving') return 'Сохраняем текст и SRT'
+  if (boosty.stage === 'transcribing') {
+    if (boosty.aai_stage === 'uploading') return 'Загружаем аудио в AssemblyAI'
+    if (boosty.aai_stage === 'queued') return 'В очереди AssemblyAI'
+    if (boosty.aai_stage === 'completed') return 'Получаем текст и SRT'
+    return 'Транскрибируем в AssemblyAI'
+  }
+  return boosty.stage || 'Обработка'
 }
 
 function LocalTimedFilesCard({ job, local }) {
@@ -1621,16 +1895,18 @@ function FileCard({ job, busy, toast, copyFile, copyFlash, openIn, reveal }) {
 
 function YoutubeCard({ yt, url, title }) {
   const vid = yt?.video_id
+  const isRutube = /rutube\.ru/i.test(url || '')
+  const thumbnail = yt?.thumbnail_url || (!isRutube && vid ? `https://i.ytimg.com/vi/${vid}/mqdefault.jpg` : null)
   return (
     <div
       onClick={() => window.api?.openUrl?.(url)}
       role="button"
-      title="Открыть на YouTube"
+      title={isRutube ? 'Открыть на Rutube' : 'Открыть на YouTube'}
       className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 mb-6 flex items-start gap-4 cursor-pointer hover:border-zinc-600 transition-colors"
     >
-      {vid ? (
+      {thumbnail ? (
         <img
-          src={`https://i.ytimg.com/vi/${vid}/mqdefault.jpg`}
+          src={thumbnail}
           alt=""
           className="w-24 h-14 object-cover rounded bg-zinc-800 border border-zinc-800 shrink-0"
           onError={e => { e.currentTarget.style.visibility = 'hidden' }}
@@ -1666,10 +1942,17 @@ function fmtSecs(secs) {
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
-function EntityCard({ platform = 'telegram', target, title, kind }) {
+function EntityCard({ platform = 'telegram', target, sourceId = null, title, kind }) {
   const sources = useSources()
-  const cleanHandle = String(target || '').replace(/^@/, '')
-  const matched = sources.find(s => s.platform === platform && s.handle === cleanHandle)
+  let cleanHandle = String(target || '').replace(/^@/, '')
+  try {
+    if (/^https?:\/\//i.test(cleanHandle)) cleanHandle = new URL(cleanHandle).pathname.split('/').filter(Boolean)[0] || cleanHandle
+  } catch {}
+  const matched = sources.find(s => s.platform === platform && (
+    (sourceId != null && Number(s.id) === Number(sourceId)) || s.handle === cleanHandle
+  ))
+  const displayHandle = matched?.handle || cleanHandle.replace(/^source:\d+$/i, '')
+  const kindLabel = kind === 'boosty_channel' ? 'Автор Boosty' : (kind || 'Источник')
   const clickable = !!matched
   const onClick = clickable
     ? () => pushScreen('source-detail', { sourceId: matched.id, platform })
@@ -1685,9 +1968,9 @@ function EntityCard({ platform = 'telegram', target, title, kind }) {
     >
       <PlatformLogo platform={platform} size={32} />
       <div className="flex-1 min-w-0">
-        <div className="font-medium truncate">{title || target}</div>
+        <div className="font-medium truncate">{title || matched?.display_name || target}</div>
         <div className="text-zinc-500" style={{ fontSize: '14px' }}>
-          {kind || 'unknown'} · @{cleanHandle}
+          {kindLabel}{displayHandle ? ` · @${displayHandle}` : ''}
         </div>
       </div>
       {clickable && <span className="text-zinc-600 shrink-0">→</span>}

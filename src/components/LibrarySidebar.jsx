@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
-import { ChevronDown, ChevronRight, ChevronUp, Minus } from 'lucide-react'
+import { ChevronDown, ChevronRight, ChevronUp, Minus, TriangleAlert } from 'lucide-react'
 import { PLATFORMS } from '../lib/detect'
 import { toggleScreen, useStore } from '../lib/store'
 import { useSources, useSourcesLoaded } from '../lib/sources'
@@ -8,12 +8,17 @@ import PlatformLogo from './PlatformLogo'
 import Avatar from './Avatar'
 import { useTelegramSelection } from '../lib/telegramSelection'
 import SidebarContextMenu from './SidebarContextMenu'
+import {
+  isTelegramSourceUnavailable,
+  telegramSourceHealthTitle,
+} from '../lib/telegramSourceHealth'
 
 // Keep every first-class platform reachable even when its source list is
 // empty. The same names are the platform-level screen routes.
 const PLATFORM_GROUP_ORDER = [
   'telegram',
   'youtube',
+  'boosty',
   'instagram',
   'reddit',
   'tiktok',
@@ -350,6 +355,9 @@ function PlatformGroup({
   const totalCount = items.length
 
   const isTelegram = platform === 'telegram'
+  const unavailableCount = isTelegram
+    ? items.filter(isTelegramSourceUnavailable).length
+    : 0
   const Header = onHeaderClick ? 'button' : 'div'
 
   return (
@@ -374,8 +382,17 @@ function PlatformGroup({
         >
           {meta?.label || platform}
         </span>
+        {unavailableCount > 0 && (
+          <span
+            className="ml-auto inline-flex items-center gap-1 text-red-400 shrink-0 tabular-nums text-xs"
+            title={`${unavailableCount} недоступных Telegram-источников`}
+          >
+            <TriangleAlert size={12} />
+            {unavailableCount}
+          </span>
+        )}
         <span
-          className="text-zinc-500 ml-auto shrink-0 tabular-nums text-xs"
+          className={`${unavailableCount > 0 ? '' : 'ml-auto'} text-zinc-500 shrink-0 tabular-nums text-xs`}
         >
           {totalCount.toLocaleString('ru-RU')}
         </span>
@@ -438,6 +455,8 @@ function SourceRow({
   // Selection only applies to Telegram rows — multi-select is meaningless for
   // YouTube / Instagram (different operations per platform).
   const selected = !!(isTelegram && selection.has(source.id))
+  const unavailable = !!(isTelegram && isTelegramSourceUnavailable(source))
+  const healthTitle = unavailable ? telegramSourceHealthTitle(source) : ''
   // Cmd/Ctrl-click = toggle. Shift-click = range from anchor to this row.
   // Plain click = single-select navigation (existing behaviour).
   const onClick = (e) => {
@@ -485,22 +504,31 @@ function SourceRow({
       data-library-source-id={source.id}
       onClick={onClick}
       onContextMenu={onCtx}
+      title={healthTitle || undefined}
       className={`relative w-full text-left ${isTelegram ? 'pl-4 pr-2' : 'px-2'} py-1.5 rounded-md flex items-center gap-2 group min-w-0 select-none outline-none focus:outline-none ${
-        selected
-          ? 'bg-emerald-900/40 ring-1 ring-emerald-700/60'
-          : active ? 'bg-zinc-800' : 'hover:bg-zinc-900'
+        unavailable
+          ? selected
+            ? 'bg-red-950/50 ring-1 ring-red-600/80'
+            : active ? 'bg-red-950/45 ring-1 ring-red-800/70' : 'bg-red-950/20 hover:bg-red-950/40'
+          : selected
+            ? 'bg-emerald-900/40 ring-1 ring-emerald-700/60'
+            : active ? 'bg-zinc-800' : 'hover:bg-zinc-900'
       }`}
     >
       {isTelegram && <SemanticIndexRail source={source} indexJob={indexJob} />}
-      <Avatar source={source} size={20} />
-      <span className="text-zinc-300 truncate text-sm min-w-0 flex-1">
+      <span className={unavailable ? 'rounded-full ring-1 ring-red-700/80' : ''}>
+        <Avatar source={source} size={20} />
+      </span>
+      <span className={`${unavailable ? 'text-red-300' : 'text-zinc-300'} truncate text-sm min-w-0 flex-1`}>
         {source.display_name && source.display_name !== source.handle
           ? source.display_name
           : `@${source.handle}`}
       </span>
+      {unavailable && <TriangleAlert size={13} className="text-red-400 shrink-0" />}
       <span className={`text-xs ml-auto shrink-0 ${
-        selected ? 'text-emerald-300'
-                 : active ? 'text-zinc-300' : 'text-zinc-600 group-hover:text-zinc-500'
+        unavailable ? 'text-red-400'
+          : selected ? 'text-emerald-300'
+            : active ? 'text-zinc-300' : 'text-zinc-600 group-hover:text-zinc-500'
       }`}>
         {source.items_count || 0}
       </span>
@@ -594,8 +622,19 @@ function byLastSyncedDesc(a, b) {
 // the main list keeps the by-weight order.
 function splitSources(items, platform) {
   const isTg = platform === 'telegram'
-  const inMain = (s) => !!s.is_explicit && (!isTg || (s.items_count || 0) > 0)
-  const explicit = items.filter(inMain).sort(byItemsDescNameAsc)
+  // A broken Telegram source must never disappear inside collapsed
+  // «Прочее»: the whole point of the persistent marker is that it remains
+  // visible even after background pulls stop producing History rows.
+  const inMain = (s) => (isTg && isTelegramSourceUnavailable(s))
+    || (!!s.is_explicit && (!isTg || (s.items_count || 0) > 0))
+  const explicit = items.filter(inMain).sort((a, b) => {
+    if (isTg) {
+      const dangerDiff = Number(isTelegramSourceUnavailable(b))
+        - Number(isTelegramSourceUnavailable(a))
+      if (dangerDiff) return dangerDiff
+    }
+    return byItemsDescNameAsc(a, b)
+  })
   const other    = items.filter(s => !inMain(s)).sort(byLastSyncedDesc)
   return { explicit, other }
 }

@@ -95,7 +95,7 @@ export function useStore(selector = s => s) {
 //
 // Screens NOT listed here keep plain stacking (notes on top of source-detail).
 const HOME_ENTRY = { name: 'paste', payload: null }
-const PLATFORM_SCREENS = new Set(['telegram', 'youtube', 'instagram', 'reddit', 'tiktok', 'twitter'])
+const PLATFORM_SCREENS = new Set(['telegram', 'youtube', 'boosty', 'instagram', 'reddit', 'tiktok', 'twitter'])
 
 // A toggle destination is slightly broader than a literal {name, payload}:
 // - every settings section belongs to the same open Settings surface, so a
@@ -186,6 +186,7 @@ function canonicalTrail(name, payload) {
     case 'ig-config':
     case 'telegram':
     case 'youtube':
+    case 'boosty':
     case 'instagram':
     case 'reddit':
     case 'tiktok':

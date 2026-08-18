@@ -136,15 +136,24 @@ async function runTelegramAutoOnce({ db, jobRunner, indexJob, reason = 'timer' }
     const rows = db.listTelegramAutoSources()
     const groups = new Map()
     let skippedNoTypes = 0
+    let skippedUnavailable = 0
     for (const row of rows) {
+      // A source-level access failure is persistent, unlike a transient job
+      // error.  Do not create the same red History row every 30 minutes.
+      // Manual fetches are still allowed and act as the control probe; a
+      // successful entity response clears tg_health in job-runner.
+      if (row.tg_health?.status === 'unavailable') {
+        skippedUnavailable += 1
+        continue
+      }
       if (!addToGroup(groups, row)) skippedNoTypes += 1
     }
     if (!groups.size) {
-      console.log(`[TelegramAuto] ${reason}: no enabled sources${skippedNoTypes ? `, skipped_no_types=${skippedNoTypes}` : ''}`)
-      return { ok: true, groups: 0, sources: 0 }
+      console.log(`[TelegramAuto] ${reason}: no runnable sources skipped_no_types=${skippedNoTypes} skipped_unavailable=${skippedUnavailable}`)
+      return { ok: true, groups: 0, sources: rows.length, skippedNoTypes, skippedUnavailable }
     }
 
-    console.log(`[TelegramAuto] ${reason}: groups=${groups.size} sources=${rows.length} skipped_no_types=${skippedNoTypes}`)
+    console.log(`[TelegramAuto] ${reason}: groups=${groups.size} sources=${rows.length} skipped_no_types=${skippedNoTypes} skipped_unavailable=${skippedUnavailable}`)
     let pulledSources = 0
     let indexedSources = 0
     let skippedBlocked = 0
@@ -213,8 +222,8 @@ async function runTelegramAutoOnce({ db, jobRunner, indexJob, reason = 'timer' }
       }
     }
 
-    console.log(`[TelegramAuto] ${reason}: done pulled=${pulledSources} indexed=${indexedSources} skipped_blocked=${skippedBlocked} total_ms=${Date.now() - started}`)
-    return { ok: true, groups: groups.size, sources: rows.length, pulledSources, indexedSources, skippedBlocked }
+    console.log(`[TelegramAuto] ${reason}: done pulled=${pulledSources} indexed=${indexedSources} skipped_blocked=${skippedBlocked} skipped_unavailable=${skippedUnavailable} total_ms=${Date.now() - started}`)
+    return { ok: true, groups: groups.size, sources: rows.length, pulledSources, indexedSources, skippedBlocked, skippedUnavailable }
   } catch (err) {
     console.error(`[TelegramAuto] ${reason}: failed ${err?.message || err}`)
     return { ok: false, error: String(err?.message || err) }

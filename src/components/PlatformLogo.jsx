@@ -41,6 +41,17 @@ function YouTube({ size, className }) {
   )
 }
 
+function Rutube({ size, className }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} className={className} aria-label="Rutube">
+      <rect x="1" y="1" width="22" height="22" rx="5" fill="#17171B" />
+      <path d="M7 6.5h5.6c3.1 0 5 1.5 5 4.1 0 1.8-.9 3.1-2.5 3.7l3.2 3.2h-4.1l-2.7-2.8h-.9v2.8H7v-11Zm5.2 5.4c1.2 0 1.8-.4 1.8-1.3s-.6-1.3-1.8-1.3h-1.6v2.6h1.6Z" fill="#fff" />
+      <path d="M4.2 7.2v9.6" stroke="#00E7F0" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M19.8 7.2v9.6" stroke="#EE2A5B" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 function Instagram({ size, className }) {
   return (
     <svg viewBox="0 0 24 24" width={size} height={size} className={className} aria-label="Instagram">
@@ -112,12 +123,26 @@ function LocalFile({ size, className }) {
   )
 }
 
+function Boosty({ size, className }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} className={className} aria-label="Boosty">
+      <circle cx="12" cy="12" r="12" fill="#F15F2C" />
+      <path
+        d="M8.1 5.2h5.1c2.7 0 4.3 1.2 4.3 3.3 0 1.3-.7 2.4-1.9 2.9 1.6.4 2.5 1.6 2.5 3.3 0 2.7-2 4.1-5.2 4.1H8.1V5.2Zm4.7 5.3c1.2 0 1.8-.5 1.8-1.4s-.6-1.3-1.8-1.3h-1.7v2.7h1.7Zm.2 5.7c1.4 0 2.1-.6 2.1-1.6 0-1.1-.7-1.6-2.1-1.6h-1.9v3.2H13Z"
+        fill="#fff"
+      />
+    </svg>
+  )
+}
+
 const LOGOS = {
   telegram:  Telegram,
   youtube:   YouTube,
+  rutube:    Rutube,
   instagram: Instagram,
   tiktok:    TikTok,
   reddit:    Reddit,
   twitter:   Twitter,
+  boosty:    Boosty,
   local:     LocalFile,
 }

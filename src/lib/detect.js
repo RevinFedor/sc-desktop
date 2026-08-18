@@ -4,10 +4,12 @@
 export const PLATFORMS = {
   telegram: { label: 'Telegram', accent: '#229ED9' },
   youtube:  { label: 'YouTube',  accent: '#FF0000' },
+  rutube:   { label: 'Rutube',   accent: '#EE2A5B' },
   tiktok:   { label: 'TikTok',   accent: '#FF0050' },
   instagram:{ label: 'Instagram',accent: '#E4405F' },
   reddit:   { label: 'Reddit',   accent: '#FF4500' },
   twitter:  { label: 'Twitter/X', accent: '#71717A' },
+  boosty:   { label: 'Boosty',   accent: '#F15F2C' },
   local:    { label: 'Local file', accent: '#a1a1aa' },
 }
 
@@ -60,12 +62,16 @@ export function detect(input) {
       return tg(raw)
     if (lower.includes('youtube.com') || lower.includes('youtu.be'))
       return yt(raw)
+    if (lower.includes('rutube.ru'))
+      return rutube(raw)
     if (lower.includes('tiktok.com'))
       return tk(raw)
     if (lower.includes('instagram.com'))
       return ig(raw)
     if (lower.includes('reddit.com') || lower.includes('redd.it'))
       return rd(raw)
+    if (lower.includes('boosty.to'))
+      return boosty(raw)
     return { platform: null, kind: 'url-unknown', target: raw, raw }
   }
 
@@ -123,6 +129,13 @@ function yt(url) {
   return { platform: 'youtube', kind: 'video', target: url, raw: url }
 }
 
+function rutube(url) {
+  if (/rutube\.ru\/(?:(?:live\/)?video(?:\/private)?|(?:play\/)?embed)\/[0-9a-z]{32}(?:[/?#]|$)/i.test(url)) {
+    return { platform: 'rutube', kind: 'video', target: url, raw: url }
+  }
+  return { platform: 'rutube', kind: 'url', target: url, raw: url }
+}
+
 function tk(url) {
   // Short URLs (vt.tiktok.com / vm.tiktok.com / m.tiktok.com) — treat as video
   // (resolved to a real /@user/video/... URL on the Python side).
@@ -155,4 +168,24 @@ function rd(url) {
   const m = url.match(/reddit\.com\/r\/([^/?]+)/i)
   if (m) return { platform: 'reddit', kind: 'subreddit', target: url, handle: m[1], raw: url }
   return { platform: 'reddit', kind: 'url', target: url, raw: url }
+}
+
+function boosty(url) {
+  try {
+    const parsed = new URL(url)
+    const layer = parsed.searchParams.get('layer') || ''
+    if (/^video:[^:]+:[0-9a-f-]{36}:[0-9a-f-]{36}$/i.test(layer)) {
+      return { platform: 'boosty', kind: 'video', target: url, raw: url }
+    }
+    if (/\/posts\/[0-9a-f-]{36}\/?$/i.test(parsed.pathname)) {
+      return { platform: 'boosty', kind: 'post', target: url, raw: url }
+    }
+    if (/\/purchase\/\d+\/?$/i.test(parsed.pathname)) {
+      return { platform: 'boosty', kind: 'purchase', target: url, raw: url }
+    }
+    const author = parsed.pathname.split('/').filter(Boolean)[0] || null
+    return { platform: 'boosty', kind: 'channel', target: url, handle: author, raw: url }
+  } catch {
+    return { platform: 'boosty', kind: 'url', target: url, raw: url }
+  }
 }

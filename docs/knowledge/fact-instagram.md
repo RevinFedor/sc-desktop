@@ -160,6 +160,14 @@ pipeline; image-only Post завершается явной ошибкой от�
 SC Desk не добавляет profile timeline или batch-посты: одна ссылка остаётся
 одним import. Внешний REST/SSE lifecycle — `fact-sc-desk.md`.
 
+Успешно подготовленное аудио без текста от Gemini — не «media отсутствует» и
+не generic parser crash. Ответ `finishReason=STOP` без текстовых parts
+преобразуется в стабильный `audio_no_text`; остальные model/API/download
+ошибки сохраняют исходную причину. Код проходит через job и mobile API отдельно
+от человеческого сообщения, поэтому UI не должен распознавать ошибку по строке.
+Уже понесённая стоимость Gemini сохраняется в `item_error` и job totals даже
+когда транскрипт не создан: пустой результат не означает бесплатный запрос.
+
 ---
 
 ## 🏷 `external_id`-префикс — `reel:` и `post:`

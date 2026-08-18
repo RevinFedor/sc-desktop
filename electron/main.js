@@ -36,6 +36,9 @@ const {
 } = require('./telegram-auto')
 const { startMobileApiServer } = require('./mobile-api-server')
 const {
+  createTelegramNotificationService,
+} = require('./telegram-notification-service')
+const {
   publicAppSettings,
   patchAppSettings,
 } = require('./app-settings')
@@ -333,6 +336,15 @@ ipcMain.handle('appSettings:get', () => publicAppSettings(readScSettingsStrict()
 ipcMain.handle('appSettings:patch', (_evt, payload) => (
   patchAppSettings(readScSettingsStrict, writeScSettings, payload)
 ))
+
+// The old interactive getUpdates/Instagram bot stays retired. Custom Terminal
+// still depends on the bot token for outbound completion alerts, so that
+// delivery service remains independent from both polling and the mobile API.
+const telegramNotificationService = createTelegramNotificationService({
+  readScSettings: readScSettingsStrict,
+  db,
+  allowTerminalNotifications: !isDev || process.env.SC_TELEGRAM_BOT_DEV === '1',
+})
 
 let mobileApiServer = null
 
@@ -666,6 +678,7 @@ ipcMain.handle('folder:fetch', (_e, params) => {
   }
   // Resolve each source_id → telegram handle the Python side speaks.
   const targets = []
+  const sourceIds = []
   let tgSession = null
   for (const sid of params.source_ids) {
     try {
@@ -676,6 +689,7 @@ ipcMain.handle('folder:fetch', (_e, params) => {
         if (tgSession && tgSession !== s.tg_session) return { ok: false, error: 'Выбранные чаты относятся к разным Telegram-аккаунтам' }
         tgSession = s.tg_session
         targets.push(s.handle)
+        sourceIds.push(Number(s.id))
       }
     } catch {}
   }
@@ -684,7 +698,7 @@ ipcMain.handle('folder:fetch', (_e, params) => {
   try {
     const id = jobRunner.startTelegramFolderFetch({
       folder_id:  params.folder_id || null,
-      source_ids: params.source_ids.map(Number),
+      source_ids: sourceIds,
       targets,
       mode:       params.mode || 'last_n',
       limit:      params.limit || 0,
@@ -1274,6 +1288,32 @@ ipcMain.handle('yt:copyCachedFile', (_evt, filePath) => {
 ipcMain.handle('yt:single',     (_evt, params) => jobRunner.startYoutubeSingle(params))
 ipcMain.handle('yt:resumeAi',   (_evt, { jobId, engine }) => jobRunner.resumeYoutubeAi(jobId, { engine }))
 
+// ─── Rutube single-video ─────────────────────────────────────────
+ipcMain.handle('rutube:lookupCache', (_evt, videoId) => {
+  const row = jobRunner.lookupRutubeCache(videoId)
+  if (!row) return null
+  return {
+    id:           row.id,
+    file_path:    row.file_path,
+    finished_at:  row.finished_at,
+    cost_usd:     row.cost_usd || 0,
+    parameters:   row.parameters_json ? JSON.parse(row.parameters_json) : null,
+  }
+})
+ipcMain.handle('rutube:copyCachedFile', (_evt, filePath) => {
+  if (!filePath || !fs.existsSync(filePath)) return { ok: false, error: 'File not found' }
+  try {
+    const content = fs.readFileSync(filePath, 'utf8')
+    clipboard.writeText(content)
+    jobRunner.playClipboardSound()
+    return { ok: true, bytes: content.length }
+  } catch (err) {
+    return { ok: false, error: String(err) }
+  }
+})
+ipcMain.handle('rutube:single',   (_evt, params) => jobRunner.startRutubeSingle(params || {}))
+ipcMain.handle('rutube:resumeAi', (_evt, { jobId, engine }) => jobRunner.resumeRutubeAi(jobId, { engine }))
+
 // ─── YouTube comments ───────────────────────────────────────────
 // Cache key is the exact (video_id, sort, limit, includeReplies) tuple —
 // changing any of those four parameters means a fresh fetch and a fresh file.
@@ -1326,6 +1366,303 @@ ipcMain.handle('tk:batchTranscribe',(_evt, params)  => jobRunner.startTiktokBatc
 // Reddit: thread fetch (full URL → post + comment tree) + search (keyword → posts list).
 ipcMain.handle('rd:threadFetch', (_evt, params) => jobRunner.startRedditThreadFetch(params))
 ipcMain.handle('rd:search',      (_evt, params) => jobRunner.startRedditSearch(params))
+
+// Boosty single-video: request the user's live Boosty auth from the browser
+// extension, then pass it only to the spawned worker environment. The cookie
+// never enters renderer state, job snapshots, application logs, or SQLite.
+ipcMain.handle('boosty:channelLookup', (_evt, payload = {}) => (
+  jobRunner.lookupBoostyChannel(payload)
+))
+ipcMain.handle('boosty:channelFetch', async (_evt, params = {}) => {
+  const { requestBoostyAuthCookie } = require('./browser-bridge')
+  const auth = await requestBoostyAuthCookie()
+  return jobRunner.startBoostyChannelFetch({
+    ...params,
+    authCookie: auth.value,
+    authExpiration: auth.expirationDate,
+  })
+})
+ipcMain.handle('boosty:postPreview', async (_evt, params = {}) => {
+  const { requestBoostyAuthCookie } = require('./browser-bridge')
+  const auth = await requestBoostyAuthCookie()
+  return jobRunner.previewBoostyPost({
+    url: params.url,
+    authCookie: auth.value,
+    authExpiration: auth.expirationDate,
+  })
+})
+ipcMain.handle('boosty:batchTranscribe', async (_evt, params = {}) => {
+  const { requestBoostyAuthCookie } = require('./browser-bridge')
+  const auth = await requestBoostyAuthCookie()
+  return jobRunner.startBoostyBatchTranscribe({
+    ...params,
+    authCookie: auth.value,
+    authExpiration: auth.expirationDate,
+  })
+})
+ipcMain.handle('boosty:single', async (_evt, params = {}) => {
+  const { requestBoostyAuthCookie } = require('./browser-bridge')
+  const auth = await requestBoostyAuthCookie()
+  return jobRunner.startBoostySingle({
+    url: params.url,
+    authCookie: auth.value,
+    authExpiration: auth.expirationDate,
+  })
+})
+
+function resolveLibraryPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return null
+  const absolute = path.isAbsolute(filePath)
+    ? path.resolve(filePath)
+    : path.resolve(jobRunner.LIB_ROOT, filePath)
+  const relative = path.relative(jobRunner.LIB_ROOT, absolute)
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null
+  return absolute
+}
+
+function localFileInfo(filePath) {
+  const absolute = resolveLibraryPath(filePath)
+  if (!absolute) return { present: false, bytes: 0, path: null }
+  try {
+    const stat = fs.statSync(absolute)
+    return { present: stat.isFile(), bytes: stat.isFile() ? stat.size : 0, path: absolute }
+  } catch {
+    return { present: false, bytes: 0, path: absolute }
+  }
+}
+
+function parseJsonObject(value) {
+  try {
+    const parsed = value ? JSON.parse(value) : {}
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function publicBoostyRow(row) {
+  const media = localFileInfo(row.media_path)
+  const transcript = localFileInfo(row.transcript_path)
+  const srt = localFileInfo(row.transcript_path
+    ? String(row.transcript_path).replace(/\.txt$/i, '.srt')
+    : null)
+  const thumbnail = localFileInfo(row.thumbnail_path)
+  return {
+    id: row.id,
+    source_id: row.source_id,
+    external_id: String(row.external_id),
+    type: row.type,
+    url: row.url,
+    title: row.title,
+    caption: row.caption,
+    published_at: row.published_at,
+    duration_seconds: row.duration_seconds,
+    views: row.views,
+    likes: row.likes,
+    comments: row.comments,
+    parent_external_id: row.parent_external_id,
+    depth: row.depth,
+    thumbnail_path: row.thumbnail_path,
+    thumbnail_present: thumbnail.present,
+    media_path: media.present ? media.path : null,
+    media_present: media.present,
+    media_bytes: media.bytes,
+    transcript_path: transcript.present ? transcript.path : null,
+    transcript_present: transcript.present,
+    transcript_bytes: transcript.bytes,
+    srt_path: srt.present ? srt.path : null,
+    srt_present: srt.present,
+    download_status: media.present ? 'done' : (row.media_path ? 'missing' : row.download_status),
+    download_error: row.download_error,
+    transcribe_status: transcript.present ? 'done' : (row.transcript_path ? 'missing' : row.transcribe_status),
+    transcribe_error: row.transcribe_error,
+    transcribe_engine: row.transcribe_engine,
+    meta: parseJsonObject(row.raw_meta_json),
+  }
+}
+
+ipcMain.handle('boosty:posts', (_evt, payload = {}) => {
+  const sourceId = Number(payload.source_id)
+  const source = db.getSource(sourceId)
+  if (!source || source.platform !== 'boosty') return { ok: false, error: 'Источник Boosty не найден' }
+  const publicRows = db.listBoostyItems(sourceId).map(publicBoostyRow)
+  const parents = publicRows.filter(row => row.type === 'boosty_post')
+  const childrenByParent = new Map()
+  for (const row of publicRows) {
+    if (row.type !== 'boosty_video' || !row.parent_external_id) continue
+    const key = String(row.parent_external_id)
+    if (!childrenByParent.has(key)) childrenByParent.set(key, [])
+    childrenByParent.get(key).push(row)
+  }
+  const posts = parents.map(parent => {
+    const videos = (childrenByParent.get(parent.external_id) || []).sort((a, b) => (
+      Number(a.meta.position || 0) - Number(b.meta.position || 0)
+    ))
+    return {
+      ...parent,
+      videos,
+      video_count: Math.max(Number(parent.meta.video_count || 0), videos.length),
+      known_videos_count: videos.length,
+      duration_seconds: videos.reduce((sum, video) => sum + Number(video.duration_seconds || 0), 0),
+      media_bytes: videos.reduce((sum, video) => sum + Number(video.media_bytes || 0), 0),
+      media_present_count: videos.filter(video => video.media_present).length,
+      transcribed_count: videos.filter(video => video.transcript_present).length,
+    }
+  })
+  const videos = publicRows.filter(row => row.type === 'boosty_video')
+  return {
+    ok: true,
+    source,
+    meta: parseJsonObject(source.meta_json),
+    posts,
+    stats: {
+      posts: posts.length,
+      videos: videos.length,
+      transcribed: videos.filter(video => video.transcript_present).length,
+      audio_files: videos.filter(video => video.media_present).length,
+      audio_bytes: videos.reduce((sum, video) => sum + Number(video.media_bytes || 0), 0),
+      locked_posts: posts.filter(post => post.meta.access_state === 'locked').length,
+      lost_posts: posts.filter(post => post.meta.access_state === 'lost').length,
+    },
+  }
+})
+
+function deleteBoostyAudioForSource(sourceId, requested = null) {
+  const rows = db.listBoostyVideos(sourceId, requested)
+  let removedBytes = 0
+  let removedFiles = 0
+  const clearedIds = []
+  const errors = []
+  for (const row of rows) {
+    if (!row.media_path) continue
+    const info = localFileInfo(row.media_path)
+    if (!info.path) {
+      errors.push({ video_id: String(row.external_id), message: 'Путь аудио находится вне библиотеки' })
+      continue
+    }
+    try {
+      if (info.present) {
+        fs.unlinkSync(info.path)
+        removedBytes += info.bytes
+        removedFiles += 1
+      }
+      clearedIds.push(String(row.external_id))
+    } catch (err) {
+      errors.push({ video_id: String(row.external_id), message: String(err?.message || err) })
+    }
+  }
+  if (clearedIds.length) db.clearItemMediaPaths(sourceId, clearedIds, 'evicted')
+  return {
+    ok: errors.length === 0,
+    removed: clearedIds.length,
+    removed_files: removedFiles,
+    bytes: removedBytes,
+    errors,
+  }
+}
+
+function boostySourceIds() {
+  return db.getDb().prepare(`SELECT id FROM sources WHERE platform='boosty' ORDER BY id`).all()
+}
+
+function boostyPlatformStorageSnapshot() {
+  const sources = boostySourceIds()
+  const mediaPaths = []
+  const transcriptPaths = []
+  const thumbnailPaths = []
+  const perSource = {}
+  let textBytes = 0
+  let indexBytes = 0
+  let indexVectors = 0
+  for (const source of sources) {
+    const breakdown = db.storageBreakdownForSource(source.id)
+    const audio = sumExistingFiles(breakdown.media_paths)
+    perSource[String(source.id)] = {
+      audio_bytes: audio.bytes,
+      audio_files: audio.present,
+      audio_known: audio.total,
+    }
+    mediaPaths.push(...breakdown.media_paths)
+    transcriptPaths.push(...breakdown.transcript_paths)
+    thumbnailPaths.push(...breakdown.thumbnail_paths)
+    textBytes += Number(breakdown.text_bytes || 0)
+    indexBytes += Number(breakdown.index_bytes || 0)
+    indexVectors += Number(breakdown.index_vectors || 0)
+  }
+  const audio = sumExistingFiles(mediaPaths)
+  const transcripts = sumExistingFiles(transcriptPaths)
+  const thumbnails = sumExistingFiles(thumbnailPaths)
+  return {
+    ok: true,
+    root: jobRunner.LIB_ROOT,
+    sources: sources.length,
+    audio,
+    transcripts,
+    thumbnails,
+    text: { bytes: textBytes },
+    index: { bytes: indexBytes, vectors: indexVectors },
+    per_source: perSource,
+    total_bytes: audio.bytes + transcripts.bytes + thumbnails.bytes + textBytes + indexBytes,
+  }
+}
+
+ipcMain.handle('boosty:platformStorage', () => {
+  try {
+    return boostyPlatformStorageSnapshot()
+  } catch (err) {
+    console.error('[Boosty] platform storage failed', err)
+    return { ok: false, error: String(err?.message || err) }
+  }
+})
+
+ipcMain.handle('boosty:deleteAudio', (_evt, payload = {}) => {
+  const sourceId = Number(payload.source_id)
+  const source = db.getSource(sourceId)
+  if (!source || source.platform !== 'boosty') return { ok: false, error: 'Источник Boosty не найден' }
+  const hasExplicitSelection = Array.isArray(payload.video_ids)
+  const requested = hasExplicitSelection
+    ? [...new Set(payload.video_ids.map(String).filter(Boolean))]
+    : null
+  if (hasExplicitSelection && requested.length === 0) {
+    return { ok: false, error: 'Не выбрано ни одного аудиофайла' }
+  }
+  return deleteBoostyAudioForSource(sourceId, requested)
+})
+
+ipcMain.handle('boosty:deletePlatformAudio', () => {
+  const sources = boostySourceIds()
+  const result = { ok: true, sources: 0, removed: 0, removed_files: 0, bytes: 0, errors: [] }
+  for (const source of sources) {
+    const one = deleteBoostyAudioForSource(source.id, null)
+    if (one.removed) result.sources += 1
+    result.removed += Number(one.removed || 0)
+    result.removed_files += Number(one.removed_files || 0)
+    result.bytes += Number(one.bytes || 0)
+    result.errors.push(...(one.errors || []).map(error => ({ source_id: source.id, ...error })))
+  }
+  result.ok = result.errors.length === 0
+  return result
+})
+
+ipcMain.handle('boosty:copyTranscripts', (_evt, payload = {}) => {
+  const sourceId = Number(payload.source_id)
+  const ids = Array.isArray(payload.video_ids)
+    ? [...new Set(payload.video_ids.map(String).filter(Boolean))]
+    : []
+  if (!sourceId || !ids.length) return { ok: false, error: 'Нечего копировать' }
+  const rows = db.listBoostyVideos(sourceId, ids)
+  const chunks = []
+  for (const row of rows) {
+    const info = localFileInfo(row.transcript_path)
+    if (!info.present) continue
+    try { chunks.push(fs.readFileSync(info.path, 'utf8')) } catch {}
+  }
+  if (!chunks.length) return { ok: false, error: 'Сохранённых расшифровок нет' }
+  const combined = chunks.join('\n\n' + '='.repeat(72) + '\n\n')
+  clipboard.writeText(combined)
+  jobRunner.playClipboardSound()
+  return { ok: true, count: chunks.length, bytes: Buffer.byteLength(combined, 'utf8') }
+})
 
 // Local file transcribe — paste an absolute path → AssemblyAI/Gemini → clipboard.
 ipcMain.handle('local:transcribe', (_evt, params) => jobRunner.startLocalTranscribe(params))
@@ -1679,36 +2016,47 @@ ipcMain.handle('ui:setPreference', (_e, payload) => {
 
 ipcMain.handle('sources:list',     (_e, platform) => db.listSources(platform || null))
 ipcMain.handle('sources:get',      (_e, id)       => db.getSource(id))
-ipcMain.handle('sources:detail',   (_e, id) => ({
-  source:        db.getSource(id),
-  typeBreakdown: db.itemTypeBreakdown(id),
-  senders:       db.senderBreakdown(id),
-  coverage:      db.listCoverage(id),
-  // Min/max published_at across saved items — UI shows it as a period
-  // range so the user sees what slice of history is in the DB without
-  // relying on coverage rows (which may have null date_from/date_to
-  // for IG/YT where flat-playlist doesn't provide ranges).
-  dateRange:     db.itemsDateRange(id),
-  // Hide noisy "list refresh" operations — yt_channel_fetch happens every
-  // sync and is not what the user means by "история парсинга". Old rows
-  // already in DB are filtered out so legacy installs look clean too.
-  jobs:          db.listJobsForSource(id)
-                   .filter(j => j.type !== 'yt_channel_fetch' && j.type !== 'tk_channel_fetch'),
-  // Telegram-only: total comments stored across all posts of this source.
-  // 0 for non-TG sources or channels without discussion. UI renders chip in
-  // type_breakdown row.
-  commentsCount:    db.countCommentsBySource(id),
-  // Posts that already have at least one stored comment — used to compute
-  // «Дотянуть» availability (posts_total - this length).
-  postsWithComments: db.listPostsWithComments(id).length,
-}))
+ipcMain.handle('sources:detail',   (_e, id) => {
+  const source = db.getSource(id)
+  return {
+    source,
+    typeBreakdown: db.itemTypeBreakdown(id),
+    // A successful «Анализ канала» is already durable in the jobs table.
+    // Return it separately from saved item rows: the renderer may visualise
+    // what Telegram reported without inflating «Сохранено сообщений».
+    telegramAnalysis: source?.platform === 'telegram'
+      ? db.latestTelegramAnalysisForSource(id)
+      : null,
+    senders:       db.senderBreakdown(id),
+    coverage:      db.listCoverage(id),
+    // Min/max published_at across saved items — UI shows it as a period
+    // range so the user sees what slice of history is in the DB without
+    // relying on coverage rows (which may have null date_from/date_to
+    // for IG/YT where flat-playlist doesn't provide ranges).
+    dateRange:     db.itemsDateRange(id),
+    // Hide noisy "list refresh" operations — yt_channel_fetch happens every
+    // sync and is not what the user means by "история парсинга". Old rows
+    // already in DB are filtered out so legacy installs look clean too.
+    jobs:          db.listJobsForSource(id)
+                     .filter(j => j.type !== 'yt_channel_fetch' && j.type !== 'tk_channel_fetch'),
+    // Telegram-only: total comments stored across all posts of this source.
+    // 0 for non-TG sources or channels without discussion. UI renders chip in
+    // type_breakdown row.
+    commentsCount:    db.countCommentsBySource(id),
+    // Posts that already have at least one stored comment — used to compute
+    // «Дотянуть» availability (posts_total - this length).
+    postsWithComments: db.listPostsWithComments(id).length,
+  }
+})
 
 function sumExistingFiles(paths) {
   let bytes = 0, present = 0
-  for (const p of paths || []) {
-    try { bytes += fs.statSync(p).size; present++ } catch { /* missing file — skip */ }
+  const unique = [...new Set(paths || [])]
+  for (const p of unique) {
+    const absolute = path.isAbsolute(String(p || '')) ? p : path.join(jobRunner.LIB_ROOT, String(p || ''))
+    try { bytes += fs.statSync(absolute).size; present++ } catch { /* missing file — skip */ }
   }
-  return { bytes, present, total: (paths || []).length }
+  return { bytes, present, total: unique.length }
 }
 
 ipcMain.handle('sources:socialOverview', (_e, id) => {
@@ -1748,6 +2096,7 @@ ipcMain.handle('sources:storage', (_e, id) => {
     const b = db.storageBreakdownForSource(id)
     const media = sumExistingFiles(b.media_paths)
     const transcripts = sumExistingFiles(b.transcript_paths)
+    const thumbnails = sumExistingFiles(b.thumbnail_paths)
     return {
       ok: true,
       root: jobRunner.LIB_ROOT,
@@ -1755,7 +2104,8 @@ ipcMain.handle('sources:storage', (_e, id) => {
       index:       { bytes: b.index_bytes, vectors: b.index_vectors },
       media:       media,
       transcripts: transcripts,
-      total_bytes: b.text_bytes + b.index_bytes + media.bytes + transcripts.bytes,
+      thumbnails:  thumbnails,
+      total_bytes: b.text_bytes + b.index_bytes + media.bytes + transcripts.bytes + thumbnails.bytes,
     }
   } catch (err) {
     console.error('[sources:storage] failed', err)
@@ -2001,6 +2351,7 @@ app.whenReady().then(() => {
     const { startServer } = require('./browser-bridge')
     startServer({
       jobRunner,
+      notificationService: telegramNotificationService,
       settingsAccess: { readScSettings: readScSettingsStrict, writeScSettings },
     })
   } catch (err) {

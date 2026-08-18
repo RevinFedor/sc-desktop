@@ -12,6 +12,10 @@ import TelegramScopeFields, {
 } from '../components/TelegramScopeFields'
 import { CONTENT_TYPES, defaultContent } from '../components/TelegramTypesPopover'
 import { formatCopyToast, formatTokens, formatBytes } from '../lib/formatTokens'
+import {
+  isTelegramSourceUnavailable,
+  telegramSourceHealthTitle,
+} from '../lib/telegramSourceHealth'
 
 // Default range when no folder-saved value exists yet — last week is the
 // most common catch-up window the user actually picks. Centralised default
@@ -24,6 +28,7 @@ const DIALOG_CATEGORY_TABS = [
   { id: 'channels', label: 'Каналы', title: 'Каналы: Telethon Channel с broadcast=true' },
   { id: 'chats',    label: 'Чаты',   title: 'Группы и супергруппы: Telethon Chat или megagroup' },
   { id: 'auto',     label: 'auto',    title: 'Чаты, где включён auto-pull или auto-index', icon: 'auto' },
+  { id: 'unavailable', label: 'Недоступны', title: 'Telegram больше не отдаёт эти чаты выбранному аккаунту', icon: 'unavailable' },
 ]
 
 const AUTO_TYPE_LABELS = {
@@ -390,11 +395,12 @@ export default function TelegramScreen({ payload }) {
   }, [activeTabId, sessionScopedAll, folderSources])
 
   const dialogCategoryCounts = useMemo(() => {
-    const counts = { all: baseVisibleSources.length, personal: 0, channels: 0, chats: 0, auto: 0 }
+    const counts = { all: baseVisibleSources.length, personal: 0, channels: 0, chats: 0, auto: 0, unavailable: 0 }
     for (const s of baseVisibleSources) {
       const category = telegramDialogCategory(s)
       if (category in counts) counts[category] += 1
       if (telegramHasAuto(s)) counts.auto += 1
+      if (isTelegramSourceUnavailable(s)) counts.unavailable += 1
     }
     return counts
   }, [baseVisibleSources])
@@ -402,6 +408,7 @@ export default function TelegramScreen({ payload }) {
   const visibleSources = useMemo(() => {
     if (dialogCategory === 'all') return baseVisibleSources
     if (dialogCategory === 'auto') return baseVisibleSources.filter(telegramHasAuto)
+    if (dialogCategory === 'unavailable') return baseVisibleSources.filter(isTelegramSourceUnavailable)
     return baseVisibleSources.filter(s => telegramDialogCategory(s) === dialogCategory)
   }, [baseVisibleSources, dialogCategory])
 
@@ -957,26 +964,37 @@ export default function TelegramScreen({ payload }) {
           ) : (
             <>
               <div className="px-4 py-2 border-b border-zinc-800 flex items-center gap-2 overflow-x-auto">
-                {DIALOG_CATEGORY_TABS.map(tab => (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    onClick={() => setDialogCategory(tab.id)}
-                    title={tab.title}
-                    className={`shrink-0 px-2.5 py-1 rounded-md flex items-center gap-1.5 ${
-                      dialogCategory === tab.id
-                        ? 'bg-zinc-800 text-zinc-100'
-                        : 'text-zinc-500 hover:text-zinc-200 hover:bg-zinc-900'
-                    }`}
-                    style={{ fontSize: '13px' }}
-                  >
-                    {tab.icon === 'auto' && <RotateCw size={13} className="shrink-0" />}
-                    <span>{tab.label}</span>
-                    <span className={dialogCategory === tab.id ? 'text-zinc-300' : 'text-zinc-600'}>
-                      {dialogCategoryCounts[tab.id] || 0}
-                    </span>
-                  </button>
-                ))}
+                {DIALOG_CATEGORY_TABS.map(tab => {
+                  const active = dialogCategory === tab.id
+                  const danger = tab.id === 'unavailable'
+                  return (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => setDialogCategory(tab.id)}
+                      title={tab.title}
+                      className={`shrink-0 px-2.5 py-1 rounded-md flex items-center gap-1.5 ${
+                        active
+                          ? danger
+                            ? 'bg-red-950/60 text-red-200 ring-1 ring-red-900/70'
+                            : 'bg-zinc-800 text-zinc-100'
+                          : danger && dialogCategoryCounts.unavailable > 0
+                            ? 'text-red-400 hover:text-red-200 hover:bg-red-950/30'
+                            : 'text-zinc-500 hover:text-zinc-200 hover:bg-zinc-900'
+                      }`}
+                      style={{ fontSize: '13px' }}
+                    >
+                      {tab.icon === 'auto' && <RotateCw size={13} className="shrink-0" />}
+                      {tab.icon === 'unavailable' && <TriangleAlert size={13} className="shrink-0" />}
+                      <span>{tab.label}</span>
+                      <span className={danger && dialogCategoryCounts.unavailable > 0
+                        ? 'text-red-400'
+                        : active ? 'text-zinc-300' : 'text-zinc-600'}>
+                        {dialogCategoryCounts[tab.id] || 0}
+                      </span>
+                    </button>
+                  )
+                })}
               </div>
               <div className="px-4 py-2 border-b border-zinc-800 flex items-center gap-3">
                 <Checkbox
@@ -1064,11 +1082,16 @@ export default function TelegramScreen({ payload }) {
                   const checked = selectedIds.has(s.id)
                   const perChat = (progress?.per_chat || []).find(p => p.target === s.handle)
                   const isCurrent = inflight && progress?.current_target === s.handle
+                  const unavailable = isTelegramSourceUnavailable(s)
+                  const healthTitle = telegramSourceHealthTitle(s)
                   return (
                     <li
                       key={s.id}
+                      title={unavailable ? healthTitle : undefined}
                       className={`px-4 py-2 flex items-center gap-3 border-b border-zinc-900 last:border-b-0 ${
-                        isCurrent ? 'bg-zinc-900/60' : 'hover:bg-zinc-900/40'
+                        isCurrent
+                          ? unavailable ? 'bg-red-950/35' : 'bg-zinc-900/60'
+                          : unavailable ? 'bg-red-950/20 hover:bg-red-950/35' : 'hover:bg-zinc-900/40'
                       }`}
                     >
                       <Checkbox
@@ -1076,13 +1099,15 @@ export default function TelegramScreen({ payload }) {
                         onChange={() => toggleOne(s.id)}
                         size="sm"
                       />
-                      <Avatar source={s} size={26} />
+                      <span className={unavailable ? 'rounded-full ring-1 ring-red-700/80' : ''}>
+                        <Avatar source={s} size={26} />
+                      </span>
                       {/* flex-1 min-w-0 на имени + shrink-0 nowrap на счётчиках:
                           длинное название чата сжимается с «…», а «Текст 10»
                           справа никогда не переносится на вторую строку. */}
                       <button
                         onClick={() => pushScreen('source-detail', { sourceId: s.id })}
-                        className="text-zinc-200 truncate hover:underline flex-1 min-w-0 text-left"
+                        className={`${unavailable ? 'text-red-300' : 'text-zinc-200'} truncate hover:underline flex-1 min-w-0 text-left`}
                         style={{ fontSize: '14px' }}
                       >
                         {s.display_name && s.display_name !== s.handle
@@ -1090,6 +1115,11 @@ export default function TelegramScreen({ payload }) {
                           : `@${s.handle}`}
                       </button>
                       <span className="ml-auto flex items-center gap-3 text-zinc-500 shrink-0 whitespace-nowrap" style={{ fontSize: '13px' }}>
+                        {unavailable && (
+                          <span className="inline-flex items-center gap-1 text-red-400" title={healthTitle}>
+                            <TriangleAlert size={13} /> недоступен
+                          </span>
+                        )}
                         {perChat?.status === 'done' && (
                           <span className="text-emerald-500" title={`Только что спарсено: ${perChat.items_done || 0} сообщений`}>
                             +{perChat.items_done || 0}
@@ -1117,6 +1147,12 @@ export default function TelegramScreen({ payload }) {
           <div className="mt-2 text-zinc-500" style={{ fontSize: '12px' }}>
             <span className="text-zinc-400">auto-pull</span> запускается через минуту после старта и дальше каждые 30 минут, пока приложение открыто;{' '}
             <span className="text-zinc-400">auto-index</span> идёт после подтягивания.
+          </div>
+        )}
+
+        {dialogCategory === 'unavailable' && (
+          <div className="mt-2 text-red-300/80" style={{ fontSize: '12px' }}>
+            Фоновые запросы для этих чатов остановлены. Выбери чат и запусти ручной запрос: успешная проверка снимет красную пометку автоматически.
           </div>
         )}
 

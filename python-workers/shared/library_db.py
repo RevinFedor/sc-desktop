@@ -12,7 +12,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-PLATFORMS = ("instagram", "telegram", "youtube", "tiktok", "reddit")
+PLATFORMS = ("instagram", "telegram", "youtube", "tiktok", "reddit", "boosty")
 
 DEFAULT_DB_PATH = (
     Path.home() / "Library" / "Application Support" / "sc-desktop" / "library.db"

@@ -6,6 +6,7 @@ const {
   classifyUrl,
   firstHttpUrl,
   instagramPathParts,
+  isCancellableImport,
   isInstagramHost,
   publicRequest,
   reconcilePersistedRequest,
@@ -191,4 +192,13 @@ test('reads a persisted YouTube title from either cache shape', () => {
     'Stored title',
   )
   assert.equal(youtubeCacheTitle({ parameters_json: '{bad-json' }), null)
+})
+
+test('allows cancellation only while an import can still do work', () => {
+  for (const status of ['queued', 'running', 'awaiting_ai']) {
+    assert.equal(isCancellableImport({ status }), true, status)
+  }
+  for (const status of ['done', 'error', 'cancelled']) {
+    assert.equal(isCancellableImport({ status }), false, status)
+  }
 })

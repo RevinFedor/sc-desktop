@@ -96,6 +96,8 @@ export function RequestJobRow({ job, active, onClose = closeActivity }) {
         ? sources.find(s => s.id === job.source_id)
     : job.type === 'ig_profile_fetch' && job.source_id
         ? sources.find(s => s.id === job.source_id)
+    : (job.type === 'boosty_channel_fetch' || job.type === 'boosty_batch_transcribe') && job.source_id
+        ? sources.find(s => s.id === job.source_id)
     : null
   )
   const pct = job.items_total ? Math.min(100, Math.round((job.items_done / job.items_total) * 100)) : null
@@ -144,7 +146,7 @@ export function RequestJobRow({ job, active, onClose = closeActivity }) {
           </div>
           {/* Unified progress — items counter, dialog-walk scan, per-kind
               media phase. Hides itself when there's nothing to show. */}
-          {job.type !== 'yt_transcribe' && job.type !== 'tk_transcribe' && (
+          {job.type !== 'yt_transcribe' && job.type !== 'rutube_transcribe' && job.type !== 'tk_transcribe' && job.type !== 'boosty_transcribe' && (
             <JobProgress job={job} variant="compact" />
           )}
         </>
@@ -278,6 +280,7 @@ function labelFor(type, job) {
     download_item:        'Загрузка',
     bulk_transcribe:      'Пакетная транскрипция',
     yt_transcribe:        'YouTube · транскрипт',
+    rutube_transcribe:    'Rutube · расшифровка',
     yt_comments:          'YouTube · комментарии',
     yt_batch_comments:    'YouTube · комментарии (пакет)',
     yt_channel_fetch:     'YouTube · канал',
@@ -286,6 +289,9 @@ function labelFor(type, job) {
     tk_channel_fetch:     'TikTok · канал',
     tk_batch_transcribe:  'TikTok · пакет',
     ig_profile_fetch:     'Instagram · профиль',
+    boosty_transcribe:    'Boosty · видео',
+    boosty_channel_fetch: 'Boosty · каталог',
+    boosty_batch_transcribe: 'Boosty · пакет',
     local_transcribe:     'Локальный файл',
   })[type] || type
 }

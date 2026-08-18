@@ -540,6 +540,35 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     return true; // async
   }
 
+  // Настоящий mouseMoved нужен для CSS :hover. Синтетические mouseover /
+  // mousemove из content-script вызывают JS-listeners, но не раскрывают
+  // hover-only controls вроде ChatGPT «Показать в текстовом поле».
+  if (req && req.__sc_trusted_hover === true && sender?.tab?.id != null && typeof req.x === 'number' && typeof req.y === 'number') {
+    const tabId = sender.tab.id;
+    const { x, y } = req;
+    (async () => {
+      try {
+        let needDetach = false;
+        try {
+          await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', { expression: '1' });
+        } catch {
+          await chrome.debugger.attach({ tabId }, '1.3');
+          needDetach = true;
+        }
+        await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+          type: 'mouseMoved', x, y, button: 'none', buttons: 0,
+        });
+        if (needDetach) {
+          try { await chrome.debugger.detach({ tabId }); } catch {}
+        }
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, err: e?.message || String(e) });
+      }
+    })();
+    return true; // async
+  }
+
   // __sc_usergesture_click: кликнуть элемент по selector ВНУТРИ
   // Runtime.evaluate{userGesture:true}. Это синтезирует transient user-activation
   // ДАЖЕ в hidden/inactive вкладке (в отличие от Input.dispatchMouseEvent, который
@@ -937,6 +966,38 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
           // hot-reload polling (grace+cooldown) и применяем свежий код сразу.
           scBgDbg('bridge_cmd.reload_extension', { ts: it.ts })
           setTimeout(() => { try { chrome.runtime.reload() } catch {} }, 100)
+        } else if (it.cmd === 'boosty_auth' && it.requestId) {
+          // Short-lived authenticated handoff for the desktop Boosty worker.
+          // The value is posted straight to Electron and never logged or put
+          // in chrome.storage. `cookies` + <all_urls> are already in manifest.
+          let auth = null
+          let error = null
+          try {
+            const cookies = await chrome.cookies.getAll({ domain: 'boosty.to', name: 'auth' })
+            const cookie = (cookies || []).sort((a, b) =>
+              Number(b.expirationDate || 0) - Number(a.expirationDate || 0)
+            )[0]
+            if (cookie?.value) {
+              auth = { value: cookie.value, expirationDate: cookie.expirationDate || null }
+            } else {
+              error = 'В браузере нет cookie авторизации Boosty'
+            }
+          } catch (e) {
+            error = e?.message || String(e)
+          }
+          const response = await fetch('http://127.0.0.1:53127/boosty-auth-state', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-SC-Extension-Id': chrome.runtime.id,
+            },
+            body: JSON.stringify({ requestId: it.requestId, auth, error }),
+          })
+          scBgDbg('bridge_cmd.boosty_auth', {
+            ok: response.ok && !!auth,
+            status: response.status,
+            requestId: String(it.requestId).slice(0, 8),
+          })
         }
       } catch (e) {
         scBgDbg('bridge_cmd.fail', { cmd: it.cmd, tabId: it.tabId, err: e?.message })

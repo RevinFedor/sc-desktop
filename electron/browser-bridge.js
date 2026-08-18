@@ -46,6 +46,9 @@ const os = require('node:os')
 const crypto = require('node:crypto')
 const researchState = require('./research-state')
 const {
+  createTerminalNotificationRoute,
+} = require('./terminal-notification-route')
+const {
   EXTENSION_YOUTUBE_SCHEMA_VERSION,
   extensionYoutubeFromSettings,
   extensionYoutubeSchemaState,
@@ -190,6 +193,29 @@ const AISTUDIO_TTL_MS = 60 * 60 * 1000 // 1 час
 // Bridge не имеет прямого доступа к chrome.tabs — кладём команду в queue,
 // расширение opt-in polls и выполняет. См. background.js::pollBridgeCommands.
 const BRIDGE_COMMAND_QUEUE = []  // [{cmd:'focus_tab'|'close_tab', tabId, ts}]
+// requestId → {resolve, reject, timer}. The auth value exists only in this
+// short-lived in-memory handoff and is never logged or persisted.
+const BOOSTY_AUTH_REQUESTS = new Map()
+
+function capBridgeCommandQueue() {
+  if (BRIDGE_COMMAND_QUEUE.length > 50) {
+    BRIDGE_COMMAND_QUEUE.splice(0, BRIDGE_COMMAND_QUEUE.length - 50)
+  }
+}
+
+function requestBoostyAuthCookie({ timeoutMs = 12000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const requestId = crypto.randomUUID()
+    const timer = setTimeout(() => {
+      BOOSTY_AUTH_REQUESTS.delete(requestId)
+      reject(new Error('Расширение браузера не ответило. Откройте Boosty в браузере и повторите.'))
+    }, timeoutMs)
+    BOOSTY_AUTH_REQUESTS.set(requestId, { resolve, reject, timer })
+    BRIDGE_COMMAND_QUEUE.push({ cmd: 'boosty_auth', requestId, ts: Date.now() })
+    capBridgeCommandQueue()
+    console.log(`[BrowserBridge] queued Boosty auth request id=${requestId.slice(0, 8)}`)
+  })
+}
 // host_permissions расширения — синхронизировано с manifest.json
 const ALLOWED_ORIGINS = new Set([
   'https://www.youtube.com',
@@ -421,7 +447,10 @@ function safeReadFile(fp, maxBytes = 4 * 1024 * 1024) {
   } catch { return null }
 }
 
-function startServer({ jobRunner, settingsAccess }) {
+function startServer({ jobRunner, notificationService, settingsAccess }) {
+  const terminalNotificationRoute = createTerminalNotificationRoute({
+    notificationService,
+  })
 
   const server = http.createServer(async (req, res) => {
     setCors(req, res)
@@ -432,8 +461,35 @@ function startServer({ jobRunner, settingsAccess }) {
     catch { return sendJson(res, 400, { error: 'bad url' }) }
 
     try {
+      if (await terminalNotificationRoute.handle(req, res, url)) return
+
       if (req.method === 'GET' && url.pathname === '/healthz') {
         return sendJson(res, 200, { ok: true, version: 1 })
+      }
+
+      // One-shot cookie response from the installed extension. The cookie is
+      // resolved directly to the waiting IPC request and is not retained in
+      // bridge state after that. Never include its value in logs/responses.
+      if (req.method === 'POST' && url.pathname === '/boosty-auth-state') {
+        if (!isExtensionSettingsRequest(req)) {
+          console.warn('[BrowserBridge] Boosty auth response rejected: extension origin required')
+          return sendJson(res, 403, { ok: false, error: 'extension origin required' })
+        }
+        const body = await readBody(req)
+        const requestId = String(body.requestId || '')
+        const pending = BOOSTY_AUTH_REQUESTS.get(requestId)
+        if (!pending) return sendJson(res, 404, { ok: false, error: 'request expired' })
+        BOOSTY_AUTH_REQUESTS.delete(requestId)
+        clearTimeout(pending.timer)
+        const value = typeof body.auth?.value === 'string' ? body.auth.value : ''
+        if (!value) {
+          pending.reject(new Error(body.error || 'В браузере нет активной авторизации Boosty. Войдите в Boosty и повторите.'))
+          console.log(`[BrowserBridge] Boosty auth missing id=${requestId.slice(0, 8)}`)
+        } else {
+          pending.resolve({ value, expirationDate: body.auth.expirationDate || null })
+          console.log(`[BrowserBridge] Boosty auth received id=${requestId.slice(0, 8)}`)
+        }
+        return sendJson(res, 200, { ok: true })
       }
 
       // Desktop Settings and the browser popup share one YouTube parsing
@@ -1353,7 +1409,7 @@ function startServer({ jobRunner, settingsAccess }) {
         const cmd = url.pathname === '/focus-tab' ? 'focus_tab' : 'close_tab'
         BRIDGE_COMMAND_QUEUE.push({ cmd, tabId: body.tabId, ts: Date.now() })
         // Cap queue at 50 чтобы не накопилось мусора если расширение не polls.
-        if (BRIDGE_COMMAND_QUEUE.length > 50) BRIDGE_COMMAND_QUEUE.splice(0, BRIDGE_COMMAND_QUEUE.length - 50)
+        capBridgeCommandQueue()
         return sendJson(res, 200, { ok: true })
       }
       // Открыть/сфокусировать вкладку по URL. Используется из History-MCP UI
@@ -1370,7 +1426,7 @@ function startServer({ jobRunner, settingsAccess }) {
           return sendJson(res, 200, { ok: true, tabId: r?.tabId ?? null })
         } catch (e) {
           BRIDGE_COMMAND_QUEUE.push({ cmd: 'open_url', url: body.url, ts: Date.now() })
-          if (BRIDGE_COMMAND_QUEUE.length > 50) BRIDGE_COMMAND_QUEUE.splice(0, BRIDGE_COMMAND_QUEUE.length - 50)
+          capBridgeCommandQueue()
           return sendJson(res, 200, { ok: true, queued: true })
         }
       }
@@ -1380,7 +1436,7 @@ function startServer({ jobRunner, settingsAccess }) {
       // расширением через тот же bridge-commands poll.
       if (req.method === 'POST' && url.pathname === '/reload-extension') {
         BRIDGE_COMMAND_QUEUE.push({ cmd: 'reload_extension', ts: Date.now() })
-        if (BRIDGE_COMMAND_QUEUE.length > 50) BRIDGE_COMMAND_QUEUE.splice(0, BRIDGE_COMMAND_QUEUE.length - 50)
+        capBridgeCommandQueue()
         return sendJson(res, 200, { ok: true })
       }
       // Расширение polls этот endpoint через chrome.alarms watchdog (или
@@ -1505,4 +1561,4 @@ function startServer({ jobRunner, settingsAccess }) {
   return server
 }
 
-module.exports = { startServer, PORT, RELOAD_WS_PORT }
+module.exports = { startServer, requestBoostyAuthCookie, PORT, RELOAD_WS_PORT }

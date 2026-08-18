@@ -309,6 +309,12 @@ function applyImportFailure(item, result = {}) {
   return item
 }
 
+function isCancellableImport(item) {
+  return item?.status === 'queued'
+    || item?.status === 'running'
+    || item?.status === 'awaiting_ai'
+}
+
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let size = 0
@@ -666,6 +672,12 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
           return sendJson(res, 202, { ok: true, import: publicRequest(item) })
         }
         if (req.method === 'POST' && action === 'cancel') {
+          if (item.status === 'cancelled') {
+            return sendJson(res, 200, { ok: true, import: publicRequest(item) })
+          }
+          if (!isCancellableImport(item)) {
+            return sendJson(res, 409, { ok: false, error: 'only an active import can be cancelled' })
+          }
           if (item.jobId != null) jobRunner.cancelJob(item.jobId)
           item.jobId = null
           item.status = 'cancelled'
@@ -715,6 +727,7 @@ module.exports = {
   classifySubmittedUrl,
   firstHttpUrl,
   instagramPathParts,
+  isCancellableImport,
   isInstagramHost,
   publicRequest,
   reconcilePersistedRequest,

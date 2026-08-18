@@ -15,6 +15,10 @@ try {
 }
 const db = require('./database')
 const { formatCommentsBlock } = require('./assemble')
+const {
+  TELEGRAM_SOURCE_UNAVAILABLE,
+  telegramStableTarget,
+} = require('./telegram-source-state')
 
 // In production __dirname points inside app.asar (a tar-like archive, not a real
 // dir) so spawn(cwd=…) fails with ENOTDIR. The build copies Python workers as
@@ -62,15 +66,25 @@ const LIB_ROOT = process.env.SC_DESKTOP_DIR
 const JOBS_DIR = path.join(LIB_ROOT, 'jobs')
 const YT_TRANSCRIPTS_DIR = path.join(LIB_ROOT, 'transcripts', 'youtube')
 const YT_COMMENTS_DIR    = path.join(LIB_ROOT, 'transcripts', 'youtube_comments')
+const RUTUBE_TRANSCRIPTS_DIR = path.join(LIB_ROOT, 'transcripts', 'rutube')
 const TK_TRANSCRIPTS_DIR = path.join(LIB_ROOT, 'transcripts', 'tiktok')
 const IG_TRANSCRIPTS_DIR = path.join(LIB_ROOT, 'transcripts', 'instagram')
 const LOCAL_TRANSCRIPTS_DIR = path.join(LIB_ROOT, 'transcripts', 'local')
+const BOOSTY_TRANSCRIPTS_DIR = path.join(LIB_ROOT, 'transcripts', 'boosty')
+const BOOSTY_MEDIA_DIR = path.join(LIB_ROOT, 'media', 'boosty')
+const BOOSTY_THUMBNAILS_DIR = path.join(LIB_ROOT, 'thumbnails', 'boosty')
+const BOOSTY_TMP_DIR = path.join(LIB_ROOT, 'tmp', 'boosty')
 try { fs.mkdirSync(JOBS_DIR, { recursive: true }) } catch {}
 try { fs.mkdirSync(YT_TRANSCRIPTS_DIR, { recursive: true }) } catch {}
 try { fs.mkdirSync(YT_COMMENTS_DIR, { recursive: true }) } catch {}
+try { fs.mkdirSync(RUTUBE_TRANSCRIPTS_DIR, { recursive: true }) } catch {}
 try { fs.mkdirSync(TK_TRANSCRIPTS_DIR, { recursive: true }) } catch {}
 try { fs.mkdirSync(IG_TRANSCRIPTS_DIR, { recursive: true }) } catch {}
 try { fs.mkdirSync(LOCAL_TRANSCRIPTS_DIR, { recursive: true }) } catch {}
+try { fs.mkdirSync(BOOSTY_TRANSCRIPTS_DIR, { recursive: true }) } catch {}
+try { fs.mkdirSync(BOOSTY_MEDIA_DIR, { recursive: true }) } catch {}
+try { fs.mkdirSync(BOOSTY_THUMBNAILS_DIR, { recursive: true }) } catch {}
+try { fs.mkdirSync(BOOSTY_TMP_DIR, { recursive: true }) } catch {}
 
 const SC_SETTINGS_PATH = path.join(os.homedir(), '.config', 'sc', 'settings.json')
 
@@ -255,6 +269,38 @@ function telegramSourceForFetchParams(params = {}) {
     return db.findTelegramSourceByTarget(params.target) || null
   } catch {
     return null
+  }
+}
+
+function telegramWorkerTarget(params = {}, source = null) {
+  const stable = telegramStableTarget(source || telegramSourceForFetchParams(params))
+  return stable || params.target
+}
+
+function clearTelegramUnavailableAfterLiveResolve(sourceId, context) {
+  if (!sourceId) return
+  try {
+    const result = db.clearTelegramSourceHealth(sourceId)
+    if (result?.changed) {
+      console.log(`[Jobs] ${context} cleared unavailable source #${sourceId}`)
+    }
+  } catch (err) {
+    console.error(`[Jobs] ${context} clear source health failed`, err)
+  }
+}
+
+function persistTelegramUnavailableFailure(job, context) {
+  if (!job?.source_id || !job?._usesStableTelegramTarget) return
+  if (job.error_code !== TELEGRAM_SOURCE_UNAVAILABLE) return
+  try {
+    const result = db.setTelegramSourceUnavailable(job.source_id, {
+      code: job.error_code,
+      message: job.error,
+      checked_at: job.finished_at,
+    })
+    console.warn(`[Jobs] ${context} source #${job.source_id} unavailable changed=${result?.changed ? 1 : 0}`)
+  } catch (err) {
+    console.error(`[Jobs] ${context} persist source health failed`, err)
   }
 }
 
@@ -765,8 +811,10 @@ if (process.env.SC_DESKTOP_MCP !== '1') {
         'tg_folder_fetch', 'tg_folder_refresh', 'tg_reply_backfill',
         'tg_catchup',
         'yt_transcribe', 'yt_comments', 'yt_batch_comments',
+        'rutube_transcribe',
         'yt_channel_fetch', 'tk_transcribe', 'tk_channel_fetch',
-        'ig_profile_fetch', 'local_transcribe',
+        'ig_profile_fetch', 'local_transcribe', 'boosty_transcribe',
+        'boosty_channel_fetch', 'boosty_batch_transcribe',
       ],
     })
     if (n > 0) console.log(`[Jobs] reset ${n} zombie running job row(s) → interrupted`)
@@ -837,12 +885,17 @@ function snapshot(j) {
     yt_channel:   j.yt_channel || null,
     yt_batch:     j.yt_batch || null,
     yt_comments:  j.yt_comments || null,
+    rutube:       j.rutube || null,
     // TikTok shapes (mirror the YouTube ones structurally).
     tk:         j.tk || null,
     tk_channel: j.tk_channel || null,
     tk_batch:   j.tk_batch || null,
     // Local-file transcript shape.
     local:      j.local || null,
+    // Boosty single-video download + transcript shape.
+    boosty:     j.boosty || null,
+    boosty_channel: j.boosty_channel || null,
+    boosty_batch: j.boosty_batch || null,
     // tg_preview-specific aggregate (null for other job types).
     preview_summary: j.preview_summary || null,
     // tg_folder_fetch umbrella — driven by sequential per-chat fetches.
@@ -947,6 +1000,33 @@ function listJobs() {
   } catch (err) {
     console.error('[Jobs] historic local query failed', err)
   }
+  let historicRutube = []
+  try {
+    const rows = db.listSourcelessJobs({ type: 'rutube_transcribe', limit: 150 })
+    historicRutube = rows
+      .filter(row => {
+        let params = null
+        try { params = row.parameters_json ? JSON.parse(row.parameters_json) : null } catch {}
+        return !live.some(j => (
+          j.type === 'rutube_transcribe' && (
+            (row.file_path && j.file_path && j.file_path === row.file_path) ||
+            (j.started_at === row.started_at && j.target === params?.url)
+          )
+        ))
+      })
+      .map(rowToRutubeSnapshot)
+  } catch (err) {
+    console.error('[Jobs] historic Rutube query failed', err)
+  }
+  let historicBoosty = []
+  try {
+    const rows = db.listSourcelessJobs({ type: 'boosty_transcribe', limit: 150 })
+    historicBoosty = rows
+      .filter(row => !live.some(j => j.file_path && j.file_path === row.file_path))
+      .map(rowToBoostySnapshot)
+  } catch (err) {
+    console.error('[Jobs] historic Boosty query failed', err)
+  }
   // TG single-message — also sourceless (params.mode === 'single').
   // Without this the user loses the result after restart: live jobs Map is
   // empty on a fresh process, but the row is in DB. Mirrors the YouTube
@@ -1029,7 +1109,7 @@ function listJobs() {
   } catch (err) {
     console.error('[Jobs] historic yt_batch_comments query failed', err)
   }
-  return [...live, ...historic, ...historicLocal, ...historicTgSingle, ...historicYtBatch, ...historicIgBatch, ...historicYtComments, ...historicYtBatchComments]
+  return [...live, ...historic, ...historicLocal, ...historicRutube, ...historicBoosty, ...historicTgSingle, ...historicYtBatch, ...historicIgBatch, ...historicYtComments, ...historicYtBatchComments]
     .sort((a, b) => (b.started_at || 0) - (a.started_at || 0))
 }
 
@@ -1101,6 +1181,42 @@ function rowToYoutubeCommentsSnapshot(row) {
   }
 }
 
+function rowToRutubeSnapshot(row) {
+  let p = null
+  try { p = row.parameters_json ? JSON.parse(row.parameters_json) : null } catch {}
+  return {
+    id:            `db-${row.id}`,
+    type:          row.type,
+    target:        p?.url || '',
+    status:        row.status,
+    items_done:    0,
+    items_total:   null,
+    error:         row.error || null,
+    started_at:    row.started_at,
+    finished_at:   row.finished_at,
+    entity_title:  p?.title || null,
+    entity_kind:   'rutube_video',
+    file_path:     row.file_path,
+    params:        p,
+    type_breakdown: null,
+    rutube: {
+      video_id:      p?.video_id || null,
+      title:         p?.title || null,
+      channel:       p?.channel || null,
+      duration_sec:  p?.duration_sec || null,
+      thumbnail_url: p?.thumbnail_url || null,
+      lang:          p?.lang || null,
+      with_ts:       !!p?.with_ts,
+      engine:        p?.engine || null,
+      kind:          p?.engine ? 'ai' : 'subs',
+      chars:         p?.chars || null,
+      file_path:     row.file_path,
+      cost_usd:      row.cost_usd || 0,
+      stage:         row.status === 'done' ? 'transcribed' : 'idle',
+    },
+  }
+}
+
 function rowToLocalSnapshot(row) {
   let p = null
   try { p = row.parameters_json ? JSON.parse(row.parameters_json) : null } catch {}
@@ -1138,6 +1254,38 @@ function rowToLocalSnapshot(row) {
       },
       cost_usd:     row.cost_usd || 0,
       stage:        row.status === 'done' ? 'transcribed' : 'idle',
+    },
+  }
+}
+
+function rowToBoostySnapshot(row) {
+  let p = null
+  try { p = row.parameters_json ? JSON.parse(row.parameters_json) : null } catch {}
+  const meta = p?._boosty || {}
+  return {
+    id:            `db-${row.id}`,
+    type:          row.type,
+    target:        p?.url || meta.canonical_url || '',
+    status:        row.status,
+    items_done:    0,
+    items_total:   null,
+    error:         row.error || null,
+    error_code:    p?._error_code || null,
+    started_at:    row.started_at,
+    finished_at:   row.finished_at,
+    entity_title:  meta.title || null,
+    entity_kind:   'boosty_video',
+    file_path:     row.file_path,
+    params:        p,
+    type_breakdown: null,
+    boosty: {
+      ...meta,
+      stage:        row.status === 'done' ? 'done' : 'idle',
+      file_path:    row.file_path,
+      audio_path:   meta.audio_path || p?.result_files?.audio || null,
+      audio_bytes:  meta.audio_bytes || null,
+      srt_path:     meta.srt_path || p?.result_files?.srt || null,
+      result_files: p?.result_files || null,
     },
   }
 }
@@ -1596,6 +1744,9 @@ function startTelegramFetch(params) {
 
   const startStartedMs = Date.now()
   const id = nextId++
+  const telegramSource = telegramSourceForFetchParams(params)
+  const workerTarget = telegramWorkerTarget(params, telegramSource)
+  const usesStableTelegramTarget = !!telegramStableTarget(telegramSource)
   // Снимок активной сессии ДО построения args: он же уходит Python'у явным
   // --session (иначе Python перечитал бы settings.json сам — окно гонки, в
   // котором переключение сессии в UI ретаргетит уже-спавнящийся fetch, и
@@ -1603,7 +1754,7 @@ function startTelegramFetch(params) {
   const tgSession = telegramSessionForFetchParams(params)
   const args = [
     path.join(WORKERS_ROOT, 'telegram', 'tg_fetch_json.py'),
-    params.target,
+    workerTarget,
     '--mode', params.mode,
   ]
   if (tgSession) args.push('--session', tgSession)
@@ -1658,7 +1809,8 @@ function startTelegramFetch(params) {
   const isMediaOnly = Array.isArray(params._media_only_msg_ids)
                       && params._media_only_msg_ids.length > 0
   const isSingle = params.mode === 'single'
-  const knownSourceIdRaw = params._source_id || params.source_id || params.source_id_hint || null
+  const knownSourceIdRaw = params._source_id || params.source_id || params.source_id_hint
+    || telegramSource?.id || null
   const knownSourceId = !isSingle && knownSourceIdRaw != null
     ? Number(knownSourceIdRaw)
     : null
@@ -1702,7 +1854,7 @@ function startTelegramFetch(params) {
   if (wantsAi && !allowReprocess && !isEphemeral) {
     const skipStartedMs = Date.now()
     try {
-      const src = db.findTelegramSourceByTarget(params.target)
+      const src = telegramSource || db.findTelegramSourceByTarget(params.target)
       if (src && src.id) {
         const groups = db.listProcessedExternalIdsByKind(src.id)
         const nVoice = Object.keys(groups.voice || {}).length
@@ -1731,6 +1883,7 @@ function startTelegramFetch(params) {
   if (knownSourceId && Number.isFinite(knownSourceId) && knownSourceId > 0) {
     startBits.push(`source=${knownSourceId}`)
   }
+  if (usesStableTelegramTarget) startBits.push(`resolve_target=${workerTarget}`)
   if (params.sinceMessageId) startBits.push(`since=${params.sinceMessageId}`)
   if (Array.isArray(params.topic_ids) && params.topic_ids.length > 0) {
     startBits.push(`topics=${params.topic_ids.join(',')}`)
@@ -1768,6 +1921,8 @@ function startTelegramFetch(params) {
     tg_session: tgSession,        // снимок на спавне — он же ушёл в --session
     child,
     _startStartedMs: startStartedMs,
+    _telegramWorkerTarget: workerTarget,
+    _usesStableTelegramTarget: usesStableTelegramTarget,
     _skipFilePath: skipFilePath,  // tmp file with already-processed external_ids;
                                   // removed in close handler.
     tg_requested_range: requestedDateRange,
@@ -1830,6 +1985,7 @@ function startTelegramFetch(params) {
     const closeItemCount = Array.isArray(job.items) ? job.items.length : 0
     console.log(`[Jobs] close #${id} begin status=${job.status} code=${code} items=${closeItemCount} db #${job.dbRowId || '-'} source #${job.source_id || '-'}`)
     if (maybePromoteSuspiciousEmptyTelegramFetch(job)) emit(job)
+    persistTelegramUnavailableFailure(job, `tg_fetch #${id}`)
 
     // Clean up the skip-processed JSON file (best-effort; missing file ok).
     if (job._skipFilePath) {
@@ -2372,7 +2528,7 @@ function handleEvent(job, evt) {
           const upsertStartedMs = Date.now()
           job.source_id = db.upsertSource({
             platform: 'telegram',
-            handle:   job.target,
+            handle:   evt.username || job.target,
             display_name: evt.title,
             external_id:  String(evt.id || ''),
             avatar_url:   evt.avatar_path || null,
@@ -2382,6 +2538,7 @@ function handleEvent(job, evt) {
             tg_session: job.tg_session || null,
           })
           console.log(`[Jobs] tg_fetch #${job.id} upsertSource source #${job.source_id} took ${Date.now() - upsertStartedMs}ms`)
+          clearTelegramUnavailableAfterLiveResolve(job.source_id, `tg_fetch #${job.id}`)
         } catch (err) {
           console.error('[Jobs] upsertSource failed', err)
         }
@@ -2718,7 +2875,9 @@ function getJobDetail(id) {
       if (!row) return null
       if (row.type === 'yt_transcribe')    return rowToYoutubeSnapshot(row)
       if (row.type === 'yt_comments')      return rowToYoutubeCommentsSnapshot(row)
+      if (row.type === 'rutube_transcribe') return rowToRutubeSnapshot(row)
       if (row.type === 'local_transcribe') return rowToLocalSnapshot(row)
+      if (row.type === 'boosty_transcribe') return rowToBoostySnapshot(row)
       // tg_fetch with source_id IS NULL → single-message run. Use the
       // single-shape snapshot so JobDetail's TelegramBody gets entity_title
       // and type_breakdown out of params (the live Map is empty after restart).
@@ -2744,7 +2903,10 @@ function getJobDetail(id) {
   // gets `null` after the live Map lookup and shows "Loading…" forever.
   try {
     const row = db.getDb().prepare('SELECT * FROM jobs WHERE id = ?').get(id)
-    return row ? rowToHistoricSnapshot(row) : null
+    if (!row) return null
+    if (row.type === 'rutube_transcribe') return rowToRutubeSnapshot(row)
+    if (row.type === 'boosty_transcribe') return rowToBoostySnapshot(row)
+    return rowToHistoricSnapshot(row)
   } catch (err) {
     console.error('[Jobs] getJobDetail DB fallback failed', err)
     return null
@@ -2782,7 +2944,7 @@ function rowToHistoricSnapshot(row) {
     tg_progress:  params?._tg_progress || null,
     started_at:   row.started_at || null,
     finished_at:  row.finished_at || null,
-    entity_title: params?.title || null,
+    entity_title: params?.entity_title || params?.title || null,
     entity_kind:  null,
     file_path:    row.file_path || null,
     params:       params || null,
@@ -2795,9 +2957,13 @@ function rowToHistoricSnapshot(row) {
     yt:           null,
     yt_channel:   null,
     yt_batch:     null,
+    rutube:       null,
     tk:           null,
     tk_channel:   null,
     tk_batch:     null,
+    boosty:       null,
+    boosty_channel: null,
+    boosty_batch: null,
     media_phase:  params?._media_phase || null,
   }
   // Re-create the per-batch shape so JobDetail's body components can render
@@ -2816,6 +2982,22 @@ function rowToHistoricSnapshot(row) {
     base.yt_batch = batchShape
   } else if (type === 'tk_batch_transcribe') {
     base.tk_batch = batchShape
+  } else if (type === 'boosty_channel_fetch') {
+    base.entity_kind = 'boosty_channel'
+    base.boosty_channel = params?._boosty_channel || {
+      posts_total: row.items_done || 0,
+      catalog_complete: row.status === 'done',
+    }
+  } else if (type === 'boosty_batch_transcribe') {
+    base.entity_kind = 'boosty_channel'
+    base.boosty_batch = params?._boosty_batch || {
+      mode: params?.mode || 'transcribe',
+      saved: row.items_done || 0,
+      cached: 0,
+      errors: row.items_failed || 0,
+      current: null,
+      log: [],
+    }
   } else if (type === 'tg_folder_fetch') {
     // Recover the folder umbrella shape from params._folder_summary which
     // close-handler stuffs into parameters_json. Without it, JobDetail
@@ -3105,6 +3287,9 @@ function startTelegramFolderRefresh(options = {}) {
             is_explicit:  false,
             tg_session:   job.tg_session || null,
           })
+          // Appearing in a live iter_dialogs folder sweep is a successful
+          // control probe for this exact account/source.
+          clearTelegramUnavailableAfterLiveResolve(sid, `tg_folder_refresh #${job.id}`)
           sourceIds.push(sid)
         } catch (err) {
           console.error('[FolderRefresh] upsertSource failed', chat.handle, err)
@@ -3264,16 +3449,21 @@ function startTelegramReplyBackfill(params) {
   // сейчас», а та, к которой чат привязан (sources.tg_session). Активная —
   // только fallback для legacy-строк без привязки.
   let tgSession = null
-  try { tgSession = (db.getSource(sourceId) || {}).tg_session || null } catch {}
+  let telegramSource = null
+  try {
+    telegramSource = db.getSource(sourceId) || null
+    tgSession = telegramSource?.tg_session || null
+  } catch {}
   if (!tgSession) tgSession = activeTgSession()
+  const workerTarget = telegramStableTarget(telegramSource) || target
   const args = [
     path.join(WORKERS_ROOT, 'telegram', 'tg_reply_backfill_ndjson.py'),
-    String(target),
+    String(workerTarget),
     '--ids', ids,
   ]
   if (tgSession) args.push('--session', tgSession)
 
-  console.log(`[Jobs] start tg_reply_backfill #${id} source=${sourceId} target=${target} pending=${pending.length} session=${tgSession || 'default'}`)
+  console.log(`[Jobs] start tg_reply_backfill #${id} source=${sourceId} target=${target} resolve_target=${workerTarget} pending=${pending.length} session=${tgSession || 'default'}`)
   const child = spawn(WORKER_PYTHON, args, {
     cwd: WORKERS_ROOT,
     env: workerEnv(),
@@ -3387,6 +3577,9 @@ function startTelegramReplyBackfill(params) {
       job.status = 'error'
       job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
     }
+    if (job.status === 'done') {
+      clearTelegramUnavailableAfterLiveResolve(sourceId, `tg_reply_backfill #${id}`)
+    }
     job.items_done = job.tg_reply_backfill.resolved
     delete job.pendingUpdates
 
@@ -3469,6 +3662,7 @@ function finalizeTelegramUmbrellaStatus(job) {
 function startTelegramFolderFetch(params) {
   const id = nextId++
   const targets = Array.isArray(params.targets) ? params.targets.slice() : []
+  const sourceIds = Array.isArray(params.source_ids) ? params.source_ids.slice() : []
   if (!targets.length) {
     throw new Error('startTelegramFolderFetch: targets required')
   }
@@ -3511,6 +3705,7 @@ function startTelegramFolderFetch(params) {
     for (let i = 0; i < targets.length; i++) {
       if (job.status !== 'running') break       // cancelled mid-walk
       const target = targets[i]
+      const sourceId = Number(sourceIds[i]) || null
       job.tg_folder.current_idx = i
       job.tg_folder.current_target = target
       emit(job)
@@ -3534,7 +3729,7 @@ function startTelegramFolderFetch(params) {
         const wantsPolls    = true
         const wantsComments = !!(types && types.includes('comments'))
         const needsEngine   = wantsVoice
-        childId = startTelegramFetch({
+        const fetchParams = {
           target,
           mode:  params.mode || 'last_n',
           limit: params.limit || 0,
@@ -3552,7 +3747,11 @@ function startTelegramFolderFetch(params) {
           include_comments:  wantsComments,
           _folder_umbrella_id: id,
           _tg_session_override: tgSession,
-        })
+        }
+        if (sourceId && Number.isFinite(sourceId) && sourceId > 0) {
+          fetchParams._source_id = sourceId
+        }
+        childId = startTelegramFetch(fetchParams)
       } catch (err) {
         job.tg_folder.per_chat.push({ target, status: 'error',
                                       error: String(err && err.message || err) })
@@ -3862,10 +4061,13 @@ function startTelegramCatchUp(params) {
  */
 function startTelegramPreview(params) {
   const id = nextId++
+  const telegramSource = telegramSourceForFetchParams(params)
+  const workerTarget = telegramWorkerTarget(params, telegramSource)
+  const usesStableTelegramTarget = !!telegramStableTarget(telegramSource)
   const tgSession = telegramSessionForFetchParams(params)   // снимок → --session (см. startTelegramFetch)
   const args = [
     path.join(WORKERS_ROOT, 'telegram', 'tg_fetch_json.py'),
-    params.target,
+    workerTarget,
     '--mode', params.mode,
     '--preview-only',
   ]
@@ -3876,7 +4078,7 @@ function startTelegramPreview(params) {
   if (params.url)   args.push('--url', params.url)
   if (params.sinceMessageId) args.push('--since-msgid', String(params.sinceMessageId))
 
-  console.log(`[Jobs] start tg_preview #${id} target=${params.target} mode=${params.mode} limit=${params.limit || 'none'}`)
+  console.log(`[Jobs] start tg_preview #${id} target=${params.target} resolve_target=${workerTarget} mode=${params.mode} limit=${params.limit || 'none'}`)
 
   const child = spawn(WORKER_PYTHON, args, {
     cwd: WORKERS_ROOT,
@@ -3893,8 +4095,11 @@ function startTelegramPreview(params) {
     items_total: params.limit || null,
     started_at: Math.floor(Date.now() / 1000),
     params: { ...params },
+    source_id: telegramSource?.id || null,
     type_breakdown: {},
     tg_session: tgSession,
+    _telegramWorkerTarget: workerTarget,
+    _usesStableTelegramTarget: usesStableTelegramTarget,
     child,
   }
   jobs.set(id, job)
@@ -3922,6 +4127,7 @@ function startTelegramPreview(params) {
     }
     job.finished_at = Math.floor(Date.now() / 1000)
     const dur = job.finished_at - job.started_at
+    persistTelegramUnavailableFailure(job, `tg_preview #${id}`)
 
     // Persist the preview into jobs table so Activity / SourceDetail history
     // restore it after Electron restart, identical to fetch jobs. We stash
@@ -3962,7 +4168,7 @@ function handlePreviewEvent(job, evt) {
       try {
         job.source_id = db.upsertSource({
           platform: 'telegram',
-          handle:   job.target,
+          handle:   evt.username || job.target,
           display_name: evt.title,
           external_id:  String(evt.id || ''),
           avatar_url:   evt.avatar_path || null,
@@ -3971,6 +4177,7 @@ function handlePreviewEvent(job, evt) {
           is_explicit: true,     // preview = юзер ввёл @канал в config-form
           tg_session: job.tg_session || null, // снимок со спавна, не «сейчас»
         })
+        clearTelegramUnavailableAfterLiveResolve(job.source_id, `tg_preview #${job.id}`)
       } catch (err) {
         console.error('[Jobs] preview upsertSource failed', err)
       }
@@ -4567,6 +4774,282 @@ function handleYoutubeEvent(job, evt) {
       break
     case 'error':
       job.error = evt.message
+      break
+  }
+}
+
+// ─── Rutube single-video transcript ──────────────────────────────────
+//
+// The visible flow mirrors YouTube (free subtitles, then explicit AI), but
+// persistence stays sourceless. A Rutube author is not a YouTube Library
+// source, and this first version deliberately has no channel/catalog flow.
+
+const RUTUBE_SCRIPT = path.join(WORKERS_ROOT, 'web', 'rutube_single_ndjson.py')
+
+function lookupRutubeCache(videoId) {
+  if (!videoId) return null
+  try {
+    const rows = db.getDb().prepare(
+      `SELECT * FROM jobs
+        WHERE type = 'rutube_transcribe'
+          AND status = 'done'
+          AND file_path IS NOT NULL
+        ORDER BY finished_at DESC
+        LIMIT 200`
+    ).all()
+    for (const row of rows) {
+      let params = null
+      try { params = row.parameters_json ? JSON.parse(row.parameters_json) : null } catch {}
+      if (String(params?.video_id || '') !== String(videoId)) continue
+      if (!row.file_path || !fs.existsSync(row.file_path)) continue
+      return row
+    }
+  } catch (err) {
+    console.error('[Jobs] lookupRutubeCache failed', err)
+  }
+  return null
+}
+
+function startRutubeSingle(params = {}) {
+  const url = String(params.url || '').trim()
+  if (!url) throw new Error('startRutubeSingle: url required')
+
+  // React protects the button while a request is running, but a remount or
+  // rapid Enter must not create a second process for the exact same paste.
+  for (const existing of jobs.values()) {
+    if (existing.type !== 'rutube_transcribe' || existing.target !== url) continue
+    if (existing.status === 'running' || existing.status === 'awaiting_ai') return existing.id
+  }
+
+  const id = nextId++
+  const args = [
+    RUTUBE_SCRIPT,
+    url,
+    '--out-dir', RUTUBE_TRANSCRIPTS_DIR,
+    '--lang', params.lang || 'ru',
+  ]
+  if (params.withTs) args.push('--with-ts')
+
+  console.log(`[Jobs] start rutube_transcribe #${id} url=${url} lang=${params.lang || 'ru'}`)
+
+  const job = {
+    id,
+    type: 'rutube_transcribe',
+    target: url,
+    status: 'running',
+    items_done: 0,
+    items_total: null,
+    started_at: Math.floor(Date.now() / 1000),
+    params: { url, lang: params.lang || 'ru', withTs: !!params.withTs, stage: 'subs' },
+    rutube: { stage: 'searching', video_id: null, duration_sec: null, channel: null },
+    child: null,
+  }
+  jobs.set(id, job)
+  emit(job)
+
+  const child = spawn(WORKER_PYTHON, args, {
+    cwd: WORKERS_ROOT,
+    env: workerEnv(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  job.child = child
+  attachRutubeStreams(job, child)
+  return id
+}
+
+function resumeRutubeAi(jobId, opts = {}) {
+  const job = jobs.get(jobId)
+  if (!job) return { ok: false, error: 'job not found' }
+  if (job.type !== 'rutube_transcribe') return { ok: false, error: 'wrong job type' }
+  if (job.status !== 'awaiting_ai') return { ok: false, error: `job is ${job.status}` }
+
+  const engine = opts.engine === 'assemblyai' ? 'assemblyai' : 'gemini'
+  const args = [
+    RUTUBE_SCRIPT,
+    job.target,
+    '--out-dir', RUTUBE_TRANSCRIPTS_DIR,
+    '--ai',
+    '--engine', engine,
+  ]
+  console.log(`[Jobs] resume rutube_transcribe #${jobId} engine=${engine}`)
+
+  job.status = 'running'
+  job.error = null
+  job.finished_at = null
+  job.params = { ...job.params, stage: 'ai', engine }
+  job.rutube = { ...job.rutube, stage: 'transcribing', engine }
+  emit(job)
+
+  const child = spawn(WORKER_PYTHON, args, {
+    cwd: WORKERS_ROOT,
+    env: workerEnv(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  job.child = child
+  attachRutubeStreams(job, child)
+  return { ok: true }
+}
+
+function attachRutubeStreams(job, child) {
+  const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
+  rl.on('line', line => {
+    if (!line.trim()) return
+    let event
+    try { event = JSON.parse(line) } catch { return }
+    handleRutubeEvent(job, event)
+  })
+
+  let stderrTail = ''
+  child.stderr.on('data', chunk => {
+    stderrTail = (stderrTail + chunk.toString()).slice(-2000)
+  })
+  child.on('error', err => {
+    job.error = `spawn error: ${err.message}`
+  })
+  child.on('close', code => {
+    job.child = null
+    if (job.status === 'running') {
+      if (code === 0 && job.file_path) {
+        job.status = 'done'
+      } else if (code !== null) {
+        job.status = 'error'
+        job.error = job.error || stderrTail.slice(-300) || `python exited ${code}`
+      }
+    }
+    job.finished_at = Math.floor(Date.now() / 1000)
+
+    if (job.status !== 'awaiting_ai' && job.status !== 'running') {
+      try {
+        db.recordJob({
+          type: 'rutube_transcribe',
+          source_id: null,
+          status: job.status,
+          items_total: null,
+          items_done: 0,
+          cost_usd: job.cost_usd || 0,
+          params: {
+            url: job.target,
+            video_id: job.rutube?.video_id,
+            title: job.entity_title,
+            channel: job.rutube?.channel,
+            duration_sec: job.rutube?.duration_sec,
+            thumbnail_url: job.rutube?.thumbnail_url,
+            engine: job.params?.engine,
+            lang: job.rutube?.lang || job.params?.lang,
+            with_ts: !!job.params?.withTs,
+            chars: job.rutube?.chars || null,
+          },
+          error: job.error,
+          started_at: job.started_at,
+          finished_at: job.finished_at,
+          file_path: job.file_path || null,
+        })
+      } catch (err) {
+        console.error('[Jobs] rutube_transcribe DB write failed', err)
+      }
+    }
+
+    const duration = job.finished_at - job.started_at
+    console.log(`[Jobs] end rutube_transcribe #${job.id} status=${job.status} duration=${duration}s${job.error ? ' error=' + job.error : ''}`)
+    emit(job)
+  })
+}
+
+function handleRutubeEvent(job, event) {
+  emitEvent(job, event)
+  switch (event.type) {
+    case 'metadata_start':
+      job.rutube = { ...(job.rutube || {}), stage: 'fetching_metadata' }
+      emit(job)
+      break
+    case 'video':
+      job.entity_title = event.title
+      job.entity_kind = 'rutube_video'
+      job.rutube = {
+        ...(job.rutube || {}),
+        stage: 'searching',
+        video_id: event.video_id,
+        title: event.title,
+        channel: event.channel,
+        duration_sec: event.duration_sec,
+        thumbnail_url: event.thumbnail_url || null,
+        canonical_url: event.url,
+      }
+      emit(job)
+      break
+    case 'subs_racing':
+      job.rutube = { ...(job.rutube || {}), stage: 'searching' }
+      emit(job)
+      break
+    case 'subs_found':
+      job.rutube = {
+        ...(job.rutube || {}),
+        stage: 'subs_found',
+        lang: event.lang,
+        with_ts: !!event.with_ts,
+        chars: event.chars,
+      }
+      emit(job)
+      break
+    case 'subs_missing':
+      job.rutube = {
+        ...(job.rutube || {}),
+        stage: 'awaiting_ai',
+        est_cost_usd: event.est_cost_usd,
+        duration_sec: event.duration_sec || job.rutube?.duration_sec,
+      }
+      job.status = 'awaiting_ai'
+      emit(job)
+      break
+    case 'audio_download_start':
+      job.rutube = { ...(job.rutube || {}), stage: 'downloading_audio', engine: event.engine }
+      emit(job)
+      break
+    case 'audio_download_done':
+      job.rutube = { ...(job.rutube || {}), stage: 'audio_ready', engine: event.engine, audio_bytes: event.bytes }
+      emit(job)
+      break
+    case 'transcribe_start':
+      job.rutube = { ...(job.rutube || {}), stage: 'transcribing', engine: event.engine }
+      emit(job)
+      break
+    case 'transcribe_done':
+      job.rutube = {
+        ...(job.rutube || {}),
+        stage: 'transcribed',
+        chars: event.chars,
+        cost_usd: event.cost_usd,
+      }
+      job.cost_usd = (job.cost_usd || 0) + Number(event.cost_usd || 0)
+      emit(job)
+      break
+    case 'save_start':
+      job.rutube = { ...(job.rutube || {}), stage: event.kind === 'subs' ? 'subs_found' : 'saving' }
+      emit(job)
+      break
+    case 'saved': {
+      job.file_path = event.file_path
+      job.rutube = {
+        ...(job.rutube || {}),
+        file_path: event.file_path,
+        kind: event.kind,
+        chars: event.chars,
+      }
+      try {
+        const copied = copyFileToClipboard(event.file_path)
+        if (copied.ok) job.rutube.copied_bytes = copied.bytes
+      } catch {}
+      break
+    }
+    case 'done':
+      if (job.status === 'running' && job.file_path) {
+        job.status = 'done'
+        job.finished_at = Math.floor(Date.now() / 1000)
+      }
+      emit(job)
+      break
+    case 'error':
+      job.error = event.message || 'Rutube worker error'
       break
   }
 }
@@ -6490,13 +6973,19 @@ const TG_SEND_SAVED_SCRIPT = path.join(WORKERS_ROOT, 'telegram', 'tg_send_saved_
 const IG_SESSIONS_SCRIPT = path.join(WORKERS_ROOT, 'instagram', 'ig_sessions_ndjson.py')
 const IG_LOGIN_SCRIPT = path.join(WORKERS_ROOT, 'instagram', 'ig_login_ndjson.py')
 
-function runOneShotNdjson(scriptPath, argv, { onEvent } = {}) {
+function runOneShotNdjson(scriptPath, argv, { onEvent, extraEnv } = {}) {
   return new Promise((resolve, reject) => {
+    const env = workerEnv()
+    if (extraEnv && typeof extraEnv === 'object') Object.assign(env, extraEnv)
     const child = spawn(WORKER_PYTHON, [scriptPath, ...argv], {
       cwd: WORKERS_ROOT,
-      env: workerEnv(),
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
+    // Drop secrets from our mutable copy once spawn has cloned the env.
+    if (extraEnv) {
+      for (const key of Object.keys(extraEnv)) delete env[key]
+    }
     const events = []
     let stderrTail = ''
     const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
@@ -6647,6 +7136,1167 @@ async function runYoutubeSearch({ query, limit = 20, offset = 0 }) {
   }
   if (errMsg && items.length === 0) throw new Error(errMsg)
   return { entity, items }
+}
+
+// ─── Boosty catalog + post preview ───────────────────────────────────
+//
+// The first-party JSON API exposes an opaque cursor (`extra.offset`) and a
+// truthful `isLast` flag. The Python worker follows that cursor directly;
+// there is no browser scrolling and the renderer never receives auth or
+// signed player URLs.
+
+const BOOSTY_CATALOG_SCRIPT = path.join(WORKERS_ROOT, 'web', 'boosty_catalog_ndjson.py')
+const BOOSTY_THUMBNAIL_SCRIPT = path.join(WORKERS_ROOT, 'web', 'boosty_thumbnail_cache_ndjson.py')
+const boostyThumbnailProcesses = new Map()
+
+function relativeLibraryPath(filePath) {
+  if (!filePath) return null
+  const absolute = path.resolve(String(filePath))
+  const relative = path.relative(LIB_ROOT, absolute)
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null
+  return relative.split(path.sep).join('/')
+}
+
+function boostySelectedVideoId(rawUrl) {
+  try {
+    const layer = new URL(String(rawUrl || '')).searchParams.get('layer') || ''
+    const match = layer.match(/^video:[^:]+:[0-9a-f-]{36}:([0-9a-f-]{36})$/i)
+    return match ? match[1].toLowerCase() : null
+  } catch {
+    return null
+  }
+}
+
+function boostySourceMeta(entity, summary = null) {
+  const meta = {
+    canonical_url: entity?.canonical_url || null,
+    posts_remote_count: entity?.posts_count ?? null,
+    subscribers_count: entity?.subscribers_count ?? null,
+    subscription: entity?.subscription || null,
+    subscription_kind: entity?.subscription_kind || null,
+  }
+  if (summary) Object.assign(meta, {
+    catalog_complete: summary?.catalog_complete === true,
+    catalog_posts_count: summary?.posts_total ?? null,
+    catalog_video_posts_count: summary?.video_posts ?? null,
+    catalog_videos_count: summary?.videos_total ?? null,
+    catalog_accessible_posts: summary?.accessible_posts ?? null,
+    catalog_tags: summary?.tags || [],
+    catalog_checked_at: Math.floor(Date.now() / 1000),
+  })
+  return meta
+}
+
+function persistBoostyCatalog({ entity, posts, thumbnails, summary, explicit = false, markSynced = false }) {
+  if (!entity?.author_handle) throw new Error('Boosty не вернул автора')
+  const sourceId = db.upsertBoostyChannel({
+    author_id: entity.author_id || null,
+    handle: entity.author_handle,
+    display_name: entity.title || entity.author_handle,
+    avatar_url: entity.avatar_url || null,
+    meta: boostySourceMeta(entity, summary),
+    is_explicit: explicit,
+    mark_synced: markSynced,
+  })
+  const relativeThumbnails = {}
+  for (const [externalId, filePath] of Object.entries(thumbnails || {})) {
+    const relative = relativeLibraryPath(filePath)
+    if (relative) relativeThumbnails[String(externalId)] = relative
+  }
+  const counts = db.upsertBoostyCatalog({
+    source_id: sourceId,
+    posts: posts || [],
+    thumbnail_paths: relativeThumbnails,
+  })
+  db.patchSourceMeta(sourceId, boostySourceMeta(entity, summary), { mark_synced: markSynced })
+  return { sourceId, counts }
+}
+
+function startBoostyThumbnailCache({ sourceId, entity, posts, notifyJob = null, fullCatalog = false }) {
+  if (!sourceId || !entity?.author_handle || !Array.isArray(posts) || !posts.length) return
+  const items = []
+  for (const post of posts) {
+    if (post?.external_id && post?.thumbnail_url) {
+      items.push({ external_id: String(post.external_id), url: post.thumbnail_url })
+    }
+    for (const video of post?.videos || []) {
+      if (video?.video_id && video?.thumbnail_url) {
+        items.push({ external_id: String(video.video_id), url: video.thumbnail_url })
+      }
+    }
+  }
+  if (!items.length) return
+
+  // A refresh supersedes an older cache pass for the same author. Metadata is
+  // already safely persisted and remote previews remain usable while this
+  // best-effort background process is replaced.
+  const previous = boostyThumbnailProcesses.get(sourceId)
+  if (previous?.child && !previous.child.killed && !fullCatalog) return
+  if (previous?.child && !previous.child.killed) {
+    try { previous.child.kill('SIGTERM') } catch {}
+  }
+
+  const manifestPath = path.join(
+    BOOSTY_TMP_DIR,
+    `thumbnails-${sourceId}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
+  )
+  fs.writeFileSync(manifestPath, JSON.stringify({ author: entity.author_handle, items }), {
+    encoding: 'utf8',
+    mode: 0o600,
+  })
+  const child = spawn(WORKER_PYTHON, [
+    BOOSTY_THUMBNAIL_SCRIPT,
+    '--manifest', manifestPath,
+    '--output-dir', BOOSTY_THUMBNAILS_DIR,
+  ], {
+    cwd: WORKERS_ROOT,
+    env: workerEnv(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const state = { child, manifestPath, cached: 0, requested: items.length, summary: null, fullCatalog }
+  boostyThumbnailProcesses.set(sourceId, state)
+  if (notifyJob?.boosty_channel) {
+    notifyJob.boosty_channel = {
+      ...notifyJob.boosty_channel,
+      thumbnail_cache: { status: 'running', cached: 0, requested: items.length },
+    }
+    emit(notifyJob)
+  }
+  console.log(`[Jobs] boosty thumbnail cache start source=${sourceId} rows=${items.length}`)
+
+  let stderrTail = ''
+  const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
+  rl.on('line', line => {
+    if (!line.trim()) return
+    let evt
+    try { evt = JSON.parse(line) } catch { return }
+    if (evt.type === 'thumbnail' && evt.external_id && evt.path) {
+      const relative = relativeLibraryPath(evt.path)
+      if (relative && db.setItemThumbnailPath(sourceId, evt.external_id, relative)) state.cached += 1
+    } else if (evt.type === 'done') {
+      state.summary = evt
+    }
+  })
+  child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk.toString()).slice(-1000) })
+  child.on('close', code => {
+    try { fs.unlinkSync(manifestPath) } catch {}
+    if (boostyThumbnailProcesses.get(sourceId) === state) boostyThumbnailProcesses.delete(sourceId)
+    const ok = code === 0 && !!state.summary
+    try {
+      const cacheMeta = state.fullCatalog
+        ? {
+            thumbnail_cache_status: ok ? 'done' : 'partial',
+            thumbnail_cache_count: state.cached,
+            thumbnail_cache_checked_at: Math.floor(Date.now() / 1000),
+          }
+        : {
+            // A post preview/filtered request may cache only a handful of
+            // images; keep the full-catalog count as the aggregate truth.
+            thumbnail_preview_checked_at: Math.floor(Date.now() / 1000),
+          }
+      db.patchSourceMeta(sourceId, cacheMeta)
+    } catch (err) {
+      console.error('[Jobs] boosty thumbnail cache metadata failed', err)
+    }
+    if (notifyJob?.boosty_channel) {
+      notifyJob.boosty_channel = {
+        ...notifyJob.boosty_channel,
+        thumbnail_cache: {
+          status: ok ? 'done' : 'partial',
+          cached: state.cached,
+          requested: items.length,
+        },
+      }
+      emit(notifyJob)
+    }
+    console.log(`[Jobs] boosty thumbnail cache end source=${sourceId} status=${ok ? 'done' : 'partial'} cached=${state.cached}${stderrTail && !ok ? ' stderr=' + stderrTail.slice(-180) : ''}`)
+  })
+}
+
+function lookupBoostyChannel(payload = {}) {
+  const handle = String(payload.handle || payload.target || '')
+    .trim()
+    .replace(/^https?:\/\/(?:www\.)?boosty\.to\//i, '')
+    .split(/[/?#]/, 1)[0]
+    .replace(/^@+/, '')
+  if (!handle) return null
+  try {
+    const connection = db.getDb()
+    return connection.prepare(`
+      SELECT s.*,
+        (SELECT COUNT(*) FROM items i WHERE i.source_id=s.id AND i.type='boosty_post') AS items_count,
+        (SELECT COUNT(*) FROM items i WHERE i.source_id=s.id AND i.type='boosty_video') AS boosty_videos_count,
+        (SELECT COUNT(*) FROM items i WHERE i.source_id=s.id AND i.type='boosty_video' AND i.transcribe_status='done') AS boosty_transcribed_count
+      FROM sources s WHERE s.platform='boosty' AND s.handle=? LIMIT 1
+    `).get(handle) || null
+  } catch (err) {
+    console.error('[Jobs] lookupBoostyChannel failed', err)
+    return null
+  }
+}
+
+function startBoostyChannelFetch(params = {}) {
+  const target = String(params.target || params.url || '').trim()
+  const authCookie = String(params.authCookie || '').trim()
+  if (!target) throw new Error('startBoostyChannelFetch: target required')
+  if (!authCookie) throw new Error('startBoostyChannelFetch: browser auth required')
+  const targetKey = target.replace(/[?#].*$/, '').replace(/\/+$/, '').toLowerCase()
+  for (const existing of jobs.values()) {
+    if (existing.status !== 'running' || existing.type !== 'boosty_channel_fetch') continue
+    const existingKey = String(existing.target || '').replace(/[?#].*$/, '').replace(/\/+$/, '').toLowerCase()
+    if (existingKey === targetKey) return existing.id
+  }
+  const id = nextId++
+
+  const args = [
+    BOOSTY_CATALOG_SCRIPT,
+    target,
+    '--limit', String(Math.max(0, Number(params.limit || 0))),
+    '--order', params.order === 'asc' ? 'asc' : 'desc',
+  ]
+  if (params.from_ts) args.push('--from-ts', String(params.from_ts))
+  if (params.to_ts) args.push('--to-ts', String(params.to_ts))
+  if (Array.isArray(params.tags) && params.tags.length) args.push('--tags', params.tags.join(','))
+  if (params.only_allowed) args.push('--only-allowed')
+
+  const env = workerEnv()
+  env.SC_BOOSTY_AUTH_COOKIE = authCookie
+  if (params.authExpiration) env.SC_BOOSTY_AUTH_EXPIRES = String(params.authExpiration)
+  const child = spawn(WORKER_PYTHON, args, {
+    cwd: WORKERS_ROOT,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  delete env.SC_BOOSTY_AUTH_COOKIE
+  delete env.SC_BOOSTY_AUTH_EXPIRES
+
+  const safeParams = {
+    target,
+    limit: Math.max(0, Number(params.limit || 0)),
+    order: params.order === 'asc' ? 'asc' : 'desc',
+    from_ts: params.from_ts || null,
+    to_ts: params.to_ts || null,
+    tags: Array.isArray(params.tags) ? params.tags : [],
+    only_allowed: !!params.only_allowed,
+  }
+  const isFullFeedRequest = safeParams.limit === 0
+    && !safeParams.from_ts
+    && !safeParams.to_ts
+    && safeParams.tags.length === 0
+    && !safeParams.only_allowed
+  const job = {
+    id,
+    type: 'boosty_channel_fetch',
+    target,
+    status: 'running',
+    items_done: 0,
+    items_total: null,
+    started_at: Math.floor(Date.now() / 1000),
+    params: safeParams,
+    entity_title: null,
+    entity_kind: 'boosty_channel',
+    source_id: null,
+    boosty_channel: { stage: 'authorizing', loaded: 0, catalog_complete: false },
+    _boostyEntity: null,
+    _boostyPosts: [],
+    _boostyThumbnails: {},
+    _boostySummary: null,
+    child,
+  }
+  jobs.set(id, job)
+  emit(job)
+  console.log(`[Jobs] start boosty_channel_fetch #${id} target=${target} limit=${safeParams.limit || 'all'} order=${safeParams.order}`)
+
+  const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
+  rl.on('line', line => {
+    if (!line.trim()) return
+    let evt
+    try { evt = JSON.parse(line) } catch { return }
+    emitEvent(job, evt)
+    switch (evt.type) {
+      case 'entity':
+        job._boostyEntity = evt
+        job.entity_title = evt.title || evt.author_handle
+        job.items_total = Number(evt.posts_count || 0) || null
+        job.boosty_channel = {
+          ...job.boosty_channel,
+          stage: 'catalog',
+          author_handle: evt.author_handle,
+          title: evt.title,
+          avatar_url: evt.avatar_url,
+          remote_total: evt.posts_count || null,
+          subscription: evt.subscription || null,
+        }
+        try {
+          job.source_id = db.upsertBoostyChannel({
+            author_id: evt.author_id || null,
+            handle: evt.author_handle,
+            display_name: evt.title || evt.author_handle,
+            avatar_url: evt.avatar_url || null,
+            meta: boostySourceMeta(evt),
+            is_explicit: true,
+            mark_synced: false,
+          })
+        } catch (err) {
+          console.error('[Jobs] upsertBoostyChannel failed', err)
+        }
+        emit(job)
+        break
+      case 'post':
+        if (evt.data) job._boostyPosts.push(evt.data)
+        break
+      case 'page':
+        job.items_done = Number(evt.loaded || job._boostyPosts.length)
+        job.items_total = Number(evt.remote_total || job.items_total || 0) || null
+        job.boosty_channel = {
+          ...job.boosty_channel,
+          stage: 'catalog',
+          loaded: job.items_done,
+          remote_total: job.items_total,
+          oldest_at: evt.oldest_at || null,
+          has_more: evt.has_more === true,
+        }
+        emit(job)
+        break
+      case 'thumbnail':
+        if (evt.external_id && evt.path) job._boostyThumbnails[String(evt.external_id)] = evt.path
+        break
+      case 'done':
+        job._boostySummary = {
+          ...evt,
+          catalog_complete: isFullFeedRequest && evt.catalog_complete === true,
+        }
+        job.items_done = Number(evt.posts_total || job._boostyPosts.length)
+        job.items_total = job.items_done
+        job.boosty_channel = {
+          ...job.boosty_channel,
+          stage: 'saving',
+          loaded: job.items_done,
+          posts_total: evt.posts_total || 0,
+          video_posts: evt.video_posts || 0,
+          videos_total: evt.videos_total || 0,
+          accessible_posts: evt.accessible_posts || 0,
+          catalog_complete: isFullFeedRequest && evt.catalog_complete === true,
+          tags: evt.tags || [],
+        }
+        emit(job)
+        break
+      case 'error':
+        job.error = evt.message || 'Не удалось загрузить каталог Boosty'
+        job.error_code = evt.code || null
+        emit(job)
+        break
+    }
+  })
+
+  let stderrTail = ''
+  child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk.toString()).slice(-2000) })
+  child.on('error', err => { job.error = `spawn error: ${err.message}` })
+  child.on('close', code => {
+    job.child = null
+    if (job.status === 'running') {
+      job.status = code === 0 && job._boostySummary ? 'done' : 'error'
+      if (job.status === 'error') job.error = job.error || stderrTail.slice(-300) || `python exited ${code}`
+    }
+    job.finished_at = Math.floor(Date.now() / 1000)
+    try {
+      if (job._boostyEntity && job._boostyPosts.length) {
+        const entityForThumbnails = job._boostyEntity
+        const postsForThumbnails = job._boostyPosts
+        const persisted = persistBoostyCatalog({
+          entity: job._boostyEntity,
+          posts: job._boostyPosts,
+          thumbnails: job._boostyThumbnails,
+          // A filtered/ranged request enriches the known post list but must
+          // not overwrite the source-wide proof that the whole feed was read.
+          summary: isFullFeedRequest
+            ? (job._boostySummary || { catalog_complete: false, posts_total: job._boostyPosts.length })
+            : null,
+          explicit: true,
+          markSynced: job.status === 'done' && isFullFeedRequest,
+        })
+        job.source_id = persisted.sourceId
+        job.boosty_channel = {
+          ...job.boosty_channel,
+          stage: job.status === 'done' ? 'done' : job.boosty_channel.stage,
+          stored_posts: persisted.counts.posts,
+          stored_videos: persisted.counts.videos,
+        }
+        if (job.status === 'done') {
+          startBoostyThumbnailCache({
+            sourceId: persisted.sourceId,
+            entity: entityForThumbnails,
+            posts: postsForThumbnails,
+            notifyJob: job,
+            fullCatalog: isFullFeedRequest,
+          })
+        }
+      }
+      const persistedParams = {
+        ...safeParams,
+        _boosty_channel: job.boosty_channel,
+        entity_title: job.entity_title,
+      }
+      job.params = persistedParams
+      db.recordJob({
+        type: job.type,
+        source_id: job.source_id || null,
+        status: job.status,
+        items_total: job.items_total,
+        items_done: job.items_done,
+        items_failed: job.status === 'error' ? 1 : 0,
+        cost_usd: 0,
+        params: persistedParams,
+        error: job.error,
+        started_at: job.started_at,
+        finished_at: job.finished_at,
+      })
+    } catch (err) {
+      console.error('[Jobs] boosty_channel_fetch DB write failed', err)
+      if (job.status === 'done') {
+        job.status = 'error'
+        job.error = 'Каталог получен, но не удалось сохранить его в библиотеку'
+      }
+    }
+    delete job._boostyEntity
+    delete job._boostyPosts
+    delete job._boostyThumbnails
+    delete job._boostySummary
+    console.log(`[Jobs] end boosty_channel_fetch #${id} status=${job.status} posts=${job.items_done}${job.error ? ' error=' + job.error : ''}`)
+    emit(job)
+    markJobClosed(job)
+  })
+  return id
+}
+
+async function previewBoostyPost(params = {}) {
+  const url = String(params.url || '').trim()
+  const authCookie = String(params.authCookie || '').trim()
+  if (!url) throw new Error('previewBoostyPost: url required')
+  if (!authCookie) throw new Error('previewBoostyPost: browser auth required')
+  const events = await runOneShotNdjson(
+    BOOSTY_CATALOG_SCRIPT,
+    [url, '--post'],
+    { extraEnv: { SC_BOOSTY_AUTH_COOKIE: authCookie } },
+  )
+  const failure = events.find(evt => evt.type === 'error')
+  const entity = events.find(evt => evt.type === 'entity') || null
+  const post = events.find(evt => evt.type === 'post')?.data || null
+  if (failure || !entity || !post) {
+    const err = new Error(failure?.message || 'Boosty не вернул данные поста')
+    err.code = failure?.code || 'boosty_preview_failed'
+    throw err
+  }
+  const thumbnails = {}
+  for (const evt of events) {
+    if (evt.type === 'thumbnail' && evt.external_id && evt.path) thumbnails[String(evt.external_id)] = evt.path
+  }
+  const persisted = persistBoostyCatalog({
+    entity,
+    posts: [post],
+    thumbnails,
+    // A one-post preview proves only that post. It must never overwrite a
+    // previously verified full-channel coverage count with "1 post".
+    summary: null,
+    explicit: false,
+    markSynced: false,
+  })
+  startBoostyThumbnailCache({
+    sourceId: persisted.sourceId,
+    entity,
+    posts: [post],
+  })
+  return {
+    source_id: persisted.sourceId,
+    entity,
+    post,
+    selected_video_id: boostySelectedVideoId(url),
+  }
+}
+
+function boostyBatchSelectionRows(sourceId, videoIds) {
+  const source = db.getSource(sourceId)
+  if (!source || source.platform !== 'boosty') throw new Error('Источник Boosty не найден')
+  const rows = db.listBoostyVideos(sourceId, videoIds)
+  const byId = new Map(rows.map(row => [String(row.external_id), row]))
+  const ordered = []
+  for (const rawId of videoIds) {
+    const row = byId.get(String(rawId))
+    if (row && !ordered.some(item => String(item.external_id) === String(row.external_id))) ordered.push(row)
+  }
+  if (!ordered.length) throw new Error('Выбранные видео Boosty не найдены в библиотеке')
+  return { source, rows: ordered }
+}
+
+function existingFile(filePath) {
+  return existingFileBytes(filePath) > 0
+}
+
+function existingFileBytes(filePath) {
+  try {
+    const stat = filePath ? fs.statSync(filePath) : null
+    return stat?.isFile() ? stat.size : 0
+  } catch {
+    return 0
+  }
+}
+
+function boostyCachedBatchLog(row, mode) {
+  const transcriptPath = mode === 'download' ? null : row.transcript_path
+  const candidateSrt = transcriptPath
+    ? String(transcriptPath).replace(/\.txt$/i, '.srt')
+    : null
+  return {
+    video_id: String(row.external_id),
+    title: row.title || null,
+    kind: 'cache',
+    file_path: transcriptPath,
+    srt_path: existingFile(candidateSrt) ? candidateSrt : null,
+    audio_path: row.media_path || null,
+    audio_bytes: existingFileBytes(row.media_path),
+  }
+}
+
+function synthesiseCachedBoostyBatch(params, rows, mode) {
+  const id = nextId++
+  const now = Math.floor(Date.now() / 1000)
+  const log = rows.map(row => boostyCachedBatchLog(row, mode))
+  const job = {
+    id,
+    type: 'boosty_batch_transcribe',
+    target: `source:${params.source_id}`,
+    source_id: Number(params.source_id),
+    status: 'done',
+    items_done: rows.length,
+    items_total: rows.length,
+    started_at: now,
+    finished_at: now,
+    params: { ...params, mode },
+    entity_title: params.entity_title || null,
+    entity_kind: 'boosty_channel',
+    boosty_batch: {
+      mode,
+      saved: rows.length,
+      cached: rows.length,
+      errors: 0,
+      current: null,
+      log,
+    },
+  }
+  jobs.set(id, job)
+  try {
+    db.recordJob({
+      type: job.type,
+      source_id: job.source_id,
+      status: 'done',
+      items_total: rows.length,
+      items_done: rows.length,
+      items_failed: 0,
+      cost_usd: 0,
+      params: { ...job.params, _boosty_batch: job.boosty_batch },
+      started_at: now,
+      finished_at: now,
+    })
+  } catch (err) {
+    console.error('[Jobs] cached Boosty batch DB write failed', err)
+  }
+  emit(job)
+  markJobClosed(job)
+  return id
+}
+
+function startBoostyBatchTranscribe(params = {}) {
+  const sourceId = Number(params.source_id)
+  const videoIds = Array.isArray(params.video_ids)
+    ? [...new Set(params.video_ids.map(String).filter(Boolean))]
+    : []
+  if (!sourceId || !videoIds.length) throw new Error('Нужно выбрать хотя бы одно видео Boosty')
+  const mode = params.mode === 'download' ? 'download' : 'transcribe'
+  const authCookie = String(params.authCookie || '').trim()
+  if (!authCookie) throw new Error('startBoostyBatchTranscribe: browser auth required')
+  for (const existing of jobs.values()) {
+    if (existing.status !== 'running' || existing.type !== 'boosty_batch_transcribe') continue
+    if (Number(existing.source_id) === sourceId) return existing.id
+  }
+  const { source, rows } = boostyBatchSelectionRows(sourceId, videoIds)
+
+  const cachedRows = []
+  const runRows = []
+  for (const row of rows) {
+    const ready = mode === 'download'
+      ? existingFile(row.media_path)
+      : existingFile(row.transcript_path)
+    if (ready) cachedRows.push(row)
+    else runRows.push(row)
+  }
+  const safeParams = {
+    source_id: sourceId,
+    video_ids: videoIds,
+    mode,
+    entity_title: source.display_name || source.handle,
+  }
+  if (!runRows.length) return synthesiseCachedBoostyBatch(safeParams, cachedRows, mode)
+
+  const id = nextId++
+  const selectionPath = path.join(BOOSTY_TMP_DIR, `selection-${id}-${Date.now()}.json`)
+  const selection = runRows.map(row => {
+    let meta = {}
+    try { meta = JSON.parse(row.raw_meta_json || '{}') } catch {}
+    return {
+      url: row.url,
+      video_id: String(row.external_id),
+      position: meta.position || null,
+      title: row.title || null,
+      duration_sec: row.duration_seconds || null,
+      author: source.display_name || source.handle,
+      audio_path: existingFile(row.media_path) ? row.media_path : null,
+    }
+  })
+  fs.writeFileSync(selectionPath, JSON.stringify({ items: selection }), { encoding: 'utf8', mode: 0o600 })
+
+  const args = [
+    BOOSTY_SCRIPT,
+    '--selection-file', selectionPath,
+    '--media-dir', BOOSTY_MEDIA_DIR,
+    '--transcript-dir', BOOSTY_TRANSCRIPTS_DIR,
+    '--work-dir', BOOSTY_TMP_DIR,
+  ]
+  if (mode === 'download') args.push('--download-only')
+  const env = workerEnv()
+  env.SC_BOOSTY_AUTH_COOKIE = authCookie
+  if (params.authExpiration) env.SC_BOOSTY_AUTH_EXPIRES = String(params.authExpiration)
+  const child = spawn(WORKER_PYTHON, args, {
+    cwd: WORKERS_ROOT,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  delete env.SC_BOOSTY_AUTH_COOKIE
+  delete env.SC_BOOSTY_AUTH_EXPIRES
+
+  const seedLog = cachedRows.map(row => boostyCachedBatchLog(row, mode))
+  const job = {
+    id,
+    type: 'boosty_batch_transcribe',
+    target: `source:${sourceId}`,
+    source_id: sourceId,
+    status: 'running',
+    items_done: cachedRows.length,
+    items_total: rows.length,
+    started_at: Math.floor(Date.now() / 1000),
+    params: safeParams,
+    entity_title: source.display_name || source.handle,
+    entity_kind: 'boosty_channel',
+    boosty_batch: {
+      mode,
+      saved: cachedRows.length,
+      cached: cachedRows.length,
+      errors: 0,
+      current: null,
+      log: seedLog,
+    },
+    _boostySelectionPath: selectionPath,
+    child,
+  }
+  jobs.set(id, job)
+  emit(job)
+  console.log(`[Jobs] start boosty_batch_transcribe #${id} source=${sourceId} mode=${mode} selected=${rows.length} cached=${cachedRows.length}`)
+
+  const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
+  rl.on('line', line => {
+    if (!line.trim()) return
+    let evt
+    try { evt = JSON.parse(line) } catch { return }
+    handleBoostyBatchEvent(job, evt)
+  })
+  let stderrTail = ''
+  child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk.toString()).slice(-2000) })
+  child.on('error', err => { job.error = `spawn error: ${err.message}` })
+  child.on('close', code => {
+    job.child = null
+    try { fs.unlinkSync(selectionPath) } catch {}
+    delete job._boostySelectionPath
+    if (job.status === 'running') {
+      job.status = code === 0 ? 'done' : 'error'
+      if (code !== 0) job.error = job.error || stderrTail.slice(-300) || `python exited ${code}`
+    }
+    job.finished_at = Math.floor(Date.now() / 1000)
+    const persistedParams = { ...safeParams, _boosty_batch: job.boosty_batch }
+    job.params = persistedParams
+    try {
+      db.recordJob({
+        type: job.type,
+        source_id: sourceId,
+        status: job.status,
+        items_total: job.items_total,
+        items_done: job.boosty_batch.saved,
+        items_failed: job.boosty_batch.errors,
+        cost_usd: job.cost_usd || 0,
+        params: persistedParams,
+        error: job.error,
+        started_at: job.started_at,
+        finished_at: job.finished_at,
+      })
+      if (mode === 'transcribe' && job.boosty_batch.saved > cachedRows.length) {
+        db.recordCoverage({
+          source_id: sourceId,
+          job_id: null,
+          date_from: null,
+          date_to: null,
+          content_type: 'video',
+          depth: 'transcribed',
+          items_count: job.boosty_batch.saved - cachedRows.length,
+        })
+      }
+    } catch (err) {
+      console.error('[Jobs] boosty_batch_transcribe DB write failed', err)
+    }
+    console.log(`[Jobs] end boosty_batch_transcribe #${id} status=${job.status} saved=${job.boosty_batch.saved} errors=${job.boosty_batch.errors}`)
+    emit(job)
+    markJobClosed(job)
+  })
+  return id
+}
+
+function handleBoostyBatchEvent(job, evt) {
+  emitEvent(job, evt)
+  const batch = job.boosty_batch
+  const videoId = evt.video_id ? String(evt.video_id) : batch.current?.video_id
+  switch (evt.type) {
+    case 'auth_ready':
+      batch.stage = 'resolving'
+      emit(job)
+      break
+    case 'batch_start':
+      batch.stage = 'running'
+      batch.run_total = Number(evt.items_total || 0)
+      emit(job)
+      break
+    case 'item_start':
+      batch.current = {
+        i: Number(evt.item_index || 1) + Number(batch.cached || 0),
+        n: job.items_total,
+        video_id: videoId,
+        title: evt.title || null,
+        duration_sec: evt.duration_sec || null,
+        stage: 'resolving',
+      }
+      emit(job)
+      break
+    case 'metadata':
+      batch.current = {
+        ...(batch.current || {}),
+        video_id: videoId,
+        title: evt.title || batch.current?.title,
+        duration_sec: evt.duration_sec || batch.current?.duration_sec,
+        stage: 'downloading',
+      }
+      emit(job)
+      break
+    case 'download_progress':
+      batch.current = {
+        ...(batch.current || {}),
+        stage: 'downloading',
+        downloaded_bytes: evt.downloaded_bytes || 0,
+        total_bytes: evt.total_bytes || null,
+        percent: evt.percent ?? null,
+        speed_bps: evt.speed_bps || null,
+        eta_sec: evt.eta_sec || null,
+      }
+      // yt-dlp can report dozens of chunks per second. Keep progress live
+      // without flooding job:update / React with one IPC frame per chunk.
+      if (!job._lastProgressEmit || Date.now() - job._lastProgressEmit >= 250) {
+        job._lastProgressEmit = Date.now()
+        emit(job)
+      }
+      break
+    case 'download_processing':
+      if (batch.current) batch.current.stage = 'extracting'
+      emit(job)
+      break
+    case 'download_done':
+      if (videoId && evt.audio_path) {
+        try {
+          db.markItemDownloaded({ source_id: job.source_id, external_id: videoId, media_path: evt.audio_path })
+        } catch (err) {
+          console.error('[Jobs] Boosty audio path DB write failed', err)
+        }
+      }
+      batch.current = {
+        ...(batch.current || {}),
+        stage: job.params.mode === 'download' ? 'saving' : 'transcribing',
+        audio_path: evt.audio_path || null,
+        audio_bytes: evt.audio_bytes || null,
+      }
+      emit(job)
+      break
+    case 'transcribe_start':
+      if (batch.current) batch.current.stage = 'transcribing'
+      emit(job)
+      break
+    case 'transcribe_progress':
+      batch.current = {
+        ...(batch.current || {}),
+        stage: 'transcribing',
+        provider_stage: evt.stage || null,
+        elapsed_sec: evt.elapsed_sec || null,
+      }
+      emit(job)
+      break
+    case 'transcribe_done':
+      job.cost_usd = (job.cost_usd || 0) + Number(evt.cost_usd || 0)
+      break
+    case 'audio_saved':
+      batch.saved += 1
+      job.items_done = batch.saved + batch.errors
+      if (videoId && evt.audio_path) {
+        try { db.markItemDownloaded({ source_id: job.source_id, external_id: videoId, media_path: evt.audio_path }) }
+        catch (err) { console.error('[Jobs] Boosty audio saved DB write failed', err) }
+      }
+      batch.log.push({
+        video_id: videoId,
+        title: evt.title || batch.current?.title || null,
+        kind: evt.cached ? 'cache' : 'audio',
+        audio_path: evt.audio_path,
+        audio_bytes: evt.audio_bytes || batch.current?.audio_bytes || null,
+      })
+      batch.current = null
+      emit(job)
+      break
+    case 'saved':
+      batch.saved += 1
+      job.items_done = batch.saved + batch.errors
+      if (videoId) {
+        try {
+          if (evt.audio_path) db.markItemDownloaded({ source_id: job.source_id, external_id: videoId, media_path: evt.audio_path })
+          if (evt.file_path) {
+            db.markItemTranscribed({
+              source_id: job.source_id,
+              external_id: videoId,
+              transcript_path: evt.file_path,
+              engine: 'assemblyai',
+              cost_usd: evt.cost_usd || null,
+            })
+          }
+        } catch (err) {
+          console.error('[Jobs] Boosty transcript DB write failed', err)
+        }
+      }
+      batch.log.push({
+        video_id: videoId,
+        title: evt.title || batch.current?.title || null,
+        kind: evt.cached ? 'cache' : 'ai',
+        file_path: evt.file_path || null,
+        srt_path: evt.srt_path || null,
+        audio_path: evt.audio_path || null,
+        audio_bytes: evt.audio_bytes || batch.current?.audio_bytes || null,
+      })
+      batch.current = null
+      emit(job)
+      break
+    case 'item_error':
+      batch.errors += 1
+      job.items_done = batch.saved + batch.errors
+      batch.log.push({
+        video_id: videoId,
+        title: evt.title || batch.current?.title || null,
+        kind: 'error',
+        message: evt.message,
+      })
+      try {
+        if (job.params.mode === 'download') {
+          db.markItemDownloadError({ source_id: job.source_id, external_id: videoId, error: evt.message })
+        } else {
+          db.markItemTranscribeError({ source_id: job.source_id, external_id: videoId, error: evt.message })
+        }
+      } catch (err) {
+        console.error('[Jobs] Boosty item error DB write failed', err)
+      }
+      batch.current = null
+      emit(job)
+      break
+    case 'done':
+      batch.stage = 'done'
+      batch.worker_failed = Number(evt.items_failed || 0)
+      emit(job)
+      break
+    case 'error':
+      if (evt.code === 'cancelled' && job.status === 'cancelled') break
+      job.error = evt.message || 'Не удалось обработать видео Boosty'
+      job.error_code = evt.code || null
+      emit(job)
+      break
+  }
+}
+
+// ─── Boosty single video ─────────────────────────────────────────────
+//
+// The renderer supplies only a Boosty URL. Main obtains the short-lived
+// `auth` cookie from the installed browser extension and passes it here as an
+// in-memory argument. The value is put only in the child environment: never
+// in job.params, snapshots, logs, or SQLite.
+
+const BOOSTY_SCRIPT = path.join(WORKERS_ROOT, 'web', 'boosty_single_ndjson.py')
+
+function startBoostySingle(params = {}) {
+  const id = nextId++
+  const url = String(params.url || '').trim()
+  const authCookie = String(params.authCookie || '').trim()
+  if (!url) throw new Error('startBoostySingle: url required')
+  if (!authCookie) throw new Error('startBoostySingle: browser auth required')
+
+  const args = [
+    BOOSTY_SCRIPT,
+    url,
+    '--media-dir', BOOSTY_MEDIA_DIR,
+    '--transcript-dir', BOOSTY_TRANSCRIPTS_DIR,
+    '--work-dir', BOOSTY_TMP_DIR,
+  ]
+  const safeParams = { url, engine: 'assemblyai' }
+  const job = {
+    id,
+    type: 'boosty_transcribe',
+    target: url,
+    status: 'running',
+    items_done: 0,
+    items_total: null,
+    started_at: Math.floor(Date.now() / 1000),
+    params: safeParams,
+    entity_title: null,
+    entity_kind: 'boosty_video',
+    boosty: { stage: 'authorizing', engine: 'assemblyai' },
+    child: null,
+  }
+  jobs.set(id, job)
+  emit(job)
+  console.log(`[Jobs] start boosty_transcribe #${id} url=${url}`)
+
+  const env = workerEnv()
+  env.SC_BOOSTY_AUTH_COOKIE = authCookie
+  if (params.authExpiration) env.SC_BOOSTY_AUTH_EXPIRES = String(params.authExpiration)
+  const child = spawn(WORKER_PYTHON, args, {
+    cwd: WORKERS_ROOT,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  // Drop the local references immediately after spawn. The child has its own
+  // environment copy; the live job remains secret-free.
+  delete env.SC_BOOSTY_AUTH_COOKIE
+  delete env.SC_BOOSTY_AUTH_EXPIRES
+  job.child = child
+  attachBoostyStreams(job, child)
+  return id
+}
+
+function attachBoostyStreams(job, child) {
+  const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
+  rl.on('line', line => {
+    if (!line.trim()) return
+    let evt
+    try { evt = JSON.parse(line) } catch { return }
+    handleBoostyEvent(job, evt)
+  })
+
+  let stderrTail = ''
+  child.stderr.on('data', chunk => {
+    stderrTail = (stderrTail + chunk.toString()).slice(-2000)
+  })
+
+  child.on('close', code => {
+    job.child = null
+    if (job.status === 'running') {
+      if (code === 0 && job.file_path) {
+        job.status = 'done'
+      } else if (code === null) {
+        // cancelJob already set the terminal status.
+      } else if (code === 130 && job.status === 'cancelled') {
+        // SIGTERM handler converted the stop into a clean Python interrupt.
+      } else {
+        job.status = 'error'
+        job.error = job.error || stderrTail.slice(-300) || `python exited ${code}`
+      }
+    }
+    job.finished_at = Math.floor(Date.now() / 1000)
+
+    if (job.status !== 'running') {
+      const boosty = job.boosty || {}
+      const persistedParams = {
+        url: job.target,
+        engine: 'assemblyai',
+        result_files: boosty.result_files || null,
+        _boosty: {
+          canonical_url: boosty.canonical_url || null,
+          post_id: boosty.post_id || null,
+          video_id: boosty.video_id || null,
+          title: boosty.title || job.entity_title || null,
+          author: boosty.author || null,
+          author_handle: boosty.author_handle || null,
+          duration_sec: boosty.duration_sec || null,
+          thumbnail: boosty.thumbnail || null,
+          audio_path: boosty.audio_path || null,
+          audio_bytes: boosty.audio_bytes || null,
+          srt_path: boosty.srt_path || null,
+          chars: boosty.chars || null,
+        },
+      }
+      if (job.error_code) persistedParams._error_code = job.error_code
+      job.params = persistedParams
+      try {
+        db.recordJob({
+          type: 'boosty_transcribe',
+          source_id: null,
+          status: job.status,
+          items_total: null,
+          items_done: 0,
+          cost_usd: job.cost_usd || 0,
+          params: persistedParams,
+          error: job.error,
+          started_at: job.started_at,
+          finished_at: job.finished_at,
+          file_path: job.file_path || null,
+        })
+      } catch (err) {
+        console.error('[Jobs] boosty_transcribe DB write failed', err)
+      }
+    }
+    console.log(`[Jobs] end boosty_transcribe #${job.id} status=${job.status}${job.error ? ' error=' + job.error : ''}`)
+    emit(job)
+    markJobClosed(job)
+  })
+
+  child.on('error', err => {
+    job.error = `spawn error: ${err.message}`
+  })
+}
+
+function handleBoostyEvent(job, evt) {
+  emitEvent(job, evt)
+  switch (evt.type) {
+    case 'auth_ready':
+      job.boosty = { ...(job.boosty || {}), stage: 'resolving' }
+      emit(job)
+      break
+    case 'metadata':
+      job.entity_title = evt.title || job.entity_title
+      job.boosty = {
+        ...(job.boosty || {}),
+        stage: 'downloading',
+        canonical_url: evt.canonical_url,
+        post_id: evt.post_id,
+        video_id: evt.video_id,
+        title: evt.title,
+        author: evt.author,
+        author_handle: evt.author_handle,
+        duration_sec: evt.duration_sec,
+        thumbnail: evt.thumbnail,
+        playlist_index: evt.playlist_index,
+        playlist_count: evt.playlist_count,
+      }
+      emit(job)
+      break
+    case 'download_progress':
+      job.items_done = Number(evt.downloaded_bytes || 0)
+      job.items_total = Number(evt.total_bytes || 0) || null
+      job.boosty = {
+        ...(job.boosty || {}),
+        stage: 'downloading',
+        downloaded_bytes: evt.downloaded_bytes || 0,
+        total_bytes: evt.total_bytes || null,
+        percent: evt.percent ?? null,
+        speed_bps: evt.speed_bps || null,
+        eta_sec: evt.eta_sec || null,
+        fragment_index: evt.fragment_index || null,
+        fragment_count: evt.fragment_count || null,
+      }
+      if (!job._lastProgressEmit || Date.now() - job._lastProgressEmit >= 250) {
+        job._lastProgressEmit = Date.now()
+        emit(job)
+      }
+      break
+    case 'download_processing':
+      job.boosty = { ...(job.boosty || {}), stage: 'extracting' }
+      emit(job)
+      break
+    case 'download_done':
+      job.boosty = {
+        ...(job.boosty || {}),
+        stage: 'transcribing',
+        audio_path: evt.audio_path,
+        audio_bytes: evt.audio_bytes,
+        duration_sec: evt.duration_sec || job.boosty?.duration_sec,
+      }
+      emit(job)
+      break
+    case 'transcribe_start':
+      job.boosty = { ...(job.boosty || {}), stage: 'transcribing', engine: evt.engine }
+      emit(job)
+      break
+    case 'transcribe_progress':
+      job.boosty = {
+        ...(job.boosty || {}),
+        stage: 'transcribing',
+        engine: evt.engine,
+        aai_stage: evt.stage,
+        aai_status: evt.aai_status,
+        aai_elapsed_sec: evt.elapsed_sec,
+        aai_audio_dur_sec: evt.audio_duration_sec,
+        aai_transcript_id: evt.transcript_id,
+      }
+      emit(job)
+      break
+    case 'transcribe_done':
+      job.boosty = {
+        ...(job.boosty || {}),
+        stage: 'saving',
+        chars: evt.chars,
+      }
+      job.cost_usd = (job.cost_usd || 0) + Number(evt.cost_usd || 0)
+      emit(job)
+      break
+    case 'saved': {
+      job.file_path = evt.file_path
+      const resultFiles = {
+        text: evt.file_path || null,
+        srt: evt.srt_path || null,
+        audio: evt.audio_path || null,
+      }
+      job.boosty = {
+        ...(job.boosty || {}),
+        stage: 'done',
+        file_path: evt.file_path,
+        srt_path: evt.srt_path || null,
+        audio_path: evt.audio_path || job.boosty?.audio_path || null,
+        audio_bytes: evt.audio_bytes || job.boosty?.audio_bytes || null,
+        duration_sec: evt.duration_sec || job.boosty?.duration_sec || null,
+        chars: evt.chars || job.boosty?.chars || null,
+        result_files: resultFiles,
+      }
+      try {
+        const copied = copyFileToClipboard(evt.file_path)
+        if (copied.ok) job.boosty.copied_bytes = copied.bytes
+      } catch {}
+      emit(job)
+      break
+    }
+    case 'done':
+      if (job.status === 'running' && job.file_path) {
+        job.status = 'done'
+        job.finished_at = Math.floor(Date.now() / 1000)
+      }
+      emit(job)
+      break
+    case 'error':
+      if (evt.code === 'cancelled' && job.status === 'cancelled') {
+        job.error = null
+        job.error_code = null
+        job.boosty = { ...(job.boosty || {}), stage: 'cancelled' }
+        emit(job)
+        break
+      }
+      job.error = evt.message || 'Boosty worker error'
+      job.error_code = evt.code || null
+      emit(job)
+      break
+  }
 }
 
 // ─── Local file transcribe ────────────────────────────────────────────
@@ -6877,6 +8527,9 @@ module.exports = {
   startYoutubeSingle,
   resumeYoutubeAi,
   lookupYoutubeCache,
+  startRutubeSingle,
+  resumeRutubeAi,
+  lookupRutubeCache,
   startYoutubeComments,
   lookupYoutubeCommentsCache,
   startYoutubeBatchComments,
@@ -6896,6 +8549,11 @@ module.exports = {
   startInstagramBatchTranscribe,
   startRedditThreadFetch,
   startRedditSearch,
+  lookupBoostyChannel,
+  startBoostyChannelFetch,
+  previewBoostyPost,
+  startBoostyBatchTranscribe,
+  startBoostySingle,
   startLocalTranscribe,
   runYoutubeSearch,
   resumeYoutubeBatch,
@@ -6909,4 +8567,8 @@ module.exports = {
   LIB_ROOT,
   JOBS_DIR,
   YT_TRANSCRIPTS_DIR,
+  RUTUBE_TRANSCRIPTS_DIR,
+  BOOSTY_TRANSCRIPTS_DIR,
+  BOOSTY_MEDIA_DIR,
+  BOOSTY_THUMBNAILS_DIR,
 }

@@ -18,9 +18,12 @@ import YouTubeSearchForm from '../components/YouTubeSearchForm'
 import YouTubeCommentsForm from '../components/YouTubeCommentsForm'
 import TelegramFolderForm from '../components/TelegramFolderForm'
 import HomeRecentActivities from '../components/HomeRecentActivities'
+import BoostySingleForm from '../components/BoostySingleForm'
+import BoostyChannelForm from '../components/BoostyChannelForm'
+import RutubeSingleForm from '../components/RutubeSingleForm'
 
-const PLATFORM_ORDER = ['telegram', 'youtube', 'instagram', 'tiktok', 'reddit']
-const PLATFORM_LABELS = { telegram: 'Telegram', youtube: 'YouTube', instagram: 'Instagram', tiktok: 'TikTok', reddit: 'Reddit', local: 'Local file' }
+const PLATFORM_ORDER = ['telegram', 'youtube', 'boosty', 'instagram', 'tiktok', 'reddit']
+const PLATFORM_LABELS = { telegram: 'Telegram', youtube: 'YouTube', rutube: 'Rutube', instagram: 'Instagram', tiktok: 'TikTok', reddit: 'Reddit', boosty: 'Boosty', local: 'Local file' }
 
 // Extract `?search_query=...` for chip display so the user sees "gpt 5.5 opus"
 // instead of the full youtube.com URL in their Recent paste row.
@@ -163,6 +166,7 @@ export default function PasteScreen({ payload }) {
   function shouldRemember(platform, kind) {
     if (platform === 'youtube' && kind === 'channel') return false
     if (platform === 'tiktok'  && kind === 'channel') return false
+    if (platform === 'boosty'  && kind === 'channel') return false
     return true
   }
 
@@ -176,6 +180,7 @@ export default function PasteScreen({ payload }) {
     const k =
       p === 'youtube'   ? 'channel' :
       p === 'tiktok'    ? 'channel' :
+      p === 'boosty'    ? 'channel' :
       p === 'instagram' ? 'profile' :
       p === 'reddit'    ? 'search' :
       detection.kind
@@ -335,6 +340,7 @@ export default function PasteScreen({ payload }) {
                 const ephemeral =
                   (activePlatform === 'telegram' && (activeKind === 'message' || activeKind === 'topic-message')) ||
                   (activePlatform === 'youtube' && (activeKind === 'video' || activeKind === 'search' || activeKind === 'comments')) ||
+                  activePlatform === 'boosty' ||
                   activePlatform === 'local'
                 if (activePlatform === 'telegram' && !ephemeral) clearInput()
               }}
@@ -424,6 +430,16 @@ function Detection({
         {committed.platform === 'local' && (
           <span className="text-zinc-500" style={{ fontSize: '14px' }}>
             · [транскрипт]
+          </span>
+        )}
+        {committed.platform === 'rutube' && (
+          <span className="text-zinc-500" style={{ fontSize: '14px' }}>
+            · [расшифровка]
+          </span>
+        )}
+        {committed.platform === 'boosty' && (
+          <span className="text-zinc-500" style={{ fontSize: '14px' }}>
+            · [{committed.kind === 'channel' ? 'автор · весь каталог' : committed.kind === 'post' ? 'пост · все видео' : 'видео · аудио + титры'}]
           </span>
         )}
       </div>
@@ -704,6 +720,15 @@ function PlatformForm({ formRef, platform, kind, target, includeComments, detect
       />
     )
   }
+  if (platform === 'rutube' && kind === 'video') {
+    return (
+      <RutubeSingleForm
+        ref={formRef}
+        url={target}
+        onStarted={onStarted}
+      />
+    )
+  }
   if (platform === 'youtube' && kind === 'search') {
     return (
       <YouTubeSearchForm
@@ -798,6 +823,24 @@ function PlatformForm({ formRef, platform, kind, target, includeComments, detect
       <LocalFileTranscribeForm
         ref={formRef}
         path={target}
+        onStarted={onStarted}
+      />
+    )
+  }
+  if (platform === 'boosty' && kind === 'channel') {
+    return (
+      <BoostyChannelForm
+        ref={formRef}
+        url={target}
+        onStarted={onStarted}
+      />
+    )
+  }
+  if (platform === 'boosty' && (kind === 'post' || kind === 'video' || kind === 'purchase' || kind === 'url')) {
+    return (
+      <BoostySingleForm
+        ref={formRef}
+        url={target}
         onStarted={onStarted}
       />
     )

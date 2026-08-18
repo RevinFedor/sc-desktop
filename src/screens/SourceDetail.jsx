@@ -20,6 +20,7 @@ import IndexButton from '../components/IndexButton'
 import ToolbarButton from '../components/ToolbarButton'
 import NewRequestSplitButton from '../components/NewRequestSplitButton'
 import JobProgress, { cleanErrorMessage } from '../components/JobProgress'
+import BoostySourceDetail from '../components/BoostySourceDetail'
 import { refreshSources } from '../lib/sources'
 import { useJobs } from '../lib/jobs'
 import { useInvalidator } from '../lib/dataBus'
@@ -256,7 +257,27 @@ export default function SourceDetail({ payload }) {
   }
 
   const s = data.source
-  const totalItems = (data.typeBreakdown || []).reduce((sum, r) => sum + (r.count || 0), 0)
+  if (s.platform === 'boosty') {
+    return <BoostySourceDetail source={s} jobs={data.jobs || []} />
+  }
+  const savedTypeBreakdown = data.typeBreakdown || []
+  const totalItems = savedTypeBreakdown.reduce((sum, r) => sum + (r.count || 0), 0)
+  // Preview analysis and saved rows answer different questions.  Only when
+  // there are no saved rows at all do we use the analysis as the distribution
+  // fallback; the top «Сохранено сообщений» count intentionally stays zero.
+  // Each fallback row carries analysis_missing so CoverageBars can mark every
+  // discovered type (including text/service) as not yet saved.
+  const analysisTypeBreakdown = s.platform === 'telegram' && totalItems === 0
+    ? telegramAnalysisBreakdown(data.telegramAnalysis)
+    : []
+  const distributionTypeBreakdown = analysisTypeBreakdown.length
+    ? analysisTypeBreakdown
+    : savedTypeBreakdown
+  const distributionTotalItems = distributionTypeBreakdown.reduce(
+    (sum, row) => sum + (row.count || 0),
+    0,
+  )
+  const distributionIsAnalysisOnly = analysisTypeBreakdown.length > 0
   const lastItemAt = s.last_item_at ? new Date(s.last_item_at * 1000) : null
   const lastSyncedAt = s.last_synced_at ? new Date(s.last_synced_at * 1000) : null
   const canOpenNewRequest = hasNewRequestForm(s.platform)
@@ -565,16 +586,18 @@ export default function SourceDetail({ payload }) {
 
           {/* Distribution by content type */}
           <Section title="Распределение по типам">
-            {(data.typeBreakdown || []).length === 0 ? (
-              <div className="text-zinc-600 italic">Пока пусто. Сделайте парсинг.</div>
+            {distributionTypeBreakdown.length === 0 ? (
+              <div className="text-zinc-600 italic">Пока пусто. Запустите анализ канала или парсинг.</div>
             ) : (
               <CoverageBars
                 sourceId={sourceId}
-                typeBreakdown={data.typeBreakdown || []}
-                totalItems={totalItems}
+                typeBreakdown={distributionTypeBreakdown}
+                totalItems={distributionTotalItems}
                 platform={s.platform}
                 indexed={idxStatus?.done || 0}
                 commentsCount={data.commentsCount || 0}
+                analysisOnly={distributionIsAnalysisOnly}
+                analyzedAt={data.telegramAnalysis?.analyzed_at || null}
               />
             )}
           </Section>
@@ -882,6 +905,22 @@ function isVisibleHistoryJobRow(job) {
     if (params?._range_plan_child) return false
   } catch {}
   return true
+}
+
+function telegramAnalysisBreakdown(analysis) {
+  const counts = analysis?.type_counts
+  if (!counts || typeof counts !== 'object' || Array.isArray(counts)) return []
+  return Object.entries(counts)
+    .map(([type, rawCount]) => ({
+      type,
+      count: Math.max(0, Math.floor(Number(rawCount) || 0)),
+      with_media: 0,
+      transcribed: 0,
+      processed: 0,
+      with_caption: 0,
+      analysis_missing: Math.max(0, Math.floor(Number(rawCount) || 0)),
+    }))
+    .filter(row => row.count > 0)
 }
 
 function JobHistoryRow({ job, source, liveJob, onDelete, onCancel }) {

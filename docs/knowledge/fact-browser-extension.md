@@ -412,7 +412,8 @@ page path не должен быть дополнительным source of trut
 | `system_instruction` | (string) **Имя сохранённого пресета** в Gemini Studio (а не сам текст инструкции). Autoscrape выберет его из `mat-select` dropdown'а; не найден или дубли → throw |
 | `model_title` | (string, default «Gemini 3 Flash Preview») Точное имя model-card'а |
 | `claude_project` / `claude_model` / `claude_post_project` | Claude-target настройки; живут рядом с Gemini-настройками и не стираются при переключении target'а |
-| `chatgpt_prompt` / `chatgpt_model` / `chatgpt_effort` | ChatGPT-target настройки; prompt добавляется перед текстом видео, модель/effort уходят в `sc-compose` handoff |
+| `chatgpt_prompt` / `chatgpt_show_in_text_field` | Задача для composer и toggle быстрого разворачивания Pasted Text в поле; задача никогда не становится частью транскрипт-вложения |
+| `chatgpt_mode` / `chatgpt_chat_model` / `chatgpt_chat_effort` / `chatgpt_work_model` / `chatgpt_work_effort` | Отдельные пары Chat и Work. Плоские `chatgpt_model` / `chatgpt_effort` остаются совместимыми алиасами активного режима для старых content-script'ов |
 
 Настройки target'ов хранятся параллельно. Popup показывает только карточку
 выбранной цели, но переключение селекта не теряет Gemini/Claude/ChatGPT
@@ -423,6 +424,11 @@ YouTube-настройки **читаются content-script'ом из storage �
 кнопка на карточке должна знать `auto_aistudio` чтобы показать `⬇ sc · AI`
 или `⬇ sc`, без round-trip'а в popup. `chrome.storage.onChanged` listener
 обновляет лейблы всех существующих кнопок при перещёлкивании toggle.
+
+Popup — единственный постоянный владелец ChatGPT-пары и режима для YouTube.
+Ручная форма SC Desktop может выбрать параметры только для одного диагностического
+research-запуска, но не должна становиться вторым экраном глобальных YouTube-настроек.
+Доставка задачи и текста — `fact-chatgpt-research.md::Задача и исходный материал — разные каналы`.
 
 См. `fact-yt-extension-flow.md` для полного flow.
 

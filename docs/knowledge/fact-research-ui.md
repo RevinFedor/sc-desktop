@@ -26,8 +26,12 @@ crumbFor даёт label «Новый research».
   (детерминированность — не показывать выбор которого нет). Список моделей — живой из
   `GET /pplx-models` (фолбэк на статический если реестр ещё не зарегистрирован).
 - **AI Studio** — Модель (фиксированный список Gemini/DR из реестра).
-- **ChatGPT** — Модель (5.5/5.4/5.3/5.2/4.5/o3) + Интеллект (instant…pro-extended,
-  default xhigh) + чекбокс «Источники в ответе». Зеркала реестров CS — см.
+- **ChatGPT** — Режим `Chat`/`Work`, затем модель и интеллект, допустимые именно
+  для выбранного режима: Chat даёт `GPT-5.5 Instant` или `GPT-5.6 Sol`, Work —
+  `GPT-5.6 Sol/Terra/Luna` и уровни до `Max`/`Ultra`. Это ручной per-run инструмент
+  проверки: выбор не дублирует и не сохраняет YouTube-настройки extension popup.
+  Сейчас стартовые значения формы — Chat / Sol / xhigh; вызывающий
+  `external-research` skill отдельно выбирает Work / Sol / Max. Зеркала реестров CS —
   `fact-chatgpt-research.md::Параметры`.
 
 **Запуск — через main-process IPC (`window.api.researchStart/Status/PplxModels`), НЕ

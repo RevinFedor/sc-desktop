@@ -1,7 +1,52 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  LINK_TARGET="$(readlink "$SCRIPT_PATH")"
+  if [[ "$LINK_TARGET" == /* ]]; then
+    SCRIPT_PATH="$LINK_TARGET"
+  else
+    SCRIPT_PATH="$SCRIPT_DIR/$LINK_TARGET"
+  fi
+done
+ROOT="$(cd "$(dirname "$SCRIPT_PATH")/../.." && pwd)"
+
+usage() {
+  cat <<'EOF'
+SC — быстрые команды SC Desktop
+
+  sc <boosty-url>          автор → каталог; пост → обработать все видео
+  sc -b <boosty-url>       совместимый явный запуск Boosty
+  sc --boosty <url>        то же самое
+  sc -i --login            войти в Instagram
+EOF
+}
+
+run_boosty() {
+  if [[ -x "$ROOT/.venv/bin/python3" ]]; then
+    PYTHON="$ROOT/.venv/bin/python3"
+  else
+    PYTHON="python3"
+  fi
+  exec "$PYTHON" "$ROOT/python-workers/web/boosty_cli.py" "$@"
+}
+
+if [[ "${1:-}" == "-b" || "${1:-}" == "--boosty" || "${1:-}" == "boosty" ]]; then
+  shift
+  if [[ $# -eq 0 ]]; then
+    echo "Нужна ссылка Boosty: sc -b 'https://boosty.to/.../posts/...'" >&2
+    exit 2
+  fi
+  run_boosty "$@"
+fi
+
+case "${1:-}" in
+  https://boosty.to/*|https://www.boosty.to/*|http://boosty.to/*|http://www.boosty.to/*)
+    run_boosty "$@"
+    ;;
+esac
 
 if [[ "${1:-}" == "-i" && ( "${2:-}" == "--login" || "${2:-}" == "login" ) ]]; then
   shift 2
@@ -9,10 +54,10 @@ if [[ "${1:-}" == "-i" && ( "${2:-}" == "--login" || "${2:-}" == "login" ) ]]; t
   exec npm run instagram:login -- "$@"
 fi
 
-cat >&2 <<'EOF'
-This SC Desktop compatibility shim only supports:
-  sc -i --login
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
 
-For desktop runtime code, use python-workers/ inside sc-desktop.
-EOF
+usage >&2
 exit 2

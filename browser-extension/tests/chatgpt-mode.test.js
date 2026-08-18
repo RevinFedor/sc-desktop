@@ -23,7 +23,10 @@ const instrumented = source.replace(exportMarker, `
     composerHasFilePreview,
     isShowInTextFieldLabel,
     isPastedTextChipLabel,
+    isPastedTextTooLongLabel,
     composerContainsInlineText,
+    showPastedTextInComposer,
+    trustedHover,
   };
 ${exportMarker}`);
 
@@ -46,9 +49,20 @@ const documentMock = {
 const context = vm.createContext({
   URL,
   File: FakeFile,
+  performance,
   document: documentMock,
   window: {},
-  chrome: { runtime: { onMessage: { addListener() {} } } },
+  chrome: {
+    runtime: {
+      lastError: null,
+      onMessage: { addListener() {} },
+      sendMessage(message, callback) {
+        this.sentMessages.push(message);
+        callback({ ok: true });
+      },
+      sentMessages: [],
+    },
+  },
 });
 vm.runInContext(instrumented, context);
 
@@ -67,7 +81,10 @@ const {
   composerHasFilePreview,
   isShowInTextFieldLabel,
   isPastedTextChipLabel,
+  isPastedTextTooLongLabel,
   composerContainsInlineText,
+  showPastedTextInComposer,
+  trustedHover,
 } = context.__chatgptModeExports;
 
 function control(text, attributes = {}, parentElement = null, left = 0) {
@@ -213,6 +230,47 @@ test('show-in-text-field controls support current Russian and English labels', (
   assert.equal(isShowInTextFieldLabel('Удалить файл'), false);
   assert.equal(isPastedTextChipLabel('Pasted text'), true);
   assert.equal(isPastedTextChipLabel('Вставленный текст'), true);
+  assert.equal(
+    isPastedTextTooLongLabel('Открыть вложение со вставленным текстом. Превышает длину для отображения в текстовом поле'),
+    true,
+  );
+  assert.equal(isPastedTextTooLongLabel('Pasted text. Too long to display in the text field'), true);
+  assert.equal(isPastedTextTooLongLabel('Exceeds the length for display in the text field'), true);
+  assert.equal(isPastedTextTooLongLabel('Показать в текстовом поле'), false);
+});
+
+test('Pasted Text hover uses a real debugger mouse move through background', async () => {
+  const result = await trustedHover(control('Pasted text'));
+  const message = context.chrome.runtime.sentMessages.at(-1);
+  assert.equal(result.ok, true);
+  assert.equal(message.__sc_trusted_hover, true);
+  assert.equal(message.x, 50);
+  assert.equal(message.y, 30);
+});
+
+test('oversized Pasted Text becomes a ready attachment without waiting for a missing show button', async () => {
+  const prompt = 'Задача:\nперескажи видео';
+  const chip = control('Вставленный текст', {
+    'aria-label': 'Открыть вложение со вставленным текстом. Превышает длину для отображения в текстовом поле',
+  });
+  const form = {
+    querySelectorAll() { return [chip]; },
+  };
+  documentMock.composer = {
+    innerText: prompt,
+    textContent: prompt,
+    closest(selector) { return selector === 'form' ? form : null; },
+  };
+
+  const result = await showPastedTextInComposer(
+    'oversized-job',
+    `${prompt}\n\nИсходный материал:\nочень длинный текст`,
+    prompt,
+  );
+
+  assert.equal(result.method, 'pasted_text_attachment');
+  assert.equal(result.reason, 'too_long_for_text_field');
+  documentMock.composer = null;
 });
 
 test('compose job enables inline mode only when explicitly requested', () => {

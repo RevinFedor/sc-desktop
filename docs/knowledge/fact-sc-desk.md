@@ -1,13 +1,15 @@
-# SC Desk mobile API
+# SC Desk: mobile API и исходящие уведомления
 
 Mobile API — внешний one-shot вход в те же Instagram/YouTube pipelines, которыми
 владеет SC Desktop. Первый клиент — нативная вкладка SC Desk в
-`/Users/fedor/Desktop/vs-code/habit-tracker`; Telegram-бот удалён. API не
-переносит desktop Library на телефон и не создаёт второй job engine: он хранит
-маленькую мобильную запись, запускает обычный job и проецирует его состояние в
-стабильный HTTP/SSE contract.
+`/Users/fedor/Desktop/vs-code/habit-tracker`. Старый интерактивный Telegram-вход,
+который принимал ссылки через polling, удалён; узкий исходящий канал уведомлений
+Custom Terminal остаётся отдельным живым контрактом. Mobile API не переносит
+desktop Library на телефон и не создаёт второй job engine: он хранит маленькую
+мобильную запись, запускает обычный job и проецирует его состояние в стабильный
+HTTP/SSE contract.
 
-Текущий продуктовый scope:
+Текущий продуктовый scope mobile API:
 
 - один Instagram Reel или Post с транскрибируемым video/audio;
 - одно YouTube-видео, включая Shorts/Live URL;
@@ -16,6 +18,35 @@ Mobile API — внешний one-shot вход в те же Instagram/YouTube p
 Image-only Instagram Post проходит URL-классификацию, но завершается понятной
 ошибкой отсутствия транскрибируемого media. Это не обещание OCR/vision для
 поста.
+
+## Custom Terminal: исходящие Telegram-уведомления
+
+SC Desktop сохраняет только нижний исходящий слой старого Telegram-бота:
+доставка `sendMessage` о завершении AI-вкладки. Интерактивный `getUpdates`,
+приём Instagram-ссылок и bot UI не возвращаются. Потребитель этого узкого слоя —
+Custom Terminal; удаление прежнего пользовательского входа не означает, что
+межпроектный получатель больше никому не нужен.
+
+Это отдельная loopback/auth-граница: Custom Terminal вызывает
+`POST http://127.0.0.1:53127/notifications/terminal-completion` с bearer token из
+`~/Library/Application Support/sc-desktop/notification-bridge-token`. Не
+переносить route на mobile API `:7898`, не переиспользовать `mobile-api-token` и
+не разрешать browser Origin. Dev-runtime не отправляет реальные Telegram-
+сообщения без явного opt-in.
+
+Canonical identity события — `eventId = tabId:firedAt`. Custom Terminal сначала
+пишет событие в durable FIFO и только потом доставляет: `400/401/403` завершают
+запись как постоянную ошибку контракта, а `404/429/5xx`, timeout и network failure
+остаются в очереди с backoff. SC Desktop сериализует Telegram-вызовы и хранит
+receiver-side dedupe по `eventId`, потому что Telegram мог принять сообщение,
+а HTTP-ответ отправителю — потеряться. Sender-side dedupe одного этого случая не
+закрывает.
+
+Практическое следствие: восстановление production-получателя может немедленно
+отправить весь накопленный backlog. Перед запуском сначала проверить очередь и
+явно решить, доставлять ли старые события; молча очищать её нельзя. Парная сторона
+контракта — `/Users/fedor/Desktop/custom-terminal/docs/knowledge/fact-tabs.md`
+в секции «Уведомление о завершении вкладки».
 
 ## Сетевая граница
 
@@ -72,10 +103,16 @@ mode `0700`, файл — `0600`. Значение никогда не логи�
 телефон мог потерять response после того, как Mac уже принял POST. Повтор с тем
 же id обязан вернуть существующий import.
 
+`clientRequestId` идентифицирует одну пользовательскую попытку, а не сам URL.
+Потерянный response повторяется с прежним id; осознанный retry после ошибки,
+новая ссылка и повтор старой ссылки после другой получают новый id. Если клиент
+переиспользует id для другого URL, сервер намеренно вернёт первую запись:
+idempotency не должна незаметно превратиться в повторный запуск.
+
 Public record отдаёт только стабильную проекцию:
 `id/clientRequestId/platform/url/externalId/mediaKind/title`,
 `status/stage/progress`, `backend/backendMode/engine`,
-`stepIndex/stepTotal/error/resultReady/createdAt/updatedAt`. Внутренний
+`stepIndex/stepTotal/errorCode/error/resultReady/createdAt/updatedAt`. Внутренний
 `jobId` и путь результата наружу не уходят.
 
 SSE сначала посылает `ready`, затем seed для `queued/running/awaiting_ai`,
@@ -128,6 +165,19 @@ Mobile import вызывает общий single-reel service, который в
 Reel и video-Post используют один pipeline, но сохраняют `mediaKind`, чтобы
 история не стирала продуктовую разницу. Подробности cache/backend/external-id —
 `fact-instagram.md`.
+
+### Аудио есть, распознанного текста нет
+
+Если media успешно resolved и аудиофайл уже подготовлен, но Gemini завершился
+без текстовых parts, это отдельный terminal outcome: `status=error`,
+`stage=audio_no_text`, `errorCode=audio_no_text`, `resultReady=false`. Клиенты
+ветвятся по машинному `errorCode`, а не сопоставляют локализованный `error`;
+человеческий текст может меняться без изменения API-контракта.
+
+До появления кода Gemini-парсер выдавал наружу `transcribe failed: 'parts'`.
+При загрузке старой mobile-history только эта точная Instagram-сигнатура после
+шага 5 нормализуется в `audio_no_text`. Ограничение по сигнатуре и стадии не
+даёт переименовать ранний resolve/download/API-сбой в отсутствие речи.
 
 ## YouTube: две стадии одной mobile-записи
 

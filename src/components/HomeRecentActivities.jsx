@@ -25,8 +25,11 @@ const PLATFORM_BY_TYPE = {
   tg_fetch: 'telegram', tg_preview: 'telegram',
   yt_transcribe: 'youtube', yt_comments: 'youtube', yt_batch_comments: 'youtube',
   yt_channel_fetch: 'youtube', yt_batch_transcribe: 'youtube',
+  rutube_transcribe: 'rutube',
   tk_transcribe: 'tiktok', tk_channel_fetch: 'tiktok', tk_batch_transcribe: 'tiktok',
   ig_profile_fetch: 'instagram',
+  boosty_transcribe: 'boosty',
+  boosty_channel_fetch: 'boosty', boosty_batch_transcribe: 'boosty',
   local_transcribe: 'local',
 }
 
@@ -38,10 +41,14 @@ const TYPE_LABEL = {
   yt_batch_comments:    'YouTube комменты · batch',
   yt_channel_fetch:     'YouTube канал',
   yt_batch_transcribe:  'YouTube batch',
+  rutube_transcribe:    'Rutube видео',
   tk_transcribe:        'TikTok видео',
   tk_channel_fetch:     'TikTok канал',
   tk_batch_transcribe:  'TikTok batch',
   ig_profile_fetch:     'Instagram',
+  boosty_transcribe:    'Boosty видео',
+  boosty_channel_fetch: 'Boosty каталог',
+  boosty_batch_transcribe: 'Boosty batch',
   local_transcribe:     'Локальный файл',
 }
 

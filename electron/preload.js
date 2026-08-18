@@ -61,6 +61,12 @@ contextBridge.exposeInMainWorld('api', {
   ytSingle:         (params)  => ipcRenderer.invoke('yt:single', params),
   ytResumeAi:       (payload) => ipcRenderer.invoke('yt:resumeAi', payload),
 
+  // Rutube — one-shot transcript, free subtitles first and explicit AI fallback.
+  rutubeLookupCache:    (videoId) => ipcRenderer.invoke('rutube:lookupCache', videoId),
+  rutubeCopyCachedFile: (path)    => ipcRenderer.invoke('rutube:copyCachedFile', path),
+  rutubeSingle:         (params)  => ipcRenderer.invoke('rutube:single', params),
+  rutubeResumeAi:       (payload) => ipcRenderer.invoke('rutube:resumeAi', payload),
+
   // YouTube comments (yt_comments_ndjson.py). Cache lookup matches an exact
   // (video_id, sort, limit, includeReplies) tuple.
   ytLookupCommentsCache: (payload) => ipcRenderer.invoke('yt:lookupCommentsCache', payload),
@@ -89,6 +95,18 @@ contextBridge.exposeInMainWorld('api', {
   // Reddit — thread fetch (post + tree of comments), search (keyword → posts).
   rdThreadFetch:    (params)  => ipcRenderer.invoke('rd:threadFetch', params),
   rdSearch:         (params)  => ipcRenderer.invoke('rd:search', params),
+
+  // Boosty — catalog, post preview, batch audio/transcription and local cache.
+  boostyChannelLookup:  (payload) => ipcRenderer.invoke('boosty:channelLookup', payload),
+  boostyChannelFetch:   (params)  => ipcRenderer.invoke('boosty:channelFetch', params),
+  boostyPostPreview:    (params)  => ipcRenderer.invoke('boosty:postPreview', params),
+  boostyBatchTranscribe:(params)  => ipcRenderer.invoke('boosty:batchTranscribe', params),
+  boostyPosts:          (payload) => ipcRenderer.invoke('boosty:posts', payload),
+  boostyDeleteAudio:    (payload) => ipcRenderer.invoke('boosty:deleteAudio', payload),
+  boostyPlatformStorage:()        => ipcRenderer.invoke('boosty:platformStorage'),
+  boostyDeletePlatformAudio:()    => ipcRenderer.invoke('boosty:deletePlatformAudio'),
+  boostyCopyTranscripts:(payload) => ipcRenderer.invoke('boosty:copyTranscripts', payload),
+  boostySingle:         (params)  => ipcRenderer.invoke('boosty:single', params),
 
   // Local file transcribe — paste an absolute path → AssemblyAI/Gemini.
   localTranscribe:  (params)  => ipcRenderer.invoke('local:transcribe', params),

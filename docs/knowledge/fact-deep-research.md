@@ -256,7 +256,18 @@ reload-loop'а** — тот тикает каждые 15с надёжно даж
 
 ### Основной слой (актуальный): `attachFocusEmulation` для ВСЕХ automation-вкладок
 
-**Это глобальный паттерн, не aistudio-частность** — единственное, что детерминированно держит фоновую вкладку живой. `mcp_open_research_tab` сразу после `chrome.tabs.create({active:false})` зовёт `background.js::attachFocusEmulation(tabId)`: `chrome.debugger.attach` + `Emulation.setFocusEmulationEnabled({enabled:true})`. Это держит `Page::IsPageVisible()=true` на C++ уровне renderer'а → rAF тикает на 60Hz → React/Angular коммитят DOM в фоне, таймеры не троттлятся. Подробная механика (почему JS-override visibilityState не работает, почему именно debugger) — `fact-aistudio-mcp.md::Hidden-tab strategy`. Домены под emulation перечислены в `background.js::SC_FOCUS_EMULATION_URL` (aistudio | chatgpt | claude | perplexity); тот же regex используют `onDetach` и 15-секундный watchdog для auto-reattach, если emulation слетела при SPA-навигации.
+**Это глобальный паттерн, не aistudio-частность** — основной способ держать фоновую
+вкладку живой, пока debugger действительно подключён. `mcp_open_research_tab` сразу
+после `chrome.tabs.create({active:false})` зовёт
+`background.js::attachFocusEmulation(tabId)`: `chrome.debugger.attach` +
+`Emulation.setFocusEmulationEnabled({enabled:true})`. Это держит
+`Page::IsPageVisible()=true` на C++ уровне renderer'а → rAF тикает в фоне →
+React/Angular коммитят DOM, а таймеры не троттлятся. Подробная механика (почему
+JS-override visibilityState не работает, почему именно debugger) —
+`fact-aistudio-mcp.md::Hidden-tab strategy`. Домены под emulation перечислены в
+`background.js::SC_FOCUS_EMULATION_URL` (aistudio | chatgpt | claude | perplexity);
+`onDetach` и watchdog делают повторное подключение best-effort, но не являются
+доказательством, что оно успело до запуска content-script.
 
 **Почему autoDiscardable/focus-pulse/alarms-poke НЕДОСТАТОЧНЫ (живой кейс `rm6equid`, 2026-06):** chatgpt-job в pro-режиме с уже стоящим `autoDiscardable:false` завис на 9.5 минут — 48 watcher-тиков за 577с (1/12с вместо штатных 1/2с), done наступил только когда юзер сам кликнул на вкладку. Корень: юзер **деактивировал весь браузер** (отошёл на часы), и Chromium заглушил rAF/таймеры даже в «не-discarded, живой» вкладке. `autoDiscardable:false` защищает **только от discard**, а это render-freeze — другая политика. `attachFocusEmulation` это снимает (rAF тикает независимо от активности окна). Длительность джоба роли не играет — упадёт и быстрый Поиск, если браузер давно деактивирован.
 
@@ -265,6 +276,16 @@ reload-loop'а** — тот тикает каждые 15с надёжно даж
 - **`autoDiscardable:false`** — `mcp_open_research_tab` ставит его до load complete: страховка от discard (emulation не покрывает discard-политику отдельно). Дёшево, оставлено.
 - **SW chrome.alarms watchdog + per-tab poke.** `chrome.alarms` — privileged API, **не подвержен** timer throttling. CS на старте делает `chrome.runtime.connect({name:'sc-research-keepalive'})` — SW регистрирует tabId в `RESEARCH_TABS` Set. Раз в 30с alarm шлёт `chrome.tabs.sendMessage(tabId, {__sc_research_poke})` → CS форсирует `wrappedTick()`. Полезно как нижний слой если emulation по какой-то причине не встала (attach упал, circuit-breaker). Но один tick/30с медленнее emulation — это страховка, не основной механизм.
 - **focus-pulse эскалация** (`escalateFocus` в CS) — теперь **dormant-страховка**: при живой emulation render-freeze'а нет, и пульс (выдёргивание окна браузера на передний план) не срабатывает. Остаётся на случай если attach упал и watcher всё же увидел «стрим закончился, DOM пуст».
+
+**Подтверждённый failure-mode (2026-08):** у ChatGPT возможен немедленный
+`aistudio.debugger.auto_detached` с `reason:"canceled_by_user"`, после которого
+content-script стартует hidden. Этот reason также приходит при системной отмене
+debugger-сессии, поэтому не приписывать его пользователю или другой вкладке без
+дополнительных данных. Сейчас `mcp_open_research_tab` логирует неудачный attach, но
+всё равно продолжает job; для composer это заканчивается ложным timeout'ом при уже
+видимом Send. Правильная деградация будущего ремонта — retry/явная ошибка до DOM-work,
+а не foreground-tab и не тихое продолжение без emulation. Точный инициатор detach не
+зафиксирован, поэтому это факт наблюдения, не объяснение причины.
 
 **Что пробовали и НЕ сработало**:
 - `chrome.runtime.connect` keep-alive port — снимает intensive throttling таймеров (1/мин), но не tab freezing и не render-freeze (freeze это про lifecycle/rendering, не про таймеры).
@@ -533,6 +554,13 @@ Pipeline проходит через несколько чёрных ящико�
 - **In-DOM `#sc-research-dbg-log`** — CS пишет на каждый `log(tag, data)`. Доступно через DevTools/MCP пока вкладка жива и не reload'илась. Удобно для realtime debug, но **умирает с tab close/reload** — для post-mortem непригодно.
 - **`POST /research-log`** в bridge — CS зеркалит критичные boot/recover события. Bridge пишет в `production.log` (`~/Library/Logs/sc-desktop/`), который переживает закрытие вкладки и рестарт расширения. Используется для `cs.boot`, `cs.no_id_try_recover`, `cs.no_id_recovery_failed`, `cs.id_from_recovery` — всё что нужно знать «CS впрыснулся и в каком состоянии».
 - **SW tab-lifecycle events** — `chrome.tabs.onUpdated/onReplaced/onRemoved` listener для зарегистрированных в RESEARCH_TABS вкладок, шлёт `sw.tab.*` в bridge log. Видны discard'ы (`{discarded:true}`), реальные load-cycles (`status:'loading' → 'complete'`), crash-restore (`onReplaced`), закрытие вкладки.
+
+Для фонового ChatGPT compose сначала читать цепочку `research.debugger.attach` →
+`aistudio.debugger.auto_detached` → `cs.boot` (включая `visibility`) →
+`gpt.composer.wait_after_paste`. Если финальная ошибка содержит `sendVisible:true`,
+но нет busy/disabled маркеров, это не доказательство пустого composer: проверка могла
+застрять за throttled `requestAnimationFrame` после потери emulation. `canceled_by_user`
+без дополнительных событий не называет виновника.
 
 Типичный post-mortem timeline в `production.log` после зомби-research'а:
 ```

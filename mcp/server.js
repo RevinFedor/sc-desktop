@@ -51,6 +51,7 @@ const {
 
 let _jobRunner = null
 let _indexJob = null
+let _youtubeSubtitlesClient = null
 function jobRunner() {
   if (!_jobRunner) {
     _jobRunner = require(path.join(projectRoot, 'electron', 'job-runner.js'))
@@ -62,6 +63,13 @@ function indexJob() {
     _indexJob = require(path.join(projectRoot, 'electron', 'index-job.js'))
   }
   return _indexJob
+}
+function youtubeSubtitlesClient() {
+  if (!_youtubeSubtitlesClient) {
+    const { createYoutubeSubtitlesClient } = require('./youtube-subtitles-client')
+    _youtubeSubtitlesClient = createYoutubeSubtitlesClient()
+  }
+  return _youtubeSubtitlesClient
 }
 
 // ===== GT EDITOR INTEGRATION =====
@@ -744,6 +752,82 @@ const TOOLS = [
         { required: ['images'] },
         { required: ['files'] },
       ],
+      additionalProperties: false,
+    },
+  },
+
+  // ========== YOUTUBE SUBTITLES ==========
+  {
+    name: 'youtube_get_subtitles',
+    description:
+      'Get direct or automatic subtitles for one YouTube video through the running SC Desktop app. ' +
+      'This starts the existing authenticated POST import, waits briefly, and returns transcript text ' +
+      'when ready. It never starts paid AI transcription automatically. If status is running, call ' +
+      'youtube_subtitles_status with the returned import id. Reuse client_request_id when retrying the same request.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'A YouTube watch, youtu.be, Shorts, Live, or embed video URL.',
+        },
+        client_request_id: {
+          type: 'string',
+          maxLength: 128,
+          description: 'Optional stable idempotency id. Preserve and reuse it when retrying the call.',
+        },
+        wait_ms: {
+          type: 'integer',
+          minimum: 0,
+          maximum: 45000,
+          default: 25000,
+          description: 'How long to wait for subtitles before returning a running status.',
+        },
+        offset: {
+          type: 'integer',
+          minimum: 0,
+          default: 0,
+          description: 'Character offset for long transcript pagination.',
+        },
+        max_chars: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 200000,
+          default: 50000,
+          description: 'Maximum transcript characters returned by this call.',
+        },
+      },
+      required: ['url'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'youtube_subtitles_status',
+    description:
+      'Check a YouTube subtitle request started by youtube_get_subtitles. Waits briefly and returns ' +
+      'the transcript when ready. If subtitles_not_found is returned, direct subtitles are unavailable ' +
+      'and paid AI transcription has deliberately not been started.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        import_id: { type: 'string', description: 'Import UUID returned by youtube_get_subtitles.' },
+        wait_ms: { type: 'integer', minimum: 0, maximum: 45000, default: 25000 },
+        offset: { type: 'integer', minimum: 0, default: 0 },
+        max_chars: { type: 'integer', minimum: 1, maximum: 200000, default: 50000 },
+      },
+      required: ['import_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'youtube_subtitles_cancel',
+    description: 'Cancel an active YouTube subtitle request started through SC Desktop.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        import_id: { type: 'string', description: 'Import UUID returned by youtube_get_subtitles.' },
+      },
+      required: ['import_id'],
       additionalProperties: false,
     },
   },
@@ -1557,6 +1641,20 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     if (name === 'telegram_send_saved_message') {
       const out = await telegramSendSavedMessageTool(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+
+    // ===== YouTube subtitle tools =====
+    if (name === 'youtube_get_subtitles') {
+      const out = await youtubeSubtitlesClient().start(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'youtube_subtitles_status') {
+      const out = await youtubeSubtitlesClient().status(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'youtube_subtitles_cancel') {
+      const out = await youtubeSubtitlesClient().cancel(args)
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
 

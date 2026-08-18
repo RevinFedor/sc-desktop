@@ -533,7 +533,15 @@ function mergeSourceMetaJson(existingJson, patch) {
 function upsertSource({ platform, handle, display_name, external_id, avatar_url, meta, mark_synced, is_explicit, tg_session }) {
   const db = getDb()
   const now = Math.floor(Date.now() / 1000)
-  const cleanHandle = String(handle || '').replace(/^@+/, '').trim()
+  const requestedHandle = String(handle || '').replace(/^@+/, '').trim()
+  // An entity event is a live Telegram answer.  Its username is therefore
+  // authoritative over the alias used to start the request: aliases can be
+  // renamed while external_id stays stable.  Keep the old/requested handle
+  // only as a lookup fallback for legacy rows without an external_id.
+  const telegramUsername = platform === 'telegram' && typeof meta?.username === 'string'
+    ? meta.username.replace(/^@+/, '').trim()
+    : ''
+  const cleanHandle = telegramUsername || requestedHandle
 
   // is_explicit семантика: ставится в 1 callerом ИМЕННО при целенаправленном
   // запросе по каналу (paste @channel, channel-fetch, batch-pick, telegram
@@ -582,6 +590,11 @@ function upsertSource({ platform, handle, display_name, external_id, avatar_url,
         `SELECT id, handle, meta_json FROM sources
           WHERE platform='telegram' AND handle=? COLLATE NOCASE LIMIT 1`).get(cleanHandle)
     }
+    if (!row && requestedHandle && requestedHandle !== cleanHandle) {
+      row = db.prepare(
+        `SELECT id, handle, meta_json FROM sources
+          WHERE platform='telegram' AND handle=? COLLATE NOCASE LIMIT 1`).get(requestedHandle)
+    }
     if (!row && /^-?\d+$/.test(cleanHandle)) {
       const alt = cleanHandle.startsWith('-100')
         ? cleanHandle.slice(4) : ('-100' + cleanHandle)
@@ -609,14 +622,16 @@ function upsertSource({ platform, handle, display_name, external_id, avatar_url,
         mark_synced ? 1 : 0, now, explicitFlag,
         sess, sess, sess, row.id,
       )
-      // Канонизация handle: username читабельнее и стабильнее численной
-      // формы. Если строка жила под числом, а пришёл username — переименуем
-      // (если имя не занято другой строкой). Обратное (число поверх
-      // username) не делаем.
+      // Канонизация handle: username читабельнее численной формы, а username
+      // из свежего entity-event'а авторитетнее старого username. Поэтому
+      // обновляем не только число → имя, но и old_name → new_name при том же
+      // external_id. Число поверх читаемого имени по-прежнему не пишем.
       const numericish = (h) => /^-?\d+$/.test(String(h || ''))
-      if (!numericish(cleanHandle) && numericish(row.handle)) {
+      const shouldRefreshUsername = !!telegramUsername && row.handle !== cleanHandle
+      if (!numericish(cleanHandle) && (numericish(row.handle) || shouldRefreshUsername)) {
         const clash = db.prepare(
-          `SELECT id FROM sources WHERE platform='telegram' AND handle=? AND id != ?`
+          `SELECT id FROM sources
+            WHERE platform='telegram' AND handle=? COLLATE NOCASE AND id != ?`
         ).get(cleanHandle, row.id)
         if (!clash) {
           db.prepare(`UPDATE sources SET handle=? WHERE id=?`).run(cleanHandle, row.id)
@@ -676,6 +691,9 @@ function listSources(platform = null) {
     LEFT JOIN (
       SELECT source_id,
              COUNT(*) AS items_count,
+             SUM(CASE WHEN type='boosty_post'  THEN 1 ELSE 0 END) AS boosty_posts_n,
+             SUM(CASE WHEN type='boosty_video' THEN 1 ELSE 0 END) AS boosty_videos_n,
+             SUM(CASE WHEN type='boosty_video' AND transcribe_status='done' THEN 1 ELSE 0 END) AS boosty_transcribed_n,
              SUM(CASE WHEN caption IS NOT NULL AND length(trim(caption)) > 0 THEN 1 ELSE 0 END) AS semantic_indexable_count,
              MAX(published_at) AS last_item_at,
              SUM(CASE WHEN type='text'     THEN 1 ELSE 0 END) AS text_n,
@@ -698,7 +716,13 @@ function listSources(platform = null) {
   ` : ''
   const sql = `
     SELECT s.*,
-      COALESCE(ia.items_count, 0) AS items_count,
+      CASE WHEN s.platform='boosty'
+        THEN COALESCE(ia.boosty_posts_n, 0)
+        ELSE COALESCE(ia.items_count, 0)
+      END AS items_count,
+      COALESCE(ia.boosty_posts_n, 0) AS boosty_posts_count,
+      COALESCE(ia.boosty_videos_n, 0) AS boosty_videos_count,
+      COALESCE(ia.boosty_transcribed_n, 0) AS boosty_transcribed_count,
       COALESCE(ia.semantic_indexable_count, 0) AS semantic_indexable_count,
       ${indexedExpr} AS semantic_indexed_count,
       ia.last_item_at AS last_item_at,
@@ -742,6 +766,59 @@ function setSourceNotes(sourceId, notes) {
   meta.notes = String(notes || '')
   db.prepare(`UPDATE sources SET meta_json = ? WHERE id = ?`).run(JSON.stringify(meta), sourceId)
   return { ok: true }
+}
+
+/**
+ * Persistent per-source access state.  This lives in meta_json so it stays
+ * attached to the Telegram source even when repeated auto failures are no
+ * longer written to History.  Read-modify-write is mandatory: tg_auto,
+ * username, notes and other platform metadata must survive unchanged.
+ */
+function setTelegramSourceUnavailable(sourceId, { code, message, checked_at } = {}) {
+  const db = getDb()
+  const id = Number(sourceId)
+  if (!Number.isFinite(id) || id <= 0) return { ok: false, error: 'source_id required' }
+  const row = db.prepare(
+    `SELECT platform, meta_json FROM sources WHERE id = ?`
+  ).get(id)
+  if (!row || row.platform !== 'telegram') return { ok: false, error: 'telegram source not found' }
+
+  let meta = {}
+  try { meta = row.meta_json ? JSON.parse(row.meta_json) : {} } catch {}
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) meta = {}
+  const previous = meta.tg_health && typeof meta.tg_health === 'object'
+    ? meta.tg_health
+    : {}
+  const checkedAt = Number(checked_at) || Math.floor(Date.now() / 1000)
+  meta.tg_health = {
+    status: 'unavailable',
+    code: code || 'telegram_source_unavailable',
+    message: String(message || 'Telegram больше не отдаёт этот чат выбранному аккаунту.'),
+    first_failed_at: Number(previous.first_failed_at) || checkedAt,
+    checked_at: checkedAt,
+  }
+  db.prepare(`UPDATE sources SET meta_json = ? WHERE id = ?`)
+    .run(JSON.stringify(meta), id)
+  return { ok: true, changed: previous.status !== 'unavailable' }
+}
+
+function clearTelegramSourceHealth(sourceId) {
+  const db = getDb()
+  const id = Number(sourceId)
+  if (!Number.isFinite(id) || id <= 0) return { ok: false, error: 'source_id required' }
+  const row = db.prepare(
+    `SELECT platform, meta_json FROM sources WHERE id = ?`
+  ).get(id)
+  if (!row || row.platform !== 'telegram') return { ok: false, error: 'telegram source not found' }
+
+  let meta = {}
+  try { meta = row.meta_json ? JSON.parse(row.meta_json) : {} } catch {}
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) meta = {}
+  if (!meta.tg_health) return { ok: true, changed: false }
+  delete meta.tg_health
+  const metaJson = Object.keys(meta).length ? JSON.stringify(meta) : null
+  db.prepare(`UPDATE sources SET meta_json = ? WHERE id = ?`).run(metaJson, id)
+  return { ok: true, changed: true }
 }
 
 function setTelegramAutoForSources(sourceIds, patch = {}) {
@@ -792,7 +869,7 @@ function setTelegramAutoForSources(sourceIds, patch = {}) {
 function listTelegramAutoSources() {
   const db = getDb()
   const rows = db.prepare(`
-    SELECT id, handle, display_name, tg_session, meta_json
+    SELECT id, handle, display_name, external_id, tg_session, meta_json
       FROM sources
      WHERE platform = 'telegram'
        AND handle IS NOT NULL
@@ -803,8 +880,12 @@ function listTelegramAutoSources() {
       let meta = {}
       try { meta = row.meta_json ? JSON.parse(row.meta_json) : {} } catch {}
       const raw = (meta.tg_auto && typeof meta.tg_auto === 'object') ? meta.tg_auto : {}
+      const health = (meta.tg_health && typeof meta.tg_health === 'object')
+        ? meta.tg_health
+        : null
       return {
         ...row,
+        tg_health: health,
         tg_auto: {
           pull: !!raw.pull || !!raw.index,
           index: !!raw.index,
@@ -858,7 +939,13 @@ function getSource(id) {
   // extra round-trip.
   return db.prepare(`
     SELECT s.*,
-      (SELECT COUNT(*)         FROM items i WHERE i.source_id = s.id) AS items_count,
+      CASE WHEN s.platform='boosty'
+        THEN (SELECT COUNT(*) FROM items i WHERE i.source_id = s.id AND i.type='boosty_post')
+        ELSE (SELECT COUNT(*) FROM items i WHERE i.source_id = s.id)
+      END AS items_count,
+      (SELECT COUNT(*) FROM items i WHERE i.source_id = s.id AND i.type='boosty_post') AS boosty_posts_count,
+      (SELECT COUNT(*) FROM items i WHERE i.source_id = s.id AND i.type='boosty_video') AS boosty_videos_count,
+      (SELECT COUNT(*) FROM items i WHERE i.source_id = s.id AND i.type='boosty_video' AND i.transcribe_status='done') AS boosty_transcribed_count,
       (SELECT MAX(published_at) FROM items i WHERE i.source_id = s.id) AS last_item_at
     FROM sources s WHERE s.id = ?
   `).get(id)
@@ -881,7 +968,19 @@ function upsertTiktokChannel({ channel_id, handle, display_name, avatar_url, met
   return _upsertWebChannel('tiktok', { channel_id, handle, display_name, avatar_url, meta, is_explicit })
 }
 
-function _upsertWebChannel(platform, { channel_id, handle, display_name, avatar_url, meta, is_explicit }) {
+function upsertBoostyChannel({ author_id, handle, display_name, avatar_url, meta, is_explicit, mark_synced = true }) {
+  return _upsertWebChannel('boosty', {
+    channel_id: author_id,
+    handle,
+    display_name,
+    avatar_url,
+    meta,
+    is_explicit,
+    mark_synced,
+  })
+}
+
+function _upsertWebChannel(platform, { channel_id, handle, display_name, avatar_url, meta, is_explicit, mark_synced = true }) {
   const db = getDb()
   const now = Math.floor(Date.now() / 1000)
   const cleanHandle = String(handle || '').replace(/^@+/, '').trim() || channel_id
@@ -914,12 +1013,12 @@ function _upsertWebChannel(platform, { channel_id, handle, display_name, avatar_
              external_id    = COALESCE(?, external_id),
              avatar_url     = COALESCE(?, avatar_url),
              meta_json      = COALESCE(?, meta_json),
-             last_synced_at = ?,
+             last_synced_at = CASE WHEN ? = 1 THEN ? ELSE last_synced_at END,
              is_explicit    = MAX(is_explicit, ?)
        WHERE id = ?
     `).run(
       cleanHandle, display_name || null, channel_id || null,
-      avatar_url || null, meta_json, now, explicitFlag, existing.id,
+      avatar_url || null, meta_json, mark_synced ? 1 : 0, now, explicitFlag, existing.id,
     )
     return existing.id
   }
@@ -927,7 +1026,7 @@ function _upsertWebChannel(platform, { channel_id, handle, display_name, avatar_
   db.prepare(`
     INSERT INTO sources (platform, handle, display_name, external_id, avatar_url, meta_json, last_synced_at, is_explicit)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(platform, cleanHandle, display_name || null, channel_id || null, avatar_url || null, meta_json, now, explicitFlag)
+  `).run(platform, cleanHandle, display_name || null, channel_id || null, avatar_url || null, meta_json, mark_synced ? now : null, explicitFlag)
   return db.prepare('SELECT last_insert_rowid() AS id').get().id
 }
 
@@ -1032,6 +1131,281 @@ function bulkUpsertItems(rows) {
     }
   })
   tx(rows)
+}
+
+function parseObjectJson(value) {
+  try {
+    const parsed = value ? JSON.parse(value) : {}
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Persist the Boosty hierarchy without flattening a multi-video post:
+ * one boosty_post parent plus one boosty_video child per actual player.
+ *
+ * Access is deliberately sticky. If a post was readable before and a later
+ * catalog response hides it, the row becomes `lost` rather than looking like
+ * a post we never had access to. Local audio/transcripts remain untouched by
+ * metadata refreshes because upsertItem only fills those paths when supplied.
+ */
+function upsertBoostyCatalog({ source_id, posts, thumbnail_paths = {} }) {
+  if (!source_id || !Array.isArray(posts)) return { posts: 0, videos: 0 }
+  const db = getDb()
+  const existingRows = db.prepare(`
+    SELECT * FROM items
+     WHERE source_id = ? AND type IN ('boosty_post', 'boosty_video')
+  `).all(source_id)
+  const existing = new Map(existingRows.map(row => [String(row.external_id), row]))
+  const childrenByParent = new Map()
+  for (const row of existingRows) {
+    if (row.type !== 'boosty_video' || !row.parent_external_id) continue
+    const key = String(row.parent_external_id)
+    if (!childrenByParent.has(key)) childrenByParent.set(key, [])
+    childrenByParent.get(key).push(row)
+  }
+
+  const rows = []
+  const accessUpdates = []
+  let videoCount = 0
+  for (const post of posts) {
+    if (!post || !post.post_id) continue
+    const parentId = String(post.external_id || `post:${post.post_id}`)
+    const oldParent = existing.get(parentId)
+    const oldParentMeta = parseObjectJson(oldParent?.raw_meta_json)
+    const everAccessible = oldParentMeta.ever_accessible === true || post.has_access === true
+    const accessState = post.has_access === true
+      ? 'accessible'
+      : everAccessible ? 'lost' : 'locked'
+    const parentMeta = {
+      ...oldParentMeta,
+      platform: 'boosty',
+      entity_kind: 'post',
+      post_id: String(post.post_id),
+      canonical_url: post.canonical_url || null,
+      has_access: post.has_access === true,
+      ever_accessible: everAccessible,
+      access_state: accessState,
+      subscription_level: post.subscription_level || null,
+      price: post.price ?? null,
+      currency_prices: post.currency_prices || {},
+      video_count: Number(post.video_count || 0),
+      tags: Array.isArray(post.tags) ? post.tags : [],
+      content_counters: post.content_counters || {},
+      is_deleted: !!post.is_deleted,
+      is_blocked: !!post.is_blocked,
+      is_published: post.is_published !== false,
+      is_waiting_video: !!post.is_waiting_video,
+      is_pinned: !!post.is_pinned,
+      updated_at_remote: post.updated_at || null,
+    }
+    const parentThumbnail = thumbnail_paths[parentId]
+      || (oldParent?.thumbnail_path && !/^https?:\/\//i.test(oldParent.thumbnail_path) ? oldParent.thumbnail_path : null)
+      || post.thumbnail_url
+      || oldParent?.thumbnail_path
+      || null
+    rows.push({
+      source_id,
+      external_id: parentId,
+      type: 'boosty_post',
+      url: post.canonical_url || null,
+      title: post.title || 'Пост Boosty',
+      caption: post.text || null,
+      published_at: post.publish_time || post.created_at || null,
+      duration_seconds: null,
+      views: null,
+      likes: post.likes ?? null,
+      comments: post.comments ?? null,
+      thumbnail_path: parentThumbnail,
+      sender: null,
+      has_media: Number(post.video_count || 0) > 0,
+      raw_meta: parentMeta,
+      parent_external_id: null,
+      depth: 0,
+    })
+
+    const currentVideoIds = new Set()
+    const videos = Array.isArray(post.videos) ? post.videos : []
+    for (const [index, video] of videos.entries()) {
+      if (!video?.video_id) continue
+      const videoId = String(video.video_id)
+      currentVideoIds.add(videoId)
+      videoCount += 1
+      const oldVideo = existing.get(videoId)
+      const oldVideoMeta = parseObjectJson(oldVideo?.raw_meta_json)
+      const childEverAccessible = oldVideoMeta.ever_accessible === true || post.has_access === true
+      const childTitle = video.title && video.title !== 'Видео Boosty'
+        ? video.title
+        : videos.length > 1 ? `${post.title || 'Видео Boosty'} · ${index + 1}` : (post.title || 'Видео Boosty')
+      const videoThumbnail = thumbnail_paths[videoId]
+        || (oldVideo?.thumbnail_path && !/^https?:\/\//i.test(oldVideo.thumbnail_path) ? oldVideo.thumbnail_path : null)
+        || video.thumbnail_url
+        || parentThumbnail
+        || oldVideo?.thumbnail_path
+        || null
+      rows.push({
+        source_id,
+        external_id: videoId,
+        type: 'boosty_video',
+        url: video.canonical_url || post.canonical_url || null,
+        title: childTitle,
+        caption: null,
+        published_at: post.publish_time || post.created_at || null,
+        duration_seconds: video.duration_sec || null,
+        views: video.views ?? null,
+        likes: null,
+        comments: null,
+        thumbnail_path: videoThumbnail,
+        sender: null,
+        has_media: true,
+        parent_external_id: parentId,
+        depth: 1,
+        raw_meta: {
+          ...oldVideoMeta,
+          platform: 'boosty',
+          entity_kind: 'video',
+          post_id: String(post.post_id),
+          post_external_id: parentId,
+          position: Number(video.position || index + 1),
+          video_kind: video.kind || 'video',
+          external_url: video.external_url || null,
+          canonical_url: video.canonical_url || post.canonical_url || null,
+          has_access: post.has_access === true,
+          ever_accessible: childEverAccessible,
+          access_state: post.has_access === true
+            ? 'accessible'
+            : childEverAccessible ? 'lost' : 'locked',
+          subscription_level: post.subscription_level || null,
+        },
+      })
+    }
+
+    // Locked API payloads omit the actual players. Keep known child rows and
+    // only update their access state, otherwise a refresh would silently
+    // turn previously downloaded media into apparently available videos.
+    for (const child of childrenByParent.get(parentId) || []) {
+      if (currentVideoIds.has(String(child.external_id))) continue
+      const childMeta = parseObjectJson(child.raw_meta_json)
+      const childEverAccessible = childMeta.ever_accessible === true || post.has_access === true
+      accessUpdates.push({
+        id: child.id,
+        raw_meta_json: JSON.stringify({
+          ...childMeta,
+          has_access: post.has_access === true,
+          ever_accessible: childEverAccessible,
+          access_state: post.has_access === true
+            ? 'accessible'
+            : childEverAccessible ? 'lost' : 'locked',
+          subscription_level: post.subscription_level || null,
+        }),
+      })
+    }
+  }
+
+  const tx = db.transaction(() => {
+    for (const row of rows) upsertItem(row)
+    const updateAccess = db.prepare(`
+      UPDATE items SET raw_meta_json = ?, updated_at = unixepoch() WHERE id = ?
+    `)
+    for (const patch of accessUpdates) updateAccess.run(patch.raw_meta_json, patch.id)
+  })
+  tx()
+  return { posts: rows.filter(row => row.type === 'boosty_post').length, videos: videoCount }
+}
+
+function setItemThumbnailPath(source_id, external_id, thumbnail_path) {
+  if (!source_id || !external_id || !thumbnail_path) return false
+  const result = getDb().prepare(`
+    UPDATE items
+       SET thumbnail_path = ?, updated_at = unixepoch()
+     WHERE source_id = ? AND external_id = ?
+  `).run(thumbnail_path, source_id, String(external_id))
+  return result.changes > 0
+}
+
+function patchSourceMeta(source_id, patch, { mark_synced = false } = {}) {
+  const db = getDb()
+  const row = db.prepare(`SELECT meta_json FROM sources WHERE id = ?`).get(source_id)
+  if (!row) return false
+  const metaJson = mergeSourceMetaJson(row.meta_json, patch)
+  db.prepare(`
+    UPDATE sources
+       SET meta_json = ?,
+           last_synced_at = CASE WHEN ? = 1 THEN unixepoch() ELSE last_synced_at END
+     WHERE id = ?
+  `).run(metaJson, mark_synced ? 1 : 0, source_id)
+  return true
+}
+
+function listBoostyItems(source_id) {
+  if (!source_id) return []
+  return getDb().prepare(`
+    SELECT * FROM items
+     WHERE source_id = ? AND type IN ('boosty_post', 'boosty_video')
+     ORDER BY published_at DESC,
+              CASE WHEN type='boosty_post' THEN 0 ELSE 1 END,
+              COALESCE(depth, 0), id
+  `).all(source_id)
+}
+
+function listBoostyVideos(source_id, video_ids = null) {
+  if (!source_id) return []
+  const db = getDb()
+  if (Array.isArray(video_ids) && video_ids.length) {
+    const placeholders = video_ids.map(() => '?').join(',')
+    return db.prepare(`
+      SELECT * FROM items
+       WHERE source_id = ? AND type='boosty_video'
+         AND external_id IN (${placeholders})
+    `).all(source_id, ...video_ids.map(String))
+  }
+  return db.prepare(`
+    SELECT * FROM items WHERE source_id = ? AND type='boosty_video'
+  `).all(source_id)
+}
+
+function markItemDownloaded({ source_id, external_id, media_path }) {
+  const info = getDb().prepare(`
+    UPDATE items
+       SET media_path = ?, download_status = 'done', download_error = NULL,
+           updated_at = unixepoch()
+     WHERE source_id = ? AND external_id = ?
+  `).run(media_path || null, source_id, String(external_id))
+  return info.changes > 0
+}
+
+function markItemDownloadError({ source_id, external_id, error }) {
+  const info = getDb().prepare(`
+    UPDATE items
+       SET download_status = 'error', download_error = ?, updated_at = unixepoch()
+     WHERE source_id = ? AND external_id = ?
+  `).run(String(error || 'Не удалось скачать аудио'), source_id, String(external_id))
+  return info.changes > 0
+}
+
+function markItemTranscribeError({ source_id, external_id, error }) {
+  const info = getDb().prepare(`
+    UPDATE items
+       SET transcribe_status = 'error', transcribe_error = ?, updated_at = unixepoch()
+     WHERE source_id = ? AND external_id = ?
+  `).run(String(error || 'Не удалось расшифровать аудио'), source_id, String(external_id))
+  return info.changes > 0
+}
+
+function clearItemMediaPaths(source_id, external_ids, status = 'evicted') {
+  if (!source_id || !Array.isArray(external_ids) || !external_ids.length) return 0
+  const db = getDb()
+  const placeholders = external_ids.map(() => '?').join(',')
+  const info = db.prepare(`
+    UPDATE items
+       SET media_path = NULL, download_status = ?, download_error = NULL,
+           updated_at = unixepoch()
+     WHERE source_id = ? AND type='boosty_video'
+       AND external_id IN (${placeholders})
+  `).run(status, source_id, ...external_ids.map(String))
+  return info.changes
 }
 
 // Telegram comments — bulk insert into post_comments (UPSERT on
@@ -1732,6 +2106,69 @@ function listJobsForSource(source_id, limit = 20) {
            .all(source_id, limit)
 }
 
+/**
+ * Latest successful Telegram pre-analysis for a source.
+ *
+ * tg_preview already persists its aggregate in jobs.parameters_json._summary.
+ * SourceDetail used to ignore that durable result and therefore rendered an
+ * empty distribution until the first real fetch wrote item rows.  Keep the
+ * analysis as a separate projection: it describes what Telegram reported,
+ * not what is already stored in `items`.
+ *
+ * A handful of old/partial rows can be `done` without a usable summary, so
+ * inspect a small tail and return the newest valid one instead of letting a
+ * malformed row hide the preceding successful analysis.
+ */
+function latestTelegramAnalysisForSource(source_id) {
+  const db = getDb()
+  const rows = db.prepare(`
+    SELECT id, parameters_json, started_at, finished_at, created_at
+      FROM jobs
+     WHERE source_id = ?
+       AND type = 'tg_preview'
+       AND status = 'done'
+     ORDER BY COALESCE(finished_at, started_at, created_at, 0) DESC, id DESC
+     LIMIT 20
+  `).all(source_id)
+
+  for (const row of rows) {
+    let params
+    try { params = JSON.parse(row.parameters_json || '{}') } catch { continue }
+    const summary = params?._summary
+    const rawCounts = summary?.type_counts
+    if (!rawCounts || typeof rawCounts !== 'object' || Array.isArray(rawCounts)) continue
+
+    const typeCounts = {}
+    for (const [type, value] of Object.entries(rawCounts)) {
+      const count = Number(value)
+      if (!type || !Number.isFinite(count) || count <= 0) continue
+      typeCounts[type] = Math.floor(count)
+    }
+    const countedTotal = Object.values(typeCounts).reduce((sum, count) => sum + count, 0)
+    const summaryTotal = Number(summary.items_total)
+
+    return {
+      job_id: Number(row.id),
+      analyzed_at: Number(row.finished_at || row.started_at || row.created_at) || null,
+      items_total: Number.isFinite(summaryTotal) && summaryTotal >= 0
+        ? Math.floor(summaryTotal)
+        : countedTotal,
+      type_counts: typeCounts,
+      date_min: summary.date_min || null,
+      date_max: summary.date_max || null,
+      scope: {
+        mode: params.mode || null,
+        limit: Number(params.limit || 0),
+        date: params.date || null,
+        date_to: params.date_to || null,
+        since_message_id: Number(params.sinceMessageId || 0),
+      },
+    }
+  }
+
+  return null
+}
+
 // jobs without a source (e.g. one-off YouTube transcripts). Optional type filter.
 function listSourcelessJobs({ type = null, limit = 100 } = {}) {
   const db = getDb()
@@ -2207,12 +2644,17 @@ function storageBreakdownForSource(source_id) {
     SELECT transcript_path FROM items
      WHERE source_id = ? AND transcript_path IS NOT NULL
   `).all(source_id).map(r => r.transcript_path)
+  const thumbnails = db.prepare(`
+    SELECT DISTINCT thumbnail_path FROM items
+     WHERE source_id = ? AND thumbnail_path IS NOT NULL
+  `).all(source_id).map(r => r.thumbnail_path)
   return {
     text_bytes:    t?.text_bytes || 0,
     index_vectors: vectors,
     index_bytes:   vectors * EMBEDDING_DIM * 4,   // float32 = 4 bytes/dim
     media_paths:       media,
     transcript_paths:  transcripts,
+    thumbnail_paths:   thumbnails,
   }
 }
 
@@ -2975,12 +3417,16 @@ module.exports = {
   getUiPreference, setUiPreference,
   getDb, close,
   // sources
-  upsertSource, setSourceSession, upsertYoutubeChannel, upsertTiktokChannel, listSources, getSource, deleteSource,
+  upsertSource, setSourceSession, upsertYoutubeChannel, upsertTiktokChannel, upsertBoostyChannel,
+  listSources, getSource, deleteSource, patchSourceMeta,
   getSourceNotes, setSourceNotes,
   setTelegramAutoForSources, listTelegramAutoSources,
+  setTelegramSourceUnavailable, clearTelegramSourceHealth,
   semanticIndexCountsForSources,
   // items
-  upsertItem, bulkUpsertItems, listItems, listSourceTopics,
+  upsertItem, bulkUpsertItems, upsertBoostyCatalog, setItemThumbnailPath, listBoostyItems, listBoostyVideos,
+  markItemDownloaded, markItemDownloadError, markItemTranscribeError, clearItemMediaPaths,
+  listItems, listSourceTopics,
   itemTypeBreakdown, telegramMediaEstimate, socialSourceOverview, senderBreakdown,
   itemsDateRange,
   assemblyEstimate, assemblyTranscriptPaths, assemblyFetch,
@@ -2991,7 +3437,7 @@ module.exports = {
   bulkInsertComments, countCommentsBySource,
   listCommentsForPosts, listPostsWithComments, setSourceHasDiscussion,
   // jobs
-  recordJob, updateJob, listJobsForSource, listSourcelessJobs,
+  recordJob, updateJob, listJobsForSource, latestTelegramAnalysisForSource, listSourcelessJobs,
   markStuckRunningAsInterrupted, findRunningJobForSource,
   findDoneYoutubeJob, findDoneTiktokJob,
   findYoutubeTranscriptForVideo, findTiktokTranscriptForVideo,

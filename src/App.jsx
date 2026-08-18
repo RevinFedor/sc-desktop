@@ -28,6 +28,7 @@ import NewResearchScreen from './screens/NewResearchScreen'
 import McpHistoryPanel from './components/McpHistoryPanel'
 
 const YouTubeScreen = () => <PlatformScreen platform="youtube" />
+const BoostyScreen = () => <PlatformScreen platform="boosty" />
 const InstagramScreen = () => <PlatformScreen platform="instagram" />
 const RedditScreen = () => <PlatformScreen platform="reddit" />
 const TikTokScreen = () => <PlatformScreen platform="tiktok" />
@@ -38,6 +39,7 @@ const SCREENS = {
   'tg-config':     TelegramConfig,
   telegram:        TelegramScreen,
   youtube:         YouTubeScreen,
+  boosty:          BoostyScreen,
   instagram:       InstagramScreen,
   reddit:          RedditScreen,
   tiktok:          TikTokScreen,
