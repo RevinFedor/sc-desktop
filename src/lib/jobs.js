@@ -81,6 +81,10 @@ export async function copyCachedYoutubeFile(filePath) {
   if (!window.api?.ytCopyCachedFile) return { ok: false }
   return await window.api.ytCopyCachedFile(filePath)
 }
+export async function copyYoutubeWithTimestamps(params) {
+  if (!window.api?.ytCopyWithTimestamps) return { ok: false, error: 'no_ipc' }
+  return await window.api.ytCopyWithTimestamps(params)
+}
 
 // ─── Rutube single-video transcript ──────────────────────────────────
 export async function startRutubeSingle(params) {

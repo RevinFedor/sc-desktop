@@ -4778,6 +4778,97 @@ function handleYoutubeEvent(job, evt) {
   }
 }
 
+// Derived timestamped transcript for an already-finished YouTube job.
+// This is intentionally not another history job: it does not transcribe or
+// spend money, it only re-fetches the video's existing subtitles and formats
+// them with [HH:MM:SS] markers. Concurrent clicks share one worker promise.
+const timedYoutubeRequests = new Map()
+
+function youtubeVideoIdFromUrl(url) {
+  const value = String(url || '')
+  const match = value.match(/(?:[?&]v=|youtu\.be\/|\/shorts\/|\/live\/|\/embed\/)([0-9A-Za-z_-]{11})(?:[?&#/]|$)/)
+  return match?.[1] || null
+}
+
+function timedYoutubeCachePath(sourceFilePath, videoId) {
+  if (!sourceFilePath || !videoId) return null
+  const root = path.resolve(YT_TRANSCRIPTS_DIR)
+  const source = path.resolve(String(sourceFilePath))
+  const relative = path.relative(root, source)
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null
+  const basename = path.basename(source)
+  if (!basename.startsWith(`${videoId}__`) || !basename.endsWith('.txt')) return null
+  if (basename.endsWith('__timestamps.txt')) return source
+  return path.join(path.dirname(source), basename.replace(/\.txt$/i, '__timestamps.txt'))
+}
+
+function createYoutubeTimedTranscript(params = {}) {
+  const url = String(params.url || '').trim()
+  const videoId = youtubeVideoIdFromUrl(url)
+  if (!videoId) return Promise.resolve({ ok: false, error: 'Не удалось распознать YouTube URL' })
+
+  const cachedPath = timedYoutubeCachePath(params.sourceFilePath, videoId)
+  if (cachedPath && fs.existsSync(cachedPath)) {
+    return Promise.resolve({ ok: true, file_path: cachedPath, cached: true })
+  }
+  if (timedYoutubeRequests.has(videoId)) return timedYoutubeRequests.get(videoId)
+
+  const lang = String(params.lang || 'ru').trim() || 'ru'
+  const request = new Promise(resolve => {
+    const args = [
+      YT_SCRIPT,
+      url,
+      '--out-dir', YT_TRANSCRIPTS_DIR,
+      '--lang', lang,
+      '--with-ts',
+    ]
+    console.log(`[Jobs] start yt_timed_derive video=${videoId} lang=${lang}`)
+    const child = spawn(WORKER_PYTHON, args, {
+      cwd: WORKERS_ROOT,
+      env: workerEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let filePath = null
+    let chars = null
+    let workerError = null
+    let stderrTail = ''
+
+    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
+    rl.on('line', line => {
+      if (!line.trim()) return
+      let event
+      try { event = JSON.parse(line) } catch { return }
+      if (event.type === 'saved') {
+        filePath = event.file_path || null
+        chars = event.chars || null
+      } else if (event.type === 'subs_missing') {
+        workerError = 'У видео нет доступных субтитров с таймкодами'
+      } else if (event.type === 'error') {
+        workerError = event.message || 'Не удалось получить субтитры с таймкодами'
+      }
+    })
+    child.stderr.on('data', chunk => {
+      stderrTail = (stderrTail + chunk.toString()).slice(-2000)
+    })
+    child.on('error', err => {
+      workerError = `Не удалось запустить обработку: ${err.message}`
+    })
+    child.on('close', code => {
+      if (filePath && fs.existsSync(filePath)) {
+        console.log(`[Jobs] end yt_timed_derive video=${videoId} status=done cached=0`)
+        resolve({ ok: true, file_path: filePath, chars, cached: false })
+        return
+      }
+      const detail = workerError || stderrTail.slice(-300) || `worker exited ${code}`
+      console.error(`[Jobs] end yt_timed_derive video=${videoId} status=error error=${detail}`)
+      resolve({ ok: false, error: detail })
+    })
+  })
+  timedYoutubeRequests.set(videoId, request)
+  request.finally(() => timedYoutubeRequests.delete(videoId))
+  return request
+}
+
 // ─── Rutube single-video transcript ──────────────────────────────────
 //
 // The visible flow mirrors YouTube (free subtitles, then explicit AI), but
@@ -8527,6 +8618,7 @@ module.exports = {
   startYoutubeSingle,
   resumeYoutubeAi,
   lookupYoutubeCache,
+  createYoutubeTimedTranscript,
   startRutubeSingle,
   resumeRutubeAi,
   lookupRutubeCache,

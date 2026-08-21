@@ -326,7 +326,11 @@ def write_text_file(out_dir, video_id, title, channel, video_url, body,
     'Reveal in Finder' months later."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    fpath = out_dir / f"{video_id}__{safe_slug(title)}.txt"
+    # Keep the timestamped derivative next to the ordinary transcript without
+    # overwriting it. JobDetail can generate this file later for an already
+    # completed transcript, while the original job/file remains unchanged.
+    suffix = "__timestamps" if with_ts else ""
+    fpath = out_dir / f"{video_id}__{safe_slug(title)}{suffix}.txt"
     parts = [f"# {title}".rstrip()]
     if channel:    parts.append(f"channel: {channel}")
     parts.append(f"url: {video_url}")

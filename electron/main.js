@@ -346,6 +346,30 @@ const telegramNotificationService = createTelegramNotificationService({
   allowTerminalNotifications: !isDev || process.env.SC_TELEGRAM_BOT_DEV === '1',
 })
 
+// Почта → Telegram. Использует тот же бот-токен, что и уведомления о вкладках,
+// но живёт отдельно: у писем свой источник, свои настройки и своя память о
+// доставленном. Читает только те письма, отправители которых заданы явно.
+const { createMailNotificationService } = require('./mail/mail-notification-service')
+const { createTelegramApi } = require('./telegram-api')
+const rawTelegramApi = createTelegramApi()
+
+const mailNotificationService = createMailNotificationService({
+  readScSettings: readScSettingsStrict,
+  db,
+  telegramApi: (method, payload) => {
+    const settings = readScSettingsStrict()
+    const cfg = settings.telegram_bot || {}
+    const token = String(
+      process.env.TELEGRAM_BOT_TOKEN
+      || cfg.token
+      || (settings.api_keys || {}).TELEGRAM_BOT_TOKEN
+      || ''
+    ).trim()
+    return rawTelegramApi(method, payload, token)
+  },
+  allowDelivery: !isDev || process.env.SC_MAIL_NOTIFY_DEV === '1',
+})
+
 let mobileApiServer = null
 
 async function listTelegramSessionsSnapshot() {
@@ -1285,6 +1309,34 @@ ipcMain.handle('yt:copyCachedFile', (_evt, filePath) => {
     return { ok: false, error: String(err) }
   }
 })
+ipcMain.handle('yt:copyWithTimestamps', async (_evt, payload = {}) => {
+  const result = await jobRunner.createYoutubeTimedTranscript({
+    url: payload.url,
+    lang: payload.lang,
+    sourceFilePath: payload.sourceFilePath,
+  })
+  if (!result?.ok) return result || { ok: false, error: 'Не удалось получить таймкоды' }
+  try {
+    const content = fs.readFileSync(result.file_path, 'utf8')
+    clipboard.writeText(content)
+    jobRunner.playClipboardSound()
+    const opened = payload.openInSublime === false
+      ? { ok: true, opener: null }
+      : openLocalFile(result.file_path)
+    if (!opened.ok) return { ...opened, copied: true, file_path: result.file_path }
+    console.log(`[YouTube] timed transcript copied video=${String(payload.url || '').slice(-11)} cached=${result.cached ? 1 : 0} open=${opened.opener || 'no'}`)
+    return {
+      ok: true,
+      bytes: Buffer.byteLength(content, 'utf8'),
+      chars: content.length,
+      file_path: result.file_path,
+      cached: !!result.cached,
+      opener: opened.opener || null,
+    }
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) }
+  }
+})
 ipcMain.handle('yt:single',     (_evt, params) => jobRunner.startYoutubeSingle(params))
 ipcMain.handle('yt:resumeAi',   (_evt, { jobId, engine }) => jobRunner.resumeYoutubeAi(jobId, { engine }))
 
@@ -1968,8 +2020,7 @@ ipcMain.handle('jobs:copyCombined', (_evt, filePaths) => {
   }
 })
 
-// Open in Sublime if installed; fall back to default editor.
-ipcMain.handle('jobs:openExternal', (_evt, filePath) => {
+function openLocalFile(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return { ok: false, error: 'File not found' }
   // Prefer Sublime Text via `subl` CLI (or its app bundle); else system default.
   try {
@@ -1988,6 +2039,11 @@ ipcMain.handle('jobs:openExternal', (_evt, filePath) => {
   } catch (err) {
     return { ok: false, error: String(err) }
   }
+}
+
+// Open in Sublime if installed; fall back to default editor.
+ipcMain.handle('jobs:openExternal', (_evt, filePath) => {
+  return openLocalFile(filePath)
 })
 
 // Открыть URL во внешнем браузере. Отдельно от jobs:openExternal, который
@@ -2362,6 +2418,15 @@ app.whenReady().then(() => {
   } catch (err) {
     console.warn(`[TelegramAuto] failed to start scheduler: ${err?.message || err}`)
   }
+  // Наблюдатель за почтой поднимается только если пользователь включил его
+  // в настройках; отсутствие настроек не считается ошибкой запуска.
+  mailNotificationService.start()
+    .then(state => {
+      if (state?.status && state.status !== 'disabled') {
+        console.log(`[MailNotify] start status=${state.status}${state.error ? ` reason=${state.error}` : ''}`)
+      }
+    })
+    .catch(err => console.warn(`[MailNotify] failed to start: ${err?.message || err}`))
   try {
     mobileApiServer = startMobileApiServer({
       db,

@@ -79,7 +79,16 @@ export default function Checkbox({
     return <span className={className}>{Inner}</span>
   }
   return (
-    <label className={`group inline-flex items-center gap-2 cursor-pointer select-none ${className}`}>
+    <label
+      onClick={(e) => {
+        if (disabled) return
+        // Inner stops propagation and handles clicks on the square itself.
+        // This handler makes the visible label text genuinely clickable too.
+        onChange && onChange(!checked)
+        onClick && onClick(e)
+      }}
+      className={`group inline-flex items-center gap-2 cursor-pointer select-none ${className}`}
+    >
       {Inner}
       <span className="text-zinc-300" style={{ fontSize: '14px' }}>{label}</span>
     </label>

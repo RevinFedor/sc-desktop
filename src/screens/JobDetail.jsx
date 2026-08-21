@@ -122,6 +122,31 @@ export default function JobDetail({ payload }) {
       setTimeout(() => setToast(null), 2200)
     }
   }
+  async function copyYoutubeWithTimestamps() {
+    setBusy('copy-timestamps')
+    setToast(null)
+    try {
+      const result = await window.api.ytCopyWithTimestamps({
+        url: job.target,
+        lang: job.yt?.lang || job.params?.lang || 'ru',
+        sourceFilePath: job.file_path,
+        openInSublime: true,
+      })
+      if (result?.ok) {
+        const opener = result.opener === 'subl'
+          ? 'Sublime'
+          : result.opener === 'sublime.app'
+            ? 'Sublime Text'
+            : 'редакторе'
+        setToast(`${formatCopyToast({ bytes: result.bytes })} · с таймкодами · открыто в ${opener}`)
+      } else {
+        setToast(`Ошибка таймкодов: ${result?.error || 'не удалось получить субтитры'}`)
+      }
+    } finally {
+      setBusy(null)
+      setTimeout(() => setToast(null), 5000)
+    }
+  }
   async function reveal() {
     await window.api.revealInFinder(job.file_path)
   }
@@ -312,7 +337,7 @@ export default function JobDetail({ payload }) {
             )}
           </div>
 
-          {isYoutubeSingle        && <YoutubeBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
+          {isYoutubeSingle        && <YoutubeBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} copyWithTimestamps={job.yt?.kind === 'ai' ? null : copyYoutubeWithTimestamps} openIn={openIn} reveal={reveal} />}
           {isYoutubeComments      && <YoutubeCommentsBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
           {isYoutubeChannel       && <YoutubeChannelBody job={job} />}
           {isYoutubeBatch         && <YoutubeBatchBody   job={job} />}
@@ -1293,7 +1318,7 @@ function SearchHeaderRow({ query, url }) {
   )
 }
 
-function YoutubeBody({ job, busy, toast, copyFile, openIn, reveal }) {
+function YoutubeBody({ job, busy, toast, copyFile, copyFlash, copyWithTimestamps, openIn, reveal }) {
   const yt = job.yt || {}
   const src = yt.kind === 'ai' ? `AI · ${yt.engine || ''}`.trim() : `субтитры · ${yt.lang || ''}`.trim()
   return (
@@ -1310,7 +1335,7 @@ function YoutubeBody({ job, busy, toast, copyFile, openIn, reveal }) {
         {job.error && <KV k="Ошибка" v={<span className="text-red-400">{job.error}</span>} />}
       </Section>
 
-      <FileCard job={job} busy={busy} toast={toast} copyFile={copyFile} openIn={openIn} reveal={reveal} />
+      <FileCard job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} copyWithTimestamps={copyWithTimestamps} openIn={openIn} reveal={reveal} />
     </>
   )
 }
@@ -1865,16 +1890,21 @@ function formatDateOnly(unix) {
   return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`
 }
 
-function FileCard({ job, busy, toast, copyFile, copyFlash, openIn, reveal }) {
+function FileCard({ job, busy, toast, copyFile, copyFlash, copyWithTimestamps, openIn, reveal }) {
   return (
     <Section title="Файл результата">
       {job.file_path ? (
         <>
           <div className="text-xs text-zinc-500 mb-3 break-all font-mono">{job.file_path}</div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button onClick={copyFile} busy={busy === 'copy'} flash={copyFlash}>
               {copyFlash ? `✓ ${copyFlash}` : <span className="inline-flex items-center gap-1.5"><Copy size={14} />Копировать</span>}
             </Button>
+            {copyWithTimestamps && (
+              <Button onClick={copyWithTimestamps} busy={busy === 'copy-timestamps'}>
+                <span className="inline-flex items-center gap-1.5"><Captions size={14} />Копировать с таймкодами</span>
+              </Button>
+            )}
             <Button onClick={openIn}   busy={busy === 'open'}>
               <span className="inline-flex items-center gap-1.5"><FileText size={14} />Открыть в Sublime</span>
             </Button>

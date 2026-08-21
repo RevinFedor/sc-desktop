@@ -96,6 +96,15 @@ saving_subtitles`; после явного Resume AI та же запись ра
 застынет на прежнем шаге при реально работающем worker. Внешний REST/SSE
 contract и restart recovery — `fact-sc-desk.md`.
 
+Внешние потребители не обязаны принимать одинаковое решение после этой паузы.
+Browser-extension сам продолжает `awaiting_ai`, потому что там у пользователя
+нет отдельной кнопки согласия. MCP-инструмент `youtube_get_subtitles`, наоборот,
+сообщает `subtitles_not_found` и `needs_ai=true`, но не запускает платный второй
+этап: агенту разрешено забрать готовые прямые субтитры, а не принимать денежное
+решение вместо пользователя. Не переносить auto-resume browser-extension'а на
+MCP или mobile API. Контракт ожидания, пагинации текста и отмены —
+`fact-sc-desk.md::MCP: субтитры для локального AI-агента`.
+
 ### Single-paste = source + items (architectural shift)
 
 Раньше `yt_transcribe` был **sourceless**: paste одного видео не создавал

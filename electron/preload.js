@@ -58,6 +58,7 @@ contextBridge.exposeInMainWorld('api', {
   // YouTube single-video transcript (yt_single_ndjson.py).
   ytLookupCache:    (videoId) => ipcRenderer.invoke('yt:lookupCache', videoId),
   ytCopyCachedFile: (path)    => ipcRenderer.invoke('yt:copyCachedFile', path),
+  ytCopyWithTimestamps: (payload) => ipcRenderer.invoke('yt:copyWithTimestamps', payload),
   ytSingle:         (params)  => ipcRenderer.invoke('yt:single', params),
   ytResumeAi:       (payload) => ipcRenderer.invoke('yt:resumeAi', payload),
 

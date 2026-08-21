@@ -1,7 +1,8 @@
-import React, { useEffect, useImperativeHandle, useMemo, useState, forwardRef } from 'react'
+import React, { useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from 'react'
 import {
   startYoutubeSingle, resumeYoutubeAi,
   lookupYoutubeCache, copyCachedYoutubeFile,
+  copyYoutubeWithTimestamps,
   startYoutubeComments, lookupYoutubeCommentsCache,
   watchJob,
 } from '../lib/jobs'
@@ -46,6 +47,9 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
   const [cache, setCache] = useState(null)           // { file_path, finished_at, parameters, cost_usd }
   const [lang, setLang] = useState('ru')
   const [withTs, setWithTs] = useState(false)
+  const [timedFilePath, setTimedFilePath] = useState(null)
+  const [timedChars, setTimedChars] = useState(null)
+  const [timedBusy, setTimedBusy] = useState(false)
   const [engine, setEngine] = useState('gemini')
   const [err, setErr] = useState(null)
   const [toast, setToast] = useState(null)
@@ -62,6 +66,11 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
   // toggle-on; lets us auto-show «Уже есть» without spawning the comments job.
   const [commentsCache, setCommentsCache] = useState(null)
   const [copyFlash, setCopyFlash] = useState(null)
+  // The subtitle job starts automatically after the video chip is committed.
+  // Keep the live checkbox value in a ref so a click made while that request
+  // is running still controls which result ultimately lands in the clipboard.
+  const withTsRef = useRef(false)
+  const timedRequestRef = useRef(null)
 
   const videoId = useMemo(() => extractVideoId(url), [url])
 
@@ -71,6 +80,8 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
     if (!url || !videoId) return
     let alive = true
     setStage('idle'); setErr(null); setJob(null); setCache(null); setVideoMeta(null)
+    setTimedFilePath(null); setTimedChars(null); setTimedBusy(false); timedRequestRef.current = null
+    withTsRef.current = withTs
 
     ;(async () => {
       let nextLang = 'ru'
@@ -131,9 +142,14 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
         if (snap.status === 'awaiting_ai') {
           setStage('awaiting-ai')
         } else if (snap.status === 'done') {
-          setStage('done')
-          if (snap.yt?.copied_bytes) {
-            setToast(`Готово · скопировано (${formatBytes(snap.yt.copied_bytes)})`)
+          if (withTsRef.current && !snap.yt?.with_ts) {
+            setStage('timing')
+            void finishWithTimestamps(snap)
+          } else {
+            setStage('done')
+            if (snap.yt?.copied_bytes) {
+              setToast(`Готово · скопировано (${formatBytes(snap.yt.copied_bytes)})`)
+            }
           }
         } else if (snap.status === 'error') {
           setErr(snap.error || 'Unknown error')
@@ -153,6 +169,42 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
       void off
     } finally {
       setBusy(false)
+    }
+  }
+
+  function updateWithTimestamps(value) {
+    const next = !!value
+    withTsRef.current = next
+    setWithTs(next)
+  }
+
+  async function finishWithTimestamps(snapshot) {
+    if (timedRequestRef.current) {
+      const existing = await timedRequestRef.current
+      setStage('done')
+      return existing
+    }
+    setTimedBusy(true)
+    const request = copyYoutubeWithTimestamps({
+      url,
+      lang: snapshot?.yt?.lang || lang || 'ru',
+      sourceFilePath: snapshot?.file_path,
+      openInSublime: false,
+    })
+    timedRequestRef.current = request
+    try {
+      const result = await request
+      if (result?.ok) {
+        setTimedFilePath(result.file_path)
+        setTimedChars(result.chars || null)
+        setToast(`${formatCopyToast({ bytes: result.bytes })} · с таймкодами`)
+      } else {
+        setToast(`Обычный текст готов, но таймкоды не получены: ${result?.error || 'ошибка субтитров'}`)
+      }
+      setStage('done')
+      return result
+    } finally {
+      setTimedBusy(false)
     }
   }
 
@@ -209,7 +261,7 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
     return commentsJob?.file_path || commentsCache?.file_path || null
   }
   function transcriptFilePath() {
-    return cache?.file_path || job?.file_path || null
+    return timedFilePath || cache?.file_path || job?.file_path || null
   }
   const hasTranscript = !!transcriptFilePath()
   const hasComments   = !!commentsFilePath()
@@ -227,7 +279,7 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
   }
 
   async function copyAgain() {
-    const fp = cache?.file_path || job?.file_path
+    const fp = timedFilePath || cache?.file_path || job?.file_path
     if (!fp) return
     setBusy(true)
     try {
@@ -252,7 +304,7 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
       if (stage === 'done')        { copyAgain();  return true }
       if (stage === 'error')       { kickOff();    return true }
       if (stage === 'idle')        { kickOff();    return true }
-      // 'searching' | 'transcribing' | 'subs-found' — busy, no-op
+      // 'searching' | 'timing' | 'transcribing' | 'subs-found' — busy, no-op
       return true
     },
   }), [stage, busy, job?.id, engine])
@@ -300,11 +352,15 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
         <TranscribingPanel job={job} />
       )}
 
+      {stage === 'timing' && (
+        <TimestampingPanel />
+      )}
+
       {stage === 'done' && (
         <DonePanel
-          job={job}
+          job={timedFilePath ? { ...job, yt: { ...(job?.yt || {}), with_ts: true, chars: timedChars || job?.yt?.chars } } : job}
           onCopyAgain={includeComments && hasComments ? copyCombined : copyAgain}
-          busy={busy || commentsBusy}
+          busy={busy || timedBusy || commentsBusy}
           copyFlash={copyFlash}
           combinedReady={includeComments && hasComments}
         />
@@ -319,7 +375,7 @@ const YouTubeSingleForm = forwardRef(function YouTubeSingleForm({ url, includeCo
       {(stage === 'searching' || stage === 'idle' || stage === 'error') && (
         <SettingsRow
           lang={lang} setLang={setLang}
-          withTs={withTs} setWithTs={setWithTs}
+          withTs={withTs} setWithTs={updateWithTimestamps}
         />
       )}
 
@@ -510,9 +566,24 @@ function TranscribingPanel({ job }) {
   )
 }
 
+function TimestampingPanel() {
+  return (
+    <div className="rounded-md border border-zinc-800 bg-zinc-900 px-4 py-3 mb-3">
+      <div className="flex items-center gap-2 mb-1">
+        <Spinner />
+        <span className="text-zinc-200">Добавляем таймкоды…</span>
+      </div>
+      <div className="text-zinc-500" style={{ fontSize: '14px' }}>
+        Получаем субтитры повторно и копируем версию с временными метками.
+      </div>
+    </div>
+  )
+}
+
 function DonePanel({ job, onCopyAgain, busy, copyFlash, combinedReady }) {
   const yt = job?.yt || {}
-  const src = yt.kind === 'ai' ? `AI · ${yt.engine || ''}`.trim() : `субтитры · ${yt.lang || ''}`.trim()
+  const srcBase = yt.kind === 'ai' ? `AI · ${yt.engine || ''}`.trim() : `субтитры · ${yt.lang || ''}`.trim()
+  const src = yt.with_ts ? `${srcBase} · таймкоды` : srcBase
   return (
     <div className="rounded-md border border-emerald-800/50 bg-emerald-900/10 px-4 py-3 mb-3 flex items-center gap-3">
       <div className="flex-1 min-w-0">
