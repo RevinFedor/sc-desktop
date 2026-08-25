@@ -39,6 +39,17 @@ DEFAULTS = {
         "engine": "gemini",         # gemini | assemblyai
         "video_codec": "h264",      # h264 | av1
     },
+    "azure_translator": {
+        "region": "northeurope",
+        "endpoint": "https://api.cognitive.microsofttranslator.com",
+    },
+    "boosty": {
+        # Empty path = common SC Desktop storage root. Absolute paths can point
+        # to an external disk; transcripts deliberately stay in _app_root().
+        "audio_dir": None,
+        "video_dir": None,
+        "save_video": False,
+    },
     "tiktok": {
         "preferred_engine": "tikwm",  # tikwm | yt-dlp
     },
@@ -49,6 +60,7 @@ DEFAULTS = {
         "GEMINI_API_KEY": None,
         "ASSEMBLYAI_API_KEY": None,
         "OPENAI_API_KEY": None,
+        "AZURE_TRANSLATOR_KEY": None,
         "TELEGRAM_API_ID": None,
         "TELEGRAM_API_HASH": None,
     },

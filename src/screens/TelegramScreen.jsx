@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import { Virtuoso } from 'react-virtuoso'
 import { Settings, RotateCw, Plus, Image, Video, Mic, FileText, Copy, Trash2, X, TriangleAlert, UserRound, Loader2, Cpu, ChevronDown } from 'lucide-react'
 import { openSettings, pushScreen, useStore } from '../lib/store'
 import { useSources, refreshSources } from '../lib/sources'
-import { useJobs } from '../lib/jobs'
+import { useJob, useJobsSelector } from '../lib/jobs'
 import { useInvalidator, invalidate } from '../lib/dataBus'
 import PlatformLogo from '../components/PlatformLogo'
 import Avatar from '../components/Avatar'
@@ -41,12 +42,7 @@ const AUTO_TYPE_LABELS = {
 }
 
 function telegramDialogKind(source) {
-  try {
-    const meta = JSON.parse(source?.meta_json || '{}')
-    return String(meta?.kind || '').toLowerCase()
-  } catch {
-    return ''
-  }
+  return String(telegramSourceMeta(source)?.kind || '').toLowerCase()
 }
 
 function telegramDialogCategory(source) {
@@ -57,9 +53,15 @@ function telegramDialogCategory(source) {
   return 'unknown'
 }
 
+const telegramMetaCache = new WeakMap()
 function telegramSourceMeta(source) {
-  try { return JSON.parse(source?.meta_json || '{}') || {} }
-  catch { return {} }
+  if (source && typeof source === 'object' && telegramMetaCache.has(source)) {
+    return telegramMetaCache.get(source)
+  }
+  let meta = {}
+  try { meta = JSON.parse(source?.meta_json || '{}') || {} } catch {}
+  if (source && typeof source === 'object') telegramMetaCache.set(source, meta)
+  return meta
 }
 
 function telegramAutoSettings(source) {
@@ -176,6 +178,9 @@ export default function TelegramScreen({ payload }) {
   // который бы расходился с тем, куда реально пойдёт парсинг.
   const [sessions, setSessions] = useState([])
   const [activeSession, setActiveSession] = useState(null)
+  const [autoMasterEnabled, setAutoMasterEnabled] = useState(null)
+  const [autoMasterBusy, setAutoMasterBusy] = useState(false)
+  const [autoMasterError, setAutoMasterError] = useState(null)
   // Имя переключаемой сессии (а не boolean): спиннер крутится ТОЧЕЧНО на той
   // кнопке, которую нажали, остальные просто блокируются. null = простой.
   const [switchingTo, setSwitchingTo] = useState(null)
@@ -188,6 +193,34 @@ export default function TelegramScreen({ payload }) {
     }).catch(() => {})
     return () => { alive = false }
   }, [])
+
+  useEffect(() => {
+    let alive = true
+    window.api?.appSettingsGet?.().then(settings => {
+      if (alive) setAutoMasterEnabled(settings?.telegram?.auto_enabled !== false)
+    }).catch(err => {
+      if (alive) setAutoMasterError(String(err?.message || err))
+    })
+    return () => { alive = false }
+  }, [])
+
+  async function toggleAutoMaster() {
+    if (autoMasterBusy || autoMasterEnabled == null) return
+    const next = !autoMasterEnabled
+    setAutoMasterBusy(true)
+    setAutoMasterError(null)
+    try {
+      const telegram = await window.api.appSettingsPatch({
+        section: 'telegram',
+        patch: { auto_enabled: next },
+      })
+      setAutoMasterEnabled(telegram?.auto_enabled !== false)
+    } catch (err) {
+      setAutoMasterError(String(err?.message || err))
+    } finally {
+      setAutoMasterBusy(false)
+    }
+  }
 
   async function switchSession(name) {
     if (!name || name === activeSession || switchingTo) return
@@ -251,7 +284,6 @@ export default function TelegramScreen({ payload }) {
   const [busy, setBusy] = useState(false)
   const [copyToast, setCopyToast] = useState(null)
   const [activeJobId, setActiveJobId] = useState(null)
-  const [activeSnap, setActiveSnap] = useState(null)
   const [addOpen, setAddOpen] = useState(false)
   const [refreshNote, setRefreshNote] = useState(null)
   const [refreshJobId, setRefreshJobId] = useState(null)
@@ -259,13 +291,12 @@ export default function TelegramScreen({ payload }) {
   // Pick up the live `tg_folder_refresh` job — could be ours (just kicked
   // off) or one started by another window during this session. Either way
   // the spinner reflects real backend state, not local-only optimism.
-  const allJobs = useJobs()
-  const refreshJob = useMemo(() => {
+  const refreshJob = useJobsSelector(allJobs => {
     return allJobs.find(j =>
       j.type === 'tg_folder_refresh' &&
       (j.status === 'running' || j.id === refreshJobId)
     ) || null
-  }, [allJobs, refreshJobId])
+  })
   const refreshing = refreshJob?.status === 'running'
 
   const sourcesVer  = useInvalidator('sources')
@@ -351,23 +382,18 @@ export default function TelegramScreen({ payload }) {
     }
   }, [activeTabId, folders])
 
-  // Subscribe to live job updates so the per-chat list flips current/done.
+  // Subscribe only to the umbrella selected by this screen. Child tg_fetch
+  // progress continues to drive Activity/JobDetail, but no longer wakes the
+  // entire 300-row chat list four times per second.
+  const activeSnap = useJob(activeJobId)
   useEffect(() => {
-    if (!window.api?.onJobUpdate) return
-    const unsub = window.api.onJobUpdate(j => {
-      if (!j) return
-      if (activeJobId != null && j.id === activeJobId) {
-        setActiveSnap(j)
-        if (j.status === 'done' || j.status === 'error' || j.status === 'cancelled') {
-          // Folder fetch finished — clear and let the user copy.
-          setBusy(false)
-          // Bump folders so last_fetched_at refreshes.
-          invalidate('folders')
-        }
-      }
-    })
-    return unsub
-  }, [activeJobId])
+    if (!activeSnap) return
+    if (activeSnap.status === 'done'
+        || activeSnap.status === 'error'
+        || activeSnap.status === 'cancelled') {
+      setBusy(false)
+    }
+  }, [activeSnap])
 
   // Reset selection when switching folder tabs or dialog-type tabs — hidden
   // selected rows would make the parse/copy counters ambiguous.
@@ -433,9 +459,12 @@ export default function TelegramScreen({ payload }) {
   // user sees "выбрано 3 из 12" while only 5 rows are on screen, which is
   // confusing. Same for toggleAll: it adds/removes only what the user
   // currently sees.
-  const allSelected = filteredSources.length > 0
-    && filteredSources.every(s => selectedIds.has(s.id))
-  const someSelected = filteredSources.some(s => selectedIds.has(s.id)) && !allSelected
+  const allSelected = useMemo(() => (
+    filteredSources.length > 0 && filteredSources.every(s => selectedIds.has(s.id))
+  ), [filteredSources, selectedIds])
+  const someSelected = useMemo(() => (
+    filteredSources.some(s => selectedIds.has(s.id)) && !allSelected
+  ), [filteredSources, selectedIds, allSelected])
 
   function toggleAll() {
     if (allSelected) {
@@ -449,18 +478,23 @@ export default function TelegramScreen({ payload }) {
     }
   }
 
-  function toggleOne(id) {
-    const next = new Set(selectedIds)
-    if (next.has(id)) next.delete(id)
-    else next.add(id)
-    setSelectedIds(next)
-  }
+  const toggleOne = useCallback((id) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
 
   // The selected ids drive both "Спарсить" and "Скопировать" — same
   // mental model as picker'ы YT/IG. Copy works on already-saved items
   // even without re-fetch (the user's main fast path: «обновил утром,
   // вечером ещё раз скопировал, без сетевого вызова»).
-  const selectedSources = visibleSources.filter(s => selectedIds.has(s.id))
+  const selectedSources = useMemo(
+    () => filteredSources.filter(s => selectedIds.has(s.id)),
+    [filteredSources, selectedIds],
+  )
   const selectionCount = selectedSources.length
 
   const autoPickedTypes = useMemo(
@@ -568,9 +602,6 @@ export default function TelegramScreen({ payload }) {
       } else if (refreshJob.status === 'error') {
         setRefreshNote({ kind: 'error', text: refreshJob.error || 'Ошибка обновления' })
       }
-      invalidate('folders')
-      invalidate('sources')
-      refreshSources()
       const t = setTimeout(() => setRefreshNote(null), 3000)
       return () => clearTimeout(t)
     }
@@ -591,9 +622,11 @@ export default function TelegramScreen({ payload }) {
     if (next.mode === 'all') dbDays = 0
     else { const d = presetDaysOf(next.mode); if (d != null) dbDays = d }
     if (dbDays == null) return
+    setFolders(prev => prev.map(folder => (
+      folder.id === activeTabId ? { ...folder, default_period_days: dbDays } : folder
+    )))
     try {
       await window.api.folderUpdateParams(activeTabId, { default_period_days: dbDays })
-      invalidate('folders')
     } catch {}
   }, [activeTabId])
 
@@ -604,9 +637,13 @@ export default function TelegramScreen({ payload }) {
       const next = typeof updater === 'function' ? updater(prev) : updater
       if (activeTabId != null) {
         const arr = Object.keys(next).filter(k => next[k])
+        const serialized = JSON.stringify(arr)
+        setFolders(rows => rows.map(folder => (
+          folder.id === activeTabId ? { ...folder, default_types_json: serialized } : folder
+        )))
         // Fire and forget — no need to block on this round-trip.
         window.api.folderUpdateParams(activeTabId, {
-          default_types_json: JSON.stringify(arr),
+          default_types_json: serialized,
         }).catch(() => {})
       }
       return next
@@ -625,7 +662,6 @@ export default function TelegramScreen({ payload }) {
         return
       }
       setAutoToast({ kind: 'ok', text: label })
-      invalidate('sources')
       refreshSources()
       setTimeout(() => setAutoToast(null), 2200)
     } catch (err) {
@@ -675,7 +711,6 @@ export default function TelegramScreen({ payload }) {
       return
     }
     setBusy(true)
-    setActiveSnap(null)
     try {
       const res = await window.api.folderFetch({
         folder_id:  activeTabId,
@@ -744,6 +779,13 @@ export default function TelegramScreen({ payload }) {
   // Live progress shape from the umbrella job.
   const progress = activeSnap?.tg_folder
   const inflight = busy && activeSnap?.status === 'running'
+  const progressByTarget = useMemo(() => {
+    const map = new Map()
+    for (const row of (progress?.per_chat || [])) {
+      map.set(String(row?.target || '').replace(/^@/, ''), row)
+    }
+    return map
+  }, [progress?.per_chat])
 
   return (
     <div className="h-full overflow-auto">
@@ -797,6 +839,35 @@ export default function TelegramScreen({ payload }) {
             </div>
           )}
           <span className="ml-auto flex items-center gap-2">
+            {autoMasterError && (
+              <span className="text-xs text-red-300 max-w-[180px] truncate" title={autoMasterError}>
+                Не удалось изменить авто
+              </span>
+            )}
+            <button
+              type="button"
+              role="switch"
+              data-telegram-auto-master
+              aria-checked={autoMasterEnabled === true}
+              aria-busy={autoMasterBusy}
+              disabled={autoMasterBusy || autoMasterEnabled == null}
+              onClick={toggleAutoMaster}
+              title={autoMasterEnabled
+                ? 'Автозапросы включены: первый проход через минуту после запуска, затем каждые 30 минут. Нажмите, чтобы остановить текущий проход и выключить расписание.'
+                : 'Автозапросы выключены. Сохранённые правила чатов не удалены.'}
+              className={`h-7 px-2.5 rounded-md border inline-flex items-center gap-2 text-xs transition-colors disabled:opacity-60 ${
+                autoMasterEnabled
+                  ? 'border-emerald-700/60 bg-emerald-900/25 text-emerald-300 hover:bg-emerald-900/40'
+                  : 'border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800'
+              }`}
+            >
+              <span className={`w-2 h-2 rounded-full shrink-0 ${
+                autoMasterBusy
+                  ? 'bg-amber-400 animate-pulse'
+                  : autoMasterEnabled ? 'bg-emerald-400' : 'bg-zinc-600'
+              }`} />
+              <span>{autoMasterEnabled ? 'Авто активно' : 'Авто выключено'}</span>
+            </button>
             {refreshing && refreshJob?.tg_folder_refresh && (
               <span className="text-xs text-zinc-500 tabular-nums">
                 {refreshJob.tg_folder_refresh.done_folders || 0}
@@ -830,6 +901,7 @@ export default function TelegramScreen({ payload }) {
         {/* Tabs row: All chats + folders + add */}
         <div className="flex items-center gap-2 flex-wrap mb-5 pb-3 border-b border-zinc-800">
           <Tab
+            tabId="all"
             active={activeTabId == null}
             onClick={() => setActiveTabId(null)}
             label="Все чаты"
@@ -838,6 +910,7 @@ export default function TelegramScreen({ payload }) {
           {folders.map(f => (
             <Tab
               key={f.id}
+              tabId={f.id}
               active={activeTabId === f.id}
               onClick={() => setActiveTabId(f.id)}
               label={f.title}
@@ -1077,67 +1150,23 @@ export default function TelegramScreen({ payload }) {
                   Ничего не найдено по запросу «{chatQuery}».
                 </div>
               ) : (
-              <ul>
-                {filteredSources.map(s => {
-                  const checked = selectedIds.has(s.id)
-                  const perChat = (progress?.per_chat || []).find(p => p.target === s.handle)
-                  const isCurrent = inflight && progress?.current_target === s.handle
-                  const unavailable = isTelegramSourceUnavailable(s)
-                  const healthTitle = telegramSourceHealthTitle(s)
-                  return (
-                    <li
-                      key={s.id}
-                      title={unavailable ? healthTitle : undefined}
-                      className={`px-4 py-2 flex items-center gap-3 border-b border-zinc-900 last:border-b-0 ${
-                        isCurrent
-                          ? unavailable ? 'bg-red-950/35' : 'bg-zinc-900/60'
-                          : unavailable ? 'bg-red-950/20 hover:bg-red-950/35' : 'hover:bg-zinc-900/40'
-                      }`}
-                    >
-                      <Checkbox
-                        checked={checked}
-                        onChange={() => toggleOne(s.id)}
-                        size="sm"
-                      />
-                      <span className={unavailable ? 'rounded-full ring-1 ring-red-700/80' : ''}>
-                        <Avatar source={s} size={26} />
-                      </span>
-                      {/* flex-1 min-w-0 на имени + shrink-0 nowrap на счётчиках:
-                          длинное название чата сжимается с «…», а «Текст 10»
-                          справа никогда не переносится на вторую строку. */}
-                      <button
-                        onClick={() => pushScreen('source-detail', { sourceId: s.id })}
-                        className={`${unavailable ? 'text-red-300' : 'text-zinc-200'} truncate hover:underline flex-1 min-w-0 text-left`}
-                        style={{ fontSize: '14px' }}
-                      >
-                        {s.display_name && s.display_name !== s.handle
-                          ? s.display_name
-                          : `@${s.handle}`}
-                      </button>
-                      <span className="ml-auto flex items-center gap-3 text-zinc-500 shrink-0 whitespace-nowrap" style={{ fontSize: '13px' }}>
-                        {unavailable && (
-                          <span className="inline-flex items-center gap-1 text-red-400" title={healthTitle}>
-                            <TriangleAlert size={13} /> недоступен
-                          </span>
-                        )}
-                        {perChat?.status === 'done' && (
-                          <span className="text-emerald-500" title={`Только что спарсено: ${perChat.items_done || 0} сообщений`}>
-                            +{perChat.items_done || 0}
-                          </span>
-                        )}
-                        {perChat?.status === 'error' && (
-                          <span className="text-red-400" title={perChat.error || ''}>✗ ошибка</span>
-                        )}
-                        {isCurrent && (
-                          <span className="text-emerald-400">↻ парсю…</span>
-                        )}
-                        <AutoBadges row={s} />
-                        <ItemTypeBreakdown row={s} />
-                      </span>
-                    </li>
-                  )
-                })}
-              </ul>
+              <div data-telegram-source-list className="h-[520px] min-h-0">
+                <Virtuoso
+                  data={filteredSources}
+                  defaultItemHeight={43}
+                  increaseViewportBy={160}
+                  computeItemKey={(_index, source) => source.id}
+                  itemContent={(_index, s) => (
+                    <TelegramSourceRow
+                      source={s}
+                      checked={selectedIds.has(s.id)}
+                      perChat={progressByTarget.get(String(s.handle || '').replace(/^@/, '')) || null}
+                      isCurrent={!!(inflight && String(progress?.current_target || '').replace(/^@/, '') === String(s.handle || '').replace(/^@/, ''))}
+                      onToggle={toggleOne}
+                    />
+                  )}
+                />
+              </div>
               )}
             </>
           )}
@@ -1177,6 +1206,57 @@ export default function TelegramScreen({ payload }) {
     </div>
   )
 }
+
+const TelegramSourceRow = React.memo(function TelegramSourceRow({
+  source, checked, perChat, isCurrent, onToggle,
+}) {
+  const unavailable = isTelegramSourceUnavailable(source)
+  const healthTitle = telegramSourceHealthTitle(source)
+  return (
+    <div
+      data-telegram-source-row
+      data-source-id={source.id}
+      title={unavailable ? healthTitle : undefined}
+      className={`px-4 py-2 flex items-center gap-3 border-b border-zinc-900 last:border-b-0 ${
+        isCurrent
+          ? unavailable ? 'bg-red-950/35' : 'bg-zinc-900/60'
+          : unavailable ? 'bg-red-950/20 hover:bg-red-950/35' : 'hover:bg-zinc-900/40'
+      }`}
+    >
+      <Checkbox checked={checked} onChange={() => onToggle(source.id)} size="sm" />
+      <span className={unavailable ? 'rounded-full ring-1 ring-red-700/80' : ''}>
+        <Avatar source={source} size={26} />
+      </span>
+      <button
+        onClick={() => pushScreen('source-detail', { sourceId: source.id })}
+        className={`${unavailable ? 'text-red-300' : 'text-zinc-200'} truncate hover:underline flex-1 min-w-0 text-left`}
+        style={{ fontSize: '14px' }}
+      >
+        {source.display_name && source.display_name !== source.handle
+          ? source.display_name
+          : `@${source.handle}`}
+      </button>
+      <span className="ml-auto flex items-center gap-3 text-zinc-500 shrink-0 whitespace-nowrap" style={{ fontSize: '13px' }}>
+        {unavailable && (
+          <span className="inline-flex items-center gap-1 text-red-400" title={healthTitle}>
+            <TriangleAlert size={13} /> недоступен
+          </span>
+        )}
+        {perChat?.status === 'done' && (
+          <span className="text-emerald-500" title={`Только что спарсено: ${perChat.items_done || 0} сообщений`}>
+            +{perChat.items_done || 0}
+          </span>
+        )}
+        {perChat?.status === 'error' && (
+          <span className="text-red-400" title={perChat.error || ''}>✗ ошибка</span>
+        )}
+        {isCurrent && <span className="text-emerald-400">↻ парсю…</span>}
+        <AutoBadges row={source} />
+        <ItemTypeBreakdown row={source} />
+      </span>
+    </div>
+  )
+})
 
 function AutoActionButton({ active, mixed, disabled, onClick, icon, label, actionCount }) {
   return (
@@ -1363,9 +1443,10 @@ function ItemTypeBreakdown({ row }) {
   )
 }
 
-function Tab({ active, onClick, label, count }) {
+function Tab({ tabId, active, onClick, label, count }) {
   return (
     <button
+      data-telegram-tab-id={tabId}
       onClick={onClick}
       className={`px-3 py-1.5 rounded-md flex items-center gap-2 ${
         active

@@ -33,8 +33,13 @@ GET  /research-status?id=…&wait=60000
 ```
 
 `attachments` / `files` и `conversationUrl` сейчас имеют смысл только для ChatGPT-провайдера:
-attachments — локальные image files, которые bridge валидирует и отдаёт CS через
-`GET /research-attachment?id&index`; `conversationUrl` — существующий
+attachments — локальные изображения или (в Chat mode) документы; объект может задать
+1-based диапазон `startLine/endLine` либо `lines:"X-Y"`. Bridge материализует только
+выбранный срез и отдаёт CS через `GET /research-attachment?id&index`; до 20 файлов идут
+отдельно, >20 текстовых автоматически объединяются. Browser-origin не может передавать
+локальные пути. Пределы 20 файлов, 20 MiB на файл, 100 MiB суммарно и 20 MiB на bundle —
+локальная защита bridge, не заявленный максимум ChatGPT. Это опция того же глобального
+skill `external-research`, а не отдельный файловый skill. `conversationUrl` — существующий
 `https://chatgpt.com/c/<id>` для follow-up в тот же чат. Сгенерированные картинки идут
 обратно не в long-poll body как base64: CS POST'ит `/research-artifact`, bridge сохраняет
 файл в `LIB_ROOT/research-artifacts/<jobId>/...`, а `result.images[]` содержит только

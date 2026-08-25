@@ -217,6 +217,74 @@ def optional_number(value, *, integer=False):
         return None
 
 
+def _move_finished_file(source, target):
+    """Move a completed file atomically, including across mounted volumes."""
+    source = Path(source)
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(source, target)
+        return target
+    except OSError:
+        temporary = target.with_name(target.name + ".part")
+        temporary.unlink(missing_ok=True)
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+        source.unlink(missing_ok=True)
+        return target
+
+
+def _existing_video_path(video_root, canonical, descriptor):
+    if not video_root:
+        return None
+    directory = Path(video_root) / safe_slug(canonical["author"], 60) / canonical["post_id"]
+    stem = f"{safe_slug(descriptor['video_id'], 50)}__{safe_slug(descriptor['title'])}"
+    candidates = sorted(
+        (
+            path for path in directory.glob(stem + ".*")
+            if path.is_file()
+            and path.stat().st_size > 0
+            and path.suffix.lower() not in {".mp3", ".srt", ".txt", ".part", ".ytdl"}
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _extract_audio(video_path, audio_path):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg не найден — не удалось извлечь MP3 из видео")
+    audio_path = Path(audio_path)
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = audio_path.with_name(audio_path.stem + ".part.mp3")
+    temporary.unlink(missing_ok=True)
+    command = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(video_path), "-vn", "-codec:a", "libmp3lame",
+        "-b:a", "96k", str(temporary),
+    ]
+    global _ACTIVE_PROCESS
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    _ACTIVE_PROCESS = process
+    try:
+        _stdout, stderr = process.communicate()
+    finally:
+        _ACTIVE_PROCESS = None
+    if process.returncode != 0 or not temporary.is_file() or temporary.stat().st_size <= 0:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(redact_error((stderr or "ffmpeg не создал MP3").strip()))
+    os.replace(temporary, audio_path)
+    return audio_path
+
+
 def download_audio(
     canonical,
     descriptor,
@@ -225,6 +293,8 @@ def download_audio(
     work_dir,
     item_context=None,
     force_download=False,
+    save_video=False,
+    video_root=None,
 ):
     video_id = descriptor["video_id"]
     title = descriptor["title"]
@@ -240,11 +310,16 @@ def download_audio(
     final_dir.mkdir(parents=True, exist_ok=True)
     stem = f"{safe_slug(video_id, 50)}__{safe_slug(title)}"
     final_audio_path = final_dir / (stem + ".mp3")
-    if not force_download and final_audio_path.is_file() and final_audio_path.stat().st_size > 0:
+    existing_video = None if force_download else _existing_video_path(video_root, canonical, descriptor)
+    audio_ready = not force_download and final_audio_path.is_file() and final_audio_path.stat().st_size > 0
+    video_ready = not save_video or existing_video is not None
+    if audio_ready and video_ready:
         emit_item({
             "type": "download_done",
             "audio_path": str(final_audio_path),
             "audio_bytes": final_audio_path.stat().st_size,
+            "video_path": str(existing_video) if existing_video else None,
+            "video_bytes": existing_video.stat().st_size if existing_video else None,
             "duration_sec": int(round(float(duration or 0))),
             "reused": True,
         }, item_context)
@@ -257,6 +332,33 @@ def download_audio(
             "author": uploader,
             "thumbnail": thumbnail,
             "reused": True,
+            "video_path": existing_video,
+            "video_bytes": existing_video.stat().st_size if existing_video else None,
+        }
+
+    if save_video and existing_video is not None and not audio_ready:
+        emit_item({"type": "download_processing"}, item_context)
+        _extract_audio(existing_video, final_audio_path)
+        emit_item({
+            "type": "download_done",
+            "audio_path": str(final_audio_path),
+            "audio_bytes": final_audio_path.stat().st_size,
+            "video_path": str(existing_video),
+            "video_bytes": existing_video.stat().st_size,
+            "duration_sec": int(round(float(duration or 0))),
+            "reused": True,
+        }, item_context)
+        return {
+            "audio_path": final_audio_path,
+            "audio_bytes": final_audio_path.stat().st_size,
+            "duration_sec": int(round(float(duration or 0))),
+            "video_id": video_id,
+            "title": title,
+            "author": uploader,
+            "thumbnail": thumbnail,
+            "reused": True,
+            "video_path": existing_video,
+            "video_bytes": existing_video.stat().st_size,
         }
 
     staging_dir = Path(work_dir) / "download"
@@ -271,10 +373,6 @@ def download_audio(
     command = [
         yt_dlp_binary(),
         "--cookies", str(cookie_path),
-        "--format", "bestaudio/best",
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "--audio-quality", "96K",
         "--output", outtmpl,
         "--force-overwrites",
         "--newline",
@@ -285,6 +383,22 @@ def download_audio(
         "--progress-template", progress_template,
         "--print", "after_move:__SC_FILE__%(filepath)s",
     ]
+    if save_video:
+        command.extend([
+            "--format", (
+                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+                "best[height<=1080][ext=mp4]/"
+                "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
+            ),
+            "--merge-output-format", "mp4",
+        ])
+    else:
+        command.extend([
+            "--format", "bestaudio/best",
+            "--extract-audio",
+            "--audio-format", "mp3",
+            "--audio-quality", "96K",
+        ])
     if playlist_count > 1:
         command.extend(["--playlist-items", str(playlist_index)])
     command.append(canonical["canonical_url"])
@@ -344,21 +458,32 @@ def download_audio(
         raise RuntimeError(redact_error(stderr_text.strip() or f"yt-dlp exited {code}"))
     emit_item({"type": "download_processing"}, item_context)
 
-    audio_path = Path(reported_path) if reported_path else staging_dir / (stem + ".mp3")
-    if not audio_path.exists():
+    downloaded_path = Path(reported_path) if reported_path else staging_dir / (stem + ".mp3")
+    if not downloaded_path.exists():
         candidates = sorted(staging_dir.glob(stem + ".*"), key=lambda p: p.stat().st_mtime, reverse=True)
-        audio_path = next((p for p in candidates if p.is_file() and not p.name.endswith(".part")), None)
-    if not audio_path or not Path(audio_path).exists():
-        raise RuntimeError("yt-dlp завершился без готового аудиофайла")
+        downloaded_path = next((p for p in candidates if p.is_file() and not p.name.endswith(".part")), None)
+    if not downloaded_path or not Path(downloaded_path).exists():
+        raise RuntimeError("yt-dlp завершился без готового медиафайла")
 
-    audio_path = Path(audio_path)
-    final_audio_path = final_dir / (stem + audio_path.suffix.lower())
-    os.replace(audio_path, final_audio_path)
+    downloaded_path = Path(downloaded_path)
+    video_path = existing_video
+    if save_video:
+        video_dir = Path(video_root) / safe_slug(canonical["author"], 60) / canonical["post_id"]
+        video_suffix = downloaded_path.suffix.lower() or ".mp4"
+        video_path = _move_finished_file(downloaded_path, video_dir / (stem + video_suffix))
+        if not audio_ready:
+            _extract_audio(video_path, final_audio_path)
+    else:
+        final_audio_path = final_dir / (stem + downloaded_path.suffix.lower())
+        _move_finished_file(downloaded_path, final_audio_path)
+
     audio_path = final_audio_path
     emit_item({
         "type": "download_done",
         "audio_path": str(audio_path),
         "audio_bytes": audio_path.stat().st_size,
+        "video_path": str(video_path) if video_path else None,
+        "video_bytes": video_path.stat().st_size if video_path else None,
         "duration_sec": int(round(float(duration or 0))),
     }, item_context)
     return {
@@ -370,6 +495,8 @@ def download_audio(
         "author": uploader,
         "thumbnail": thumbnail,
         "reused": False,
+        "video_path": video_path,
+        "video_bytes": video_path.stat().st_size if video_path else None,
     }
 
 
@@ -474,13 +601,16 @@ def result_paths(transcript_root, canonical, media):
     return out_dir / (stem + ".txt"), out_dir / (stem + ".srt")
 
 
-def completed_result(media_root, transcript_root, canonical, descriptor):
+def completed_result(media_root, transcript_root, canonical, descriptor, video_root=None, require_video=False):
     media_dir = Path(media_root) / safe_slug(canonical["author"], 60) / canonical["post_id"]
     audio_stem = f"{safe_slug(descriptor['video_id'], 50)}__{safe_slug(descriptor['title'])}"
     audio_path = media_dir / (audio_stem + ".mp3")
     text_path, srt_path = result_paths(transcript_root, canonical, descriptor)
     paths = (audio_path, text_path, srt_path)
     if not all(path.is_file() and path.stat().st_size > 0 for path in paths):
+        return None
+    video_path = _existing_video_path(video_root, canonical, descriptor)
+    if require_video and video_path is None:
         return None
     try:
         chars = len(text_path.read_text(encoding="utf-8"))
@@ -491,6 +621,8 @@ def completed_result(media_root, transcript_root, canonical, descriptor):
         "srt_path": str(srt_path),
         "audio_path": str(audio_path),
         "audio_bytes": audio_path.stat().st_size,
+        "video_path": str(video_path) if video_path else None,
+        "video_bytes": video_path.stat().st_size if video_path else None,
         "duration_sec": descriptor["duration_sec"],
         "chars": chars,
         "kind": "cached",
@@ -550,6 +682,7 @@ def load_selection_groups(file_path):
             "position": int(row["position"]) if row.get("position") else None,
             "title": row.get("title") or None,
             "audio_path": row.get("audio_path") or None,
+            "video_path": row.get("video_path") or None,
             "duration_sec": row.get("duration_sec") or None,
             "author": row.get("author") or canonical.get("author"),
         }
@@ -606,9 +739,14 @@ def main(argv):
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--selection-file", help=argparse.SUPPRESS)
     parser.add_argument("--download-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--save-video", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--video-dir", help=argparse.SUPPRESS)
     parser.add_argument("--force-download", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--metadata-only", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    if args.save_video and not args.video_dir:
+        raise ValueError("Для сохранения видео нужна --video-dir")
 
     started = time.time()
     if not args.url and not args.selection_file:
@@ -643,6 +781,14 @@ def main(argv):
                     if request.get("audio_path")
                     and Path(request["audio_path"]).is_file()
                     and Path(request["audio_path"]).stat().st_size > 0
+                    and (
+                        not args.save_video
+                        or (
+                            request.get("video_path")
+                            and Path(request["video_path"]).is_file()
+                            and Path(request["video_path"]).stat().st_size > 0
+                        )
+                    )
                 ]
                 remote_requests = [request for request in requests if request not in local_requests]
                 for request in local_requests:
@@ -659,6 +805,7 @@ def main(argv):
                         "playlist_index": request.get("position") or 1,
                         "playlist_count": max(1, len(requests)),
                         "existing_audio_path": request.get("audio_path"),
+                        "existing_video_path": request.get("video_path"),
                     })
                 if not remote_requests:
                     continue
@@ -779,6 +926,8 @@ def main(argv):
                     args.transcript_dir,
                     canonical,
                     descriptor,
+                    video_root=args.video_dir,
+                    require_video=args.save_video,
                 )
                 if existing:
                     emit_item({"type": "metadata", **descriptor}, context)
@@ -813,6 +962,8 @@ def main(argv):
                             "author": descriptor["author"],
                             "thumbnail": descriptor["thumbnail"],
                             "reused": True,
+                            "video_path": Path(item["existing_video_path"]) if item.get("existing_video_path") else None,
+                            "video_bytes": Path(item["existing_video_path"]).stat().st_size if item.get("existing_video_path") else None,
                         }
                     else:
                         media = download_audio(
@@ -823,11 +974,15 @@ def main(argv):
                             temp_dir,
                             item_context=context,
                             force_download=args.force_download,
+                            save_video=args.save_video,
+                            video_root=args.video_dir,
                         )
                     if args.download_only:
                         saved = {
                             "audio_path": str(media["audio_path"]),
                             "audio_bytes": media["audio_bytes"],
+                            "video_path": str(media["video_path"]) if media.get("video_path") else None,
+                            "video_bytes": media.get("video_bytes"),
                             "duration_sec": media["duration_sec"],
                             "video_id": media["video_id"],
                             "title": media["title"],
@@ -855,6 +1010,8 @@ def main(argv):
                         "srt_path": str(srt_path) if srt_path else None,
                         "audio_path": str(media["audio_path"]),
                         "audio_bytes": media["audio_bytes"],
+                        "video_path": str(media["video_path"]) if media.get("video_path") else None,
+                        "video_bytes": media.get("video_bytes"),
                         "duration_sec": media["duration_sec"],
                         "chars": len(text),
                         "kind": "ai",

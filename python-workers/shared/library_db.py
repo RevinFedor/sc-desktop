@@ -6,6 +6,8 @@ Override with $SC_DESKTOP_DB (or legacy $MEDIA_INBOX_DB).
 This module is import-safe: it does not run migrations on import. Call
 `open_db()` to lazily create + migrate the file on first access.
 """
+from __future__ import annotations
+
 import json
 import os
 import sqlite3
@@ -21,7 +23,10 @@ DEFAULT_DB_PATH = (
 
 def _db_path() -> Path:
     override = os.environ.get("SC_DESKTOP_DB") or os.environ.get("MEDIA_INBOX_DB")
-    return Path(override) if override else DEFAULT_DB_PATH
+    if override:
+        return Path(override)
+    root = os.environ.get("SC_DESKTOP_DIR") or os.environ.get("MEDIA_INBOX_DIR")
+    return Path(root) / "library.db" if root else DEFAULT_DB_PATH
 
 
 SCHEMA_V1 = """
@@ -63,6 +68,7 @@ CREATE TABLE IF NOT EXISTS items (
   likes               INTEGER,
   comments            INTEGER,
   media_path          TEXT,
+  video_path          TEXT,
   thumbnail_path      TEXT,
   transcript_path     TEXT,
   download_status     TEXT NOT NULL DEFAULT 'none',
@@ -72,6 +78,7 @@ CREATE TABLE IF NOT EXISTS items (
   transcribe_engine   TEXT,
   transcribe_cost_usd REAL,
   raw_meta_json       TEXT,
+  has_media           INTEGER NOT NULL DEFAULT 0,
   topic_id            INTEGER,
   topic_title         TEXT,
   -- Reddit-only: comment tree. parent_external_id == NULL for the post itself
@@ -86,6 +93,7 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE INDEX IF NOT EXISTS idx_items_source     ON items(source_id);
 CREATE INDEX IF NOT EXISTS idx_items_published  ON items(published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_items_source_published ON items(source_id, published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_items_source_published_id ON items(source_id, published_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_items_source_caption_present ON items(source_id)
   WHERE caption IS NOT NULL AND length(trim(caption)) > 0;
 CREATE INDEX IF NOT EXISTS idx_items_status     ON items(download_status, transcribe_status);
@@ -109,6 +117,21 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_source_started ON jobs(source_id, started_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS source_coverage (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id    INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  job_id       INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+  date_from    INTEGER,
+  date_to      INTEGER,
+  content_type TEXT NOT NULL,
+  depth        TEXT NOT NULL,
+  items_count  INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_coverage_source ON source_coverage(source_id);
 
 -- Telegram channel comments (lives in linked discussion group, not the channel
 -- itself). Keep these mirrored 1:1 with electron/database.js — both sides UPSERT.
@@ -154,6 +177,56 @@ CREATE TABLE IF NOT EXISTS folder_sources (
 
 CREATE INDEX IF NOT EXISTS idx_folder_sources_source ON folder_sources(source_id);
 
+-- Shared with Electron. Python workers do not currently use these tables,
+-- but both runtimes open the same library.db and must declare one schema.
+CREATE TABLE IF NOT EXISTS translation_cache (
+  cache_key     TEXT PRIMARY KEY,
+  operation     TEXT NOT NULL CHECK(operation IN ('translate', 'dictionary')),
+  source_lang   TEXT NOT NULL,
+  target_lang   TEXT NOT NULL,
+  source_text   TEXT NOT NULL,
+  response_json TEXT NOT NULL,
+  provider      TEXT NOT NULL DEFAULT 'azure',
+  created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at    INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_translation_cache_lookup
+  ON translation_cache(operation, source_lang, target_lang);
+
+CREATE TABLE IF NOT EXISTS learning_entries (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind            TEXT NOT NULL CHECK(kind IN ('word', 'phrase')),
+  state           TEXT NOT NULL DEFAULT 'saved'
+                    CHECK(state IN ('saved', 'known', 'ignored')),
+  source_lang     TEXT NOT NULL,
+  target_lang     TEXT NOT NULL,
+  source_text     TEXT NOT NULL,
+  normalized_text TEXT NOT NULL,
+  translation     TEXT,
+  metadata_json   TEXT,
+  created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(kind, source_lang, target_lang, normalized_text)
+);
+CREATE INDEX IF NOT EXISTS idx_learning_entries_state
+  ON learning_entries(state, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_examples (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id            INTEGER NOT NULL REFERENCES learning_entries(id) ON DELETE CASCADE,
+  video_id            TEXT NOT NULL DEFAULT '',
+  video_url           TEXT,
+  video_title         TEXT,
+  cue_start_ms        INTEGER NOT NULL DEFAULT -1,
+  cue_end_ms          INTEGER,
+  source_text         TEXT NOT NULL,
+  translated_text     TEXT,
+  created_at          INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(entry_id, video_id, cue_start_ms, source_text)
+);
+CREATE INDEX IF NOT EXISTS idx_learning_examples_entry
+  ON learning_examples(entry_id, cue_start_ms);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
   caption, transcript,
   content='', contentless_delete=1,
@@ -183,6 +256,8 @@ def open_db() -> sqlite3.Connection:
         "ALTER TABLE sources ADD COLUMN tg_session TEXT",
         "ALTER TABLE sources ADD COLUMN tg_session_conflict INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE folders ADD COLUMN tg_session TEXT",
+        "ALTER TABLE items ADD COLUMN video_path TEXT",
+        "ALTER TABLE items ADD COLUMN has_media INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             conn.execute(ddl)
@@ -346,3 +421,91 @@ def list_items(
         f"SELECT * FROM items WHERE source_id = ? ORDER BY {safe_order} LIMIT ?",
         (source_id, limit),
     ))
+
+
+def processed_external_ids_by_kind(
+    conn: sqlite3.Connection,
+    source_id: int,
+) -> dict[str, dict[str, str]]:
+    """Return already processed Telegram media IDs grouped by pipeline kind.
+
+    This query intentionally runs in the Python fetch subprocess. Building and
+    serialising the same potentially huge map in Electron main made the Parse
+    click stall before the subprocess was even spawned.
+    """
+    result: dict[str, dict[str, str]] = {"voice": {}, "photo": {}, "pdf": {}}
+    rows = conn.execute(
+        """
+        SELECT external_id, type, transcribe_engine
+          FROM items
+         WHERE source_id = ?
+           AND transcribe_status = 'done'
+           AND external_id IS NOT NULL
+        """,
+        (int(source_id),),
+    )
+    for row in rows:
+        engine = str(row["transcribe_engine"] or "")
+        external_id = str(row["external_id"])
+        if row["type"] in ("voice", "audio", "video"):
+            result["voice"][external_id] = engine
+        elif row["type"] == "photo":
+            result["photo"][external_id] = engine
+        elif row["type"] == "document":
+            result["pdf"][external_id] = engine
+    return result
+
+
+def pending_reply_external_ids(
+    conn: sqlite3.Connection,
+    source_id: int,
+    limit: int = 5000,
+) -> list[int]:
+    """IDs whose reply edge or reactions still need an authoritative read."""
+    bounded = max(1, min(int(limit or 5000), 50000))
+    rows = conn.execute(
+        """
+        SELECT external_id
+          FROM items
+         WHERE source_id = ?
+           AND (reply_resolved = 0 OR reactions_resolved = 0)
+         ORDER BY CAST(external_id AS INTEGER) ASC
+         LIMIT ?
+        """,
+        (int(source_id), bounded),
+    )
+    result = []
+    for row in rows:
+        try:
+            result.append(int(row["external_id"]))
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
+def missing_comment_post_ids(
+    conn: sqlite3.Connection,
+    source_id: int,
+) -> list[int]:
+    """Post IDs without any stored discussion rows, newest first."""
+    rows = conn.execute(
+        """
+        SELECT i.external_id
+          FROM items i
+         WHERE i.source_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM post_comments pc
+              WHERE pc.source_id = i.source_id
+                AND pc.post_external_id = i.external_id
+           )
+         ORDER BY i.published_at DESC, i.id DESC
+        """,
+        (int(source_id),),
+    )
+    result = []
+    for row in rows:
+        try:
+            result.append(int(row["external_id"]))
+        except (TypeError, ValueError):
+            pass
+    return result

@@ -54,11 +54,19 @@ function eventDelayMs(event) {
 
 function installLoopGapProbe() {
   let last = performance.now()
+  let visible = document.visibilityState === 'visible'
+  document.addEventListener('visibilitychange', () => {
+    // Chromium aggressively throttles intervals while DevTools or another
+    // page owns focus. Reset the baseline at the visibility boundary so the
+    // first visible tick does not report hidden-time throttling as a UI stall.
+    visible = document.visibilityState === 'visible'
+    last = performance.now()
+  })
   window.setInterval(() => {
     const now = performance.now()
     const gapMs = now - last - LOOP_INTERVAL_MS
     last = now
-    if (document.visibilityState !== 'visible') return
+    if (!visible || document.visibilityState !== 'visible') return
     if (gapMs >= LOOP_GAP_MS) {
       send('RendererLoopGap', {
         gapMs,
@@ -73,6 +81,7 @@ function installLongTaskProbe() {
   try {
     const obs = new PerformanceObserver((list) => {
       for (const entry of list.getEntries()) {
+        if (document.visibilityState !== 'visible') continue
         if (entry.duration < LONG_TASK_MS) continue
         send('RendererLongTask', {
           durationMs: entry.duration,

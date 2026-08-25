@@ -385,20 +385,18 @@ export default function TelegramConfigForm({
     let alive = true
     const handle = chosen ? null : String(target).replace(/^@/, '')
     const externalId = chosen ? String(chosen.chat_id) : null
+    setSourceRow(null)
+    setHasDiscussion(null)
+    setTopics([])
+    setMaxExternalId(0)
+    setTypeBreakdown([])
     ;(async () => {
       try {
         let s = null
         if (sourceId && window.api.sourceGet) {
           s = await window.api.sourceGet(sourceId)
-        } else {
-          const sources = await window.api.sourcesList?.()
-          if (!alive || !Array.isArray(sources)) return
-          s = sources.find(s =>
-            s.platform === 'telegram' && (
-              (handle && s.handle === handle) ||
-              (externalId && s.external_id === externalId)
-            )
-          )
+        } else if (window.api.sourceFindTelegram) {
+          s = await window.api.sourceFindTelegram(externalId || handle)
         }
         if (!alive) return
         if (s) setSourceRow(s)
@@ -435,7 +433,7 @@ export default function TelegramConfigForm({
       } catch {}
     })()
     return () => { alive = false }
-  }, [target, chosen?.chat_id, sourceId])
+  }, [target, chosen?.chat_id, sourceId, itemsEstimateVer])
 
   // Reset topic selection if the user switches between candidate chats —
   // ids belong to the previous chat and would silently no-op against the

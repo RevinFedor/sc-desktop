@@ -6,6 +6,7 @@
 
 import { useSyncExternalStore } from 'react'
 import { subscribe as busSubscribe, invalidate } from './dataBus'
+import { createRefreshCoordinator } from './refreshCoordinator.mjs'
 
 let folders = []
 const subs = new Set()
@@ -14,7 +15,7 @@ let inited = false
 function emit() { subs.forEach(fn => fn()) }
 function snapshot() { return folders }
 
-async function refresh() {
+async function pullFolders() {
   if (!window.api?.folderList) return
   try {
     folders = await window.api.folderList() || []
@@ -22,6 +23,13 @@ async function refresh() {
   } catch (err) {
     console.error('[folders] refresh failed', err)
   }
+}
+
+const refreshCoordinator = createRefreshCoordinator(pullFolders)
+let latestRefresh = Promise.resolve()
+function refresh() {
+  latestRefresh = refreshCoordinator.request()
+  return latestRefresh
 }
 
 function init() {
@@ -41,6 +49,10 @@ export function useFolders() {
 }
 
 export function refreshFolders() {
+  if (!inited) {
+    init()
+    return latestRefresh
+  }
   invalidate('folders')
-  return refresh()
+  return latestRefresh
 }

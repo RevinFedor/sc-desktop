@@ -18,6 +18,7 @@ usage() {
 SC — быстрые команды SC Desktop
 
   sc <boosty-url>          автор → каталог; пост → обработать все видео
+  sc boosty-all <url>      весь автор: аудио → AssemblyAI → следующий ролик
   sc -b <boosty-url>       совместимый явный запуск Boosty
   sc --boosty <url>        то же самое
   sc -i --login            войти в Instagram
@@ -32,6 +33,19 @@ run_boosty() {
   fi
   exec "$PYTHON" "$ROOT/python-workers/web/boosty_cli.py" "$@"
 }
+
+run_boosty_all() {
+  exec "$ROOT/scripts/boosty-all.sh" "$@"
+}
+
+if [[ "${1:-}" == "boosty-all" || "${1:-}" == "--boosty-all" ]]; then
+  shift
+  if [[ $# -eq 0 ]]; then
+    echo "Нужна ссылка автора Boosty: sc boosty-all 'https://boosty.to/author'" >&2
+    exit 2
+  fi
+  run_boosty_all "$@"
+fi
 
 if [[ "${1:-}" == "-b" || "${1:-}" == "--boosty" || "${1:-}" == "boosty" ]]; then
   shift

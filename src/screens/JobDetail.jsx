@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { Virtuoso } from 'react-virtuoso'
 import { Brain, Captions, Copy, FileAudio, FileText, FolderOpen, Save, Play, Trash2 } from 'lucide-react'
 import { popScreen, pushScreen } from '../lib/store'
 import PlatformLogo from '../components/PlatformLogo'
@@ -72,6 +73,7 @@ const TG_TYPE_LABEL = {
 
 export default function JobDetail({ payload }) {
   const id = payload?.jobId
+  const identity = payload?.jobIdentity || (typeof id === 'string' && id.startsWith('db-') ? 'db' : 'live')
   const [job, setJob] = useState(payload?.job || null)
   const [busy, setBusy] = useState(null)
   const [toast, setToast] = useState(null)
@@ -83,12 +85,16 @@ export default function JobDetail({ payload }) {
   useEffect(() => {
     let alive = true
     if (!window.api || !id) return
-    window.api.jobDetail(id).then(j => alive && setJob(j))
+    // Activity passes the current in-memory snapshot in payload. Some job
+    // families (notably the worker-thread indexer) have no jobRunner/SQLite
+    // detail row yet; a null IPC response must not erase the valid snapshot.
+    window.api.jobDetail({ id, identity }).then(j => { if (alive && j) setJob(j) })
     const off = window.api.onJobUpdate(updated => {
-      if (alive && updated && (updated.id === id || updated.db_id === id)) setJob(updated)
+      if (!alive || !updated) return
+      if (identity === 'db' ? updated.db_id === id : updated.id === id) setJob(updated)
     })
     return () => { alive = false; off && off() }
-  }, [id])
+  }, [id, identity])
 
   if (!job) {
     return (
@@ -322,7 +328,13 @@ export default function JobDetail({ payload }) {
                   <button
                     onClick={async () => {
                       setBusy('cancel')
-                      try { await window.api.cancelJob(job.id) } catch {}
+                      try {
+                        await window.api.cancelJob({
+                          id: identity === 'db' ? id : job.id,
+                          identity,
+                          type: job.type,
+                        })
+                      } catch {}
                       setBusy(null)
                     }}
                     disabled={busy === 'cancel'}
@@ -1111,10 +1123,12 @@ function BoostyBatchBody({ job }) {
       srt_path: state.srt_present ? state.srt_path : null,
       audio_path: state.media_present ? state.media_path : null,
       audio_bytes: state.media_present ? state.media_bytes : null,
+      video_path: state.video_present ? state.video_path : null,
+      video_bytes: state.video_present ? state.video_bytes : null,
       audio_removed: !!row.audio_path && !state.media_present,
     }
   })
-  const files = resolvedLog.filter(row => row && row.kind !== 'error' && (row.file_path || row.srt_path || row.audio_path || row.audio_removed))
+  const files = resolvedLog.filter(row => row && row.kind !== 'error' && (row.file_path || row.srt_path || row.audio_path || row.video_path || row.audio_removed))
   const errors = resolvedLog.filter(row => row?.kind === 'error')
   const transcriptPaths = [...new Set(files.map(row => row.file_path).filter(Boolean))]
 
@@ -1137,7 +1151,7 @@ function BoostyBatchBody({ job }) {
           {current.total_bytes > 0 && <KV k="Скачано" v={`${fmtBytes(current.downloaded_bytes || 0)} / ${fmtBytes(current.total_bytes)}`} />}
         </Section>
       )}
-      <Section title={batch.mode === 'download' ? 'Загрузка аудио' : 'Расшифровка'}>
+      <Section title={batch.mode === 'download' ? (job.params?.save_video ? 'Загрузка аудио и видео' : 'Загрузка аудио') : 'Расшифровка'}>
         <KV k="Выбрано" v={Number(job.items_total || 0).toLocaleString('ru-RU')} />
         <KV k="Готово" v={Number(batch.saved ?? job.items_done ?? 0).toLocaleString('ru-RU')} />
         <KV k="Из кэша" v={Number(batch.cached || 0).toLocaleString('ru-RU')} />
@@ -1180,6 +1194,11 @@ function BoostyBatchBody({ job }) {
                 {row.audio_path && (
                   <button type="button" onClick={() => window.api?.revealInFinder?.(row.audio_path)} className="px-2 py-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 inline-flex items-center gap-1.5">
                     <FolderOpen size={13} /> MP3{row.audio_bytes ? ` · ${fmtBytes(row.audio_bytes)}` : ''}
+                  </button>
+                )}
+                {row.video_path && (
+                  <button type="button" onClick={() => window.api?.revealInFinder?.(row.video_path)} className="px-2 py-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 inline-flex items-center gap-1.5">
+                    <Play size={13} /> Видео{row.video_bytes ? ` · ${fmtBytes(row.video_bytes)}` : ''}
                   </button>
                 )}
                 {row.audio_removed && <span className="text-xs text-zinc-600">MP3 удалён</span>}
@@ -1603,14 +1622,21 @@ function YoutubeBatchBody({ job }) {
           )}
         </div>
       }>
-        <div className="max-h-96 overflow-auto -m-4 divide-y divide-zinc-900">
+        <div className="-m-4 overflow-hidden">
           {items.length === 0 && (b.log || []).length === 0 && (
             <div className="px-4 py-3 text-zinc-600 italic" style={{ fontSize: '14px' }}>Пока нет результатов</div>
           )}
           {filteredItems.length === 0 && items.length > 0 && search && (
             <div className="px-4 py-3 text-zinc-600 italic" style={{ fontSize: '14px' }}>Ничего не найдено</div>
           )}
-          {filteredItems.map((it, idx) => {
+          {filteredItems.length > 0 && (
+          <Virtuoso
+            style={{ height: Math.min(384, Math.max(64, filteredItems.length * 42)) }}
+            data={filteredItems}
+            defaultItemHeight={42}
+            increaseViewportBy={140}
+            computeItemKey={(_index, item) => item.external_id}
+            itemContent={(idx, it) => {
             const log = logByVid.get(it.external_id)
             // Is this row the *currently in-flight* transcription?
             // b.current.video_id (set per-video in job-runner) is the
@@ -1654,7 +1680,7 @@ function YoutubeBatchBody({ job }) {
               return (
                 <div
                   key={idx}
-                  className={`px-4 py-2 flex items-center gap-3 ${isCurrent ? 'bg-emerald-950/30' : ''}`}
+                  className={`px-4 py-2 flex items-center gap-3 border-b border-zinc-900 last:border-b-0 ${isCurrent ? 'bg-emerald-950/30' : ''}`}
                   onClick={path ? () => window.api?.openExternal?.(path) : undefined}
                   role={path ? 'button' : undefined}
                   style={path ? { cursor: 'pointer' } : undefined}
@@ -1699,7 +1725,7 @@ function YoutubeBatchBody({ job }) {
                 onClick={path ? () => window.api?.openExternal?.(path) : undefined}
                 role={path ? 'button' : undefined}
                 title={path ? 'Открыть транскрипт' : undefined}
-                className={`px-4 py-2 flex items-center gap-3 ${isCurrent ? 'bg-emerald-950/30' : ''} ${path ? 'cursor-pointer hover:bg-zinc-900/60' : ''}`}
+                className={`px-4 py-2 flex items-center gap-3 border-b border-zinc-900 last:border-b-0 ${isCurrent ? 'bg-emerald-950/30' : ''} ${path ? 'cursor-pointer hover:bg-zinc-900/60' : ''}`}
               >
                 {finalStatus ? (
                   <span style={{ fontSize: '14px' }} className={`${finalStatus.color} shrink-0 inline-flex items-center gap-1`}>
@@ -1722,7 +1748,9 @@ function YoutubeBatchBody({ job }) {
                 )}
               </div>
             )
-          })}
+            }}
+          />
+          )}
           {items.length === 0 && (b.log || []).map((row, idx) => (
             <div key={idx} className="px-4 py-2 flex items-center gap-3">
               <span style={{ fontSize: '14px' }}>

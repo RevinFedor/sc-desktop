@@ -223,7 +223,9 @@ function assembleText(rows, opts = {}) {
     out.push(`--- ${label} ---`, body, '')
 
     if (commentsByPostId) {
-      const cmts = commentsByPostId.get(String(row.external_id)) || []
+      const cmts = commentsByPostId.get(`${row.source_id}:${String(row.external_id)}`)
+        || commentsByPostId.get(String(row.external_id))
+        || []
       if (cmts.length > 0) {
         out.push(`--- комментарии (${cmts.length}) ---`)
         for (const ln of _formatComments(cmts)) out.push(ln)

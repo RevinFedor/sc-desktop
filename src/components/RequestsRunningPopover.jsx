@@ -1,10 +1,15 @@
 import React, { useEffect, useRef } from 'react'
-import { useJobs } from '../lib/jobs'
+import { useJobsSelector } from '../lib/jobs'
+import { EMPTY_JOBS, sameArrayItems } from '../lib/jobSelectorCore.mjs'
 import { isActiveRequestJob, isVisibleRequestJob, RequestJobRow } from './ActivityPanel'
 
 export default function RequestsRunningPopover({ open, onClose, anchorRef }) {
-  const jobs = useJobs()
-  const active = jobs.filter(j => isVisibleRequestJob(j) && isActiveRequestJob(j))
+  const active = useJobsSelector(
+    jobs => open
+      ? jobs.filter(j => isVisibleRequestJob(j) && isActiveRequestJob(j))
+      : EMPTY_JOBS,
+    sameArrayItems,
+  )
   const ref = useRef(null)
 
   useEffect(() => {

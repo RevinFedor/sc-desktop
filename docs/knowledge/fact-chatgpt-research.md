@@ -57,32 +57,46 @@ DOM-события вызывают JS-listener'ы, но не включают C
 
 ## Параметры job'а
 
-- **`options.mode`** — `chat` или `work`. У YouTube каждая из этих пар хранится
-  отдельно, поэтому переключение не переносит модель и интеллект между режимами.
-- **`options.model`** — в `chat`: `5.5` (GPT-5.5 Instant) или `5.6-sol`; в `work`:
-  `5.6-sol`, `5.6-terra` или `5.6-luna`. Старые `5.4/5.3/5.2/4.5/o3` при чтении
+Реестр ниже — подтверждённый снимок интерфейса аккаунта на 2026-08-23, а не
+вечная гарантия ChatGPT: при следующей смене меню его нужно заново сверить с живым DOM.
+
+- **`options.mode`** — `chat` или `work`. Chat не расходует недельную квоту Work;
+  Work расходует её, поэтому автоматический default в skill — Chat, а Work выбирается
+  явно. У YouTube каждая из этих пар хранится отдельно, поэтому переключение не
+  переносит модель и интеллект между режимами.
+- **`options.model`** — в `chat`: `5.5` (GPT-5.5 Instant), `5.6-sol` или временный
+  `o3` («доступна до 26 августа»); в `work`: `5.6-sol`, `5.6-terra` или `5.6-luna`.
+  Старые `5.4/5.3/5.2/4.5` при чтении
   настроек нормализуются к текущей паре, а числовой legacy-id `5.6` означает Sol.
   **ChatGPT запоминает модель per-аккаунт**, поэтому CS верифицирует её на каждом
   запуске, а не считает дефолт уже выбранным.
 - **Модель выбирается ПЕРЕД уровнем интеллекта** — состав уровней зависит от модели
   и смена модели может сбросить уровень.
 - **`options.effort`** — для `chat/5.5` только `instant`; для `chat/5.6-sol`:
-  `medium/high/xhigh/pro`; для `work`: `low/medium/high/xhigh/max/ultra`.
-  «Очень высокий» = `xhigh`. Pro остаётся двухслойным меню: верхний Pro и его detail
-  проверяются отдельно, потому что checked detail при выключенном верхнем Pro не означает
-  активный режим. Legacy `pro-extended` нормализуется к `pro` в настройках.
+  `instant/medium/high/xhigh/pro`; для `chat/o3` — `medium`; для `work`:
+  `low/medium/high/xhigh/max/ultra`. «Очень высокий» = `xhigh`. В новом UI Pro —
+  единый radio без старого detail-подменю; legacy `pro-extended` нормализуется к `pro`.
+- **`options.speed`** (только Work) — `standard` (безопасный default) или `fast`.
+  UI прямо подписывает Fast как «Скорость 1,5x, расход выше», поэтому её нельзя
+  включать неявно. Выбор скорости верифицируется так же, как модель и effort.
 - **`options.sources`** (default false, только research-ветка) — включать ли блок источников в `result.text`.
   Источники **парсятся всегда** и лежат в `result.sources[{url,title}]`; activity/tool
   steps из правой панели ChatGPT лежат в `result.source_activity[]` и дублируются в
   `result.sources_meta.activity_items[]` вместе с `activity`/thinking-таймингами. Флаг
   управляет только текстовой презентацией, не сбором. Принцип —
   `methodology/переносимый-дизайн.md::Сбор данных ≠ выдача`.
-- **`attachments` / `files`** — локальные изображения для upload в composer. Поддержано
-  только для `provider:"chatgpt"`: bridge валидирует MIME/размер, копирует файл в
+- **`attachments` / `files`** — абсолютные пути или объекты
+  `{path,startLine,endLine}` / `{path,lines:"10-80"}`. Документы и диапазоны доступны
+  только в Chat; существующие image attachments остаются доступны и в Work. Bridge
+  копирует файл или только выбранный 1-based диапазон в
   `LIB_ROOT/research-artifacts/<jobId>/input/`, а CS забирает bytes через
-  `/research-attachment` и кладёт `File` в `#upload-photos` / image file input. Копия
-  в `LIB_ROOT` важна не только для upload'а: история должна пережить удаление исходника
-  из Desktop-папки и показать, что именно было отправлено.
+  `/research-attachment` и кладёт `File` напрямую в `#upload-files` / `#upload-photos` —
+  системный macOS picker не нужен. До 20 файлов идут отдельными chips; >20 текстовых
+  входов автоматически собираются в один bundle, бинарный набор >20 отклоняется.
+  Локальные пределы bridge: 20 MiB на файл, 100 MiB суммарно, bundle до 20 MiB.
+  Это защитные пределы SC Desktop, а не подтверждённый максимум web-composer ChatGPT.
+  Запрос с путями принимается только без browser Origin, чтобы веб-страница не могла
+  назвать локальный файл. История хранит `input_files[]` отдельно от `input_images[]`.
 - **`conversationUrl` / `continueUrl` / `url`** — продолжение существующего ChatGPT-чата
   `https://chatgpt.com/c/<conversation-id>`. Bridge нормализует URL, добавляет
   `?sc-research=<id>#sc-research=<id>` и открывает тот же conversation вместо нового
@@ -96,16 +110,19 @@ DOM-события вызывают JS-listener'ы, но не включают C
 Выбор режима, модели и уровня — verify-and-retry: после клика меню переоткрывается и читается
 `aria-checked` только у видимых menu-нóд (ChatGPT оставляет stale-ноды от закрытых меню;
 текст pill'а лагает — живой probe: после клика Instant pill ещё показывал «Pro»).
-Для `pro/pro-extended` verify читает верхний `Pro` и detail-radio отдельно.
-Провал выбора режима, модели **или уровня** фатальный
+Новый корневой popover сначала показывает slider и «Расширенные», а внутри — строки
+`Модель`, `Усилие` и (в Work) `Скорость`. `textContent` склеивает подпись и значение
+(`УсилиеВысокий`), поэтому trigger определяется по префиксу, не по пробелу. Провал
+выбора режима, модели, уровня **или скорости** фатальный
 (`chatgpt_mode_select_failed` / `chatgpt_model_select_failed` /
-`chatgpt_effort_select_failed`): молчаливый запрос со sticky-настройкой аккаунта хуже
+`chatgpt_effort_select_failed` / `chatgpt_speed_select_failed`): молчаливый запрос со sticky-настройкой аккаунта хуже
 честной ошибки, потому что пользователь явно выбрал другую конфигурацию.
 
-`~/.claude/skills/external-research/SKILL.md` задаёт другой, вызывающий дефолт для
-bridge-job'ов: `work` + `5.6-sol` + `max`. Он не меняет сохранённые YouTube-настройки
+`~/.claude/skills/external-research/SKILL.md` задаёт вызывающий дефолт для
+bridge-job'ов: `chat` + `5.6-sol` + `xhigh`. Он не меняет сохранённые YouTube-настройки
 и не должен неявно синхронизироваться с ручной формой SC Desktop; у обеих поверхностей
-свои явно видимые параметры.
+свои явно видимые параметры. Файлы и диапазоны — часть этого же skill и того же
+`/research-start`; отдельного skill для прикрепления файлов нет.
 
 Текст ответа не является источником истины о версии: модель может назвать себя иначе.
 Подтверждение — проверка выбранного menu-radio и bridge-лог выбора, не self-report.
@@ -261,8 +278,11 @@ thinking-блоки («Думал на протяжении X» — RU/EN), за
 Кнопка композера — 3 состояния (спарсено с живого DOM, юзер подтвердил модель):
 **голосовой режим** (композер пуст) → **отправить** (`[data-testid="send-button"]`,
 появляется только при непустом композере — появление = paste принят) → **остановить**
-(`[data-testid="stop-button"]`, стримит). Done = stop ушёл + quiet 3с + есть текст ответа
-или новый generated image container после pre-submit baseline.
+(`[data-testid="stop-button"]`, стримит). Stop ушёл + quiet 3с — только кандидат.
+Настоящий текстовый финал подтверждается в backend conversation API как
+`channel:"final" + end_turn:true`; это не даёт принять промежуточное Work-сообщение
+«Думаю» за ответ. DOM fallback дополнительно требует action «Копировать ответ» в том же
+assistant-turn. Image-only финал по-прежнему подтверждается новым generated image container.
 Paste — ClipboardEvent + DataTransfer в ProseMirror `#prompt-textarea` (как Lexical у
 Perplexity, execCommand из isolated world игнорируется). Если stop не появился за 120с —
 терминальная ошибка `chatgpt_submit_failed` (paste в пустоту / логин-волл).
@@ -277,12 +297,11 @@ composer ещё disabled, а job потом ждёт stop-button до submit tim
 состояние ChatGPT меняют длительность loader'а. После paste нужно ждать реальные
 маркеры готовности composer'а: Send видим и enabled, editor не disabled/contenteditable=false,
 нет `aria-busy`, progressbar/loader/spinner и текстовых признаков uploading/loading.
-В реализации это `MutationObserver` + `requestAnimationFrame`; `setTimeout` остаётся
-только аварийным ceiling'ом, который должен завершить job ошибкой с диагностикой, а
-не «подождать на всякий случай». В hidden-вкладке `requestAnimationFrame` сам по себе
-не является драйвером проверки: если emulation слетела, observer может видеть изменения,
-но scheduled check не выполнится. Симптом `sendVisible:true` при timeout означает именно
-эту рассинхронизацию, не обязательно незагруженный composer.
+В реализации это `MutationObserver` + прямой microtask-check + контрольный polling;
+`requestAnimationFrame` больше не является обязательным драйвером. Короткое quiet-окно
+подтверждает стабильность уже готовых маркеров, а длинный `setTimeout` остаётся аварийным
+ceiling'ом. Именно rAF-only схема давала `sendVisible:true` при 120-секундном timeout в
+hidden-вкладке, хотя composer фактически был готов.
 
 **Done-сигнал ≠ результат сохранён.** Живой кейс `ryccfz` был именно chatgpt-job:
 `watcher.done` сработал, ответ готов в браузере, но финальный `status=done` не долетел

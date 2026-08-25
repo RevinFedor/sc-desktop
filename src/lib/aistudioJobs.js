@@ -13,11 +13,13 @@ import { useSyncExternalStore } from 'react'
 
 let jobs = []           // {jobId, status, stage, modelId, elapsedSec, ...}[]
 let lastFetchAt = 0
+let summaryRefreshInFlight = null
+let fullRefreshInFlight = null
 const subs = new Set()
 
 function emit() { subs.forEach(s => s()) }
 
-function setJobs(next) {
+function setJobs(next, { preserveDetails = false } = {}) {
   if (!Array.isArray(next)) return
   // shallow compare (одинаковая длина + одинаковые updatedAt) — экономим
   // ре-рендер. Stored state не используется как identity-source, useStore'ы
@@ -25,18 +27,44 @@ function setJobs(next) {
   const same = jobs.length === next.length && jobs.every((j, i) =>
     next[i] && j.jobId === next[i].jobId && j.updatedAt === next[i].updatedAt
   )
-  if (same) return
-  jobs = next
+  if (preserveDetails && same) return
+  if (preserveDetails) {
+    const previous = new Map(jobs.map(job => [job.jobId, job]))
+    // Summary updates deliberately omit responseText/sources/fullPrompt.
+    // Merge them over an already-loaded detail object so opening one job does
+    // not lose its answer on the next 1.5-second navbar update.
+    jobs = next.map(job => previous.has(job.jobId)
+      ? { ...previous.get(job.jobId), ...job }
+      : job)
+  } else {
+    jobs = next
+  }
   emit()
 }
 
-async function refresh() {
+async function refresh(options = {}) {
   if (!window.api?.aistudioListJobs) return
+  const full = options?.full === true
+  const current = full ? fullRefreshInFlight : summaryRefreshInFlight
+  if (current) return current
+  const promise = (async () => {
+    try {
+      const r = await window.api.aistudioListJobs({ full })
+      lastFetchAt = Date.now()
+      setJobs(r?.jobs || [], { preserveDetails: !full })
+      return r
+    } catch {
+      return null
+    }
+  })()
+  if (full) fullRefreshInFlight = promise
+  else summaryRefreshInFlight = promise
   try {
-    const r = await window.api.aistudioListJobs()
-    lastFetchAt = Date.now()
-    setJobs(r?.jobs || [])
-  } catch {}
+    return await promise
+  } finally {
+    if (full && fullRefreshInFlight === promise) fullRefreshInFlight = null
+    if (!full && summaryRefreshInFlight === promise) summaryRefreshInFlight = null
+  }
 }
 
 // Wire push-канал на load. Без это renderer не получит свежие jobs при
@@ -64,7 +92,7 @@ export function useAistudioJobs(selector = j => j) {
   return useSyncExternalStore(subscribe, () => selector(jobs), () => selector(jobs))
 }
 
-export function refreshAistudioJobs() { return refresh() }
+export function refreshAistudioJobs(options = {}) { return refresh(options) }
 
 export async function clearAistudioJob(payload) {
   if (!window.api?.aistudioClearJob) return

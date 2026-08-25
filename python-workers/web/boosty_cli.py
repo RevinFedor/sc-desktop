@@ -17,6 +17,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +30,14 @@ BRIDGE_PORT = 53127
 EXTENSION_ID = "phnlfhkblebijojjnnlbcbklijgcijgf"
 EXTENSION_ORIGIN = "chrome-extension://" + EXTENSION_ID
 MAX_AUTH_BODY_BYTES = 64 * 1024
+LOCAL_AUTH_TOKEN_PATH = Path(
+    os.environ.get("SC_DESKTOP_NOTIFICATION_TOKEN_PATH")
+    or Path(
+        os.environ.get("SC_DESKTOP_DIR")
+        or os.environ.get("MEDIA_INBOX_DIR")
+        or (Path.home() / "Library" / "Application Support" / "sc-desktop")
+    ) / "notification-bridge-token"
+)
 
 
 class AuthState:
@@ -145,10 +155,8 @@ def request_browser_auth(timeout_sec):
     state = AuthState()
     try:
         server = AuthServer((BRIDGE_HOST, BRIDGE_PORT), _handler_for(state))
-    except OSError as exc:
-        raise RuntimeError(
-            "Локальный порт авторизации занят. Закройте SC Desktop и повторите sc -b."
-        ) from exc
+    except OSError:
+        return request_running_desktop_auth(timeout_sec)
 
     thread = threading.Thread(target=server.serve_forever, name="boosty-auth-bridge", daemon=True)
     thread.start()
@@ -164,6 +172,44 @@ def request_browser_auth(timeout_sec):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def request_running_desktop_auth(timeout_sec):
+    try:
+        token = LOCAL_AUTH_TOKEN_PATH.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(
+            "SC Desktop уже занимает порт авторизации, но локальный токен недоступен. "
+            "Перезапустите обновлённый SC Desktop или закройте его и повторите."
+        ) from exc
+    request = urllib.request.Request(
+        "http://127.0.0.1:53127/boosty-auth-request",
+        data=b"{}",
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(3.0, timeout_sec + 3.0)) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise RuntimeError(
+                "Запущена старая версия SC Desktop без CLI-моста Boosty. "
+                "Перезапустите обновлённое приложение или закройте его."
+            ) from exc
+        raise RuntimeError(f"SC Desktop не отдал авторизацию Boosty (HTTP {exc.code})") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError("Не удалось запросить авторизацию у запущенного SC Desktop") from exc
+    auth = payload.get("auth") if isinstance(payload, dict) else None
+    if not isinstance(auth, dict) or not isinstance(auth.get("value"), str) or not auth["value"]:
+        raise RuntimeError("SC Desktop не получил активную авторизацию Boosty из браузера")
+    return {
+        "value": auth["value"],
+        "expirationDate": auth.get("expirationDate"),
+    }
 
 
 def human_bytes(value):
@@ -350,9 +396,18 @@ def find_existing_result(canonical):
     from boosty_single_ndjson import safe_slug
 
     storage = app_root()
+    workers_root = str(Path(__file__).resolve().parents[1])
+    if workers_root not in sys.path:
+        sys.path.insert(0, workers_root)
+    try:
+        from shared.settings import load as load_settings
+        configured_audio = (load_settings().get("boosty") or {}).get("audio_dir")
+    except Exception:
+        configured_audio = None
     author_dir = storage / "transcripts" / "boosty" / safe_slug(canonical["author"], 60)
+    audio_root = Path(os.path.expanduser(str(configured_audio))).resolve() if configured_audio else storage / "media" / "boosty"
     audio_dir = (
-        storage / "media" / "boosty" / safe_slug(canonical["author"], 60) / canonical["post_id"]
+        audio_root / safe_slug(canonical["author"], 60) / canonical["post_id"]
     )
     if not author_dir.is_dir() or not audio_dir.is_dir():
         return None
@@ -393,11 +448,20 @@ def run_worker(url, auth, metadata_only=False, force=False):
     root = Path(__file__).resolve().parents[2]
     worker = Path(__file__).with_name("boosty_single_ndjson.py")
     storage = app_root()
+    workers_root = str(root / "python-workers")
+    if workers_root not in sys.path:
+        sys.path.insert(0, workers_root)
+    try:
+        from shared.settings import load as load_settings
+        configured_audio = (load_settings().get("boosty") or {}).get("audio_dir")
+    except Exception:
+        configured_audio = None
+    audio_dir = Path(os.path.expanduser(str(configured_audio))).resolve() if configured_audio else storage / "media" / "boosty"
     command = [
         sys.executable,
         str(worker),
         url,
-        "--media-dir", str(storage / "media" / "boosty"),
+        "--media-dir", str(audio_dir),
         "--transcript-dir", str(storage / "transcripts" / "boosty"),
         "--work-dir", str(storage / "tmp" / "boosty"),
     ]
@@ -406,9 +470,6 @@ def run_worker(url, auth, metadata_only=False, force=False):
     if force:
         command.append("--force-download")
 
-    workers_root = str(root / "python-workers")
-    if workers_root not in sys.path:
-        sys.path.insert(0, workers_root)
     try:
         from shared.settings import get_api_key
         api_key = get_api_key("ASSEMBLYAI_API_KEY")

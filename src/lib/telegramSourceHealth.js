@@ -1,13 +1,19 @@
+const healthCache = new WeakMap()
+
 export function telegramSourceHealth(source) {
+  if (source && typeof source === 'object' && healthCache.has(source)) {
+    return healthCache.get(source)
+  }
+  let result = null
   try {
     const meta = JSON.parse(source?.meta_json || '{}')
     const health = meta?.tg_health
-    return health && typeof health === 'object' && !Array.isArray(health)
+    result = health && typeof health === 'object' && !Array.isArray(health)
       ? health
       : null
-  } catch {
-    return null
-  }
+  } catch {}
+  if (source && typeof source === 'object') healthCache.set(source, result)
+  return result
 }
 
 export function isTelegramSourceUnavailable(source) {

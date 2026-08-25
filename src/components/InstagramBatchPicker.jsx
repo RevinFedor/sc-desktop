@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { Virtuoso } from 'react-virtuoso'
 import Checkbox from './Checkbox'
 
 /**
@@ -189,16 +190,29 @@ export default function InstagramBatchPicker({ sourceId }) {
         >Сбросить</button>
       </div>
 
-      <div className="max-h-96 overflow-auto divide-y divide-zinc-900">
-        {filtered.map(it => (
-          <ReelRow
-            key={it.external_id}
-            item={it}
-            checked={selected.has(it.external_id)}
-            transcribed={transcribedSet.has(it.external_id)}
-            onToggle={() => toggle(it.external_id)}
+      <div
+        data-instagram-reel-list
+        className="overflow-hidden"
+        style={{ height: Math.min(384, Math.max(64, filtered.length * 54)) }}
+      >
+        {filtered.length > 0 && (
+          <Virtuoso
+            data={filtered}
+            defaultItemHeight={54}
+            increaseViewportBy={160}
+            computeItemKey={(_index, item) => item.external_id}
+            itemContent={(_index, item) => (
+              <div data-instagram-reel-row className="border-b border-zinc-900 last:border-b-0">
+                <ReelRow
+                  item={item}
+                  checked={selected.has(item.external_id)}
+                  transcribed={transcribedSet.has(item.external_id)}
+                  onToggle={() => toggle(item.external_id)}
+                />
+              </div>
+            )}
           />
-        ))}
+        )}
         {filtered.length === 0 && (
           <div className="px-4 py-3 text-zinc-500 italic" style={{ fontSize: '14px' }}>
             Ничего не найдено

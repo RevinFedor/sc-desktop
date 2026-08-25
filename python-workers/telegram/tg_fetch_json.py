@@ -54,6 +54,7 @@ if sys.platform == 'darwin':
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
 from credentials import telegram_credentials
+from library_db import open_db, missing_comment_post_ids, processed_external_ids_by_kind
 
 try:
     TELEGRAM_API_ID, TELEGRAM_API_HASH = telegram_credentials()
@@ -1544,6 +1545,7 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
 
 
 def main():
+    global SESSION_PATH, _SKIP_VOICE, _SKIP_PHOTO, _SKIP_PDF
     parser = argparse.ArgumentParser()
     parser.add_argument("target", nargs="?", default=None,
                         help="@username, chat_id, or URL (omit when --resolve-title)")
@@ -1601,6 +1603,10 @@ def main():
                              "have transcribe_status='done' in the desktop DB. "
                              "Matching msg_ids skip download+AI and emit "
                              "media-skipped(reason='already processed').")
+    parser.add_argument("--skip-processed-source-id", type=int, default=None,
+                        help="Load already-processed media IDs directly from "
+                             "library.db inside this subprocess. Preferred by "
+                             "Electron because large ID maps never cross main.")
     # Telegram channel comments. include-comments: do a second pass over each
     # fetched post and pull its discussion-thread messages. comments-limit:
     # max comments per post (0 = no limit). comments-only-post-ids: comma-list
@@ -1618,6 +1624,9 @@ def main():
     parser.add_argument("--comments-only-post-ids", default=None,
                         help="Comma-separated channel msg_ids; runs only the "
                              "comments pass over these existing posts")
+    parser.add_argument("--comments-only-source-id", type=int, default=None,
+                        help="Read posts missing comments directly from library.db; "
+                             "avoids huge argv/IPC payloads for long channels")
     parser.add_argument("--media-only-msg-ids", default=None,
                         help="Comma-separated msg_ids of ALREADY-SAVED messages "
                              "to (re)process media for on demand (mode=media_only). "
@@ -1631,7 +1640,6 @@ def main():
     args = parser.parse_args()
 
     if args.session:
-        global SESSION_PATH
         SESSION_PATH = _resolve_session_path(args.session)
 
     # Pre-populate the "already processed" sets from the desktop DB if a file
@@ -1643,7 +1651,6 @@ def main():
         try:
             with open(args.skip_processed_file, "r", encoding="utf-8") as f:
                 payload = json.load(f) or {}
-            global _SKIP_VOICE, _SKIP_PHOTO, _SKIP_PDF
             def _coerce(v):
                 if isinstance(v, dict):
                     return {str(k): str(e or '') for k, e in v.items()}
@@ -1659,6 +1666,26 @@ def main():
         except Exception as ex:
             emit({"type": "info",
                   "message": f"skip-processed file unreadable: {ex}"})
+    elif args.skip_processed_source_id:
+        conn = None
+        try:
+            conn = open_db()
+            payload = processed_external_ids_by_kind(
+                conn, args.skip_processed_source_id
+            )
+            _SKIP_VOICE = payload["voice"]
+            _SKIP_PHOTO = payload["photo"]
+            _SKIP_PDF = payload["pdf"]
+            emit({"type": "info",
+                  "message": f"skip-processed loaded from DB: "
+                             f"voice={len(_SKIP_VOICE)} "
+                             f"photo={len(_SKIP_PHOTO)} pdf={len(_SKIP_PDF)}"})
+        except Exception as ex:
+            emit({"type": "info",
+                  "message": f"skip-processed DB lookup failed: {ex}"})
+        finally:
+            if conn is not None:
+                conn.close()
 
     try:
         if args.resolve_title is not None:
@@ -1670,13 +1697,29 @@ def main():
             emit({"type": "error", "message": "target and --mode are required"})
             sys.exit(2)
         post_ids = None
-        if args.comments_only_post_ids:
+        if args.comments_only_source_id:
+            conn = None
+            try:
+                conn = open_db()
+                post_ids = missing_comment_post_ids(conn, args.comments_only_source_id)
+                emit({"type": "info", "message": f"comments-only loaded from DB: {len(post_ids)} posts"})
+            except Exception as ex:
+                emit({"type": "error", "message": f"Cannot read comments-only posts: {ex}"})
+                sys.exit(2)
+            finally:
+                if conn is not None:
+                    conn.close()
+        elif args.comments_only_post_ids:
             try:
                 post_ids = [int(x.strip()) for x in args.comments_only_post_ids.split(",") if x.strip()]
             except Exception as ex:
                 emit({"type": "error",
                       "message": f"Bad --comments-only-post-ids: {ex}"})
                 sys.exit(2)
+        if args.comments_only_source_id and not post_ids:
+            emit({"type": "done", "items_total": 0, "comments_collected": 0,
+                  "comments_post_errors": 0, "duration_sec": 0})
+            sys.exit(0)
         media_msg_ids = None
         if args.media_only_msg_ids:
             try:

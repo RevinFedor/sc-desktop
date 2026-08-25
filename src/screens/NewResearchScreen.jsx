@@ -33,8 +33,14 @@ const CHATGPT_MODES = [
 const CHATGPT_MODELS = [
   { id: '5.5',       label: 'GPT-5.5 Instant', modes: ['chat'] },
   { id: '5.6-sol',   label: 'GPT-5.6 Sol',     modes: ['chat', 'work'] },
+  { id: 'o3',        label: 'o3 · до 26 августа', modes: ['chat'] },
   { id: '5.6-terra', label: 'GPT-5.6 Terra',   modes: ['work'] },
   { id: '5.6-luna',  label: 'GPT-5.6 Luna',    modes: ['work'] },
+]
+
+const CHATGPT_WORK_SPEEDS = [
+  { id: 'standard', label: 'Стандартный' },
+  { id: 'fast', label: 'Быстро · расход выше' },
 ]
 
 // ChatGPT — уровни интеллекта (зеркало chatgpt-research.js::EFFORTS).
@@ -57,11 +63,14 @@ function chatgptEffortOptions(mode, model) {
     return ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(id => byId[id])
   }
   if (model === '5.5') return [byId.instant]
-  return ['medium', 'high', 'xhigh', 'pro'].map(id => byId[id])
+  if (model === 'o3') return [byId.medium]
+  return ['instant', 'medium', 'high', 'xhigh', 'pro'].map(id => byId[id])
 }
 
 function defaultChatgptEffort(mode, model) {
-  return mode === 'chat' && model === '5.5' ? 'instant' : 'xhigh'
+  if (mode === 'chat' && model === '5.5') return 'instant'
+  if (mode === 'chat' && model === 'o3') return 'medium'
+  return 'xhigh'
 }
 
 // Claude — модели + их effort/thinking вариации (зеркало claude-research.js::
@@ -102,6 +111,7 @@ export default function NewResearchScreen() {
   const [gptMode, setGptMode] = useState('chat')
   const [gptModel, setGptModel] = useState('5.6-sol')
   const [gptEffort, setGptEffort] = useState('xhigh')
+  const [gptSpeed, setGptSpeed] = useState('standard')
   const [gptSources, setGptSources] = useState(false)
   const [clModel, setClModel] = useState('auto')
   const [clEffort, setClEffort] = useState('max')
@@ -164,7 +174,13 @@ export default function NewResearchScreen() {
         : { mode: pplxMode }
     }
     if (provider === 'aistudio')   body.options = { model: aiModel }
-    if (provider === 'chatgpt')    body.options = { mode: gptMode, model: gptModelValue, effort: gptEffortValue, sources: gptSources }
+    if (provider === 'chatgpt')    body.options = {
+      mode: gptMode,
+      model: gptModelValue,
+      effort: gptEffortValue,
+      ...(gptMode === 'work' ? { speed: gptSpeed } : {}),
+      sources: gptSources,
+    }
     if (provider === 'claude') {
       // «Авто» — model/effort/thinking не шлём вовсе: CS трактует отсутствие
       // как «не трогать селектор» (модель/уровень аккаунта sticky).
@@ -237,6 +253,7 @@ export default function NewResearchScreen() {
     if (/pplx_mode_switch_failed/.test(s)) return 'Не удалось переключить режим Perplexity — UI мог измениться.'
     if (/chatgpt_mode_select_failed/.test(s)) return 'Не удалось переключить ChatGPT между Chat и Work. Запрос не отправлен.'
     if (/chatgpt_effort_select_failed/.test(s)) return 'Не удалось выбрать запрошенный уровень интеллекта ChatGPT. Запрос не отправлен с другим уровнем.'
+    if (/chatgpt_speed_select_failed/.test(s)) return 'Не удалось выбрать скорость Work. Запрос не отправлен со старой настройкой.'
     // Модель не выбралась — общий контракт fatal-if-explicit (claude/chatgpt/pplx).
     if (/_model_select_failed/.test(s)) return 'Не удалось выбрать запрошенную модель на странице (UI мог измениться). Повтори или открой вкладку и проверь.'
     if (/claude_model_select_failed|chatgpt_model_select_failed|pplx_model_select_failed/.test(s)) return 'Модель не переключилась — повтори запуск.'
@@ -388,6 +405,17 @@ export default function NewResearchScreen() {
                   <label className="block text-xs text-zinc-500 mb-1">Интеллект</label>
                   <Select value={gptEffortValue} onChange={setGptEffort} options={gptEffortOptions} compact hideHint />
                 </div>
+                {gptMode === 'work' && (
+                  <div className="flex-1 min-w-0">
+                    <label className="block text-xs text-zinc-500 mb-1">Скорость</label>
+                    <Select value={gptSpeed} onChange={setGptSpeed} options={CHATGPT_WORK_SPEEDS} compact hideHint />
+                  </div>
+                )}
+              </div>
+              <div className={`text-xs ${gptMode === 'work' ? 'text-amber-500/80' : 'text-zinc-600'}`}>
+                {gptMode === 'work'
+                  ? 'Work расходует недельную квоту; «Быстро» расходует её заметно быстрее.'
+                  : 'Chat не расходует недельную квоту Work.'}
               </div>
               {/* Источники парсятся всегда; чекбокс решает, включать ли их
                   блоком в текст ответа (default: чистый текст). */}

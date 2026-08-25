@@ -5,6 +5,13 @@ import { useAppSettingsSection } from '../lib/appSettings'
 
 const DEFAULTS = {
   preferred_lang: 'ru',
+  learning_enabled: true,
+  learning_target_lang: 'ru',
+  learning_auto_pause: false,
+  learning_subtitle_position: 'bottom',
+  learning_controls_mirrored: false,
+  learning_translation_mode: 'always',
+  learning_hide_native_subtitles: true,
   engine: 'gemini',
   with_comments: false,
   target: 'aistudio',
@@ -64,6 +71,55 @@ export default function YouTubeSettings() {
           </ControlRow>
           <ControlRow label="Комментарии" hint="Добавлять комментарии к тексту перед отправкой в AI.">
             <Checkbox checked={!!settings.with_comments} onChange={v => state.patch({ with_comments: v })} label="Добавлять по умолчанию" />
+          </ControlRow>
+          <ControlRow label="Интерактивный слой" hint="Включается штатной кнопкой CC в плеере YouTube.">
+            <Checkbox checked={!!settings.learning_enabled} onChange={v => state.patch({ learning_enabled: v })} label="Включён" />
+          </ControlRow>
+          <ControlRow label="Azure Translator" hint="Ключ хранится только локально и не передаётся расширению.">
+            <span className={`text-sm ${settings.translator_configured ? 'text-emerald-400' : 'text-amber-300'}`}>
+              {settings.translator_configured
+                ? `Проверен${settings.translator_region ? ` · ${settings.translator_region}` : ''}`
+                : 'Не настроен'}
+            </span>
+          </ControlRow>
+          <ControlRow label="Язык перевода" hint="Исходный язык берётся из выбранной дорожки YouTube.">
+            <div className="w-56" data-setting="youtube-learning-target-language">
+              <Select compact hideHint value={settings.learning_target_lang} onChange={v => state.patch({ learning_target_lang: v })} options={[
+                { id: 'ru', label: 'Русский' },
+                { id: 'en', label: 'English' },
+                { id: 'de', label: 'Deutsch' },
+                { id: 'es', label: 'Español' },
+                { id: 'fr', label: 'Français' },
+                { id: 'it', label: 'Italiano' },
+                { id: 'pt', label: 'Português' },
+                { id: 'uk', label: 'Українська' },
+              ]} />
+            </div>
+          </ControlRow>
+          <ControlRow label="Показывать перевод" hint="При наведении сохраняет видео чистым; «Всегда» показывает обе строки постоянно.">
+            <div className="w-56">
+              <Select compact hideHint value={settings.learning_translation_mode} onChange={v => state.patch({ learning_translation_mode: v })} options={[
+                { id: 'always', label: 'Всегда' },
+                { id: 'hover', label: 'При наведении' },
+              ]} />
+            </div>
+          </ControlRow>
+          <ControlRow label="Позиция субтитров">
+            <div className="w-56">
+              <Select compact hideHint value={settings.learning_subtitle_position} onChange={v => state.patch({ learning_subtitle_position: v })} options={[
+                { id: 'bottom', label: 'Снизу' },
+                { id: 'top', label: 'Сверху' },
+              ]} />
+            </div>
+          </ControlRow>
+          <ControlRow label="Автопауза" hint="Останавливать видео в конце каждой реплики.">
+            <Checkbox checked={!!settings.learning_auto_pause} onChange={v => state.patch({ learning_auto_pause: v })} label="Включена" />
+          </ControlRow>
+          <ControlRow label="Стороны управления" hint="Меняет местами навигацию по репликам и настройки.">
+            <Checkbox checked={!!settings.learning_controls_mirrored} onChange={v => state.patch({ learning_controls_mirrored: v })} label="Поменять местами" />
+          </ControlRow>
+          <ControlRow label="Родные субтитры YouTube" hint="Когда слой SC активен, родной текст скрывается, чтобы строки не дублировались.">
+            <Checkbox checked={!!settings.learning_hide_native_subtitles} onChange={v => state.patch({ learning_hide_native_subtitles: v })} label="Скрывать" />
           </ControlRow>
         </SettingsCard>
       </Section>

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SC Browser Parser",
-  "version": "1.4.0",
-  "description": "SC Browser Parser — экспорт диалогов с Gemini Studio, Perplexity, Claude и ChatGPT, плюс кнопка «забрать в sc-desktop» на карточках YouTube. Браузерный канал парсинга sc-desktop.",
+  "version": "1.6.0",
+  "description": "SC Browser Parser — экспорт AI-диалогов, YouTube-парсинг и интерактивные двуязычные субтитры со словарём SC Desktop.",
   "permissions": [
     "activeTab",
     "tabs",
@@ -30,6 +30,10 @@
       "128": "images/icon128.png"
     }
   },
+  "options_ui": {
+    "page": "study/index.html",
+    "open_in_tab": true
+  },
   "icons": {
     "16": "images/icon16.png",
     "32": "images/icon32.png",
@@ -40,6 +44,10 @@
     {
       "resources": ["images/icon16.png", "images/icon32.png", "images/icon48.png", "images/icon128.png"],
       "matches": ["https://*/*"]
+    },
+    {
+      "resources": ["youtube-main-bridge.js"],
+      "matches": ["https://www.youtube.com/*", "https://m.youtube.com/*"]
     }
   ],
   "background": {
@@ -84,6 +92,7 @@
       ],
       "js": [
         "research-badge.js",
+        "research-tab-policy.js",
         "perplexity-research.js"
       ],
       "run_at": "document_idle"
@@ -95,6 +104,7 @@
       "js": [
         "settings.js",
         "research-badge.js",
+        "research-tab-policy.js",
         "chatgpt-research.js"
       ],
       "run_at": "document_idle"
@@ -109,6 +119,7 @@
         "claude-content.js",
         "research-badge.js",
         "claude-autoscrape.js",
+        "research-tab-policy.js",
         "claude-research.js"
       ],
       "run_at": "document_idle"
@@ -121,7 +132,11 @@
       "js": [
         "logger.js",
         "settings.js",
-        "youtube-content.js"
+        "pill-event-guard.js",
+        "youtube-content.js",
+        "learning-store.js",
+        "youtube-learning-utils.js",
+        "youtube-learning.js"
       ],
       "run_at": "document_idle"
     }

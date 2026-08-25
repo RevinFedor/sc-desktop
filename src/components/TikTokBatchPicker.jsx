@@ -1,6 +1,7 @@
 import React, {
   useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef,
 } from 'react'
+import { Virtuoso } from 'react-virtuoso'
 import {
   startTiktokBatchTranscribe, watchJob,
 } from '../lib/jobs'
@@ -367,7 +368,7 @@ const TikTokBatchPicker = forwardRef(function TikTokBatchPicker({
       </div>
 
       {/* List */}
-      <div className="border-y border-zinc-800 divide-y divide-zinc-900 max-h-[400px] overflow-auto">
+      <div data-tiktok-video-list className="border-y border-zinc-800 overflow-hidden">
         {!loaded && (
           <div className="px-4 py-6 text-center text-zinc-600 italic" style={{ fontSize: '14px' }}>
             Загружаем список…
@@ -378,16 +379,26 @@ const TikTokBatchPicker = forwardRef(function TikTokBatchPicker({
             {search ? 'Ничего не найдено' : 'Канал пуст — сделайте Sync new'}
           </div>
         )}
-        {filtered.map(v => (
-          <VideoRow
-            key={v.video_id}
-            video={v}
-            inSel={selected.has(v.video_id) || chipsSet.has(v.video_id)}
-            done={!!v.transcript_path}
-            filtered={filtered}
-            onToggle={toggleVideo}
+        {loaded && filtered.length > 0 && (
+          <Virtuoso
+            style={{ height: Math.min(400, Math.max(64, filtered.length * 54)) }}
+            data={filtered}
+            defaultItemHeight={54}
+            increaseViewportBy={160}
+            computeItemKey={(_index, video) => video.video_id}
+            itemContent={(_index, video) => (
+              <div data-tiktok-video-row className="border-b border-zinc-900 last:border-b-0">
+                <VideoRow
+                  video={video}
+                  inSel={selected.has(video.video_id) || chipsSet.has(video.video_id)}
+                  done={!!video.transcript_path}
+                  filtered={filtered}
+                  onToggle={toggleVideo}
+                />
+              </div>
+            )}
           />
-        ))}
+        )}
       </div>
 
       {/* Controls */}

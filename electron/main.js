@@ -27,11 +27,18 @@ if (process.platform === 'darwin') {
 const jobRunner = require('./job-runner')
 const indexJob = require('./index-job')
 const db = require('./database')
+const dbRead = require('./database-read-client')
+const {
+  syncTelegramFolder,
+  setTelegramAutoForSources,
+  stopTelegramFinalizer,
+} = require('./telegram-finalizer-client')
 const { embedQuery } = require('./embedder')
 const { assembleText } = require('./assemble')
 const {
   startTelegramAutoScheduler,
   stopTelegramAutoScheduler,
+  setTelegramAutoEnabled,
   clearTelegramAutoSessionBlock,
 } = require('./telegram-auto')
 const { startMobileApiServer } = require('./mobile-api-server')
@@ -39,11 +46,29 @@ const {
   createTelegramNotificationService,
 } = require('./telegram-notification-service')
 const {
+  startServer: startBrowserBridge,
+  listExternalJobsForUi,
+} = require('./browser-bridge')
+const {
   publicAppSettings,
   patchAppSettings,
 } = require('./app-settings')
 
 const isDev = process.env.NODE_ENV === 'development'
+const isE2E = process.env.SC_DESKTOP_E2E === '1'
+const rendererLiveSourceByWebContents = new Map()
+
+async function readDb(method, args, fallback) {
+  try {
+    return await dbRead.request(method, ...(args || []))
+  } catch (err) {
+    // Preserve every existing flow if a packaged worker fails to load. This is
+    // a loud recovery path, not the normal architecture.
+    console.error(`[DbReadWorker] ${method} failed; falling back to main`, err)
+    return fallback()
+  }
+}
+
 const isPrimaryInstance = isDev || app.requestSingleInstanceLock()
 if (!isPrimaryInstance) {
   console.log('[Startup] Another production SC Desktop instance owns the app lock; exiting')
@@ -124,42 +149,64 @@ function createWindow() {
   }
 
   // Forward job events to the renderer.
-  jobRunner.subscribe(job => {
+  const offJobUpdates = jobRunner.subscribe(job => {
     perfDiagnostics.noteJobUpdate(job, 'jobRunner')
     if (!win.isDestroyed()) win.webContents.send('job:update', job)
+  }, {
+    includeLiveItems: job => (
+      Number(rendererLiveSourceByWebContents.get(win.webContents.id)) === Number(job.source_id)
+    ),
   })
-  indexJob.subscribe(job => {
+  const offIndexUpdates = indexJob.subscribe(job => {
     perfDiagnostics.noteJobUpdate(job, 'indexJob')
     if (!win.isDestroyed()) win.webContents.send('job:update', job)
   })
+  win.once('closed', () => {
+    rendererLiveSourceByWebContents.delete(win.webContents.id)
+    try { offJobUpdates() } catch {}
+    try { offIndexUpdates() } catch {}
+  })
 }
 
-ipcMain.handle('jobs:list', () => jobRunner.listJobs())
+ipcMain.handle('jobs:list', async () => {
+  const historyRows = await readDb('activityHistoryRows', [], () => null)
+  return jobRunner.listJobs(historyRows)
+})
+ipcMain.handle('jobs:setLiveSource', (event, sourceId) => {
+  const id = Number(sourceId)
+  if (Number.isFinite(id) && id > 0) {
+    rendererLiveSourceByWebContents.set(event.sender.id, id)
+    const snapshots = jobRunner.liveSnapshotsForSource(id)
+    for (const snapshot of snapshots) {
+      try { event.sender.send('job:update', snapshot) } catch {}
+    }
+    return { ok: true, sourceId: id, jobs: snapshots.length }
+  }
+  rendererLiveSourceByWebContents.delete(event.sender.id)
+  return { ok: true, sourceId: null, jobs: 0 }
+})
 
 // ─── AI Studio MCP jobs — зеркало state'а из browser-bridge ──────────
 //
 // Bridge хранит RAM-only Map<jobId, state> которую расширение PATCH'ит
-// на каждый log-event. Renderer poll'ит через aistudio:listJobs (1.5s
-// в useAistudioJobs store). Также broadcast 'aistudio:update' в окно
-// чтобы избежать тикающего IPC-roundtrip каждую секунду — но poll-fallback
-// остаётся как страховка если push сломается.
-//
-// Path-based fetch использует http.get локального HTTP-сервера. Это
-// дёшево (loopback latency <1ms) и не блокирует Electron event loop.
-// Unified-источник: /external-jobs объединяет AI Studio (aim_…) + Claude/
-// Perplexity research (r…). Попап «Запущенные MCP» показывает всё внешнее.
+// на каждый log-event. Main берёт компактный snapshot прямо из того же
+// модуля и раз в 1.5с broadcast'ит его renderer'у. Не ходить отсюда HTTP на
+// собственный 53127: полный /external-jobs весит мегабайты из-за сохранённых
+// ответов, а loopback учитывается Activity Monitor как сеть в обе стороны.
+// Полные ответы запрашиваются только при открытии JobDetail.
 // Имя IPC-канала оставлено aistudio:* для обратной совместимости с renderer-
 // store (исторически), но содержимое теперь — все external-research jobs.
-async function fetchAistudioJobs() {
+async function fetchAistudioJobs({ full = false } = {}) {
+  if (isE2E) return { jobs: [] }
   try {
-    const r = await fetch('http://127.0.0.1:53127/external-jobs')
-    if (!r.ok) return { jobs: [] }
-    return await r.json()
+    return { jobs: listExternalJobsForUi({ summary: !full }) }
   } catch (e) {
     return { jobs: [], error: String(e?.message || e) }
   }
 }
-ipcMain.handle('aistudio:listJobs', () => fetchAistudioJobs())
+ipcMain.handle('aistudio:listJobs', (_evt, options) => fetchAistudioJobs({
+  full: options?.full === true,
+}))
 ipcMain.handle('aistudio:clearJob', async (_evt, payload) => {
   try {
     const r = await fetch('http://127.0.0.1:53127/aistudio-clear', {
@@ -264,7 +311,7 @@ function startAistudioBroadcast() {
   aistudioBroadcastTimer = setInterval(async () => {
     const wins = BrowserWindow.getAllWindows().filter(w => !w.isDestroyed())
     if (wins.length === 0) return
-    const { jobs } = await fetchAistudioJobs()
+    const { jobs } = await fetchAistudioJobs({ full: false })
     const serialized = JSON.stringify(jobs)
     if (serialized === lastSerialized) return // экономим IPC
     lastSerialized = serialized
@@ -276,7 +323,7 @@ function stopAistudioBroadcast() {
 }
 app.on('window-all-closed', () => stopAistudioBroadcast())
 app.whenReady().then(() => {
-  if (isPrimaryInstance) startAistudioBroadcast()
+  if (isPrimaryInstance && !isE2E) startAistudioBroadcast()
 })
 
 // ─── Telegram sessions / settings ─────────────────────────────────
@@ -333,9 +380,13 @@ function writeScSettings(next) {
 }
 
 ipcMain.handle('appSettings:get', () => publicAppSettings(readScSettingsStrict()))
-ipcMain.handle('appSettings:patch', (_evt, payload) => (
-  patchAppSettings(readScSettingsStrict, writeScSettings, payload)
-))
+ipcMain.handle('appSettings:patch', (_evt, payload) => {
+  const result = patchAppSettings(readScSettingsStrict, writeScSettings, payload)
+  if (payload?.section === 'telegram' && typeof payload?.patch?.auto_enabled === 'boolean') {
+    setTelegramAutoEnabled(result.auto_enabled)
+  }
+  return result
+})
 
 // The old interactive getUpdates/Instagram bot stays retired. Custom Terminal
 // still depends on the bot token for outbound completion alerts, so that
@@ -417,6 +468,7 @@ async function resolveTelegramTargetAllSessions(text, send) {
 }
 
 ipcMain.handle('tg:listSessions', async () => {
+  if (isE2E) return { sessions: [], active: null }
   return await listTelegramSessionsSnapshot()
 })
 
@@ -490,14 +542,18 @@ ipcMain.handle('tg:catchUpComments', (_evt, params) => {
 
 // Lightweight queries used by SourceDetail to render the comments chip
 // and decide whether the «Дотянуть комментарии» button should appear.
-ipcMain.handle('tg:countComments', (_evt, sourceId) => {
+ipcMain.handle('tg:countComments', async (_evt, sourceId) => {
   if (!sourceId) return 0
-  try { return db.countCommentsBySource(Number(sourceId)) } catch { return 0 }
+  try {
+    return await readDb('countCommentsBySource', [Number(sourceId)], () => db.countCommentsBySource(Number(sourceId)))
+  } catch { return 0 }
 })
 
-ipcMain.handle('tg:postsWithComments', (_evt, sourceId) => {
+ipcMain.handle('tg:postsWithComments', async (_evt, sourceId) => {
   if (!sourceId) return []
-  try { return db.listPostsWithComments(Number(sourceId)) } catch { return [] }
+  try {
+    return await readDb('listPostsWithComments', [Number(sourceId)], () => db.listPostsWithComments(Number(sourceId)))
+  } catch { return [] }
 })
 
 // ─── Telegram folders ─────────────────────────────────────────────
@@ -532,48 +588,54 @@ ipcMain.handle('tg:resolveFolder', async (_evt, payload) => {
     // переключении сессии во время резолва).
     const sessNow = res.tg_session
       || (readScSettings().telegram || {}).session || null
-    // Materialise: upsert sources, upsert folder, set folder_sources.
-    const sourceIds = []
+    // A Telegram folder can contain thousands of dialogs. Materialise the
+    // sources + join in the persistence worker; keep the old path solely as a
+    // loud capability-preserving fallback for packaging failures.
+    let persisted
+    try {
+      persisted = await syncTelegramFolder({
+        filter_id: f.filter_id,
+        title: f.title,
+        chats: f.chats || [],
+        tg_session: sessNow,
+      })
+    } catch (workerError) {
+      console.error('[FolderResolve] persistence worker failed; falling back to main', workerError)
+      const sourceIds = []
+      const sources = []
+      for (const chat of (f.chats || [])) {
+        try {
+          const id = db.upsertSource({
+            platform: 'telegram', handle: chat.handle,
+            display_name: chat.title || null,
+            external_id: chat.tg_id != null ? String(chat.tg_id) : null,
+            avatar_url: chat.avatar_path || null,
+            meta: { kind: chat.kind, username: chat.username || null, via_folder_id: f.filter_id },
+            is_explicit: false, tg_session: sessNow,
+          })
+          sourceIds.push(id)
+          sources.push({ id, handle: chat.handle })
+        } catch (error) {
+          console.error('[FolderResolve] fallback upsertSource failed', chat.handle, error)
+        }
+      }
+      const folderId = db.upsertFolder({ tg_filter_id: f.filter_id, title: f.title, tg_session: sessNow })
+      db.setFolderSources(folderId, sourceIds)
+      persisted = { folderId, sourceIds, sources, errors: [], fallback: true }
+    }
+    const sourceIdByHandle = new Map((persisted.sources || []).map(row => [String(row.handle), row.id]))
     const sourcesOut = []
     for (const chat of (f.chats || [])) {
       try {
-        const sid = db.upsertSource({
-          platform:     'telegram',
-          handle:       chat.handle,
-          display_name: chat.title || null,
-          external_id:  chat.tg_id != null ? String(chat.tg_id) : null,
-          avatar_url:   chat.avatar_path || null,
-          meta:         { kind: chat.kind, username: chat.username || null,
-                          via_folder_id: f.filter_id },
-          // Чаты из папок не "осознанные" — иначе sidebar засрётся всеми
-          // 12 каналами папки event'ов как explicit-row'ами. Они доступны
-          // через TelegramScreen → таб папки. is_explicit поднимается до 1
-          // только если юзер позже руками их фетчит.
-          is_explicit:  false,
-          tg_session:   sessNow,
-        })
-        sourceIds.push(sid)
-        sourcesOut.push({ id: sid, ...chat })
-      } catch (err) {
-        console.error('[FolderResolve] upsertSource failed', chat.handle, err)
+        const sourceId = sourceIdByHandle.get(String(chat.handle))
+        if (sourceId) sourcesOut.push({ id: sourceId, ...chat })
+      } catch {
       }
-    }
-    let folderId
-    try {
-      folderId = db.upsertFolder({
-        tg_filter_id: f.filter_id,
-        title:        f.title,
-        tg_session:   sessNow,
-      })
-      db.setFolderSources(folderId, sourceIds)
-    } catch (err) {
-      console.error('[FolderResolve] folder upsert failed', err)
-      return { ok: false, error: String(err && err.message || err) }
     }
     return {
       ok: true,
       folder: {
-        id:           folderId,
+        id:           persisted.folderId,
         tg_filter_id: f.filter_id,
         title:        f.title,
         sources:      sourcesOut,
@@ -600,10 +662,14 @@ ipcMain.handle('tg:refreshFolders', () => {
 
 // Reply-graph backfill for one Telegram source. Resolves the chat target
 // from sources.handle, then spawns the lightweight get_messages-based job.
-ipcMain.handle('tg:replyBackfill', (_e, { source_id, limit } = {}) => {
+ipcMain.handle('tg:replyBackfill', async (_e, { source_id, limit } = {}) => {
   try {
     if (!source_id) return { ok: false, error: 'source_id required' }
-    const s = db.getSource(Number(source_id))
+    const boundedLimit = Math.max(1, Math.min(Number(limit) || 5000, 50000))
+    const [s, pending] = await Promise.all([
+      readDb('getSource', [Number(source_id)], () => db.getSource(Number(source_id))),
+      readDb('listItemsMissingParent', [Number(source_id), 1], () => db.listItemsMissingParent(Number(source_id), 1)),
+    ])
     if (!s || s.platform !== 'telegram') {
       return { ok: false, error: 'not a telegram source' }
     }
@@ -612,7 +678,9 @@ ipcMain.handle('tg:replyBackfill', (_e, { source_id, limit } = {}) => {
     const id = jobRunner.startTelegramReplyBackfill({
       source_id: Number(source_id),
       target,
-      limit: limit ? Number(limit) : undefined,
+      limit: boundedLimit,
+      _known_empty: pending.length === 0,
+      _runtime_source: s,
     })
     return { ok: true, jobId: id }
   } catch (err) {
@@ -622,7 +690,9 @@ ipcMain.handle('tg:replyBackfill', (_e, { source_id, limit } = {}) => {
 
 // session-фильтр: TelegramScreen передаёт имя выбранной сессии — отдаём
 // только её папки (+legacy без привязки). Без аргумента — все (back-compat).
-ipcMain.handle('folder:list',         (_e, tgSession) => db.listFolders(tgSession || null))
+ipcMain.handle('folder:list', (_e, tgSession) => (
+  readDb('listFolders', [tgSession || null], () => db.listFolders(tgSession || null))
+))
 // Ручной пин чата к сессии из SourceDetail (бейдж сессии / конфликт).
 ipcMain.handle('sources:setSession',  (_e, { id, session }) => {
   if (!id) return { ok: false, error: 'id required' }
@@ -633,15 +703,24 @@ ipcMain.handle('sources:setSession',  (_e, { id, session }) => {
     return { ok: false, error: String(err && err.message || err) }
   }
 })
-ipcMain.handle('sources:setTelegramAuto', (_e, payload = {}) => {
+ipcMain.handle('sources:setTelegramAuto', async (_e, payload = {}) => {
   try {
-    return db.setTelegramAutoForSources(payload.source_ids || [], payload.patch || {})
+    return await setTelegramAutoForSources(payload)
   } catch (err) {
-    return { ok: false, error: String(err && err.message || err) }
+    console.error('[TelegramAuto] persistence worker failed; falling back to main', err)
+    try {
+      return db.setTelegramAutoForSources(payload.source_ids || [], payload.patch || {})
+    } catch (fallbackError) {
+      return { ok: false, error: String(fallbackError && fallbackError.message || fallbackError) }
+    }
   }
 })
-ipcMain.handle('folder:get',          (_e, id) => db.getFolder(Number(id)))
-ipcMain.handle('folder:listSources',  (_e, id) => db.listFolderSources(Number(id)))
+ipcMain.handle('folder:get', (_e, id) => (
+  readDb('getFolder', [Number(id)], () => db.getFolder(Number(id)))
+))
+ipcMain.handle('folder:listSources', (_e, id) => (
+  readDb('listFolderSources', [Number(id)], () => db.listFolderSources(Number(id)))
+))
 ipcMain.handle('folder:remove',       (_e, id) => { db.deleteFolder(Number(id)); return { ok: true } })
 ipcMain.handle('folder:updateParams', (_e, { id, patch }) => {
   if (!id || !patch) return { ok: false, error: 'id and patch required' }
@@ -653,14 +732,22 @@ ipcMain.handle('folder:updateParams', (_e, { id, patch }) => {
 // folder:fetch, but per-source min_id is read from the DB so each chat
 // gets only what's strictly newer than its cached tip. Source-less chats
 // (never fetched) fall back to last_n=200.
-ipcMain.handle('tg:catchUp', (_e, params) => {
+ipcMain.handle('tg:catchUp', async (_e, params) => {
   if (!params || !Array.isArray(params.source_ids) || params.source_ids.length === 0) {
     return { ok: false, error: 'source_ids required' }
   }
+  const contexts = await readDb(
+    'telegramRunContexts', [params.source_ids, true],
+    () => params.source_ids.map(id => {
+      const source = db.getSource(Number(id))
+      return source ? { ...source, max_external_id: db.maxExternalId(source.id) || 0 } : null
+    }).filter(Boolean),
+  )
+  const byId = new Map(contexts.map(row => [Number(row.id), row]))
   const groups = new Map()
   for (const sid of params.source_ids) {
     try {
-      const s = db.getSource(Number(sid))
+      const s = byId.get(Number(sid))
       if (!s || s.platform !== 'telegram' || !s.handle) continue
       if (s.tg_session_conflict) return { ok: false, error: `Выбери Telegram-аккаунт для «${s.display_name || s.handle}»` }
       if (!s.tg_session) return { ok: false, error: `У «${s.display_name || s.handle}» не выбран Telegram-аккаунт` }
@@ -668,9 +755,7 @@ ipcMain.handle('tg:catchUp', (_e, params) => {
       const group = groups.get(s.tg_session)
       group.source_ids.push(Number(sid))
       group.targets.push(s.handle)
-      let since = 0
-      try { since = db.maxExternalId(s.id) || 0 } catch {}
-      group.sinces.push(since)
+      group.sinces.push(Number(s.max_external_id) || 0)
     } catch {}
   }
   if (!groups.size) return { ok: false, error: 'no resolvable telegram sources' }
@@ -696,17 +781,22 @@ ipcMain.handle('tg:catchUp', (_e, params) => {
 
 // Sequential folder fetch over a chosen subset of its sources. Returns the
 // umbrella job id so the renderer can subscribe via onJobUpdate.
-ipcMain.handle('folder:fetch', (_e, params) => {
+ipcMain.handle('folder:fetch', async (_e, params) => {
   if (!params || !Array.isArray(params.source_ids) || params.source_ids.length === 0) {
     return { ok: false, error: 'source_ids required' }
   }
   // Resolve each source_id → telegram handle the Python side speaks.
+  const contexts = await readDb(
+    'telegramRunContexts', [params.source_ids, false],
+    () => params.source_ids.map(id => db.getSource(Number(id))).filter(Boolean),
+  )
+  const byId = new Map(contexts.map(row => [Number(row.id), row]))
   const targets = []
   const sourceIds = []
   let tgSession = null
   for (const sid of params.source_ids) {
     try {
-      const s = db.getSource(Number(sid))
+      const s = byId.get(Number(sid))
       if (s && s.platform === 'telegram' && s.handle) {
         if (s.tg_session_conflict) return { ok: false, error: `Выбери Telegram-аккаунт для «${s.display_name || s.handle}»` }
         if (!s.tg_session) return { ok: false, error: `У «${s.display_name || s.handle}» не выбран Telegram-аккаунт` }
@@ -771,12 +861,12 @@ ipcMain.handle('tg:searchDialogs', async (_evt, payload) => {
 // Two channels: `tg:index` kicks off a job and returns immediately, status
 // updates flow back through `job:update`. `tg:indexStatus` is a one-shot read
 // for the IndexButton on mount / before any event fires.
-ipcMain.handle('tg:index', (_evt, { sourceId, limit }) => {
+ipcMain.handle('tg:index', async (_evt, { sourceId, limit }) => {
   try {
     const sid = Number(sourceId)
     const t0 = Date.now()
     console.log(`[tg:index] request source #${sid} limit=${limit || 'full'}`)
-    const result = indexJob.start({ sourceId, limit: limit || null, origin: 'manual-ipc' })
+    const result = await indexJob.start({ sourceId, limit: limit || null, origin: 'manual-ipc' })
     if (result && typeof result === 'object' && result.noop) {
       console.log(`[tg:index] source #${sid} noop reason=${result.reason} total_ms=${Date.now() - t0}`)
       return { ok: true, noop: true, reason: result.reason }
@@ -788,20 +878,25 @@ ipcMain.handle('tg:index', (_evt, { sourceId, limit }) => {
     // index job id, and only when an index job actually started. If semantic
     // index is already complete (`noop`), a hidden Telethon job on every
     // "Index" click is just lag with no user-visible indexing work.
-    setImmediate(() => {
+    if (!isE2E) setImmediate(async () => {
       try {
         const pendingStarted = Date.now()
-        const pending = db.listItemsMissingParent(sid, 1)
+        const pending = await readDb(
+          'listItemsMissingParent', [sid, 1],
+          () => db.listItemsMissingParent(sid, 1),
+        )
         console.log(`[tg:index] reply-backfill pending-check source #${sid} rows=${pending.length} took ${Date.now() - pendingStarted}ms`)
         if (!pending.length) return
         const sourceStarted = Date.now()
-        const s = db.getSource(sid)
+        const s = await readDb('getSource', [sid], () => db.getSource(sid))
         console.log(`[tg:index] reply-backfill source-read source #${sid} took ${Date.now() - sourceStarted}ms`)
         if (s && s.platform === 'telegram' && s.handle) {
           try {
             jobRunner.startTelegramReplyBackfill({
               source_id: sid,
               target: s.handle,
+              limit: 5000,
+              _runtime_source: s,
             })
           } catch (err) {
             // Expected when a tg_fetch is already running for this source.
@@ -821,9 +916,9 @@ ipcMain.handle('tg:index', (_evt, { sourceId, limit }) => {
   }
 })
 
-ipcMain.handle('tg:indexStatus', (_evt, sourceId) => {
+ipcMain.handle('tg:indexStatus', async (_evt, sourceId) => {
   try {
-    return indexJob.statusForSource(sourceId)
+    return await indexJob.statusForSource(sourceId)
   } catch (err) {
     console.error('[tg:indexStatus] failed', err)
     return { state: 'idle', done: 0, total: 0, error: String(err) }
@@ -841,9 +936,10 @@ ipcMain.handle('tg:search', async (_evt, { sourceId, query, limit }) => {
   try {
     if (!query || !query.trim()) return { results: [] }
     const q = await embedQuery(query)
-    const results = db.hybridSearch({
+    const params = {
       query, query_embedding: q, source_id: sourceId, limit: limit || 10,
-    })
+    }
+    const results = await readDb('hybridSearch', [params], () => db.hybridSearch(params))
     return { results }
   } catch (err) {
     console.error('[tg:search] failed', err)
@@ -921,7 +1017,35 @@ function _checkApifyToken(token) {
   })
 }
 
-ipcMain.handle('ig:getSettings', async () => {
+let apifyTokenCheckCache = { token: null, result: null, expiresAt: 0, promise: null }
+function _checkApifyTokenCached(token, { force = false } = {}) {
+  const clean = String(token || '').trim()
+  if (isE2E) {
+    return Promise.resolve({ status: clean ? 'unchecked' : 'missing', ok: clean ? null : false, message: 'validation disabled in E2E' })
+  }
+  const now = Date.now()
+  if (!force && apifyTokenCheckCache.token === clean) {
+    if (apifyTokenCheckCache.promise) return apifyTokenCheckCache.promise
+    if (apifyTokenCheckCache.result && apifyTokenCheckCache.expiresAt > now) {
+      return Promise.resolve(apifyTokenCheckCache.result)
+    }
+  }
+  const promise = _checkApifyToken(clean).then(result => {
+    if (apifyTokenCheckCache.token === clean) {
+      apifyTokenCheckCache.result = result
+      apifyTokenCheckCache.expiresAt = Date.now() + 5 * 60_000
+      apifyTokenCheckCache.promise = null
+    }
+    return result
+  }, error => {
+    if (apifyTokenCheckCache.token === clean) apifyTokenCheckCache.promise = null
+    throw error
+  })
+  apifyTokenCheckCache = { token: clean, result: null, expiresAt: 0, promise }
+  return promise
+}
+
+ipcMain.handle('ig:getSettings', async (_event, options = {}) => {
   const s = readScSettingsStrict()
   const ig = s.instagram || {}
   let legacyToken = null
@@ -932,7 +1056,13 @@ ipcMain.handle('ig:getSettings', async () => {
   } catch {}
   const backends = _readIgBackends(ig)
   const token = ig.apify_token || legacyToken || null
-  const apifyTokenCheck = await _checkApifyToken(token)
+  const apifyTokenCheck = options.validateToken === true
+    ? await _checkApifyTokenCached(token, { force: options.force === true })
+    : {
+        status: token ? 'unchecked' : 'missing',
+        ok: token ? null : false,
+        message: token ? 'validation not requested' : 'token not set',
+      }
   return {
     metadata_backend:   backends.metadata_backend,
     transcribe_backend: backends.transcribe_backend,
@@ -972,6 +1102,7 @@ ipcMain.handle('ig:setApifyToken', (_evt, token) => {
   settings.instagram = { ...(settings.instagram || {}), apify_token: clean }
   const r = writeScSettings(settings)
   if (!r.ok) return r
+  apifyTokenCheckCache = { token: null, result: null, expiresAt: 0, promise: null }
   // Wipe the legacy plaintext file so the CLI helper can't pick up an old
   // value that contradicts what the UI just wrote.
   try {
@@ -1196,7 +1327,7 @@ ipcMain.handle('ig:batchTranscribe', (_evt, params) => {
 // up in transcripts/instagram/. Two calling shapes match the YT version:
 //   { jobId, action }                                  — for batch jobs
 //   { source_id, shortcodes[], action }                — for ad-hoc selection
-ipcMain.handle('ig:assembleBatchTranscript', (_evt, payload) => {
+ipcMain.handle('ig:assembleBatchTranscript', async (_evt, payload) => {
   const action = payload?.action
   let row = null
   let sourceId = null
@@ -1234,6 +1365,30 @@ ipcMain.handle('ig:assembleBatchTranscript', (_evt, payload) => {
     originStartedAt = row.started_at
   } else {
     return { ok: false, error: 'either jobId or {source_id, shortcodes} required' }
+  }
+
+  let workerOutputPath = null
+  if (action === 'save') {
+    const dt = new Date((originStartedAt || Math.floor(Date.now() / 1000)) * 1000)
+    const date = dt.toISOString().slice(0, 10)
+    const tag = row?.id != null ? `job${row.id}` : `picker${externalIds.length}`
+    workerOutputPath = path.join(jobRunner.JOBS_DIR, `${date}_ig_batch_${tag}_combined.txt`)
+  }
+  try {
+    const result = await dbRead.request('selectedTranscriptsAssembly', {
+      sourceId,
+      externalIds,
+      action,
+      outputPath: workerOutputPath,
+    })
+    if (result?.ok && action === 'copy') {
+      clipboard.writeText(result.content || '')
+      const { content: _content, ...publicResult } = result
+      return publicResult
+    }
+    return result
+  } catch (workerError) {
+    console.error('[InstagramAssembly] worker failed; falling back to main', workerError)
   }
 
   let entries = []
@@ -1287,6 +1442,18 @@ ipcMain.handle('ig:assembleBatchTranscript', (_evt, payload) => {
 })
 
 // ─── YouTube single-video ────────────────────────────────────────
+async function readTextFileOffMain(filePath) {
+  if (!filePath) return { text: '', parts: 0, bytes: 0 }
+  return readDb('readTextFiles', [[filePath], { trim: false, separator: '' }], async () => {
+    try {
+      const text = await fs.promises.readFile(filePath, 'utf8')
+      return { text, parts: 1, bytes: Buffer.byteLength(text, 'utf8') }
+    } catch {
+      return { text: '', parts: 0, bytes: 0 }
+    }
+  })
+}
+
 ipcMain.handle('yt:lookupCache', (_evt, videoId) => {
   const row = jobRunner.lookupYoutubeCache(videoId)
   if (!row) return null
@@ -1298,13 +1465,13 @@ ipcMain.handle('yt:lookupCache', (_evt, videoId) => {
     parameters:   row.parameters_json ? JSON.parse(row.parameters_json) : null,
   }
 })
-ipcMain.handle('yt:copyCachedFile', (_evt, filePath) => {
-  if (!filePath || !fs.existsSync(filePath)) return { ok: false, error: 'File not found' }
+ipcMain.handle('yt:copyCachedFile', async (_evt, filePath) => {
   try {
-    const content = fs.readFileSync(filePath, 'utf8')
-    clipboard.writeText(content)
+    const result = await readTextFileOffMain(filePath)
+    if (!result.parts) return { ok: false, error: 'File not found' }
+    clipboard.writeText(result.text)
     jobRunner.playClipboardSound()
-    return { ok: true, bytes: content.length }
+    return { ok: true, bytes: result.bytes }
   } catch (err) {
     return { ok: false, error: String(err) }
   }
@@ -1317,8 +1484,9 @@ ipcMain.handle('yt:copyWithTimestamps', async (_evt, payload = {}) => {
   })
   if (!result?.ok) return result || { ok: false, error: 'Не удалось получить таймкоды' }
   try {
-    const content = fs.readFileSync(result.file_path, 'utf8')
-    clipboard.writeText(content)
+    const file = await readTextFileOffMain(result.file_path)
+    if (!file.parts) return { ok: false, error: 'File not found' }
+    clipboard.writeText(file.text)
     jobRunner.playClipboardSound()
     const opened = payload.openInSublime === false
       ? { ok: true, opener: null }
@@ -1327,8 +1495,8 @@ ipcMain.handle('yt:copyWithTimestamps', async (_evt, payload = {}) => {
     console.log(`[YouTube] timed transcript copied video=${String(payload.url || '').slice(-11)} cached=${result.cached ? 1 : 0} open=${opened.opener || 'no'}`)
     return {
       ok: true,
-      bytes: Buffer.byteLength(content, 'utf8'),
-      chars: content.length,
+      bytes: file.bytes,
+      chars: file.text.length,
       file_path: result.file_path,
       cached: !!result.cached,
       opener: opened.opener || null,
@@ -1352,13 +1520,13 @@ ipcMain.handle('rutube:lookupCache', (_evt, videoId) => {
     parameters:   row.parameters_json ? JSON.parse(row.parameters_json) : null,
   }
 })
-ipcMain.handle('rutube:copyCachedFile', (_evt, filePath) => {
-  if (!filePath || !fs.existsSync(filePath)) return { ok: false, error: 'File not found' }
+ipcMain.handle('rutube:copyCachedFile', async (_evt, filePath) => {
   try {
-    const content = fs.readFileSync(filePath, 'utf8')
-    clipboard.writeText(content)
+    const result = await readTextFileOffMain(filePath)
+    if (!result.parts) return { ok: false, error: 'File not found' }
+    clipboard.writeText(result.text)
     jobRunner.playClipboardSound()
-    return { ok: true, bytes: content.length }
+    return { ok: true, bytes: result.bytes }
   } catch (err) {
     return { ok: false, error: String(err) }
   }
@@ -1399,13 +1567,13 @@ ipcMain.handle('tk:lookupCache', (_evt, videoId) => {
     parameters:   row.parameters_json ? JSON.parse(row.parameters_json) : null,
   }
 })
-ipcMain.handle('tk:copyCachedFile', (_evt, filePath) => {
-  if (!filePath || !fs.existsSync(filePath)) return { ok: false, error: 'File not found' }
+ipcMain.handle('tk:copyCachedFile', async (_evt, filePath) => {
   try {
-    const content = fs.readFileSync(filePath, 'utf8')
-    clipboard.writeText(content)
+    const result = await readTextFileOffMain(filePath)
+    if (!result.parts) return { ok: false, error: 'File not found' }
+    clipboard.writeText(result.text)
     jobRunner.playClipboardSound()
-    return { ok: true, bytes: content.length }
+    return { ok: true, bytes: result.bytes }
   } catch (err) {
     return { ok: false, error: String(err) }
   }
@@ -1472,8 +1640,22 @@ function resolveLibraryPath(filePath) {
   return absolute
 }
 
-function localFileInfo(filePath) {
-  const absolute = resolveLibraryPath(filePath)
+function resolveAllowedPath(filePath, allowedRoots = [jobRunner.LIB_ROOT]) {
+  if (!filePath || typeof filePath !== 'string') return null
+  const absolute = path.isAbsolute(filePath)
+    ? path.resolve(filePath)
+    : path.resolve(jobRunner.LIB_ROOT, filePath)
+  for (const rawRoot of allowedRoots) {
+    if (!rawRoot) continue
+    const root = path.resolve(rawRoot)
+    const relative = path.relative(root, absolute)
+    if (!relative || (!relative.startsWith('..') && !path.isAbsolute(relative))) return absolute
+  }
+  return null
+}
+
+function localFileInfo(filePath, allowedRoots = [jobRunner.LIB_ROOT]) {
+  const absolute = resolveAllowedPath(filePath, allowedRoots)
   if (!absolute) return { present: false, bytes: 0, path: null }
   try {
     const stat = fs.statSync(absolute)
@@ -1493,7 +1675,9 @@ function parseJsonObject(value) {
 }
 
 function publicBoostyRow(row) {
-  const media = localFileInfo(row.media_path)
+  const storageConfig = jobRunner.getBoostyStorageConfig()
+  const media = localFileInfo(row.media_path, [jobRunner.LIB_ROOT, storageConfig.audio_dir])
+  const video = localFileInfo(row.video_path, [jobRunner.LIB_ROOT, storageConfig.video_dir])
   const transcript = localFileInfo(row.transcript_path)
   const srt = localFileInfo(row.transcript_path
     ? String(row.transcript_path).replace(/\.txt$/i, '.srt')
@@ -1519,6 +1703,9 @@ function publicBoostyRow(row) {
     media_path: media.present ? media.path : null,
     media_present: media.present,
     media_bytes: media.bytes,
+    video_path: video.present ? video.path : null,
+    video_present: video.present,
+    video_bytes: video.bytes,
     transcript_path: transcript.present ? transcript.path : null,
     transcript_present: transcript.present,
     transcript_bytes: transcript.bytes,
@@ -1533,8 +1720,13 @@ function publicBoostyRow(row) {
   }
 }
 
-ipcMain.handle('boosty:posts', (_evt, payload = {}) => {
+ipcMain.handle('boosty:posts', async (_evt, payload = {}) => {
   const sourceId = Number(payload.source_id)
+  try {
+    return await dbRead.request('boostyPosts', sourceId, jobRunner.getBoostyStorageConfig())
+  } catch (workerError) {
+    console.error('[Boosty] posts worker failed; falling back to main', workerError)
+  }
   const source = db.getSource(sourceId)
   if (!source || source.platform !== 'boosty') return { ok: false, error: 'Источник Boosty не найден' }
   const publicRows = db.listBoostyItems(sourceId).map(publicBoostyRow)
@@ -1557,7 +1749,9 @@ ipcMain.handle('boosty:posts', (_evt, payload = {}) => {
       known_videos_count: videos.length,
       duration_seconds: videos.reduce((sum, video) => sum + Number(video.duration_seconds || 0), 0),
       media_bytes: videos.reduce((sum, video) => sum + Number(video.media_bytes || 0), 0),
+      video_bytes: videos.reduce((sum, video) => sum + Number(video.video_bytes || 0), 0),
       media_present_count: videos.filter(video => video.media_present).length,
+      video_present_count: videos.filter(video => video.video_present).length,
       transcribed_count: videos.filter(video => video.transcript_present).length,
     }
   })
@@ -1573,6 +1767,8 @@ ipcMain.handle('boosty:posts', (_evt, payload = {}) => {
       transcribed: videos.filter(video => video.transcript_present).length,
       audio_files: videos.filter(video => video.media_present).length,
       audio_bytes: videos.reduce((sum, video) => sum + Number(video.media_bytes || 0), 0),
+      video_files: videos.filter(video => video.video_present).length,
+      video_bytes: videos.reduce((sum, video) => sum + Number(video.video_bytes || 0), 0),
       locked_posts: posts.filter(post => post.meta.access_state === 'locked').length,
       lost_posts: posts.filter(post => post.meta.access_state === 'lost').length,
     },
@@ -1585,9 +1781,10 @@ function deleteBoostyAudioForSource(sourceId, requested = null) {
   let removedFiles = 0
   const clearedIds = []
   const errors = []
+  const storageConfig = jobRunner.getBoostyStorageConfig()
   for (const row of rows) {
     if (!row.media_path) continue
-    const info = localFileInfo(row.media_path)
+    const info = localFileInfo(row.media_path, [jobRunner.LIB_ROOT, storageConfig.audio_dir])
     if (!info.path) {
       errors.push({ video_id: String(row.external_id), message: 'Путь аудио находится вне библиотеки' })
       continue
@@ -1621,6 +1818,7 @@ function boostyPlatformStorageSnapshot() {
   const sources = boostySourceIds()
   const mediaPaths = []
   const transcriptPaths = []
+  const videoPaths = []
   const thumbnailPaths = []
   const perSource = {}
   let textBytes = 0
@@ -1629,12 +1827,17 @@ function boostyPlatformStorageSnapshot() {
   for (const source of sources) {
     const breakdown = db.storageBreakdownForSource(source.id)
     const audio = sumExistingFiles(breakdown.media_paths)
+    const videos = sumExistingFiles(breakdown.video_paths)
     perSource[String(source.id)] = {
       audio_bytes: audio.bytes,
       audio_files: audio.present,
       audio_known: audio.total,
+      video_bytes: videos.bytes,
+      video_files: videos.present,
+      video_known: videos.total,
     }
     mediaPaths.push(...breakdown.media_paths)
+    videoPaths.push(...breakdown.video_paths)
     transcriptPaths.push(...breakdown.transcript_paths)
     thumbnailPaths.push(...breakdown.thumbnail_paths)
     textBytes += Number(breakdown.text_bytes || 0)
@@ -1643,28 +1846,85 @@ function boostyPlatformStorageSnapshot() {
   }
   const audio = sumExistingFiles(mediaPaths)
   const transcripts = sumExistingFiles(transcriptPaths)
+  const videos = sumExistingFiles(videoPaths)
   const thumbnails = sumExistingFiles(thumbnailPaths)
   return {
     ok: true,
     root: jobRunner.LIB_ROOT,
+    audio_root: jobRunner.getBoostyStorageConfig().audio_dir,
+    video_root: jobRunner.getBoostyStorageConfig().video_dir,
     sources: sources.length,
     audio,
+    videos,
     transcripts,
     thumbnails,
     text: { bytes: textBytes },
     index: { bytes: indexBytes, vectors: indexVectors },
     per_source: perSource,
-    total_bytes: audio.bytes + transcripts.bytes + thumbnails.bytes + textBytes + indexBytes,
+    total_bytes: audio.bytes + videos.bytes + transcripts.bytes + thumbnails.bytes + textBytes + indexBytes,
   }
 }
 
-ipcMain.handle('boosty:platformStorage', () => {
+ipcMain.handle('boosty:platformStorage', async () => {
   try {
-    return boostyPlatformStorageSnapshot()
+    const result = await dbRead.request('boostyPlatformStorage')
+    const storage = jobRunner.getBoostyStorageConfig()
+    return {
+      ...result,
+      root: jobRunner.LIB_ROOT,
+      audio_root: storage.audio_dir,
+      video_root: storage.video_dir,
+    }
   } catch (err) {
-    console.error('[Boosty] platform storage failed', err)
-    return { ok: false, error: String(err?.message || err) }
+    console.error('[Boosty] platform storage worker failed; falling back to main', err)
+    try { return boostyPlatformStorageSnapshot() }
+    catch (fallbackError) {
+      console.error('[Boosty] platform storage fallback failed', fallbackError)
+      return { ok: false, error: String(fallbackError?.message || fallbackError) }
+    }
   }
+})
+
+function nearestExistingDirectory(target) {
+  let current = path.resolve(target)
+  while (!fs.existsSync(current) && path.dirname(current) !== current) current = path.dirname(current)
+  return current
+}
+
+function storagePathInfo(target) {
+  const absolute = path.resolve(String(target || jobRunner.LIB_ROOT))
+  const probe = nearestExistingDirectory(absolute)
+  const stats = fs.statfsSync(probe)
+  return {
+    path: absolute,
+    probe,
+    exists: fs.existsSync(absolute),
+    free_bytes: Number(stats.bavail) * Number(stats.bsize),
+    total_bytes: Number(stats.blocks) * Number(stats.bsize),
+  }
+}
+
+ipcMain.handle('boosty:storageConfig', () => {
+  const config = jobRunner.getBoostyStorageConfig()
+  return {
+    ok: true,
+    ...config,
+    audio_disk: storagePathInfo(config.audio_dir),
+    video_disk: storagePathInfo(config.video_dir),
+  }
+})
+
+ipcMain.handle('storage:pathInfo', (_evt, target) => storagePathInfo(target))
+
+ipcMain.handle('storage:chooseDirectory', async (_evt, payload = {}) => {
+  const result = await dialog.showOpenDialog(BrowserWindow.getFocusedWindow() || undefined, {
+    title: String(payload.title || 'Выберите папку'),
+    defaultPath: payload.default_path ? String(payload.default_path) : undefined,
+    properties: ['openDirectory', 'createDirectory'],
+  })
+  return result.canceled || !result.filePaths?.[0]
+    ? { ok: false, canceled: true }
+    : { ok: true, path: result.filePaths[0] }
 })
 
 ipcMain.handle('boosty:deleteAudio', (_evt, payload = {}) => {
@@ -1696,24 +1956,26 @@ ipcMain.handle('boosty:deletePlatformAudio', () => {
   return result
 })
 
-ipcMain.handle('boosty:copyTranscripts', (_evt, payload = {}) => {
+ipcMain.handle('boosty:copyTranscripts', async (_evt, payload = {}) => {
   const sourceId = Number(payload.source_id)
   const ids = Array.isArray(payload.video_ids)
     ? [...new Set(payload.video_ids.map(String).filter(Boolean))]
     : []
   if (!sourceId || !ids.length) return { ok: false, error: 'Нечего копировать' }
-  const rows = db.listBoostyVideos(sourceId, ids)
-  const chunks = []
-  for (const row of rows) {
-    const info = localFileInfo(row.transcript_path)
-    if (!info.present) continue
-    try { chunks.push(fs.readFileSync(info.path, 'utf8')) } catch {}
-  }
-  if (!chunks.length) return { ok: false, error: 'Сохранённых расшифровок нет' }
-  const combined = chunks.join('\n\n' + '='.repeat(72) + '\n\n')
-  clipboard.writeText(combined)
+  const result = await readDb('boostyCopyText', [sourceId, ids], () => {
+    const chunks = []
+    for (const row of db.listBoostyVideos(sourceId, ids)) {
+      const info = localFileInfo(row.transcript_path)
+      if (!info.present) continue
+      try { chunks.push(fs.readFileSync(info.path, 'utf8')) } catch {}
+    }
+    const text = chunks.join('\n\n' + '='.repeat(72) + '\n\n')
+    return { text, parts: chunks.length, bytes: Buffer.byteLength(text, 'utf8') }
+  })
+  if (!result?.text) return { ok: false, error: 'Сохранённых расшифровок нет' }
+  clipboard.writeText(result.text)
   jobRunner.playClipboardSound()
-  return { ok: true, count: chunks.length, bytes: Buffer.byteLength(combined, 'utf8') }
+  return { ok: true, count: result.parts, bytes: result.bytes }
 })
 
 // Local file transcribe — paste an absolute path → AssemblyAI/Gemini → clipboard.
@@ -1739,13 +2001,14 @@ ipcMain.handle('yt:resumeBatch', (_evt, payload) => {
 // Used before starting a batch so the form can show "5 already transcribed".
 ipcMain.handle('yt:itemsState', (_evt, { source_id, video_ids }) => {
   if (!source_id || !Array.isArray(video_ids) || video_ids.length === 0) return []
-  const rows = db.getItemsByExternalIds(source_id, video_ids)
-  return rows.map(r => ({
-    external_id:    r.external_id,
-    transcript_path: r.transcript_path,
-    duration_seconds: r.duration_seconds,
-    title:          r.title,
-  }))
+  return readDb('youtubeItemsState', [source_id, video_ids], () => (
+    db.getItemsByExternalIds(source_id, video_ids).map(r => ({
+      external_id: r.external_id,
+      transcript_path: r.transcript_path,
+      duration_seconds: r.duration_seconds,
+      title: r.title,
+    }))
+  ))
 })
 
 // Cross-source bulk lookup for sourceless contexts (YouTube search picker).
@@ -1754,18 +2017,16 @@ ipcMain.handle('yt:itemsState', (_evt, { source_id, video_ids }) => {
 // already-fetched channel shows ✓ and skips re-transcription.
 ipcMain.handle('yt:itemsStateGlobal', (_evt, { video_ids }) => {
   if (!Array.isArray(video_ids) || video_ids.length === 0) return []
-  const map = db.findYoutubeTranscriptsByVideoIds(video_ids)
-  const out = []
-  for (const [vid, hit] of map) {
-    out.push({
-      external_id:     vid,
-      transcript_path: hit.file_path,
-      origin:          hit.origin,           // 'items' | 'jobs'
-      source_id:       hit.source_id,
-      source_handle:   hit.source_handle || null,
-    })
-  }
-  return out
+  return readDb('youtubeItemsStateGlobal', [video_ids], () => {
+    const out = []
+    for (const [vid, hit] of db.findYoutubeTranscriptsByVideoIds(video_ids)) {
+      out.push({
+        external_id: vid, transcript_path: hit.file_path, origin: hit.origin,
+        source_id: hit.source_id, source_handle: hit.source_handle || null,
+      })
+    }
+    return out
+  })
 })
 
 // Bulk per-video comments-state lookup. Picker uses it to render the 💬✓
@@ -1775,26 +2036,23 @@ ipcMain.handle('yt:itemsStateGlobal', (_evt, { video_ids }) => {
 //                    include_replies, count_total}.
 ipcMain.handle('yt:itemsCommentsState', (_evt, { video_ids }) => {
   if (!Array.isArray(video_ids) || video_ids.length === 0) return []
-  const map = db.findYoutubeCommentsByVideoIds(video_ids)
-  const out = []
-  for (const [vid, hit] of map) {
-    out.push({
-      external_id:     vid,
-      file_path:       hit.file_path,
-      finished_at:     hit.finished_at,
-      sort:            hit.sort,
-      limit:           hit.limit,
-      include_replies: !!hit.include_replies,
-      count_total:     hit.count_total,
-    })
-  }
-  return out
+  return readDb('youtubeItemsCommentsState', [video_ids], () => {
+    const out = []
+    for (const [vid, hit] of db.findYoutubeCommentsByVideoIds(video_ids)) {
+      out.push({
+        external_id: vid, file_path: hit.file_path, finished_at: hit.finished_at,
+        sort: hit.sort, limit: hit.limit, include_replies: !!hit.include_replies,
+        count_total: hit.count_total,
+      })
+    }
+    return out
+  })
 })
 
 // Build a combined transcript blob.  Two calling shapes:
 //   { jobId, action }                          — for batch jobs (live or historical)
 //   { source_id, video_ids[], action }         — for ad-hoc selection (picker)
-ipcMain.handle('yt:assembleBatchTranscript', (_evt, payload) => {
+ipcMain.handle('yt:assembleBatchTranscript', async (_evt, payload) => {
   const action = payload?.action
   let row = null
   let sourceId = null
@@ -1834,6 +2092,36 @@ ipcMain.handle('yt:assembleBatchTranscript', (_evt, payload) => {
     originStartedAt = row.started_at
   } else {
     return { ok: false, error: 'either jobId or {source_id, video_ids} required' }
+  }
+
+  let workerParams = {}
+  try { workerParams = row?.parameters_json ? JSON.parse(row.parameters_json) : {} } catch {}
+  let workerOutputPath = null
+  if (action === 'save') {
+    const dt = new Date((originStartedAt || Math.floor(Date.now() / 1000)) * 1000)
+    const date = dt.toISOString().slice(0, 10)
+    const tag = row?.id != null ? `job${row.id}` : `picker${videoIds.length}`
+    workerOutputPath = path.join(jobRunner.JOBS_DIR, `${date}_yt_batch_${tag}_combined.txt`)
+  }
+  try {
+    const result = await dbRead.request('youtubeBatchAssembly', {
+      sourceId,
+      videoIds,
+      params: workerParams,
+      liveLog: row?.yt_batch?.log || null,
+      action,
+      outputPath: workerOutputPath,
+    })
+    if (result?.ok && action === 'copy') {
+      clipboard.writeText(result.content || '')
+      const { content: _content, ...publicResult } = result
+      return publicResult
+    }
+    return result
+  } catch (workerError) {
+    // Keep the existing synchronous implementation below as a loud recovery
+    // path if the packaged read worker cannot load.
+    console.error('[YouTubeAssembly] worker failed; falling back to main', workerError)
   }
 
   // Pull transcript_path + title via items table (works for completed jobs
@@ -1951,25 +2239,47 @@ ipcMain.handle('yt:assembleBatchTranscript', (_evt, payload) => {
 // Аргумент: голый id (legacy, limit=20) или {id, limit} — «История парсинга»
 // докручивает limit кнопкой «показать ещё», иначе записи старше 20-й
 // недостижимы (HIGH-1 аудита: SQL LIMIT прятал хвост истории насовсем).
-ipcMain.handle('jobs:listForSource', (_e, payload) => {
+ipcMain.handle('jobs:listForSource', async (_e, payload) => {
   const obj   = (typeof payload === 'object' && payload != null) ? payload : null
   const id    = obj ? obj.id : payload
   const limit = obj && Number.isFinite(obj.limit) ? obj.limit : 20
-  return db.listJobsForSource(id, limit)
-    .filter(j => j.type !== 'yt_channel_fetch' && j.type !== 'tk_channel_fetch')
+  const rows = await readDb(
+    'listJobsForSource', [id, limit],
+    () => db.listJobsForSource(id, limit),
+  )
+  return rows.filter(j => j.type !== 'yt_channel_fetch' && j.type !== 'tk_channel_fetch')
+})
+ipcMain.handle('jobs:listForSourcePage', async (_e, payload = {}) => {
+  const id = payload.id ?? payload.sourceId
+  const options = { limit: payload.limit || 20, cursor: payload.cursor || null }
+  const page = await readDb(
+    'listJobsForSourcePage', [id, options],
+    () => db.listJobsForSourcePage(id, options),
+  )
+  return {
+    ...page,
+    jobs: (page.jobs || []).filter(j => j.type !== 'yt_channel_fetch' && j.type !== 'tk_channel_fetch'),
+  }
 })
 
-ipcMain.handle('jobs:cancel', (_evt, id) => {
+ipcMain.handle('jobs:cancel', (_evt, payload) => {
+  const request = payload && typeof payload === 'object' ? payload : { id: payload }
   // Historic ids are not cancellable — they're already finished.
-  if (typeof id === 'string' && id.startsWith('db-')) return false
-  return jobRunner.cancelJob(id)
+  if (typeof request.id === 'string' && request.id.startsWith('db-')) return false
+  return jobRunner.cancelJob(request.id, {
+    identity: request.identity || null,
+    type: request.type || null,
+  })
 })
 
-ipcMain.handle('jobs:detail', (_evt, id) => jobRunner.getJobDetail(id))
+ipcMain.handle('jobs:detail', (_evt, payload) => {
+  const request = payload && typeof payload === 'object' ? payload : { id: payload }
+  return jobRunner.getJobDetail(request.id, { identity: request.identity || null })
+})
 
-ipcMain.handle('jobs:setAutoIndexAfterFetch', (_evt, { jobId, enabled } = {}) => {
+ipcMain.handle('jobs:setAutoIndexAfterFetch', async (_evt, { jobId, enabled } = {}) => {
   try {
-    return jobRunner.setAutoIndexAfterFetch(jobId, enabled === true)
+    return await jobRunner.setAutoIndexAfterFetch(jobId, enabled === true)
   } catch (err) {
     console.error('[Jobs] setAutoIndexAfterFetch failed', err)
     return { ok: false, error: String(err && err.message || err) }
@@ -1982,12 +2292,16 @@ ipcMain.handle('clipboard:writeText', (_evt, text) => {
   return { ok: true, bytes: Buffer.byteLength(String(text || ''), 'utf8') }
 })
 
-ipcMain.handle('jobs:copyFile', (_evt, filePath) => {
-  if (!filePath || !fs.existsSync(filePath)) return { ok: false, error: 'File not found' }
+ipcMain.handle('jobs:copyFile', async (_evt, filePath) => {
+  if (!filePath) return { ok: false, error: 'File not found' }
   try {
-    const content = fs.readFileSync(filePath, 'utf8')
-    clipboard.writeText(content)
-    return { ok: true, bytes: content.length }
+    const result = await readDb('readTextFiles', [[filePath], { trim: false, separator: '' }], async () => {
+      const text = await fs.promises.readFile(filePath, 'utf8')
+      return { text, parts: 1, bytes: Buffer.byteLength(text, 'utf8') }
+    })
+    if (!result?.parts) return { ok: false, error: 'File not found' }
+    clipboard.writeText(result.text)
+    return { ok: true, bytes: result.bytes }
   } catch (err) {
     return { ok: false, error: String(err) }
   }
@@ -1997,24 +2311,24 @@ ipcMain.handle('jobs:copyFile', (_evt, filePath) => {
 // payload. Inserts a blank line between sections; missing files are skipped
 // silently. Returns bytes of the final blob so the caller can show
 // «✓ Скопировано · KB» without a second read.
-ipcMain.handle('jobs:copyCombined', (_evt, filePaths) => {
+ipcMain.handle('jobs:copyCombined', async (_evt, filePaths) => {
   if (!Array.isArray(filePaths) || filePaths.length === 0) {
     return { ok: false, error: 'No files' }
   }
   try {
-    const parts = []
-    for (const fp of filePaths) {
-      if (!fp) continue
-      try {
-        if (!fs.existsSync(fp)) continue
-        parts.push(fs.readFileSync(fp, 'utf8').trim())
-      } catch {}
-    }
-    if (parts.length === 0) return { ok: false, error: 'No readable files' }
-    const blob = parts.join('\n\n') + '\n'
-    clipboard.writeText(blob)
+    const result = await readDb('readTextFiles', [filePaths, { trim: true, separator: '\n\n' }], async () => {
+      const parts = []
+      for (const filePath of filePaths) {
+        if (!filePath) continue
+        try { parts.push((await fs.promises.readFile(filePath, 'utf8')).trim()) } catch {}
+      }
+      const text = parts.length ? `${parts.join('\n\n')}\n` : ''
+      return { text, parts: parts.length, bytes: Buffer.byteLength(text, 'utf8') }
+    })
+    if (!result?.parts) return { ok: false, error: 'No readable files' }
+    clipboard.writeText(result.text)
     jobRunner.playClipboardSound()
-    return { ok: true, bytes: Buffer.byteLength(blob, 'utf8'), parts: parts.length }
+    return { ok: true, bytes: result.bytes, parts: result.parts }
   } catch (err) {
     return { ok: false, error: String(err && err.message || err) }
   }
@@ -2070,40 +2384,33 @@ ipcMain.handle('ui:setPreference', (_e, payload) => {
   return db.setUiPreference(p.key, p.value)
 })
 
-ipcMain.handle('sources:list',     (_e, platform) => db.listSources(platform || null))
-ipcMain.handle('sources:get',      (_e, id)       => db.getSource(id))
-ipcMain.handle('sources:detail',   (_e, id) => {
-  const source = db.getSource(id)
-  return {
-    source,
-    typeBreakdown: db.itemTypeBreakdown(id),
-    // A successful «Анализ канала» is already durable in the jobs table.
-    // Return it separately from saved item rows: the renderer may visualise
-    // what Telegram reported without inflating «Сохранено сообщений».
-    telegramAnalysis: source?.platform === 'telegram'
-      ? db.latestTelegramAnalysisForSource(id)
-      : null,
-    senders:       db.senderBreakdown(id),
-    coverage:      db.listCoverage(id),
-    // Min/max published_at across saved items — UI shows it as a period
-    // range so the user sees what slice of history is in the DB without
-    // relying on coverage rows (which may have null date_from/date_to
-    // for IG/YT where flat-playlist doesn't provide ranges).
-    dateRange:     db.itemsDateRange(id),
-    // Hide noisy "list refresh" operations — yt_channel_fetch happens every
-    // sync and is not what the user means by "история парсинга". Old rows
-    // already in DB are filtered out so legacy installs look clean too.
-    jobs:          db.listJobsForSource(id)
-                     .filter(j => j.type !== 'yt_channel_fetch' && j.type !== 'tk_channel_fetch'),
-    // Telegram-only: total comments stored across all posts of this source.
-    // 0 for non-TG sources or channels without discussion. UI renders chip in
-    // type_breakdown row.
-    commentsCount:    db.countCommentsBySource(id),
-    // Posts that already have at least one stored comment — used to compute
-    // «Дотянуть» availability (posts_total - this length).
-    postsWithComments: db.listPostsWithComments(id).length,
-  }
-})
+ipcMain.handle('sources:list', (_e, platform) => (
+  readDb('listSources', [platform || null], () => db.listSources(platform || null))
+))
+ipcMain.handle('sources:get', (_e, id) => (
+  readDb('getSource', [id], () => db.getSource(id))
+))
+ipcMain.handle('sources:findTelegram', (_e, target) => (
+  readDb('findTelegramSourceByTarget', [target], () => db.findTelegramSourceByTarget(target))
+))
+ipcMain.handle('sources:detail', (_e, id) => (
+  readDb('sourceDetail', [id], () => {
+    const source = db.getSource(id)
+    return {
+      source,
+      typeBreakdown: db.itemTypeBreakdown(id),
+      telegramAnalysis: source?.platform === 'telegram' ? db.latestTelegramAnalysisForSource(id) : null,
+      senders: db.senderBreakdown(id),
+      coverage: db.listCoverage(id),
+      dateRange: db.itemsDateRange(id),
+      jobs: source?.platform === 'boosty'
+        ? db.listJobsForSource(id).filter(j => j.type !== 'yt_channel_fetch' && j.type !== 'tk_channel_fetch')
+        : [],
+      commentsCount: db.countCommentsBySource(id),
+      postsWithComments: db.listPostsWithComments(id).length,
+    }
+  })
+))
 
 function sumExistingFiles(paths) {
   let bytes = 0, present = 0
@@ -2115,26 +2422,25 @@ function sumExistingFiles(paths) {
   return { bytes, present, total: unique.length }
 }
 
-ipcMain.handle('sources:socialOverview', (_e, id) => {
+ipcMain.handle('sources:socialOverview', async (_e, id) => {
   try {
-    const overview = db.socialSourceOverview(id)
-    if (!overview) return { ok: false, error: 'unsupported source' }
-    const storage = db.storageBreakdownForSource(id)
-    const media = sumExistingFiles(storage.media_paths)
-    const transcripts = sumExistingFiles(storage.transcript_paths)
-    const dbPayloadBytes = Number(overview.bytes?.db_payload || 0)
-    return {
-      ok: true,
-      ...overview,
-      storage: {
-        root: jobRunner.LIB_ROOT,
-        db_payload: { bytes: dbPayloadBytes },
-        media,
-        transcripts,
-        index: { bytes: storage.index_bytes || 0, vectors: storage.index_vectors || 0 },
-        total_bytes: dbPayloadBytes + media.bytes + transcripts.bytes + (storage.index_bytes || 0),
-      },
-    }
+    return await readDb('socialOverview', [id], () => {
+      const overview = db.socialSourceOverview(id)
+      if (!overview) return { ok: false, error: 'unsupported source' }
+      const storage = db.storageBreakdownForSource(id)
+      const media = sumExistingFiles(storage.media_paths)
+      const transcripts = sumExistingFiles(storage.transcript_paths)
+      const dbPayloadBytes = Number(overview.bytes?.db_payload || 0)
+      return {
+        ok: true, ...overview,
+        storage: {
+          root: jobRunner.LIB_ROOT,
+          db_payload: { bytes: dbPayloadBytes }, media, transcripts,
+          index: { bytes: storage.index_bytes || 0, vectors: storage.index_vectors || 0 },
+          total_bytes: dbPayloadBytes + media.bytes + transcripts.bytes + (storage.index_bytes || 0),
+        },
+      }
+    })
   } catch (err) {
     console.error('[sources:socialOverview] failed', err)
     return { ok: false, error: String(err && err.message || err) }
@@ -2147,21 +2453,32 @@ ipcMain.handle('sources:socialOverview', (_e, id) => {
 // formats to MB. `root` is the single storage dir (CLAUDE.md invariant —
 // everything lives under LIB_ROOT) so the «open folder» button knows where
 // to point.
-ipcMain.handle('sources:storage', (_e, id) => {
+ipcMain.handle('sources:storage', async (_e, id) => {
   try {
-    const b = db.storageBreakdownForSource(id)
-    const media = sumExistingFiles(b.media_paths)
-    const transcripts = sumExistingFiles(b.transcript_paths)
-    const thumbnails = sumExistingFiles(b.thumbnail_paths)
+    const result = await readDb('sourceStorage', [id], () => {
+      const b = db.storageBreakdownForSource(id)
+      const source = db.getSource(id)
+      const media = sumExistingFiles(b.media_paths)
+      const videos = sumExistingFiles(b.video_paths)
+      const transcripts = sumExistingFiles(b.transcript_paths)
+      const thumbnails = sumExistingFiles(b.thumbnail_paths)
+      return {
+        ok: true,
+        platform: source?.platform || null,
+        root: jobRunner.LIB_ROOT,
+        text: { bytes: b.text_bytes },
+        index: { bytes: b.index_bytes, vectors: b.index_vectors },
+        media, videos, transcripts, thumbnails,
+        total_bytes: b.text_bytes + b.index_bytes + media.bytes + videos.bytes
+          + transcripts.bytes + thumbnails.bytes,
+      }
+    })
+    const boostyStorage = result?.platform === 'boosty' ? jobRunner.getBoostyStorageConfig() : null
     return {
-      ok: true,
-      root: jobRunner.LIB_ROOT,
-      text:        { bytes: b.text_bytes },
-      index:       { bytes: b.index_bytes, vectors: b.index_vectors },
-      media:       media,
-      transcripts: transcripts,
-      thumbnails:  thumbnails,
-      total_bytes: b.text_bytes + b.index_bytes + media.bytes + transcripts.bytes + thumbnails.bytes,
+      ...result,
+      root: boostyStorage?.audio_dir || result?.root || jobRunner.LIB_ROOT,
+      audio_root: boostyStorage?.audio_dir || null,
+      video_root: boostyStorage?.video_dir || null,
     }
   } catch (err) {
     console.error('[sources:storage] failed', err)
@@ -2183,14 +2500,24 @@ ipcMain.handle('storage:openRoot', (_e, dir) => {
   }
 })
 
-ipcMain.handle('items:list',   (_e, params) => db.listItems(params))
-ipcMain.handle('items:search', (_e, { source_id, query, limit }) =>
-  db.searchItems(source_id || null, query, limit || 50))
-ipcMain.handle('items:topics', (_e, source_id) => db.listSourceTopics(source_id))
-ipcMain.handle('items:typeBreakdown', (_e, { source_id, topic_id }) =>
-  db.itemTypeBreakdown(source_id, topic_id ?? null))
-ipcMain.handle('items:telegramMediaEstimate', (_e, scope) =>
-  db.telegramMediaEstimate(scope || {}))
+ipcMain.handle('items:list', (_e, params) => (
+  readDb('listItems', [params], () => db.listItems(params))
+))
+ipcMain.handle('items:listPage', (_e, params) => (
+  readDb('listItemsPage', [params], () => db.listItemsPage(params))
+))
+ipcMain.handle('items:search', (_e, { source_id, query, limit }) => (
+  readDb('searchItems', [source_id || null, query, limit || 50], () => db.searchItems(source_id || null, query, limit || 50))
+))
+ipcMain.handle('items:topics', (_e, source_id) => (
+  readDb('listSourceTopics', [source_id], () => db.listSourceTopics(source_id))
+))
+ipcMain.handle('items:typeBreakdown', (_e, { source_id, topic_id }) => (
+  readDb('itemTypeBreakdown', [source_id, topic_id ?? null], () => db.itemTypeBreakdown(source_id, topic_id ?? null))
+))
+ipcMain.handle('items:telegramMediaEstimate', (_e, scope) => (
+  readDb('telegramMediaEstimate', [scope || {}], () => db.telegramMediaEstimate(scope || {}))
+))
 
 // Copy the caption(s) of specific saved messages (per-row «копировать» and the
 // bulk «копировать N» action in ChatView). The caption already carries any
@@ -2201,26 +2528,22 @@ ipcMain.handle('items:telegramMediaEstimate', (_e, scope) =>
 // transcript in caption but type='voice' would be dropped by the assembly
 // WHERE), whereas here the user explicitly picked exact rows and wants exactly
 // their text. Returns {ok, bytes, count}.
-ipcMain.handle('items:copyMany', (_e, { source_id, external_ids }) => {
+ipcMain.handle('items:copyMany', async (_e, { source_id, external_ids }) => {
   try {
     if (!source_id || !Array.isArray(external_ids) || external_ids.length === 0) {
       return { ok: false, error: 'no ids', count: 0 }
     }
-    const ids = external_ids.map(String)
-    const rows = db.getItemsByExternalIds(source_id, ids)
-    // Order by published_at so a multi-select copy reads top-to-bottom in
-    // chat order, not in click order.
-    rows.sort((a, b) => (a.published_at || 0) - (b.published_at || 0))
-    const parts = []
-    for (const r of rows) {
-      const cap = (r.caption || '').trim()
-      if (cap) parts.push(cap)
-    }
-    if (parts.length === 0) return { ok: false, error: 'empty', count: 0 }
-    const blob = parts.join('\n\n') + '\n'
-    clipboard.writeText(blob)
+    const result = await readDb('copyManyText', [source_id, external_ids], () => {
+      const rows = db.getItemsByExternalIds(source_id, external_ids.map(String))
+      rows.sort((a, b) => (a.published_at || 0) - (b.published_at || 0))
+      const parts = rows.map(row => String(row.caption || '').trim()).filter(Boolean)
+      const text = parts.length ? `${parts.join('\n\n')}\n` : ''
+      return { text, count: parts.length, bytes: Buffer.byteLength(text, 'utf8') }
+    })
+    if (!result?.text) return { ok: false, error: 'empty', count: 0 }
+    clipboard.writeText(result.text)
     jobRunner.playClipboardSound()
-    return { ok: true, bytes: Buffer.byteLength(blob, 'utf8'), count: parts.length }
+    return { ok: true, bytes: result.bytes, count: result.count }
   } catch (err) {
     return { ok: false, error: String(err?.message || err), count: 0 }
   }
@@ -2232,54 +2555,34 @@ ipcMain.handle('items:copyMany', (_e, { source_id, external_ids }) => {
 //   items:assembleEstimate → cheap COUNT (debounced from UI)
 //   items:assembleCopy     → assemble + clipboard.writeText + Blow.aiff
 //   items:assembleSave     → assemble + showSaveDialog + write to disk
-ipcMain.handle('items:assembleEstimate', (_e, scope) => {
-  const base = db.assemblyEstimate(scope)
-  // Header overhead per row: "--- DD.MM.YY HH:MM Sender [tag] ---" + body +
-  // blank line. Header itself is ~30-60 bytes; the format is stable so we
-  // budget 50 B per item. Adds <1.5% to the visible total at typical chat
-  // sizes — much closer to the real clipboard payload than the old
-  // "char-count = bytes" estimate.
-  const headerBytes = base.count * 50
-
-  // Voice/video bodies live on disk — sum file sizes for accuracy.
-  let transcriptBytes = 0
-  try {
-    const rows = db.assemblyTranscriptPaths(scope)
-    for (const r of rows) {
-      try {
-        if (r.transcript_path) transcriptBytes += fs.statSync(r.transcript_path).size
-      } catch { /* missing file ignored — assembleText falls back to a stub */ }
+ipcMain.handle('items:assembleEstimate', (_e, scope) => (
+  readDb('assemblyEstimate', [scope], () => {
+    const base = db.assemblyEstimate(scope)
+    let transcriptBytes = 0
+    for (const row of db.assemblyTranscriptPaths(scope)) {
+      try { if (row.transcript_path) transcriptBytes += fs.statSync(row.transcript_path).size } catch {}
     }
-  } catch (err) {
-    console.error('[Assemble] transcript stat failed', err)
-  }
+    const bytes = (base.caption_bytes || 0) + transcriptBytes + base.count * 50
+    return { ...base, bytes, tokens: Math.round(bytes / 3) }
+  })
+))
 
-  const bytes = (base.caption_bytes || 0) + transcriptBytes + headerBytes
-  // Token estimate. We don't ship a real tokenizer (tiktoken would pull a
-  // multi-MB native module + table for one panel), so we use the
-  // industry-standard heuristic: ~1 token ≈ 3 UTF-8 bytes for mixed
-  // Russian/English chat text. Real Claude/GPT tokenization for Cyrillic
-  // sits in the 2.7-3.3 B/token range; 3 is a safe middle. Surface it as
-  // "~N токенов" so the user knows it's an approximation.
-  const tokens = Math.round(bytes / 3)
-  return { ...base, bytes, tokens }
-})
-
-ipcMain.handle('items:assembleCopy', (_e, scope) => {
+ipcMain.handle('items:assembleCopy', async (_e, scope) => {
   try {
-    const rows = db.assemblyFetch(scope)
-    const commentsByPostId = _buildCommentsMap(scope, rows)
-    const chatLabelBySourceId = _buildChatLabelMap(scope)
-    const text = assembleText(rows, {
-      showTopicHeaders: scope?.topic_id == null,
-      commentsByPostId,
-      chatLabelBySourceId,
+    const result = await readDb('assemblyText', [scope], () => {
+      const rows = db.assemblyFetch(scope)
+      const text = assembleText(rows, {
+        showTopicHeaders: scope?.topic_id == null,
+        commentsByPostId: _buildCommentsMap(scope, rows),
+        chatLabelBySourceId: _buildChatLabelMap(scope),
+      })
+      const bytes = Buffer.byteLength(text || '', 'utf8')
+      return { text, count: rows.length, bytes, tokens: Math.round(bytes / 3) }
     })
-    if (!text) return { ok: false, error: 'empty', count: 0 }
-    clipboard.writeText(text)
+    if (!result?.text) return { ok: false, error: 'empty', count: 0 }
+    clipboard.writeText(result.text)
     jobRunner.playClipboardSound()
-    const bytes = Buffer.byteLength(text, 'utf8')
-    return { ok: true, count: rows.length, bytes, tokens: Math.round(bytes / 3) }
+    return { ok: true, count: result.count, bytes: result.bytes, tokens: result.tokens }
   } catch (err) {
     console.error('[Assemble] copy failed', err)
     return { ok: false, error: String(err && err.message || err) }
@@ -2329,25 +2632,25 @@ function _buildCommentsMap(scope, rows) {
 
 ipcMain.handle('items:assembleSave', async (_e, { scope, defaultName }) => {
   try {
-    const rows = db.assemblyFetch(scope)
-    const commentsByPostId = _buildCommentsMap(scope, rows)
-    const chatLabelBySourceId = _buildChatLabelMap(scope)
-    const text = assembleText(rows, {
-      showTopicHeaders: scope?.topic_id == null,
-      commentsByPostId,
-      chatLabelBySourceId,
-    })
-    if (!text) return { ok: false, error: 'empty' }
     const win = BrowserWindow.getAllWindows()[0]
     const res = await dialog.showSaveDialog(win, {
       defaultPath: defaultName || 'export.txt',
       filters: [{ name: 'Text', extensions: ['txt'] }],
     })
     if (res.canceled || !res.filePath) return { ok: false, error: 'cancelled' }
-    fs.writeFileSync(res.filePath, text, 'utf8')
-    const bytes = Buffer.byteLength(text, 'utf8')
-    return { ok: true, path: res.filePath, count: rows.length,
-             bytes, tokens: Math.round(bytes / 3) }
+    return await readDb('assemblySave', [scope, res.filePath], async () => {
+      const rows = db.assemblyFetch(scope)
+      const text = assembleText(rows, {
+        showTopicHeaders: scope?.topic_id == null,
+        commentsByPostId: _buildCommentsMap(scope, rows),
+        chatLabelBySourceId: _buildChatLabelMap(scope),
+      })
+      if (!text) return { ok: false, error: 'empty' }
+      await fs.promises.writeFile(res.filePath, text, 'utf8')
+      const bytes = Buffer.byteLength(text, 'utf8')
+      return { ok: true, path: res.filePath, count: rows.length,
+               bytes, tokens: Math.round(bytes / 3) }
+    })
   } catch (err) {
     console.error('[Assemble] save failed', err)
     return { ok: false, error: String(err && err.message || err) }
@@ -2368,7 +2671,9 @@ ipcMain.handle('jobs:deleteOne', (_e, id) => {
   return { ok: true }
 })
 ipcMain.handle('jobs:clearForSource', (_e, id) => { db.clearJobsForSource(id); return { ok: true } })
-ipcMain.handle('sources:maxExternalId', (_e, id) => db.maxExternalId(id))
+ipcMain.handle('sources:maxExternalId', (_e, id) => (
+  readDb('maxExternalId', [id], () => db.maxExternalId(id))
+))
 
 ipcMain.handle('sources:getNotes', (_e, id)         => db.getSourceNotes(id))
 ipcMain.handle('sources:setNotes', (_e, { id, notes }) => db.setSourceNotes(id, notes))
@@ -2403,31 +2708,33 @@ app.whenReady().then(() => {
   // HTTP-bridge для browser-extension (см. electron/browser-bridge.js).
   // Только loopback, фиксированный порт 53127. Падение/занятость порта не
   // ломает приложение — расширение просто покажет «sc-desktop не запущен».
-  try {
-    const { startServer } = require('./browser-bridge')
-    startServer({
-      jobRunner,
-      notificationService: telegramNotificationService,
-      settingsAccess: { readScSettings: readScSettingsStrict, writeScSettings },
-    })
-  } catch (err) {
-    console.log(`[BrowserBridge] failed to start: ${err?.message || err}`)
-  }
-  try {
-    startTelegramAutoScheduler({ db, jobRunner, indexJob })
-  } catch (err) {
-    console.warn(`[TelegramAuto] failed to start scheduler: ${err?.message || err}`)
+  if (!isE2E) {
+    try {
+      startBrowserBridge({
+        jobRunner,
+        notificationService: telegramNotificationService,
+        settingsAccess: { readScSettings: readScSettingsStrict, writeScSettings },
+      })
+    } catch (err) {
+      console.log(`[BrowserBridge] failed to start: ${err?.message || err}`)
+    }
+    try {
+      const autoEnabled = publicAppSettings(readScSettingsStrict()).telegram.auto_enabled
+      startTelegramAutoScheduler({ db, jobRunner, indexJob, enabled: autoEnabled })
+    } catch (err) {
+      console.warn(`[TelegramAuto] failed to start scheduler: ${err?.message || err}`)
+    }
   }
   // Наблюдатель за почтой поднимается только если пользователь включил его
   // в настройках; отсутствие настроек не считается ошибкой запуска.
-  mailNotificationService.start()
+  if (!isE2E) mailNotificationService.start()
     .then(state => {
       if (state?.status && state.status !== 'disabled') {
         console.log(`[MailNotify] start status=${state.status}${state.error ? ` reason=${state.error}` : ''}`)
       }
     })
     .catch(err => console.warn(`[MailNotify] failed to start: ${err?.message || err}`))
-  try {
+  if (!isE2E) try {
     mobileApiServer = startMobileApiServer({
       db,
       jobRunner,
@@ -2440,6 +2747,8 @@ app.whenReady().then(() => {
 
 app.on('before-quit', () => {
   stopTelegramAutoScheduler()
+  dbRead.stop().catch(err => console.error('[DbReadWorker] stop failed', err))
+  stopTelegramFinalizer().catch(err => console.error('[PersistenceWorker] stop failed', err))
   mobileApiServer?.close()
   mobileApiServer = null
 })

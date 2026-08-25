@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { LogIn, RotateCw, Trash2 } from 'lucide-react'
+import { getInstagramSettings } from '../lib/jobs'
 
 /**
  * Instagram settings (per-platform settings screen, opened from
@@ -32,10 +33,10 @@ function BackendBlock() {
   const [busy, setBusy] = useState(false)
   const [err, setErr]   = useState(null)
 
-  async function refresh() {
+  async function refresh(force = false) {
     setErr(null)
     try {
-      const s = await window.api.igGetSettings()
+      const s = await getInstagramSettings({ validateToken: true, force })
       setSettings(s)
     } catch (e) {
       setErr(String(e?.message || e))
@@ -62,7 +63,7 @@ function BackendBlock() {
       if (!r.ok) { setErr(r.error || 'failed'); return }
       setEditingToken(false)
       setTokenInput('')
-      await refresh()
+      await refresh(true)
     } catch (e) {
       setErr(String(e?.message || e))
     } finally { setBusy(false) }
@@ -128,7 +129,7 @@ function BackendBlock() {
             </span>
           </div>
           <button
-            onClick={refresh}
+            onClick={() => refresh(true)}
             disabled={busy}
             className="px-3 py-1 rounded-md text-zinc-300 bg-zinc-900 hover:bg-zinc-800 disabled:opacity-60"
             style={{ fontSize: '14px' }}

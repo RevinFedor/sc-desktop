@@ -459,6 +459,18 @@
   function chatgptModeLabel(mode) {
     return resolveChatgptMode(mode) === 'work' ? 'Work' : 'Chat';
   }
+  function isTemporaryChatPage() {
+    try {
+      if (new URL(window.location?.href || location.href).searchParams.get('temporary-chat') === 'true') return true;
+    } catch (_) {}
+    try {
+      return !!document.querySelector?.(
+        '[data-testid="temporary-chat-label"], button[aria-label*="temporary chat" i], button[aria-label*="временный чат" i]',
+      );
+    } catch (_) {
+      return false;
+    }
+  }
   function normalizeModeControlLabel(value) {
     return String(value || '')
       .normalize('NFKC')
@@ -590,6 +602,13 @@
   }
   async function ensureChatgptModeSelected(requestedMode) {
     const mode = resolveChatgptMode(requestedMode);
+    if (isTemporaryChatPage()) {
+      const ok = mode === 'chat';
+      const data = { mode, temporaryChat: true, reason: ok ? 'temporary_chat_is_chat' : 'work_unavailable_in_temporary_chat' };
+      log(ok ? 'mode.temporary_chat' : 'mode.temporary_chat_work_unavailable', data);
+      bridgeLog(ok ? 'gpt.mode.temporary_chat' : 'gpt.mode.temporary_chat_work_unavailable', data, getRequestId() || getComposeId(), null);
+      return ok;
+    }
     for (let attempt = 1; attempt <= 2; attempt++) {
       let target = null;
       try {
@@ -1101,25 +1120,32 @@
     }
   }
 
-  async function fetchChatGPTConversationJson() {
+  async function fetchChatGPTConversationJson(timeoutMs = 30000) {
     const conversationId = chatgptConversationIdFromLocation();
     if (!conversationId) return null;
-    const sessionRes = await fetch('/api/auth/session', { credentials: 'include' });
-    if (!sessionRes.ok) throw new Error('ChatGPT session fetch failed: HTTP ' + sessionRes.status);
-    const session = await sessionRes.json();
-    const accessToken = session?.accessToken;
-    if (!accessToken) throw new Error('ChatGPT session has no access token');
-    const res = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
-      credentials: 'include',
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`ChatGPT conversation API failed: HTTP ${res.status} ${text.slice(0, 120)}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const sessionRes = await fetch('/api/auth/session', { credentials: 'include', signal: controller.signal });
+      if (!sessionRes.ok) throw new Error('ChatGPT session fetch failed: HTTP ' + sessionRes.status);
+      const session = await sessionRes.json();
+      const accessToken = session?.accessToken;
+      if (!accessToken) throw new Error('ChatGPT session has no access token');
+      const res = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+        credentials: 'include',
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`ChatGPT conversation API failed: HTTP ${res.status} ${text.slice(0, 120)}`);
+      }
+      const data = await res.json();
+      if (!data?.mapping || !data?.current_node) throw new Error('ChatGPT conversation API returned no mapping/current_node');
+      return data;
+    } finally {
+      clearTimeout(timer);
     }
-    const data = await res.json();
-    if (!data?.mapping || !data?.current_node) throw new Error('ChatGPT conversation API returned no mapping/current_node');
-    return data;
   }
 
   function chatgptCurrentPathNodes(data) {
@@ -1264,6 +1290,7 @@
   function apiActivityFromMessage(node) {
     const msg = node?.message || {};
     const role = msg.author?.role || '';
+    const toolName = String(msg.author?.name || msg.recipient || '').toLowerCase();
     const type = msg.content?.content_type || '';
     const text = apiMessageText(node);
     if (type === 'code') {
@@ -1273,6 +1300,12 @@
       return { title: 'Execution output', text: text || compactJsonSnippet(msg.metadata?.aggregate_result || '') };
     }
     if (role === 'tool') {
+      // Внутренние file-context/spinner записи содержат копию прочитанного
+      // файла или пустой transport-payload. Это не пользовательская
+      // активность и не должно дублировать attachment в result/history.
+      if (/^(?:context_stuff|spinner)$/.test(toolName)
+          || /^(?:context_stuff|spinner|tether_browsing_display)$/.test(String(type || '').toLowerCase())) return null;
+      if (!text && (type === 'text' || type === 'multimodal_text')) return null;
       const title = msg.metadata?.command ? `Tool: ${compactText(msg.metadata.command).slice(0, 120)}` : `Tool: ${type || 'activity'}`;
       return { title, text: text || compactJsonSnippet(msg.content || '') };
     }
@@ -1281,6 +1314,101 @@
       return { title, text: text || compactJsonSnippet(msg.content || '') };
     }
     return null;
+  }
+
+  function dedupeSourceLinks(links) {
+    const out = [];
+    const seen = new Set();
+    for (const link of links || []) {
+      if (!link?.url || seen.has(link.url)) continue;
+      seen.add(link.url);
+      out.push(link);
+    }
+    return out;
+  }
+
+  function dedupeActivityItems(items) {
+    const out = [];
+    const seen = new Set();
+    for (const item of items || []) {
+      if (!item) continue;
+      const key = [item.title || '', item.command || '', item.text || ''].join('\n');
+      if (!key.trim() || seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+    }
+    return out;
+  }
+
+  // DOM Work-ответа содержит промежуточные commentary-сообщения («Думаю»,
+  // «Проверяю…»). Между tool-фазами Stop может кратко исчезнуть, поэтому
+  // только его исчезновения недостаточно. Backend conversation API явно
+  // помечает настоящий финал channel=final + end_turn=true — используем этот
+  // сигнал как terminal proof и одновременно берём полный невиртуализированный
+  // текст ответа.
+  function latestApiTurnSnapshotFromData(data) {
+    if (!data) return { ready: false, reason: 'conversation_url_pending' };
+    const nodes = chatgptCurrentPathNodes(data)
+      .filter(node => node?.message && !isHiddenApiMessage(node));
+    let lastUser = -1;
+    for (let i = 0; i < nodes.length; i++) {
+      if (apiMessageRole(nodes[i]) === 'user') lastUser = i;
+    }
+    const turnNodes = nodes.slice(lastUser + 1);
+    const finals = turnNodes.filter(node => {
+      const message = node?.message || {};
+      const type = apiMessageContentType(node);
+      if (apiMessageRole(node) !== 'assistant') return false;
+      if (type !== 'text' && type !== 'multimodal_text') return false;
+      if (!(message.channel === 'final' || message.end_turn === true)) return false;
+      return message.status !== 'in_progress';
+    });
+    const finalNode = finals[finals.length - 1] || null;
+    const sources = [];
+    const activity = [];
+    const reasoning = [];
+    for (const node of turnNodes) {
+      sources.push(...apiLinksFromMessage(node));
+      const item = apiActivityFromMessage(node);
+      if (item) activity.push(item);
+      const message = node.message || {};
+      const type = apiMessageContentType(node);
+      if (apiMessageRole(node) === 'assistant'
+          && (type === 'reasoning_recap' || message.metadata?.is_thinking_preamble_message)) {
+        const text = apiMessageText(node);
+        if (text) reasoning.push(text);
+      }
+    }
+    return {
+      ready: !!finalNode,
+      reason: finalNode ? 'api_final' : 'api_final_pending',
+      text: finalNode ? apiMessageText(finalNode) : '',
+      reasoning_text: reasoning.join('\n\n---\n\n').trim(),
+      links: dedupeSourceLinks(sources),
+      activity_items: dedupeActivityItems(activity),
+      title: data.title || document.title,
+      message_id: finalNode?.id || finalNode?.message?.id || null,
+    };
+  }
+
+  async function latestApiTurnSnapshot(timeoutMs) {
+    return latestApiTurnSnapshotFromData(await fetchChatGPTConversationJson(timeoutMs));
+  }
+
+  function terminalProofForCurrentPage(proof) {
+    // Temporary Chat не получает /c/<conversation-id> в URL, поэтому
+    // conversation API нельзя адресовать. Этот fallback вызывается только
+    // ПОСЛЕ DOM-proof watcher'а: Stop исчез, quiet-window прошёл, в том же
+    // assistant-turn есть текст и action «Копировать ответ».
+    if (isTemporaryChatPage() && proof?.reason === 'conversation_url_pending') {
+      return {
+        ...proof,
+        ready: true,
+        fallback: true,
+        reason: 'temporary_chat_dom_final',
+      };
+    }
+    return proof;
   }
 
   function renderApiSourcesMarkdown(links) {
@@ -1552,7 +1680,7 @@
     { key: 'medium',       match: /^(Medium|Средний)$/i,                 sub: false, aliases: ['medium', 'mid', 'средний'] },
     { key: 'high',         match: /^(High|Высокий)$/i,                   sub: false, aliases: ['high', 'высокий'] },
     { key: 'xhigh',        match: /^(Очень высокий|Very\s*high|Extra\s*high)$/i, sub: false, aliases: ['xhigh', 'x-high', 'extra high', 'очень высокий', 'very high'] },
-    { key: 'pro',          match: /^(Pro стандартный|Pro Стандартный|Pro standard)$/i, sub: true, aliases: ['pro', 'pro-standard', 'pro стандартный'] },
+    { key: 'pro',          match: /^Pro$/i,                              sub: false, aliases: ['pro', 'pro-standard', 'pro стандартный'] },
     { key: 'pro-extended', match: /^(Pro усиленный|Pro расширенный|Pro extended)$/i, sub: true, aliases: ['pro-extended', 'pro-ext', 'extended', 'pro усиленный', 'pro расширенный'] },
     { key: 'max',          match: /^(Max|Максимальный)$/i,               sub: false, aliases: ['max', 'максимальный'] },
     { key: 'ultra',        match: /^(Ultra|Ультра)/i,                    sub: false, aliases: ['ultra', 'ультра'] },
@@ -1561,6 +1689,7 @@
   function resolveEffort(input) {
     if (!input) return DEFAULT_EFFORT;
     const q = String(input).trim().toLowerCase();
+    if (q === 'pro-extended' || q === 'pro-ext' || q === 'pro стандартный' || q === 'pro расширенный') return 'pro';
     const hit = EFFORTS.find(e => e.key === q)
              || EFFORTS.find(e => e.aliases.some(a => a === q))
              || EFFORTS.find(e => e.aliases.some(a => q.includes(a) || a.includes(q)));
@@ -1581,6 +1710,7 @@
     { key: '5.6-luna',  label: 'GPT-5.6 Luna',  aliases: ['5.6-luna', 'gpt-5.6 luna', 'gpt-5.6-luna', 'luna'] },
     { key: '5.6-sol',   label: 'GPT-5.6 Sol',   aliases: ['5.6-sol', 'gpt-5.6 sol', 'gpt-5.6-sol', 'sol', '5.6', 'gpt-5.6', 'gpt5.6', 'gpt 5.6'] },
     { key: '5.5',       label: 'GPT-5.5 Instant', aliases: ['5.5', 'gpt-5.5', 'gpt5.5', 'gpt 5.5', 'gpt-5.5 instant'] },
+    { key: 'o3',        label: 'o3 · до 26 августа', aliases: ['o3'] },
   ];
   const DEFAULT_MODEL = '5.6-sol';
   function resolveModel(input) {
@@ -1613,7 +1743,7 @@
   // показывает те же radio сразу в корневом меню composer-pill'а.
   function findEffortSubTrigger() {
     return visibleAll('[role="menuitem"][aria-haspopup="menu"]')
-      .find(el => /^(Уровень|Level)/i.test(nodeText(el))) || null;
+      .find(el => /^(?:Усилие|Effort|Уровень|Level)/i.test(nodeText(el))) || null;
   }
   function findProMainItem() {
     return visibleAll('[role="menuitemradio"]')
@@ -1641,6 +1771,7 @@
   // недостаточно: Sol, Terra и Luna должны сохраняться как разные ключи.
   function modelKeyFromText(text) {
     const label = String(text || '').replace(/\s+/g, ' ').trim();
+    if (/^o3(?:\s|$)/i.test(label)) return 'o3';
     const tier = label.match(/\b(Sol|Terra|Luna)\b/i)?.[1]?.toLowerCase() || null;
     const gpt = label.match(/(?:GPT|Model|Модель)[\s-]*(\d+(?:\.\d+)?)(?=\D|$)/i);
     if (gpt?.[1] === '5.6') return `5.6-${tier || 'sol'}`;
@@ -1681,6 +1812,13 @@
     return visibleAll('[role="menuitemradio"]')
       .find(el => modelKeyFromText(nodeText(el)) === modelKey);
   }
+  function currentModelKeyFromOpenMenu() {
+    const explicit = visibleAll('[role="menuitem"][aria-haspopup="menu"]')
+      .find(el => /^(?:Модель|Model)/i.test(nodeText(el)));
+    const explicitKey = explicit ? modelKeyFromText(nodeText(explicit)) : null;
+    if (explicitKey) return explicitKey;
+    return modelKeyFromText(nodeText(findEffortTrigger()));
+  }
   async function openModelSubmenu(modelKey) {
     const sub = await waitFor(() => findModelSubTrigger(), 'model submenu trigger (GPT / o-series)', 8000);
     nativeHover(sub);
@@ -1700,6 +1838,13 @@
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         await openEffortMenu();
+        const current = currentModelKeyFromOpenMenu();
+        if (current === modelKey) {
+          log('model.already_set', { model: modelKey, shown: current });
+          bridgeLog('gpt.model.already_set', { model: modelKey }, getRequestId(), null);
+          pressEscape(); await sleep(200);
+          return true;
+        }
         const { sub, item } = await openModelSubmenu(modelKey);
         if (item.getAttribute('aria-checked') === 'true') {
           log('model.already_set', { model: modelKey, shown: modelKeyFromText(nodeText(sub)) });
@@ -1713,9 +1858,13 @@
         // должны указывать на запрошенную модель. Закрытые меню ChatGPT оставляет
         // в DOM, поэтому читаем только visibleAll.
         await openEffortMenu();
-        const { sub: after, item: checkedItem } = await openModelSubmenu(modelKey);
-        const shown = modelKeyFromText(nodeText(after));
-        const checked = checkedItem.getAttribute('aria-checked') === 'true';
+        const shown = currentModelKeyFromOpenMenu();
+        let checkedItem = findModelItem(modelKey);
+        if (!checkedItem && shown !== modelKey) {
+          try { ({ item: checkedItem } = await openModelSubmenu(modelKey)); } catch (_) {}
+        }
+        const checked = shown === modelKey
+          && (!checkedItem || checkedItem.getAttribute('aria-checked') === 'true');
         const ok = shown === modelKey && checked;
         const items = ok ? null : modelMenuSnapshot();
         pressEscape(); await sleep(200);
@@ -1757,7 +1906,7 @@
     const direct = findEffortItem(eff);
     if (direct) return direct;
 
-    const sub = await waitFor(() => findEffortSubTrigger(), 'effort submenu trigger (Level / Уровень)', 8000);
+    const sub = await waitFor(() => findEffortSubTrigger(), 'effort submenu trigger (Усилие / Effort)', 8000);
     nativeHover(sub);
     await sleep(500);
     if (!findEffortItem(eff)) {
@@ -1883,6 +2032,68 @@
     log('effort.select_failed', { effort: eff.key });
     // В bridge — вкладка умирает на auto-close, DOM-лог недоступен post-mortem.
     bridgeLog('gpt.effort.select_failed', { effort: eff.key }, getRequestId(), null);
+    return false;
+  }
+
+  const SPEEDS = [
+    { key: 'standard', match: /^(?:Стандартный|Standard)(?:\s|$)/i, aliases: ['standard', 'default', 'стандартный'] },
+    { key: 'fast', match: /^(?:Быстро|Fast)(?:\s|$)/i, aliases: ['fast', 'быстро'] },
+  ];
+  function resolveSpeed(value) {
+    const q = String(value || 'standard').trim().toLowerCase();
+    return SPEEDS.find(speed => speed.key === q || speed.aliases.includes(q))?.key || 'standard';
+  }
+  function speedLabel(key) {
+    return key === 'fast' ? 'Быстро' : 'Стандартный';
+  }
+  function findSpeedSubTrigger() {
+    return visibleAll('[role="menuitem"][aria-haspopup="menu"]')
+      .find(el => /^(?:Скорость|Speed)/i.test(nodeText(el))) || null;
+  }
+  function findSpeedItem(speed) {
+    return visibleAll('[role="menuitemradio"]')
+      .find(el => speed.match.test(nodeText(el)));
+  }
+  async function openSpeedItem(speed) {
+    await openEffortMenu();
+    const sub = await waitFor(() => findSpeedSubTrigger(), 'speed submenu trigger (Скорость / Speed)', 8000);
+    nativeHover(sub);
+    await sleep(500);
+    if (!findSpeedItem(speed)) {
+      nativeMouseClick(sub);
+      await sleep(700);
+    }
+    return await waitFor(() => findSpeedItem(speed), 'speed item: ' + speed.key, 8000);
+  }
+  async function ensureSpeedSelected(speedKey) {
+    const speed = SPEEDS.find(item => item.key === resolveSpeed(speedKey));
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const item = await openSpeedItem(speed);
+        if (item.getAttribute('aria-checked') === 'true') {
+          log('speed.already_set', { speed: speed.key });
+          bridgeLog('gpt.speed.already_set', { speed: speed.key }, getRequestId() || getComposeId(), null);
+          pressEscape(); await sleep(200);
+          return true;
+        }
+        nativeMouseClick(item);
+        await sleep(600);
+        const after = await openSpeedItem(speed);
+        const ok = after.getAttribute('aria-checked') === 'true';
+        pressEscape(); await sleep(200);
+        if (ok) {
+          log('speed.selected', { speed: speed.key, attempt });
+          bridgeLog('gpt.speed.selected', { speed: speed.key, attempt }, getRequestId() || getComposeId(), null);
+          return true;
+        }
+      } catch (e) {
+        const data = { speed: speed.key, attempt, err: e?.message, items: effortMenuSnapshot() };
+        log('speed.attempt_threw', data);
+        bridgeLog('gpt.speed.attempt_threw', data, getRequestId() || getComposeId(), null);
+        pressEscape(); await sleep(200);
+      }
+    }
+    bridgeLog('gpt.speed.select_failed', { speed: speed.key }, getRequestId() || getComposeId(), null);
     return false;
   }
 
@@ -2074,7 +2285,7 @@
     return !!el.disabled
       || el.hasAttribute('disabled')
       || el.getAttribute('aria-disabled') === 'true'
-      || el.closest('[aria-disabled="true"]');
+      || !!el.closest('[aria-disabled="true"]');
   }
 
   function composerBusySnapshot(ignoredTexts = []) {
@@ -2124,10 +2335,11 @@
     const t0 = performance.now();
     return new Promise((resolve, reject) => {
       let done = false;
-      let rafPending = false;
-      let verifyingReady = false;
+      let checkPending = false;
+      let readyTimer = null;
       let lastSig = '';
       const observer = new MutationObserver(scheduleCheck);
+      const poll = setInterval(checkNow, 500);
       const timer = setTimeout(() => {
         const snap = composerBusySnapshot(ignoredTexts);
         finish(null, new Error('chatgpt_composer_not_ready_after_paste: ' + JSON.stringify({
@@ -2143,7 +2355,9 @@
         observer.disconnect();
         document.removeEventListener('input', scheduleCheck, true);
         document.removeEventListener('change', scheduleCheck, true);
+        clearInterval(poll);
         clearTimeout(timer);
+        if (readyTimer) clearTimeout(readyTimer);
       }
       function finish(value, error) {
         if (done) return;
@@ -2173,11 +2387,13 @@
         log('composer.wait_after_paste', data);
         bridgeLog('gpt.composer.wait_after_paste', data, id, null);
       }
-      function verifyReadyNextFrame(firstSnap) {
-        if (verifyingReady) return;
-        verifyingReady = true;
-        requestAnimationFrame(() => {
-          verifyingReady = false;
+      function verifyReadyAfterQuiet() {
+        if (readyTimer) return;
+        // Это не guessed wait загрузки: готовность по-прежнему определяется
+        // реальными маркерами. Короткое quiet-окно лишь не даёт нажать Send
+        // в промежутке между paste-event и первым React-коммитом loader'а.
+        readyTimer = setTimeout(() => {
+          readyTimer = null;
           const snap = composerBusySnapshot(ignoredTexts);
           if (!snap.ready) {
             emitWaitLog(snap);
@@ -2185,20 +2401,24 @@
           }
           log('composer.ready_after_paste', { waitedMs: Math.round(performance.now() - t0) });
           bridgeLog('gpt.composer.ready_after_paste', { waitedMs: Math.round(performance.now() - t0) }, id, null);
-          finish(firstSnap);
-        });
+          finish(snap);
+        }, 250);
       }
       function checkNow() {
         if (done) return;
         const snap = composerBusySnapshot(ignoredTexts);
-        if (snap.ready) verifyReadyNextFrame(snap);
-        else emitWaitLog(snap);
+        if (snap.ready) {
+          verifyReadyAfterQuiet();
+        } else {
+          if (readyTimer) { clearTimeout(readyTimer); readyTimer = null; }
+          emitWaitLog(snap);
+        }
       }
       function scheduleCheck() {
-        if (done || rafPending) return;
-        rafPending = true;
-        requestAnimationFrame(() => {
-          rafPending = false;
+        if (done || checkPending) return;
+        checkPending = true;
+        queueMicrotask(() => {
+          checkPending = false;
           checkNow();
         });
       }
@@ -2212,7 +2432,9 @@
       });
       document.addEventListener('input', scheduleCheck, true);
       document.addEventListener('change', scheduleCheck, true);
-      scheduleCheck();
+      // Initial readiness must not depend on requestAnimationFrame: Chromium
+      // may report a healthy Send button while a hidden tab's rAF is frozen.
+      checkNow();
     });
   }
 
@@ -2241,9 +2463,10 @@
   function composerRoot() {
     return findComposer()?.closest('form') || document.body;
   }
-  function findUploadInputFor(file) {
-    const image = String(file?.type || '').startsWith('image/');
-    if (image) {
+  function findUploadInputFor(files) {
+    const list = Array.isArray(files) ? files : [files];
+    const onlyImages = list.length > 0 && list.every(file => String(file?.type || '').startsWith('image/'));
+    if (onlyImages) {
       return document.querySelector('#upload-photos')
           || document.querySelector('[data-testid="upload-photos-input"]')
           || document.querySelector('input[type="file"][accept*="image"]')
@@ -2297,9 +2520,10 @@
 
   async function uploadFiles(id, files, options = {}) {
     if (!files.length) return [];
+    if (files.length > 20) throw new Error('chatgpt_attachment_limit: maximum 20 files per message');
     const eventPrefix = options.eventPrefix || 'attachments';
     const previewBaseline = composerFilePreviewState(files);
-    const input = await waitFor(() => findUploadInputFor(files[0]), 'upload file input', 15000, 250);
+    const input = await waitFor(() => findUploadInputFor(files), 'upload file input', 15000, 250);
     const dt = new DataTransfer();
     for (const file of files) dt.items.add(file);
     input.files = dt.files;
@@ -2335,7 +2559,7 @@
     if (!list.length) return [];
     const files = [];
     for (const meta of list) files.push(await fetchAttachmentFile(id, meta));
-    await uploadFiles(id, files);
+    await uploadFiles(id, files, { requirePreview: true });
     return files;
   }
 
@@ -2355,11 +2579,13 @@
   function waitEnabledSendButton(timeoutMs = 120000) {
     return new Promise((resolve, reject) => {
       let done = false;
-      let rafPending = false;
+      let checkPending = false;
       const observer = new MutationObserver(scheduleCheck);
+      const poll = setInterval(checkNow, 500);
       const timer = setTimeout(() => finish(null, new Error('timeout: enabled send button (composer non-empty)')), timeoutMs);
       function cleanup() {
         observer.disconnect();
+        clearInterval(poll);
         clearTimeout(timer);
       }
       function finish(value, error) {
@@ -2375,10 +2601,10 @@
         if (b && isVisible(b) && !isDisabled(b)) finish(b);
       }
       function scheduleCheck() {
-        if (done || rafPending) return;
-        rafPending = true;
-        requestAnimationFrame(() => {
-          rafPending = false;
+        if (done || checkPending) return;
+        checkPending = true;
+        queueMicrotask(() => {
+          checkPending = false;
           checkNow();
         });
       }
@@ -2388,18 +2614,20 @@
         attributes: true,
         attributeFilter: ['disabled', 'aria-disabled', 'data-testid', 'class'],
       });
-      scheduleCheck();
+      checkNow();
     });
   }
 
   function waitSubmitAccepted(timeoutMs = 120000) {
     return new Promise(resolve => {
       let done = false;
-      let rafPending = false;
+      let checkPending = false;
       const observer = new MutationObserver(scheduleCheck);
+      const poll = setInterval(checkNow, 500);
       const timer = setTimeout(() => finish(false), timeoutMs);
       function cleanup() {
         observer.disconnect();
+        clearInterval(poll);
         clearTimeout(timer);
       }
       function finish(value) {
@@ -2415,10 +2643,10 @@
         if (findStopBtn() || !send || !isVisible(send) || isDisabled(send)) finish(true);
       }
       function scheduleCheck() {
-        if (done || rafPending) return;
-        rafPending = true;
-        requestAnimationFrame(() => {
-          rafPending = false;
+        if (done || checkPending) return;
+        checkPending = true;
+        queueMicrotask(() => {
+          checkPending = false;
           checkNow();
         });
       }
@@ -2428,7 +2656,7 @@
         attributes: true,
         attributeFilter: ['disabled', 'aria-disabled', 'data-testid', 'class'],
       });
-      scheduleCheck();
+      checkNow();
     });
   }
 
@@ -2451,6 +2679,12 @@
     // aistudio-core.js::parseLastTurn. Без этого watcher.done никогда не
     // срабатывал в фоновой вкладке: hasAnswer всегда 0.
     return ((md || el).textContent || (md || el).innerText || '').trim();
+  }
+  function hasFinalAnswerAction() {
+    const el = lastAssistantEl();
+    if (!el) return false;
+    const turn = el.closest('[data-turn="assistant"], [data-testid^="conversation-turn-"]') || el;
+    return !!turn.querySelector('[data-testid="copy-turn-action-button"], [aria-label*="Копировать ответ"], [aria-label*="Copy response" i]');
   }
   // «Думал на протяжении 2m 20s» — кнопка-сводка thinking-блока над ответом.
   function readThinkingLine() {
@@ -2763,7 +2997,7 @@
   // мгновенный done. Решение как в aistudio-mcp.js::studio_ready: один раз
   // __sc_focus_self (кратко на передний план) → React дорисовывает → done →
   // restore фокуса в done-handler'е main().
-  function startDoneWatcher(onDone, onProgress, escalation, getDoneImages) {
+  function startDoneWatcher(onDone, onProgress, escalation, getDoneImages, terminalProbe) {
     let stopAppeared = false;
     let lastUrl = location.href;
     const armedAt = Date.now();
@@ -2774,6 +3008,49 @@
     // мгновенно (stop появляется <1с, живой probe), долгая фаза — само мышление.
     const NO_STOP_FAIL_MS = 120000;
     let lastStopSeenAt = 0;
+    let fired = false;
+    let terminalProbePending = false;
+    let lastTerminalProbeAt = 0;
+    let lastTerminalProbeSig = '';
+
+    const requestDone = (meta) => {
+      if (typeof terminalProbe !== 'function') {
+        onDone(meta);
+        return true;
+      }
+      const now = Date.now();
+      if (terminalProbePending || now - lastTerminalProbeAt < 1500) return false;
+      terminalProbePending = true;
+      lastTerminalProbeAt = now;
+      Promise.resolve()
+        .then(() => terminalProbe(meta))
+        .then((proof) => {
+          terminalProbePending = false;
+          if (fired) return;
+          const sig = `${proof?.ready ? 1 : 0}|${proof?.reason || ''}|${proof?.message_id || ''}`;
+          if (sig !== lastTerminalProbeSig) {
+            lastTerminalProbeSig = sig;
+            const data = {
+              ready: !!proof?.ready,
+              reason: proof?.reason || null,
+              messageId: proof?.message_id || null,
+              textLen: proof?.text?.length || 0,
+            };
+            log(proof?.ready ? 'watcher.api_final' : 'watcher.api_pending', data);
+            bridgeLog(proof?.ready ? 'gpt.watcher.api_final' : 'gpt.watcher.api_pending', data, getRequestId(), null);
+          }
+          if (!proof?.ready) return;
+          fired = true;
+          onDone({ ...meta, apiFinal: proof });
+        })
+        .catch((error) => {
+          terminalProbePending = false;
+          const data = { err: error?.message || String(error) };
+          log('watcher.api_probe_failed', data);
+          bridgeLog('gpt.watcher.api_probe_failed', data, getRequestId(), null);
+        });
+      return false;
+    };
 
     let tickN = 0;
     let lastTickSig = null;
@@ -2800,13 +3077,14 @@
       }
       if (!armed) return false;
       const imageCount = typeof getDoneImages === 'function' ? getDoneImages().length : 0;
-      const hasAnswer = readAnswerText().length > 0;
+      const hasAnswer = readAnswerText().length > 0 && hasFinalAnswerAction();
       if (!stopAppeared) {
         if ((hasAnswer || imageCount > 0) && (send || voice)) {
-          log('watcher.done_without_stop', { hasAnswer, imageCount });
-          bridgeLog('gpt.watcher.done_without_stop', { hasAnswer, imageCount }, getRequestId(), null);
-          onDone({ url: location.href, title: document.title });
-          return true;
+          if (!terminalProbePending) {
+            log('watcher.done_without_stop', { hasAnswer, imageCount });
+            bridgeLog('gpt.watcher.done_without_stop', { hasAnswer, imageCount }, getRequestId(), null);
+          }
+          return requestDone({ url: location.href, title: document.title, imageCount });
         }
         if (now - armedAt > NO_STOP_FAIL_MS) {
           onProgress({ stage: 'submit_failed' });
@@ -2823,13 +3101,13 @@
         if (escalation && quietPassed) escalation();
         return false;
       }
-      log('watcher.done', { stop_seen: stopAppeared, hasAnswer, imageCount });
-      bridgeLog('gpt.watcher.done', { stop_seen: stopAppeared, hasAnswer, imageCount }, getRequestId(), null);
-      onDone({ url: location.href, title: document.title });
-      return true;
+      if (!terminalProbePending) {
+        log('watcher.done', { stop_seen: stopAppeared, hasAnswer, imageCount });
+        bridgeLog('gpt.watcher.done', { stop_seen: stopAppeared, hasAnswer, imageCount }, getRequestId(), null);
+      }
+      return requestDone({ url: location.href, title: document.title, imageCount });
     };
 
-    let fired = false;
     const wrappedTick = () => {
       if (fired) return true;
       const ok = tick();
@@ -2842,7 +3120,7 @@
     const onMutation = () => {
       if (scheduled || fired) return;
       scheduled = true;
-      requestAnimationFrame(() => { scheduled = false; wrappedTick(); });
+      queueMicrotask(() => { scheduled = false; wrappedTick(); });
     };
     const mo = new MutationObserver(onMutation);
     mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['aria-label', 'disabled', 'data-testid'] });
@@ -2911,6 +3189,7 @@
       const mode = resolveChatgptMode(job.mode);
       const effortKey = resolveEffort(job.effort);
       const modelKey = resolveModel(job.model);
+      const speedKey = mode === 'work' ? resolveSpeed(job.speed) : null;
       log('compose.payload', {
         id,
         promptLen: job.prompt.length,
@@ -2939,6 +3218,7 @@
           mode: job.acceptedMode || mode,
           model: job.acceptedModel || modelKey,
           effort: job.acceptedEffort || effortKey,
+          speed: job.acceptedSpeed || speedKey,
         });
         if (acknowledged) await removeComposeJob(id);
         return;
@@ -2952,6 +3232,10 @@
       if (!okModel) throw new Error(`chatgpt_model_select_failed: не удалось выбрать модель ${modelDisplay(modelKey)}`);
       const okEffort = await ensureEffortSelected(effortKey);
       if (!okEffort) throw new Error(`chatgpt_effort_select_failed: не удалось выбрать интеллект ${effortLabel(effortKey)}`);
+      if (mode === 'work') {
+        const okSpeed = await ensureSpeedSelected(speedKey);
+        if (!okSpeed) throw new Error(`chatgpt_speed_select_failed: не удалось выбрать скорость ${speedLabel(speedKey)}`);
+      }
 
       let uploadedDocument = null;
       let documentUpload = null;
@@ -3006,12 +3290,14 @@
         acceptedMode: mode,
         acceptedModel: modelKey,
         acceptedEffort: effortKey,
+        acceptedSpeed: speedKey,
       });
       log('compose.submitted', {
         id,
         mode,
         model: modelKey,
         effort: effortKey,
+        speed: speedKey,
         promptLen: job.prompt.length,
         documentChars: job.document?.text.length || 0,
         delivery,
@@ -3021,6 +3307,7 @@
         mode,
         model: modelKey,
         effort: effortKey,
+        speed: speedKey,
       });
       if (acknowledged) await removeComposeJob(id);
       else log('compose.result_ack_pending', { id, mode, model: modelKey, effort: effortKey });
@@ -3034,6 +3321,7 @@
           mode: resolveChatgptMode(job.mode),
           model: resolveModel(job.model),
           effort: resolveEffort(job.effort),
+          speed: resolveChatgptMode(job.mode) === 'work' ? resolveSpeed(job.speed) : null,
         });
         if (acknowledged) await removeComposeJob(id);
       }
@@ -3096,15 +3384,17 @@
     const mode = resolveChatgptMode(job.options?.mode);
     const effortKey = resolveEffort(job.options?.effort);
     const modelKey = resolveModel(job.options?.model);
+    const speedKey = mode === 'work' ? resolveSpeed(job.options?.speed) : null;
     const wantSourcesInText = !!job.options?.sources;
-    const keepTabAfterDone = job.options?.keepTab === true || job.options?.autoClose === false;
+    const keepTabAfterDone = scKeepResearchTabAfterDone(job.options);
     const attachmentMetas = Array.isArray(job.attachments) ? job.attachments : [];
 
     // MCP-плашка (общий research-badge.js) — юзер видит «вкладка под job'ом».
     try {
       window.scResearchBadge?.show({
         jobId: id, providerLabel: `ChatGPT · ${chatgptModeLabel(mode)}`,
-        modelTitle: modelDisplay(modelKey) + ' · ' + effortLabel(effortKey),
+        modelTitle: modelDisplay(modelKey) + ' · ' + effortLabel(effortKey)
+          + (speedKey ? ' · ' + speedLabel(speedKey) : ''),
         prompt: job.prompt || '',
       });
     } catch {}
@@ -3113,6 +3403,16 @@
     // только watcher, никакого повторного paste (иначе дубль-сообщение в чате).
     const isReloadRestart = recovered || job.status === 'running';
     const imageBaselineKeys = collectGeneratedImageKeys();
+    let apiBaselineFinalId = null;
+    if (!isReloadRestart) {
+      try {
+        const baseline = await latestApiTurnSnapshot();
+        if (baseline.ready) apiBaselineFinalId = baseline.message_id || null;
+      } catch (error) {
+        log('api.baseline_failed', { err: error?.message || String(error) });
+      }
+    }
+    let apiProbeFailures = 0;
 
     try {
       await waitFor(() => findComposer(), 'composer (#prompt-textarea — логин?)', 20000);
@@ -3149,6 +3449,13 @@
         if (!okEffort) {
           await failConfiguration(`chatgpt_effort_select_failed: не удалось выбрать интеллект ${effortLabel(effortKey)} (запрос не отправлен с другим sticky-уровнем)`);
           return;
+        }
+        if (mode === 'work') {
+          const okSpeed = await ensureSpeedSelected(speedKey);
+          if (!okSpeed) {
+            await failConfiguration(`chatgpt_speed_select_failed: не удалось выбрать скорость ${speedLabel(speedKey)} (запрос не отправлен со sticky-настройкой)`);
+            return;
+          }
         }
         let uploadedAttachmentFiles = [];
         if (attachmentMetas.length) {
@@ -3194,24 +3501,39 @@
       const stopWatcher = startDoneWatcher(
         async (final) => {
           await sleep(500);
+          const apiFinal = final.apiFinal?.ready && !final.apiFinal?.fallback
+            ? final.apiFinal
+            : null;
           // Hidden tab коммитит DOM ЧАСТИЧНО (тест: 55 символов из полного
           // ответа, стабилизация ложно проходит — замороженный DOM не растёт;
           // чип «Источники» тоже не дорисован). Извлечение валидно только на
           // отрисованной вкладке: фокус-пульс перед extract, restore после.
-          if (document.visibilityState === 'hidden') {
+          if (!apiFinal && document.visibilityState === 'hidden') {
             escalateFocus();
             const tf = performance.now();
             while (document.visibilityState === 'hidden' && performance.now() - tf < 4000) await sleep(200);
             await sleep(800); // дать React дорисовать после unfreeze
           }
-          const text = await extractAnswerStable();
-          const generatedImages = await extractGeneratedImagesStable(imageBaselineKeys);
+          const text = apiFinal?.text || await extractAnswerStable();
+          const generatedImages = final.imageCount > 0
+            ? await extractGeneratedImagesStable(imageBaselineKeys)
+            : [];
           const persistedImages = await persistGeneratedImages(id, generatedImages);
           const thinkingLine = readThinkingLine();
-          const thinkingText = readThinkingText();
+          const thinkingText = apiFinal?.reasoning_text || readThinkingText();
           // Источники парсим ВСЕГДА (в result.sources). В text — только по
           // options.sources: дефолтный ответ чистый, источники по параметру.
-          const src = await extractSources();
+          const src = apiFinal
+            ? {
+                links: apiFinal.links || [],
+                activity_items: apiFinal.activity_items || [],
+                activity: null,
+                thinking: thinkingText ? [thinkingText] : [],
+                chip_present: false,
+                panel_opened: false,
+                source: 'api',
+              }
+            : await extractSources();
           let outText = text || '';
           if (wantSourcesInText && src.links.length) {
             const block = src.links.map((l, i) => `${i + 1}. ${l.title || l.url} — ${l.url}`).join('\n');
@@ -3248,9 +3570,11 @@
                 thinking_text: thinkingText || null,
                 chip_present: src.chip_present,
                 panel_opened: src.panel_opened,
+                source: src.source || 'dom',
               },
               effort: effortKey,
               model: modelKey,
+              speed: speedKey,
             },
           });
           try { stopWatcher(); } catch {}
@@ -3291,7 +3615,27 @@
           await postState(id, { stage: prog.stage, url: prog.url, title: prog.title });
         },
         escalateFocus,
-        () => collectGeneratedImages(imageBaselineKeys)
+        () => collectGeneratedImages(imageBaselineKeys),
+        async () => {
+          try {
+            const proof = terminalProofForCurrentPage(await latestApiTurnSnapshot(8000));
+            apiProbeFailures = 0;
+            if (proof.ready && apiBaselineFinalId && proof.message_id === apiBaselineFinalId) {
+              return { ...proof, ready: false, reason: 'api_final_same_as_baseline' };
+            }
+            return proof;
+          } catch (error) {
+            apiProbeFailures++;
+            if (apiProbeFailures >= 3) {
+              return {
+                ready: true,
+                fallback: true,
+                reason: 'api_unavailable_dom_fallback',
+              };
+            }
+            throw error;
+          }
+        }
       );
     } catch (e) {
       const msg = e?.message || String(e);

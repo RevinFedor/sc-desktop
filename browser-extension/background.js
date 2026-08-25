@@ -11,8 +11,16 @@
 
 // MCP-Bridge подключается в SW через importScripts (MV3 разрешает).
 // mcp-handlers.js сам вызывает connectMcpBridge() в конце файла.
+try { importScripts('learning-store.js'); }
+catch (e) { console.warn('[SC-BG] learning-store load failed:', e); }
+try { importScripts('mcp-window-model.js'); }
+catch (e) { console.warn('[SC-BG] mcp-window-model load failed:', e); }
 try { importScripts('mcp-handlers.js'); }
 catch (e) { console.warn('[SC-BG] mcp-handlers load failed:', e); }
+try { importScripts('tab-placement.js'); }
+catch (e) { console.warn('[SC-BG] tab-placement load failed:', e); }
+try { importScripts('chatgpt-entry-url.js'); }
+catch (e) { console.warn('[SC-BG] chatgpt-entry-url load failed:', e); }
 try { importScripts('settings.js'); }
 catch (e) { console.warn('[SC-BG] settings load failed:', e); }
 
@@ -25,6 +33,62 @@ const TRACKER_TTL_MS = 30 * 60 * 1000; // считаем job stale через п
 const MAX_RESUME_ATTEMPTS = 3; // awaiting_ai → /yt-resume-ai retry cap до 'error'
 const YOUTUBE_SETTINGS_PATH = '/extension-settings/youtube';
 const SC_EXTENSION_ID = 'phnlfhkblebijojjnnlbcbklijgcijgf';
+const VOCABULARY_SYNC_ALARM = 'sc-vocabulary-sync';
+
+const learningStore = self.__scLearningStore;
+const learningMutationActions = new Set([
+  'setState', 'saveMachineTranslation', 'editTranslation', 'queueReview', 'resolveConflict',
+]);
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type !== 'sc-open-study') return undefined;
+  try {
+    const pending = chrome.runtime.openOptionsPage();
+    pending?.catch?.((error) => {
+      console.warn('[SC-BG] open vocabulary page failed:', error?.message || error);
+    });
+  } catch (error) {
+    console.warn('[SC-BG] open vocabulary page failed:', error?.message || error);
+  }
+  return false;
+});
+
+if (learningStore?.MESSAGE_METHODS) {
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type !== 'sc-learning-store') return undefined;
+    const action = String(message.action || '');
+    if (!learningStore.MESSAGE_METHODS.has(action) || typeof learningStore[action] !== 'function') {
+      sendResponse({ ok: false, error: 'Unknown learning-store action' });
+      return false;
+    }
+    Promise.resolve(learningStore[action](message.payload || {}))
+      .then((result) => {
+        sendResponse({ ok: true, result });
+        if (learningMutationActions.has(action)) learningStore.sync().catch(() => {});
+      })
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  });
+
+  learningStore.subscribe((detail) => {
+    chrome.tabs.query({ url: ['https://www.youtube.com/*', 'https://m.youtube.com/*'] }, (tabs) => {
+      for (const tab of tabs || []) {
+        if (!tab?.id) continue;
+        chrome.tabs.sendMessage(tab.id, { type: 'sc-learning-store-changed', detail }, () => {
+          void chrome.runtime.lastError;
+        });
+      }
+    });
+  });
+
+  chrome.alarms.create(VOCABULARY_SYNC_ALARM, { periodInMinutes: 1 });
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === VOCABULARY_SYNC_ALARM) learningStore.sync().catch(() => {});
+  });
+  learningStore.migrateLegacy()
+    .then(() => learningStore.sync())
+    .catch(() => {});
+}
 
 function storageSyncGet(defaults) {
   return new Promise(resolve => chrome.storage.sync.get(defaults, resolve));
@@ -175,6 +239,7 @@ function mergeYoutubeSettingsIntoJob(job, settings) {
     chatgptMode: mode,
     chatgptModel: y[`chatgpt_${mode}_model`] || y.chatgpt_model || job.chatgptModel || '5.6-sol',
     chatgptEffort: y[`chatgpt_${mode}_effort`] || y.chatgpt_effort || job.chatgptEffort || 'xhigh',
+    chatgptSpeed: mode === 'work' ? (y.chatgpt_work_speed || job.chatgptSpeed || 'standard') : null,
   };
 }
 
@@ -1750,6 +1815,7 @@ async function deliverChatgptComposeResult(requestId, result, stored = {}) {
     mode,
     model: result.model || stored.model || null,
     effort: result.effort || stored.effort || null,
+    speed: result.speed || stored.speed || null,
   };
   // Terminal result становится durable ДО первой доставки в YouTube. Иначе
   // respin SW в узком окне sendMessage потеряет реальную selector/login ошибку
@@ -1763,6 +1829,7 @@ async function deliverChatgptComposeResult(requestId, result, stored = {}) {
     mode,
     model: terminalResult.model,
     effort: terminalResult.effort,
+    speed: terminalResult.speed,
     ts: stored.ts || Date.now(),
   }, terminalResult);
   scBgDbg('chatgpt.compose.result', {
@@ -1771,8 +1838,18 @@ async function deliverChatgptComposeResult(requestId, result, stored = {}) {
     mode,
     model: result.model || stored.model || null,
     effort: result.effort || stored.effort || null,
+    speed: result.speed || stored.speed || null,
     ytVideoId: route.ytVideoId,
   });
+  postLifecycleLog('gpt.compose.result', stored.tabId ?? null, {
+    requestId,
+    ok,
+    mode,
+    model: terminalResult.model,
+    effort: terminalResult.effort,
+    speed: terminalResult.speed,
+    ytVideoId: route.ytVideoId,
+  }).catch(() => {});
 
   let delivery;
   if (ok) {
@@ -1942,6 +2019,7 @@ function composeTerminalResult(job, fallbackError = null) {
       mode: job.acceptedMode || job.mode || 'chat',
       model: job.acceptedModel || job.model || null,
       effort: job.acceptedEffort || job.effort || null,
+      speed: job.acceptedSpeed || job.speed || null,
     };
   }
   if (fallbackError) {
@@ -1951,6 +2029,7 @@ function composeTerminalResult(job, fallbackError = null) {
       mode: job?.mode || 'chat',
       model: job?.model || null,
       effort: job?.effort || null,
+      speed: job?.speed || null,
     };
   }
   return null;
@@ -2060,6 +2139,57 @@ async function createTabAsync(opts) {
   });
 }
 
+async function createTabBesideSourceAsync(opts, sourceTabId, logContext = {}) {
+  if (!Number.isInteger(sourceTabId)) return createTabAsync(opts);
+
+  let sourceTab;
+  try {
+    sourceTab = await chrome.tabs.get(sourceTabId);
+  } catch (error) {
+    scBgDbg('tabs.create_beside_source.source_missing', {
+      ...logContext,
+      sourceTabId,
+      err: error?.message || String(error),
+    });
+    return createTabAsync(opts);
+  }
+
+  const positioned = typeof scTabCreateOptionsBesideSource === 'function'
+    ? scTabCreateOptionsBesideSource(opts, sourceTab)
+    : { ...opts };
+  const hasPlacement = Number.isInteger(positioned.windowId) && Number.isInteger(positioned.index);
+  if (!hasPlacement) return createTabAsync(opts);
+
+  try {
+    const tab = await createTabAsync(positioned);
+    const placementData = {
+      ...logContext,
+      sourceTabId,
+      sourceWindowId: sourceTab.windowId,
+      sourceIndex: sourceTab.index,
+      requestedIndex: positioned.index,
+      tabId: tab?.id ?? null,
+      tabWindowId: tab?.windowId ?? null,
+      tabIndex: tab?.index ?? null,
+    };
+    scBgDbg('tabs.create_beside_source.OK', placementData);
+    postLifecycleLog('sw.tabs.create_beside_source', tab?.id ?? null, placementData).catch(() => {});
+    return tab;
+  } catch (error) {
+    // Между tabs.get и tabs.create исходное окно могло закрыться. Саму
+    // возможность открыть ChatGPT не теряем: повторяем без привязки к позиции.
+    scBgDbg('tabs.create_beside_source.retry_unplaced', {
+      ...logContext,
+      sourceTabId,
+      sourceWindowId: sourceTab.windowId,
+      sourceIndex: sourceTab.index,
+      requestedIndex: positioned.index,
+      err: error?.message || String(error),
+    });
+    return createTabAsync(opts);
+  }
+}
+
 // YouTube → ChatGPT это не MCP/research job. Здесь нужен только reusable
 // compose-layer: открыть ChatGPT, выбрать модель/effort, загрузить транскрипт
 // отдельным документом, ввести instruction в composer и нажать Send. Ответ
@@ -2079,6 +2209,7 @@ async function openChatgptBackground(payload) {
     mode: normalizeChatgptMode(payload.mode),
     model: payload.model || '5.6-sol',
     effort: payload.effort || 'xhigh',
+    speed: normalizeChatgptMode(payload.mode) === 'work' ? (payload.speed || 'standard') : null,
     ytTabId: payload.ytTabId ?? null,
     ytVideoId: payload.ytVideoId || null,
     ytTitle: payload.ytTitle || null,
@@ -2089,6 +2220,7 @@ async function openChatgptBackground(payload) {
     mode: job.mode,
     model: job.model,
     effort: job.effort,
+    speed: job.speed,
     promptLen: job.prompt.length,
     documentChars: job.document.text.length,
     documentName: job.document.name,
@@ -2101,10 +2233,10 @@ async function openChatgptBackground(payload) {
   await ensureChatgptComposeWatchdog();
   let tab;
   try {
-    tab = await createTabAsync({
-      url: 'https://chatgpt.com/?sc-compose=' + encodeURIComponent(requestId) + '#sc-compose=' + encodeURIComponent(requestId),
+    tab = await createTabBesideSourceAsync({
+      url: scChatgptComposeEntryUrl(requestId, job.mode),
       active: false,
-    });
+    }, job.ytTabId, { requestId, feature: 'youtube-chatgpt-compose' });
   } catch (error) {
     await chrome.storage.local.remove(CHATGPT_COMPOSE_JOB_PREFIX + requestId);
     clearChatgptComposeWatchdogIfIdle().catch(() => {});
@@ -2136,6 +2268,7 @@ async function openTargetBackground(target, common, job) {
       mode: job.chatgptMode,
       model: job.chatgptModel,
       effort: job.chatgptEffort,
+      speed: job.chatgptSpeed,
     });
   }
   if (target === 'claude') {

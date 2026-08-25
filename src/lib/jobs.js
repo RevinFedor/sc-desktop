@@ -1,6 +1,7 @@
 // Renderer-side jobs store. Subscribes to main-process updates via preload IPC.
 
-import { useSyncExternalStore } from 'react'
+import { useCallback, useRef, useSyncExternalStore } from 'react'
+import { createSelectionCache, findJobByIdentity } from './jobSelectorCore.mjs'
 
 let jobs = []                 // [{ id, type, target, status, items_done, items_total, ... }]
 const subs = new Set()
@@ -8,41 +9,103 @@ let unsubMain = null
 
 function emit() { subs.forEach(fn => fn()) }
 function snapshot() { return jobs }
+function subscribe(fn) { subs.add(fn); return () => subs.delete(fn) }
+
+const isActiveStatus = status => (
+  status === 'running' || status === 'awaiting_ai' || status === 'cancelling'
+)
+
+function sortJobs(list) {
+  list.sort((a, b) => {
+    if (isActiveStatus(a.status) && !isActiveStatus(b.status)) return -1
+    if (isActiveStatus(b.status) && !isActiveStatus(a.status)) return 1
+    return (b.started_at || 0) - (a.started_at || 0)
+  })
+  return list
+}
+
+function upsertJob(updated) {
+  const idx = jobs.findIndex(job => job.id === updated.id)
+  if (idx < 0) {
+    jobs = sortJobs([updated, ...jobs])
+    return
+  }
+  const previous = jobs[idx]
+  const rankChanged = isActiveStatus(previous.status) !== isActiveStatus(updated.status)
+    || previous.started_at !== updated.started_at
+  jobs = [...jobs.slice(0, idx), updated, ...jobs.slice(idx + 1)]
+  if (rankChanged) sortJobs(jobs)
+}
 
 function init() {
   if (unsubMain) return
   if (!window.api) return  // browser preview without preload
 
-  // Pull initial list
-  window.api.jobsList().then(list => {
-    jobs = list
-    emit()
-  }).catch(() => {})
-
+  // Subscribe before hydration. A fast job can emit while jobsList() is in
+  // flight; overlay those updates onto the initial DB snapshot instead of
+  // letting the older response roll live progress backwards.
+  let hydrating = true
+  const duringHydration = new Map()
   unsubMain = window.api.onJobUpdate(updated => {
-    const idx = jobs.findIndex(j => j.id === updated.id)
-    if (idx >= 0) {
-      jobs = [...jobs.slice(0, idx), updated, ...jobs.slice(idx + 1)]
-    } else {
-      jobs = [updated, ...jobs]
-    }
-    // sort: active first (running / awaiting_ai), then most recent finished
-    const isActive = s => s === 'running' || s === 'awaiting_ai'
-    jobs.sort((a, b) => {
-      if (isActive(a.status) && !isActive(b.status)) return -1
-      if (isActive(b.status) && !isActive(a.status)) return 1
-      return (b.started_at || 0) - (a.started_at || 0)
-    })
+    if (hydrating) duringHydration.set(`${typeof updated.id}:${String(updated.id)}`, updated)
+    upsertJob(updated)
     emit()
+  })
+
+  window.api.jobsList().then(list => {
+    const merged = Array.isArray(list) ? [...list] : []
+    for (const updated of duringHydration.values()) {
+      const idx = merged.findIndex(job => job.id === updated.id)
+      if (idx >= 0) merged[idx] = updated
+      else merged.push(updated)
+    }
+    hydrating = false
+    duringHydration.clear()
+    jobs = sortJobs(merged)
+    emit()
+  }).catch(() => {
+    hydrating = false
+    duringHydration.clear()
   })
 }
 
 export function useJobs() {
+  return useJobsSelector(value => value)
+}
+
+/**
+ * Subscribe to a projection of the jobs list.
+ *
+ * Unlike `useJobs().filter(...)`, an unrelated job update does not re-render
+ * the component when `equality` says that its selected projection is
+ * unchanged. This is load-bearing for large Telegram lists: a hidden child
+ * fetch must not wake TelegramScreen, ChatView, LibrarySidebar and every
+ * closed popover four times per second.
+ */
+export function useJobsSelector(selector, equality = Object.is) {
   init()
+  const selectorRef = useRef(selector)
+  selectorRef.current = selector
+  const equalityRef = useRef(equality)
+  equalityRef.current = equality
+  const cacheRef = useRef(null)
+  if (cacheRef.current == null) {
+    cacheRef.current = createSelectionCache((a, b) => equalityRef.current(a, b))
+  }
+  const getSelectedSnapshot = useCallback(
+    () => cacheRef.current.select(snapshot(), selectorRef.current),
+    [],
+  )
   return useSyncExternalStore(
-    fn => { subs.add(fn); return () => subs.delete(fn) },
-    snapshot,
-    snapshot,
+    subscribe,
+    getSelectedSnapshot,
+    getSelectedSnapshot,
+  )
+}
+
+export function useJob(jobId) {
+  return useJobsSelector(
+    list => findJobByIdentity(list, jobId),
   )
 }
 
@@ -59,9 +122,9 @@ export async function resolveTelegramTitle(text) {
   return await window.api.tgResolveTitle(text)
 }
 
-export async function cancelJob(id) {
+export async function cancelJob(id, options = {}) {
   if (!window.api) return
-  return await window.api.cancelJob(id)
+  return await window.api.cancelJob({ id, ...options })
 }
 
 // ─── YouTube single-video transcript ──────────────────────────────────
@@ -215,11 +278,18 @@ export async function startInstagramBatchTranscribe(params) {
   if (!window.api?.igBatchTranscribe) return null
   return await window.api.igBatchTranscribe(params)
 }
-export async function getInstagramSettings() {
+const instagramSettingsInflight = new Map()
+export async function getInstagramSettings(options = {}) {
   if (!window.api?.igGetSettings) {
     return { metadata_backend: 'api', transcribe_backend: 'api', apify_token_set: false }
   }
-  return await window.api.igGetSettings()
+  const key = `${options.validateToken === true ? 'validate' : 'basic'}:${options.force === true ? 'force' : 'cached'}`
+  if (instagramSettingsInflight.has(key)) return instagramSettingsInflight.get(key)
+  const promise = window.api.igGetSettings(options).finally(() => {
+    if (instagramSettingsInflight.get(key) === promise) instagramSettingsInflight.delete(key)
+  })
+  instagramSettingsInflight.set(key, promise)
+  return promise
 }
 
 /** Subscribe to a specific job's snapshot updates. Auto-fetches initial state.

@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
+import { Virtuoso } from 'react-virtuoso'
 import { ChevronDown, ChevronRight, ChevronUp, Minus, TriangleAlert } from 'lucide-react'
 import { PLATFORMS } from '../lib/detect'
 import { toggleScreen, useStore } from '../lib/store'
 import { useSources, useSourcesLoaded } from '../lib/sources'
-import { useJobs } from '../lib/jobs'
+import { useJobsSelector } from '../lib/jobs'
+import { sameArrayItems } from '../lib/jobSelectorCore.mjs'
 import PlatformLogo from './PlatformLogo'
 import Avatar from './Avatar'
 import { useTelegramSelection } from '../lib/telegramSelection'
@@ -39,15 +41,19 @@ export default function LibrarySidebar() {
   const sources = useSources()
   const loaded  = useSourcesLoaded()
   const screen = useStore(s => s.screen)
-  const grouped = group(sources)
+  const grouped = useMemo(() => group(sources), [sources])
   const activeSourceId = screen.name === 'source-detail' ? screen.payload?.sourceId : null
-  const jobs = useJobs()
+  const jobs = useJobsSelector(
+    list => list.filter(job => (
+      job?.type === 'tg_index'
+      && (job.status === 'running' || job.status === 'awaiting_ai' || job.status === 'cancelling')
+      && job.source_id != null
+    )),
+    sameArrayItems,
+  )
   const liveIndexBySource = useMemo(() => {
     const map = new Map()
     for (const job of jobs) {
-      if (job?.type !== 'tg_index') continue
-      if (job.status !== 'running' && job.status !== 'awaiting_ai') continue
-      if (job.source_id == null) continue
       map.set(Number(job.source_id), job)
     }
     return map
@@ -56,9 +62,7 @@ export default function LibrarySidebar() {
   // по умолчанию (пустой Set значит «всё свёрнуто»: см. PlatformGroup).
   const [collapsed, setCollapsed] = useState(loadCollapsedSet)
   const sidebarRef = useRef(null)
-  const scrollRef = useRef(null)
-  const headerNodesRef = useRef(new Map())
-  const groupNodesRef = useRef(new Map())
+  const virtuosoRef = useRef(null)
   const [platformPositions, setPlatformPositions] = useState({})
   const [visiblePlatforms, setVisiblePlatforms] = useState({})
   const [widePlatformPanel, setWidePlatformPanel] = useState(false)
@@ -86,59 +90,51 @@ export default function LibrarySidebar() {
   useEffect(() => {
     const known = new Set(tgOrderedIds)
     selection.pruneTo(known)
-  }, [tgOrderedIds.join(',')])
+  }, [tgOrderedIds, selection.pruneTo])
 
-  const registerHeaderNode = useCallback((platform, node) => {
-    if (node) headerNodesRef.current.set(platform, node)
-    else headerNodesRef.current.delete(platform)
-  }, [])
-
-  const registerGroupNode = useCallback((platform, node) => {
-    if (node) groupNodesRef.current.set(platform, node)
-    else groupNodesRef.current.delete(platform)
-  }, [])
-
-  const updatePlatformPositions = useCallback(() => {
-    const viewport = scrollRef.current
-    if (!viewport) return
-    const viewportRect = viewport.getBoundingClientRect()
-    const next = {}
-    const nextVisible = {}
-
-    for (const platform of PLATFORM_GROUP_ORDER) {
-      const header = headerNodesRef.current.get(platform) ||
-        viewport.querySelector(`[data-library-platform-header="${platform}"]`)
-      const groupNode = groupNodesRef.current.get(platform) ||
-        viewport.querySelector(`[data-library-platform-group="${platform}"]`)
-      if (header) {
-        const rect = header.getBoundingClientRect()
-        if (rect.bottom <= viewportRect.top + 1) next[platform] = 'up'
-        else if (rect.top >= viewportRect.bottom - 1) next[platform] = 'down'
-        else next[platform] = 'visible'
+  const sidebarModel = useMemo(() => {
+    const extra = Object.keys(grouped).filter(platform => !PLATFORM_GROUP_ORDER.includes(platform))
+    const platforms = [...PLATFORM_GROUP_ORDER, ...extra]
+    const rows = []
+    const headerIndexes = new Map()
+    const spans = new Map()
+    for (const platform of platforms) {
+      const items = grouped[platform] || []
+      const start = rows.length
+      headerIndexes.set(platform, start)
+      rows.push({ kind: 'header', platform, items })
+      const { explicit, other } = splitSources(items, platform)
+      for (const source of explicit) rows.push({ kind: 'source', platform, source })
+      if (other.length) {
+        rows.push({ kind: 'other-toggle', platform, count: other.length })
+        if (collapsed.has(platform)) {
+          for (const source of other) rows.push({ kind: 'source', platform, source, secondary: true })
+        }
       }
-      if (groupNode) {
-        const rect = groupNode.getBoundingClientRect()
-        nextVisible[platform] = rect.bottom > viewportRect.top + 1
-          && rect.top < viewportRect.bottom - 1
-      }
+      spans.set(platform, { start, end: Math.max(start, rows.length - 1) })
     }
+    return { rows, headerIndexes, spans }
+  }, [grouped, collapsed])
 
-    setPlatformPositions(prev => {
-      const changed = PLATFORM_GROUP_ORDER.some(platform => prev[platform] !== next[platform])
-      return changed ? next : prev
-    })
-    setVisiblePlatforms(prev => {
-      const changed = PLATFORM_GROUP_ORDER.some(platform => prev[platform] !== nextVisible[platform])
-      return changed ? nextVisible : prev
-    })
-  }, [])
-
-  const schedulePositionUpdate = useCallback(() => {
-    // Six header rectangles are cheap to read. Updating synchronously keeps
-    // the visible highlight deterministic even when Electron throttles
-    // animation frames for a window that was recently in the background.
-    updatePlatformPositions()
-  }, [updatePlatformPositions])
+  const handleRangeChanged = useCallback(({ startIndex, endIndex }) => {
+    const nextPositions = {}
+    const nextVisible = {}
+    for (const platform of PLATFORM_GROUP_ORDER) {
+      const header = sidebarModel.headerIndexes.get(platform)
+      const span = sidebarModel.spans.get(platform)
+      if (header == null || !span) continue
+      nextPositions[platform] = header < startIndex ? 'up' : header > endIndex ? 'down' : 'visible'
+      nextVisible[platform] = span.end >= startIndex && span.start <= endIndex
+    }
+    setPlatformPositions(prev => (
+      PLATFORM_GROUP_ORDER.some(platform => prev[platform] !== nextPositions[platform])
+        ? nextPositions : prev
+    ))
+    setVisiblePlatforms(prev => (
+      PLATFORM_GROUP_ORDER.some(platform => prev[platform] !== nextVisible[platform])
+        ? nextVisible : prev
+    ))
+  }, [sidebarModel])
 
   const updatePlatformPanelLayout = useCallback(() => {
     const wide = (sidebarRef.current?.clientWidth || 0) >= 340
@@ -146,31 +142,19 @@ export default function LibrarySidebar() {
   }, [])
 
   useEffect(() => {
-    // Refs and layout are ready when the effect runs. Compute once directly:
-    // a background/hidden first frame can defer requestAnimationFrame and must
-    // not leave every shortcut in the indeterminate/disabled state.
-    updatePlatformPositions()
     updatePlatformPanelLayout()
     const observer = new ResizeObserver(() => {
-      schedulePositionUpdate()
       updatePlatformPanelLayout()
     })
     if (sidebarRef.current) observer.observe(sidebarRef.current)
-    if (scrollRef.current) observer.observe(scrollRef.current)
-    for (const node of headerNodesRef.current.values()) observer.observe(node)
-    for (const node of groupNodesRef.current.values()) observer.observe(node)
     return () => observer.disconnect()
-  }, [loaded, sources, collapsed, schedulePositionUpdate, updatePlatformPanelLayout, updatePlatformPositions])
+  }, [updatePlatformPanelLayout])
 
   const scrollToPlatform = useCallback((platform) => {
-    const viewport = scrollRef.current
-    const target = headerNodesRef.current.get(platform) ||
-      viewport?.querySelector(`[data-library-platform-header="${platform}"]`)
-    if (!viewport || !target) return
-    const viewportRect = viewport.getBoundingClientRect()
-    const targetRect = target.getBoundingClientRect()
-    viewport.scrollTop += targetRect.top - viewportRect.top
-  }, [])
+    const index = sidebarModel.headerIndexes.get(platform)
+    if (index == null) return
+    virtuosoRef.current?.scrollToIndex({ index, align: 'start', behavior: 'auto' })
+  }, [sidebarModel])
 
   function toggleCollapsed(platform) {
     setCollapsed(prev => {
@@ -213,12 +197,7 @@ export default function LibrarySidebar() {
         ))}
       </nav>
 
-      <div
-        ref={scrollRef}
-        onScroll={schedulePositionUpdate}
-        className="flex-1 overflow-x-hidden overflow-y-auto overscroll-contain px-2 pb-2 min-h-0 min-w-0"
-        style={{ scrollbarGutter: 'stable' }}
-      >
+      <div className="flex-1 min-h-0 min-w-0 px-2 pb-2">
         {/* Three states for the empty body:
             - !loaded → shimmer rows (waiting for first sourcesList resolve)
             - loaded + no sources → real "пусто" hint
@@ -239,42 +218,54 @@ export default function LibrarySidebar() {
             No sources yet — paste a URL or @username
           </div>
         )}
-        {PLATFORM_GROUP_ORDER.map(platform => (
-          <PlatformGroup
-            key={platform}
-            platform={platform}
-            items={grouped[platform] || []}
-            activeSourceId={activeSourceId}
-            collapsedOther={!collapsed.has(platform)}
-            onToggleOther={() => toggleCollapsed(platform)}
-            tgOrderedIds={tgOrderedIds}
-            selection={selection}
-            liveIndexBySource={liveIndexBySource}
-            onContextMenu={(payload) => setCtxMenu(payload)}
-            headerRef={(node) => registerHeaderNode(platform, node)}
-            groupRef={(node) => registerGroupNode(platform, node)}
-            active={screen.name === platform}
+        {loaded && (
+          <Virtuoso
+            ref={virtuosoRef}
+            style={{ height: '100%' }}
+            data={sidebarModel.rows}
+            defaultItemHeight={34}
+            increaseViewportBy={100}
+            rangeChanged={handleRangeChanged}
+            computeItemKey={(index, row) => row.kind === 'source'
+              ? `source:${row.source.id}`
+              : `${row.kind}:${row.platform}:${index}`}
+            itemContent={(_index, row) => {
+              if (row.kind === 'header') {
+                return (
+                  <PlatformHeaderRow
+                    platform={row.platform}
+                    items={row.items}
+                    active={screen.name === row.platform}
+                  />
+                )
+              }
+              if (row.kind === 'other-toggle') {
+                return (
+                  <OtherToggleRow
+                    platform={row.platform}
+                    count={row.count}
+                    expanded={collapsed.has(row.platform)}
+                    onToggle={() => toggleCollapsed(row.platform)}
+                  />
+                )
+              }
+              const content = (
+                <SourceRow
+                  source={row.source}
+                  active={row.source.id === activeSourceId}
+                  isTelegram={row.platform === 'telegram'}
+                  selection={selection}
+                  tgOrderedIds={tgOrderedIds}
+                  indexJob={liveIndexBySource?.get(Number(row.source.id))}
+                  onContextMenu={(payload) => setCtxMenu(payload)}
+                />
+              )
+              return row.secondary
+                ? <div className="ml-2 border-l border-zinc-800 pl-1">{content}</div>
+                : content
+            }}
           />
-        ))}
-        {Object.entries(grouped)
-          .filter(([p]) => !PLATFORM_GROUP_ORDER.includes(p))
-          .map(([platform, items]) => (
-            <PlatformGroup
-              key={platform}
-              platform={platform}
-              items={items}
-              activeSourceId={activeSourceId}
-              collapsedOther={!collapsed.has(platform)}
-              onToggleOther={() => toggleCollapsed(platform)}
-              tgOrderedIds={tgOrderedIds}
-              selection={selection}
-              liveIndexBySource={liveIndexBySource}
-              onContextMenu={(payload) => setCtxMenu(payload)}
-              headerRef={(node) => registerHeaderNode(platform, node)}
-              groupRef={(node) => registerGroupNode(platform, node)}
-              active={screen.name === platform}
-            />
-          ))}
+        )}
       </div>
       {ctxMenu && (
         <SidebarContextMenu
@@ -285,6 +276,59 @@ export default function LibrarySidebar() {
         />
       )}
     </aside>
+  )
+}
+
+function PlatformHeaderRow({ platform, items, active }) {
+  const meta = PLATFORMS[platform]
+  const unavailableCount = platform === 'telegram'
+    ? items.filter(isTelegramSourceUnavailable).length
+    : 0
+  const clickable = PLATFORM_GROUP_ORDER.includes(platform)
+  const Header = clickable ? 'button' : 'div'
+  return (
+    <div className="pt-1">
+      <Header
+        data-library-platform-header={platform}
+        type={clickable ? 'button' : undefined}
+        onClick={clickable ? () => toggleScreen(platform) : undefined}
+        className={`w-full px-2 py-1.5 mb-1 flex items-center gap-2 rounded-md border min-w-0 group transition-colors ${
+          clickable
+            ? active ? 'border-zinc-700 bg-zinc-800' : 'border-zinc-800 bg-zinc-950 hover:border-zinc-700 hover:bg-zinc-900'
+            : 'border-transparent'
+        }`}
+      >
+        <PlatformLogo platform={platform} size={14} />
+        <span className="text-zinc-400 group-hover:text-zinc-200 truncate min-w-0 text-sm">
+          {meta?.label || platform}
+        </span>
+        {unavailableCount > 0 && (
+          <span className="ml-auto inline-flex items-center gap-1 text-red-400 shrink-0 tabular-nums text-xs">
+            <TriangleAlert size={12} />{unavailableCount}
+          </span>
+        )}
+        <span className={`${unavailableCount > 0 ? '' : 'ml-auto'} text-zinc-500 shrink-0 tabular-nums text-xs`}>
+          {items.length.toLocaleString('ru-RU')}
+        </span>
+      </Header>
+    </div>
+  )
+}
+
+function OtherToggleRow({ platform, count, expanded, onToggle }) {
+  return (
+    <button
+      data-library-other-toggle={platform}
+      onClick={onToggle}
+      className="w-full text-left px-2 py-1 flex items-center gap-1.5 rounded-md hover:bg-zinc-900 text-zinc-500 hover:text-zinc-300 min-w-0"
+      style={{ fontSize: '12px' }}
+      title={platform === 'telegram'
+        ? 'Чаты без сохранённых сообщений и случайные каналы — по дате последнего запроса'
+        : 'Случайные каналы'}
+    >
+      {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+      <span className="truncate min-w-0">Прочее ({count})</span>
+    </button>
   )
 }
 

@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import boosty_api
 import boosty_cli
+import boosty_full_channel
 import boosty_single_ndjson
 
 
@@ -120,6 +121,67 @@ class BoostyApiTests(unittest.TestCase):
             self.assertLess(path.stat().st_size, len(raw))
             with Image.open(path) as image:
                 self.assertLessEqual(max(image.size), 512)
+
+    def test_full_channel_plan_uses_96_kbit_audio_and_duration_pricing(self):
+        plan = boosty_full_channel.estimate_plan([
+            {"duration_sec": 1800},
+            {"duration_sec": 1800},
+        ], price_per_hour=0.15)
+        self.assertEqual(plan["videos"], 2)
+        self.assertEqual(plan["duration_sec"], 3600)
+        self.assertEqual(plan["audio_bytes"], 46_656_000)
+        self.assertAlmostEqual(plan["estimated_cost_usd"], 0.15)
+
+    def test_completed_result_requires_video_only_when_archiving(self):
+        canonical = {
+            "author": "author",
+            "post_id": "post-id",
+            "canonical_url": "https://boosty.to/author/posts/post-id",
+        }
+        descriptor = {
+            "video_id": "video-id",
+            "title": "Title",
+            "duration_sec": 10,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "audio" / "author" / "post-id"
+            media.mkdir(parents=True)
+            (media / "video-id__Title.mp3").write_bytes(b"audio")
+            transcripts = root / "transcripts" / "author"
+            transcripts.mkdir(parents=True)
+            stem = "post-id__video-id__Title"
+            (transcripts / f"{stem}.txt").write_text("text", encoding="utf-8")
+            (transcripts / f"{stem}.srt").write_text("srt", encoding="utf-8")
+            without_video = boosty_single_ndjson.completed_result(
+                root / "audio", root / "transcripts", canonical, descriptor,
+                video_root=root / "video", require_video=False,
+            )
+            self.assertIsNotNone(without_video)
+            self.assertIsNone(boosty_single_ndjson.completed_result(
+                root / "audio", root / "transcripts", canonical, descriptor,
+                video_root=root / "video", require_video=True,
+            ))
+            video_dir = root / "video" / "author" / "post-id"
+            video_dir.mkdir(parents=True)
+            (video_dir / "video-id__Title.mp4").write_bytes(b"video")
+            with_video = boosty_single_ndjson.completed_result(
+                root / "audio", root / "transcripts", canonical, descriptor,
+                video_root=root / "video", require_video=True,
+            )
+            self.assertEqual(Path(with_video["video_path"]).suffix, ".mp4")
+
+    def test_full_channel_refuses_unmounted_external_volume(self):
+        with self.assertRaisesRegex(RuntimeError, "Внешний диск не подключён"):
+            boosty_full_channel.disk_snapshot("/Volumes/definitely-not-mounted-sc/Boosty/audio")
+
+    def test_full_channel_rejects_second_concurrent_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "channel.lock"
+            with boosty_full_channel.exclusive_run(lock_path):
+                with self.assertRaisesRegex(RuntimeError, "уже запущен"):
+                    with boosty_full_channel.exclusive_run(lock_path):
+                        pass
 
 
 if __name__ == "__main__":

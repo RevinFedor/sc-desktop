@@ -3,9 +3,9 @@ const YOUTUBE_MODELS = new Set([
   'Gemini 3.1 Pro Preview',
 ])
 const CLAUDE_MODELS = new Set(['Opus 4.7', 'Sonnet 4.6', 'Haiku 4.5'])
-const CHATGPT_CHAT_MODELS = new Set(['5.5', '5.6-sol'])
+const CHATGPT_CHAT_MODELS = new Set(['5.5', '5.6-sol', 'o3'])
 const CHATGPT_WORK_MODELS = new Set(['5.6-sol', '5.6-terra', '5.6-luna'])
-const CHATGPT_RETIRED_MODELS = new Set(['5.4', '5.3', '5.2', '4.5', 'o3'])
+const CHATGPT_RETIRED_MODELS = new Set(['5.4', '5.3', '5.2', '4.5'])
 const CHATGPT_KNOWN_MODELS = new Set([
   ...CHATGPT_CHAT_MODELS,
   ...CHATGPT_WORK_MODELS,
@@ -16,14 +16,25 @@ const CHATGPT_EFFORTS = new Set([
   'low', 'xhigh', 'high', 'medium', 'instant', 'pro', 'pro-extended', 'max', 'ultra',
 ])
 const CHATGPT_CHAT_55_EFFORTS = new Set(['instant'])
-const CHATGPT_CHAT_56_EFFORTS = new Set(['medium', 'high', 'xhigh', 'pro'])
+const CHATGPT_CHAT_56_EFFORTS = new Set(['instant', 'medium', 'high', 'xhigh', 'pro'])
+const CHATGPT_CHAT_O3_EFFORTS = new Set(['medium'])
 const CHATGPT_WORK_56_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
-const EXTENSION_YOUTUBE_SCHEMA_VERSION = 1
+const CHATGPT_WORK_SPEEDS = new Set(['standard', 'fast'])
+const YOUTUBE_SUBTITLE_POSITIONS = new Set(['top', 'bottom'])
+const YOUTUBE_TRANSLATION_MODES = new Set(['hover', 'always'])
+const EXTENSION_YOUTUBE_SCHEMA_VERSION = 2
 
 const EXTENSION_YOUTUBE_DEFAULTS = Object.freeze({
   auto_aistudio: false,
   with_comments: false,
   preferred_lang: 'ru',
+  learning_enabled: true,
+  learning_target_lang: 'ru',
+  learning_auto_pause: false,
+  learning_subtitle_position: 'bottom',
+  learning_controls_mirrored: false,
+  learning_translation_mode: 'always',
+  learning_hide_native_subtitles: true,
   engine: 'gemini',
   target: 'aistudio',
   system_instruction: '',
@@ -41,6 +52,7 @@ const EXTENSION_YOUTUBE_DEFAULTS = Object.freeze({
   chatgpt_chat_effort: 'xhigh',
   chatgpt_work_model: '5.6-sol',
   chatgpt_work_effort: 'xhigh',
+  chatgpt_work_speed: 'standard',
   // Compatibility aliases. They always mirror the currently selected mode.
   chatgpt_model: '5.6-sol',
   chatgpt_effort: 'xhigh',
@@ -62,17 +74,34 @@ function booleanValue(value, fallback) {
   return typeof value === 'boolean' ? value : fallback
 }
 
+function storagePathValue(value) {
+  return typeof value === 'string' ? value.trim().slice(0, 2048) : ''
+}
+
+function sanitizeBoostySettings(raw = {}) {
+  const input = isPlainObject(raw) ? raw : {}
+  return {
+    audio_dir: storagePathValue(input.audio_dir),
+    video_dir: storagePathValue(input.video_dir),
+    save_video: booleanValue(input.save_video, false),
+  }
+}
+
 function chatgptModelsForMode(mode) {
   return mode === 'work' ? CHATGPT_WORK_MODELS : CHATGPT_CHAT_MODELS
 }
 
 function chatgptEffortsFor(mode, model) {
   if (mode === 'work') return CHATGPT_WORK_56_EFFORTS
-  return model === '5.5' ? CHATGPT_CHAT_55_EFFORTS : CHATGPT_CHAT_56_EFFORTS
+  if (model === '5.5') return CHATGPT_CHAT_55_EFFORTS
+  if (model === 'o3') return CHATGPT_CHAT_O3_EFFORTS
+  return CHATGPT_CHAT_56_EFFORTS
 }
 
 function defaultChatgptEffort(mode, model) {
-  return mode === 'chat' && model === '5.5' ? 'instant' : 'xhigh'
+  if (mode === 'chat' && model === '5.5') return 'instant'
+  if (mode === 'chat' && model === 'o3') return 'medium'
+  return 'xhigh'
 }
 
 function normalizeChatgptPair(mode, rawModel, rawEffort) {
@@ -109,6 +138,21 @@ function sanitizeExtensionYoutube(raw = {}) {
     auto_aistudio: booleanValue(input.auto_aistudio, false),
     with_comments: booleanValue(input.with_comments, false),
     preferred_lang: stringValue(input.preferred_lang, 'ru', 32).trim() || 'ru',
+    learning_enabled: booleanValue(input.learning_enabled, true),
+    learning_target_lang: stringValue(input.learning_target_lang, 'ru', 32).trim() || 'ru',
+    learning_auto_pause: booleanValue(input.learning_auto_pause, false),
+    learning_subtitle_position: enumValue(
+      input.learning_subtitle_position,
+      YOUTUBE_SUBTITLE_POSITIONS,
+      'bottom',
+    ),
+    learning_controls_mirrored: booleanValue(input.learning_controls_mirrored, false),
+    learning_translation_mode: enumValue(
+      input.learning_translation_mode,
+      YOUTUBE_TRANSLATION_MODES,
+      'always',
+    ),
+    learning_hide_native_subtitles: booleanValue(input.learning_hide_native_subtitles, true),
     engine: enumValue(input.engine, new Set(['gemini', 'assemblyai']), 'gemini'),
     target: enumValue(input.target, new Set(['aistudio', 'claude', 'chatgpt']), 'aistudio'),
     system_instruction: stringValue(input.system_instruction, '', 8000),
@@ -130,6 +174,7 @@ function sanitizeExtensionYoutube(raw = {}) {
     // so its first migration starts from explicit Work defaults.
     chatgpt_work_model: workPair.model,
     chatgpt_work_effort: workPair.effort,
+    chatgpt_work_speed: enumValue(input.chatgpt_work_speed, CHATGPT_WORK_SPEEDS, 'standard'),
   }
   result.chatgpt_model = mode === 'work' ? result.chatgpt_work_model : result.chatgpt_chat_model
   result.chatgpt_effort = mode === 'work' ? result.chatgpt_work_effort : result.chatgpt_chat_effort
@@ -164,7 +209,8 @@ const FORWARD_ENUM_KEYS = new Set([
   'engine', 'target', 'model_title', 'post_model_title', 'claude_model',
   'chatgpt_mode', 'chatgpt_model', 'chatgpt_effort',
   'chatgpt_chat_model', 'chatgpt_chat_effort',
-  'chatgpt_work_model', 'chatgpt_work_effort',
+  'chatgpt_work_model', 'chatgpt_work_effort', 'chatgpt_work_speed',
+  'learning_subtitle_position', 'learning_translation_mode',
 ])
 
 const FORWARD_ENUM_VALUES = Object.freeze({
@@ -180,6 +226,9 @@ const FORWARD_ENUM_VALUES = Object.freeze({
   chatgpt_chat_effort: CHATGPT_EFFORTS,
   chatgpt_work_model: CHATGPT_KNOWN_MODELS,
   chatgpt_work_effort: CHATGPT_EFFORTS,
+  chatgpt_work_speed: CHATGPT_WORK_SPEEDS,
+  learning_subtitle_position: YOUTUBE_SUBTITLE_POSITIONS,
+  learning_translation_mode: YOUTUBE_TRANSLATION_MODES,
 })
 
 function isFutureEnumValue(key, value) {
@@ -297,6 +346,7 @@ function instagramBackends(instagram = {}) {
 }
 
 function publicAppSettings(settings = {}) {
+  const main = isPlainObject(settings.main) ? settings.main : {}
   const youtubeCore = isPlainObject(settings.youtube) ? settings.youtube : {}
   const extensionYoutube = extensionYoutubeFromSettings(settings)
   const telegram = isPlainObject(settings.telegram) ? settings.telegram : {}
@@ -304,13 +354,20 @@ function publicAppSettings(settings = {}) {
   const instagramResolved = instagramBackends(instagram)
   const reddit = isPlainObject(settings.reddit) ? settings.reddit : {}
   const tiktok = isPlainObject(settings.tiktok) ? settings.tiktok : {}
+  const boosty = sanitizeBoostySettings(settings.boosty)
 
   return {
     main: {
       configured: true,
+      external_research_auto_close: booleanValue(main.external_research_auto_close, false),
     },
     telegram: {
       session: typeof telegram.session === 'string' ? telegram.session : null,
+      // Source-level auto rules already require an explicit opt-in.  This
+      // master gate preserves the existing behaviour for old settings files
+      // while giving the desktop UI one immediate kill-switch for every
+      // scheduled Telegram request.
+      auto_enabled: booleanValue(telegram.auto_enabled, true),
       engine: enumValue(telegram.engine, new Set(['gemini', 'assemblyai']), 'gemini'),
       model: stringValue(telegram.model, 'gemini-2.5-flash', 120),
       max_preview_items: Number.isFinite(Number(telegram.max_preview_items))
@@ -321,6 +378,9 @@ function publicAppSettings(settings = {}) {
       preferred_lang: extensionYoutube.preferred_lang,
       video_codec: stringValue(youtubeCore.video_codec, 'h264', 40),
       ...extensionYoutube,
+      translator_configured: typeof settings?.api_keys?.AZURE_TRANSLATOR_KEY === 'string'
+        && settings.api_keys.AZURE_TRANSLATOR_KEY.trim().length > 0,
+      translator_region: stringValue(settings?.azure_translator?.region, '', 80),
     },
     instagram: {
       metadata_backend: instagramResolved.metadata_backend,
@@ -334,6 +394,7 @@ function publicAppSettings(settings = {}) {
     tiktok: {
       preferred_engine: enumValue(tiktok.preferred_engine, new Set(['tikwm', 'yt-dlp']), 'tikwm'),
     },
+    boosty,
     twitter: {
       available: false,
     },
@@ -442,11 +503,17 @@ function patchAppSettings(readScSettings, writeScSettings, payload = {}) {
   }
 
   const settings = readScSettings()
-  if (section === 'reddit') {
+  if (section === 'main') {
+    settings.main = isPlainObject(settings.main) ? settings.main : {}
+    if (typeof patch.external_research_auto_close === 'boolean') {
+      settings.main.external_research_auto_close = patch.external_research_auto_close
+    }
+  } else if (section === 'reddit') {
     settings.reddit = isPlainObject(settings.reddit) ? settings.reddit : {}
     settings.reddit.backend = enumValue(patch.backend, new Set(['api', 'auto', 'apify']), settings.reddit.backend || 'api')
   } else if (section === 'telegram') {
     settings.telegram = isPlainObject(settings.telegram) ? settings.telegram : {}
+    if (typeof patch.auto_enabled === 'boolean') settings.telegram.auto_enabled = patch.auto_enabled
     if (typeof patch.engine === 'string') settings.telegram.engine = enumValue(patch.engine, new Set(['gemini', 'assemblyai']), settings.telegram.engine || 'gemini')
     if (typeof patch.model === 'string') settings.telegram.model = patch.model.slice(0, 120)
     if (Number.isFinite(Number(patch.max_preview_items))) settings.telegram.max_preview_items = Math.max(1, Math.min(500, Math.round(Number(patch.max_preview_items))))
@@ -461,6 +528,11 @@ function patchAppSettings(readScSettings, writeScSettings, payload = {}) {
     if (typeof patch.metadata_backend === 'string') settings.instagram.metadata_backend = enumValue(patch.metadata_backend, new Set(['api', 'apify']), settings.instagram.metadata_backend || 'api')
     if (typeof patch.transcribe_backend === 'string') settings.instagram.transcribe_backend = enumValue(patch.transcribe_backend, new Set(['api', 'apify']), settings.instagram.transcribe_backend || 'api')
     if (typeof patch.download_videos === 'boolean') settings.instagram.download_videos = patch.download_videos
+  } else if (section === 'boosty') {
+    settings.boosty = isPlainObject(settings.boosty) ? settings.boosty : {}
+    if (typeof patch.audio_dir === 'string') settings.boosty.audio_dir = storagePathValue(patch.audio_dir)
+    if (typeof patch.video_dir === 'string') settings.boosty.video_dir = storagePathValue(patch.video_dir)
+    if (typeof patch.save_video === 'boolean') settings.boosty.save_video = patch.save_video
   } else {
     throw new Error(`Settings section is not editable: ${section}`)
   }
@@ -474,6 +546,7 @@ module.exports = {
   EXTENSION_YOUTUBE_SCHEMA_VERSION,
   EXTENSION_YOUTUBE_DEFAULTS,
   sanitizeExtensionYoutube,
+  sanitizeBoostySettings,
   extensionYoutubeFromSettings,
   extensionYoutubeSchemaState,
   publicAppSettings,

@@ -205,7 +205,8 @@ Real user profile, no CDP, no \`navigator.webdriver\` — undetectable on hh.ru,
 ## Tool quick-reference
 
 **Discovery & basic actions**
-- \`list_tabs\` — every open tab, returns {id, url, title, active}.
+- \`list_windows\` — every normal/popup browser window with focus, bounds, and nested tabs. Use this after an OAuth/payment popup opens.
+- \`list_tabs\` — every open tab across every window, including windowId, windowType, openerTabId, and per-window active/focus state.
 - \`snapshot\` — simplified DOM tree of interactive elements with selectors. Prefer this over \`get_text\` for finding things to click.
 - \`click\`, \`fill\` — by CSS selector. \`fill\` works on input/textarea/select AND contenteditable (TipTap, ProseMirror).
 - \`hover\` — synthetic mouse hover via dispatchEvent. Triggers CSS \`:hover\`, JS hover-listeners, tooltips. **Does NOT** trigger trusted-only effects like YouTube inline-preview (those need real OS events via CDP).
@@ -220,7 +221,8 @@ Real user profile, no CDP, no \`navigator.webdriver\` — undetectable on hh.ru,
 - \`get_storage\` — read localStorage / sessionStorage with optional keyPrefix.
 
 **Tab management**
-- \`new_tab\` — open URL (foreground or background). Returns the new tabId. Use background:true to scrape multiple sites in parallel.
+- \`new_window\`, \`focus_window\`, \`close_window\` — create and manage independent normal/popup windows.
+- \`new_tab\` — open URL (foreground or background), optionally in a specific windowId. Returns the new tabId and windowId.
 - \`close_tab\`, \`focus_tab\`, \`reload_tab\` — self-explanatory. \`reload_tab\` waits for load completion by default.
 
 **Screenshots**
@@ -266,13 +268,29 @@ This MCP lives in the sc-desktop repo: \`~/Desktop/sc-desktop/mcp/browser/\`. \`
 server.registerTool(
   'list_tabs',
   {
-    description: 'List all open browser tabs with their URLs and titles',
+    description: 'List all open browser tabs across all normal and popup windows. Returns window identity, opener relation, URL, title, and tab state so OAuth/payment popups can be targeted independently.',
     inputSchema: {},
   },
   async () => {
     try {
       const result = await sendToExtension({ action: 'mcp_list_tabs' });
       return { content: [{ type: 'text', text: JSON.stringify(result.tabs, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
+    }
+  }
+);
+
+server.registerTool(
+  'list_windows',
+  {
+    description: 'List all normal and popup browser windows with IDs, type, focus/state, bounds, and nested tabs. Use after a site opens an OAuth/payment popup, then pass its tabId to snapshot/click/fill/evaluate.',
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const result = await sendToExtension({ action: 'mcp_list_windows' });
+      return { content: [{ type: 'text', text: JSON.stringify(result.windows, null, 2) }] };
     } catch (e) {
       return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
     }
@@ -501,17 +519,70 @@ server.registerTool(
 // ── Tab management ────────────────────────────────────────────────────
 
 server.registerTool(
+  'new_window',
+  {
+    description: 'Open an independent browser window. type:"popup" matches the window shape used by OAuth dialogs; returns the new window and its tabId.',
+    inputSchema: {
+      url: z.string().optional().describe('URL to load. Omit for about:blank.'),
+      type: z.enum(['normal', 'popup']).optional().describe('Default normal. Use popup for OAuth-style test windows.'),
+      focused: z.boolean().optional().describe('Default true.'),
+      left: z.number().int().optional(),
+      top: z.number().int().optional(),
+      width: z.number().int().positive().optional(),
+      height: z.number().int().positive().optional(),
+    },
+  },
+  async ({ url, type, focused, left, top, width, height }) => {
+    try {
+      const result = await sendToExtension({
+        action: 'mcp_new_window', url, type, focused, left, top, width, height,
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    } catch (e) { return { content: [{ type: 'text', text: `Error: ${e.message}` }] }; }
+  }
+);
+
+server.registerTool(
+  'focus_window',
+  {
+    description: 'Focus an existing browser window without changing which tab is active inside it.',
+    inputSchema: { windowId: z.number().int().nonnegative().describe('Browser window ID from list_windows/list_tabs') },
+  },
+  async ({ windowId }) => {
+    try {
+      const result = await sendToExtension({ action: 'mcp_focus_window', windowId });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    } catch (e) { return { content: [{ type: 'text', text: `Error: ${e.message}` }] }; }
+  }
+);
+
+server.registerTool(
+  'close_window',
+  {
+    description: 'Close one explicit browser window and all tabs inside it.',
+    inputSchema: { windowId: z.number().int().nonnegative().describe('Browser window ID from list_windows/list_tabs') },
+  },
+  async ({ windowId }) => {
+    try {
+      const result = await sendToExtension({ action: 'mcp_close_window', windowId });
+      return { content: [{ type: 'text', text: result.success ? `Closed window ${windowId}` : `Failed: ${result.error}` }] };
+    } catch (e) { return { content: [{ type: 'text', text: `Error: ${e.message}` }] }; }
+  }
+);
+
+server.registerTool(
   'new_tab',
   {
-    description: 'Open a new browser tab and (optionally) navigate to a URL. Waits for load to complete unless background:true.',
+    description: 'Open a new browser tab and optionally place it in a specific normal/popup window. Waits for load when URL is provided.',
     inputSchema: {
       url: z.string().optional().describe('URL to load. Omit for blank tab.'),
       background: z.boolean().optional().describe('If true, do not focus the new tab and do not wait for load.'),
+      windowId: z.number().int().nonnegative().optional().describe('Existing target window ID. Omit to use Chrome\'s current window.'),
     },
   },
-  async ({ url, background }) => {
+  async ({ url, background, windowId }) => {
     try {
-      const result = await sendToExtension({ action: 'mcp_new_tab', url, background: !!background });
+      const result = await sendToExtension({ action: 'mcp_new_tab', url, background: !!background, windowId });
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     } catch (e) { return { content: [{ type: 'text', text: `Error: ${e.message}` }] }; }
   }

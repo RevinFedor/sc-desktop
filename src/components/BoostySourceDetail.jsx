@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { Virtuoso } from 'react-virtuoso'
 import {
   Captions, Check, ChevronDown, ChevronRight, Copy, Download, ExternalLink,
   FolderOpen, RotateCw, Search, SlidersHorizontal, Square, StickyNote, Trash2, Video,
@@ -7,7 +8,8 @@ import Avatar from './Avatar'
 import PlatformLogo from './PlatformLogo'
 import { goHome, pushScreen } from '../lib/store'
 import { refreshSources } from '../lib/sources'
-import { useJobs } from '../lib/jobs'
+import { useJobsSelector } from '../lib/jobs'
+import { jobsForSource, sameArrayItems } from '../lib/jobSelectorCore.mjs'
 import { useInvalidator } from '../lib/dataBus'
 
 export default function BoostySourceDetail({ source: initialSource, jobs: historicJobs = [] }) {
@@ -29,7 +31,10 @@ export default function BoostySourceDetail({ source: initialSource, jobs: histor
   const [requestOnlyAllowed, setRequestOnlyAllowed] = useState(false)
   const [busy, setBusy] = useState(null)
   const [notice, setNotice] = useState(null)
-  const jobs = useJobs()
+  const jobs = useJobsSelector(
+    list => jobsForSource(list, sourceId),
+    sameArrayItems,
+  )
   const sourceVer = useInvalidator(`source:${sourceId}`)
   const itemsVer = useInvalidator(`items:${sourceId}`)
 
@@ -244,10 +249,11 @@ export default function BoostySourceDetail({ source: initialSource, jobs: histor
           <button type="button" onClick={() => pushScreen('notes', { sourceId })} className="ml-auto h-9 px-3 rounded-md bg-zinc-800 text-zinc-300 hover:bg-zinc-700 inline-flex items-center gap-2"><StickyNote size={14} /> Заметки</button>
         </div>
 
-        <div className="grid grid-cols-3 gap-3 mb-4">
+        <div className="grid grid-cols-4 gap-3 mb-4">
           <Stat label="Известно постов" value={Number(stats.posts || 0).toLocaleString('ru-RU')} />
           <Stat label="Расшифровано видео" value={`${Number(stats.transcribed || 0).toLocaleString('ru-RU')} / ${Number(stats.videos || 0).toLocaleString('ru-RU')}`} />
           <Stat label="Аудио на диске" value={fmtSize(stats.audio_bytes || 0)} />
+          <Stat label="Видео на диске" value={fmtSize(stats.video_bytes || 0)} />
         </div>
 
         <div className="flex flex-wrap items-center gap-2 mb-4">
@@ -309,6 +315,7 @@ export default function BoostySourceDetail({ source: initialSource, jobs: histor
           <div className="mt-3 rounded-md border border-zinc-800 bg-zinc-950 px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
             <span className="text-zinc-500">На диске</span>
             <StorageChip label="Аудио" bytes={storage.media?.bytes} />
+            <StorageChip label="Видео" bytes={storage.videos?.bytes} />
             <StorageChip label="Обложки" bytes={storage.thumbnails?.bytes} />
             <StorageChip label="Расшифровки" bytes={storage.transcripts?.bytes} />
             {Number(storage.text?.bytes || 0) > 0 && <StorageChip label="Текст" bytes={storage.text.bytes} />}
@@ -354,23 +361,36 @@ export default function BoostySourceDetail({ source: initialSource, jobs: histor
           </div>
         )}
 
-        <div className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950 divide-y divide-zinc-900 overflow-hidden">
+        <div
+          data-boosty-post-list
+          className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950 overflow-hidden"
+          style={{ height: Math.min(640, Math.max(120, visiblePosts.length * 82)) }}
+        >
           {!visiblePosts.length && <div className="px-4 py-8 text-zinc-500 text-center">По этому фильтру постов нет</div>}
-          {visiblePosts.map(post => (
-            <PostRow
-              key={post.external_id}
-              post={post}
-              selected={selected}
-              expanded={expanded.has(String(post.external_id))}
-              onTogglePost={() => togglePost(post)}
-              onToggleVideo={toggleVideo}
-              onToggleExpanded={() => toggleExpanded(post.external_id)}
-              onTranscribe={ids => runBatch('transcribe', ids)}
-              onDownload={ids => runBatch('download', ids)}
-              onCopy={copyTranscripts}
-              onDelete={(ids, label, bytes) => deleteAudio(ids, label, bytes)}
+          {visiblePosts.length > 0 && (
+            <Virtuoso
+              data={visiblePosts}
+              defaultItemHeight={82}
+              increaseViewportBy={200}
+              computeItemKey={(_index, post) => post.external_id}
+              itemContent={(_index, post) => (
+                <div data-boosty-post-row className="border-b border-zinc-900 last:border-b-0">
+                  <PostRow
+                    post={post}
+                    selected={selected}
+                    expanded={expanded.has(String(post.external_id))}
+                    onTogglePost={() => togglePost(post)}
+                    onToggleVideo={toggleVideo}
+                    onToggleExpanded={() => toggleExpanded(post.external_id)}
+                    onTranscribe={ids => runBatch('transcribe', ids)}
+                    onDownload={ids => runBatch('download', ids)}
+                    onCopy={copyTranscripts}
+                    onDelete={(ids, label, bytes) => deleteAudio(ids, label, bytes)}
+                  />
+                </div>
+              )}
             />
-          ))}
+          )}
         </div>
 
         <div className="mt-8">
@@ -378,7 +398,7 @@ export default function BoostySourceDetail({ source: initialSource, jobs: histor
           <div className="rounded-lg border border-zinc-800 bg-zinc-950 divide-y divide-zinc-900">
             {!historicJobs.length && <div className="px-4 py-4 text-zinc-600 text-sm">История пока пуста</div>}
             {historicJobs.slice(0, 20).map(job => (
-              <button key={job.id} type="button" onClick={() => pushScreen('job-detail', { jobId: job.id, job })} className="w-full px-4 py-3 flex items-center gap-3 text-left hover:bg-zinc-900 text-sm">
+              <button key={job.id} type="button" onClick={() => pushScreen('job-detail', { jobId: job.id, job, jobIdentity: 'db' })} className="w-full px-4 py-3 flex items-center gap-3 text-left hover:bg-zinc-900 text-sm">
                 <span className={`w-2 h-2 rounded-full ${job.status === 'done' ? 'bg-emerald-500' : job.status === 'error' ? 'bg-red-500' : 'bg-zinc-500'}`} />
                 <span className="text-zinc-300">{job.type === 'boosty_channel_fetch' ? 'Каталог постов' : job.parameters_json?.includes('download') ? 'Скачивание аудио' : 'Расшифровка видео'}</span>
                 <span className="text-zinc-600 tabular-nums">{Number(job.items_done || 0)} / {Number(job.items_total || 0)}</span>
@@ -423,6 +443,7 @@ function PostRow({ post, selected, expanded, onTogglePost, onToggleVideo, onTogg
             {post.duration_seconds > 0 && <><span className="text-zinc-800">·</span><span className="text-zinc-500 tabular-nums">{fmtDuration(post.duration_seconds)}</span></>}
             {post.transcribed_count > 0 && <><span className="text-zinc-800">·</span><span className="text-emerald-400">{post.transcribed_count === post.known_videos_count ? 'расшифровано' : `${post.transcribed_count} расшифровано`}</span></>}
             {post.media_bytes > 0 && <><span className="text-zinc-800">·</span><span className="text-zinc-400 tabular-nums">{fmtSize(post.media_bytes)}</span></>}
+            {post.video_bytes > 0 && <><span className="text-zinc-800">·</span><span className="text-zinc-500 tabular-nums">видео {fmtSize(post.video_bytes)}</span></>}
             {!post.media_bytes && one?.download_status === 'evicted' && <><span className="text-zinc-800">·</span><span className="text-zinc-600">аудио удалено</span></>}
           </div>
         </div>
@@ -444,6 +465,7 @@ function PostRow({ post, selected, expanded, onTogglePost, onToggleVideo, onTogg
               <span className="text-zinc-600 tabular-nums">{fmtDuration(video.duration_seconds)}</span>
               {video.transcript_present && <span className="text-emerald-400">готово</span>}
               {video.media_present ? <span className="text-zinc-400 tabular-nums">{fmtSize(video.media_bytes)}</span> : video.download_status === 'evicted' ? <span className="text-zinc-600">аудио удалено</span> : null}
+              {video.video_present && <span className="text-zinc-500 tabular-nums">видео {fmtSize(video.video_bytes)}</span>}
               {video.transcript_present ? <button type="button" onClick={() => onCopy([video.external_id])} className="p-1 text-emerald-500 hover:text-emerald-300"><Copy size={14} /></button> : accessState === 'accessible' ? <button type="button" onClick={() => onTranscribe([video.external_id])} className="p-1 text-zinc-500 hover:text-zinc-200"><RotateCw size={14} /></button> : null}
               {video.srt_present && <button type="button" onClick={() => window.api?.openExternal?.(video.srt_path)} title="Открыть субтитры SRT" className="p-1 text-zinc-500 hover:text-zinc-200"><Captions size={14} /></button>}
               {!video.media_present && accessState === 'accessible' && <button type="button" onClick={() => onDownload([video.external_id])} className="p-1 text-zinc-500 hover:text-zinc-200"><Download size={14} /></button>}
@@ -464,7 +486,7 @@ function ActiveBatch({ job }) {
     <div className="mt-3 rounded-md border border-orange-900/50 bg-orange-950/10 px-4 py-3">
       <div className="flex items-center gap-3">
         <span className="w-4 h-4 rounded-full border-2 border-orange-900 border-t-orange-300 animate-spin" />
-        <div className="flex-1 min-w-0"><div className="text-zinc-200">{batch.mode === 'download' ? 'Скачиваю аудио' : 'Скачиваю и расшифровываю'} · {job.items_done || 0} / {job.items_total || 0}</div><div className="text-zinc-500 text-sm truncate mt-0.5">{current?.title || 'Готовлю следующее видео'}{current?.stage ? ` · ${stageLabel(current.stage)}` : ''}</div></div>
+        <div className="flex-1 min-w-0"><div className="text-zinc-200">{batch.mode === 'download' ? (job.params?.save_video ? 'Скачиваю аудио и видео' : 'Скачиваю аудио') : 'Скачиваю и расшифровываю'} · {job.items_done || 0} / {job.items_total || 0}</div><div className="text-zinc-500 text-sm truncate mt-0.5">{current?.title || 'Готовлю следующее видео'}{current?.stage ? ` · ${stageLabel(current.stage)}` : ''}</div></div>
         <button type="button" onClick={() => window.api?.cancelJob?.(job.id)} className="h-8 px-2.5 rounded border border-zinc-700 text-zinc-300 hover:bg-zinc-800 inline-flex items-center gap-1.5"><Square size={13} /> Стоп</button>
       </div>
       {current?.stage === 'downloading' && <div className="mt-3 h-1.5 rounded-full bg-zinc-900 overflow-hidden"><div className={`h-full bg-orange-500 ${percent == null ? 'w-1/3 animate-pulse' : ''}`} style={percent == null ? undefined : { width: `${percent}%` }} /></div>}

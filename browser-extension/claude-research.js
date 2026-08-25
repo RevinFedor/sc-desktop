@@ -1401,6 +1401,7 @@
     // селектор» (back-compat: старые MCP-вызовы шлют только prompt и ожидают
     // Research mode на текущей модели аккаунта). research default = true.
     const opts0 = job.options || {};
+    const keepTabAfterDone = scKeepResearchTabAfterDone(opts0);
     const modelKey = resolveModel(opts0.model);
     const effortKey = resolveEffort(opts0.effort);
     const wantThinking = (typeof opts0.thinking === 'boolean') ? opts0.thinking : null;
@@ -1679,9 +1680,13 @@
           // открытой (результат виден) — лучше «лишняя вкладка», чем зомби-running.
           if (confirmed) {
             try { stopKeepAlive(); } catch {}
-            try {
-              chrome.runtime.sendMessage({ __sc_close_self_tab: true, reason: 'research_done' });
-            } catch {}
+            if (keepTabAfterDone) {
+              log('done.keep_tab_open');
+            } else {
+              try {
+                chrome.runtime.sendMessage({ __sc_close_self_tab: true, reason: 'research_done' });
+              } catch {}
+            }
           } else {
             log('done.unconfirmed_keep_tab_open');
           }

@@ -85,6 +85,53 @@ async function connectMcpBridge() {
 async function handleMcpCommand(command) {
   const { action, tabId } = command;
 
+  // Window discovery must not depend on whichever window Chrome currently
+  // considers "current" for this service worker. OAuth/payment popups are
+  // separate top-level windows, each with its own active tab.
+  if (action === 'mcp_list_tabs' || action === 'mcp_list_windows') {
+    const browserWindows = await chrome.windows.getAll({ populate: true });
+    if (action === 'mcp_list_windows') {
+      return { success: true, windows: scMcpSerializeWindows(browserWindows) };
+    }
+    return { success: true, tabs: scMcpFlattenWindows(browserWindows) };
+  }
+
+  if (action === 'mcp_new_window') {
+    const created = await chrome.windows.create(scMcpWindowCreateOptions(command));
+    if (!Number.isInteger(created?.id)) {
+      return { success: false, error: 'Browser did not return a window ID' };
+    }
+    const createdTabId = created?.tabs?.[0]?.id;
+    if (command.url && Number.isInteger(createdTabId) && created.tabs?.[0]?.status !== 'complete') {
+      await new Promise(resolve => {
+        function listener(updatedTabId, changeInfo) {
+          if (updatedTabId === createdTabId && changeInfo.status === 'complete') {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }
+        }
+        chrome.tabs.onUpdated.addListener(listener);
+        setTimeout(() => {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }, 15000);
+      });
+    }
+    const browserWindow = await chrome.windows.get(created.id, { populate: true });
+    return { success: true, window: scMcpSerializeWindow(browserWindow) };
+  }
+
+  if (action === 'mcp_focus_window') {
+    await chrome.windows.update(command.windowId, { focused: true });
+    const browserWindow = await chrome.windows.get(command.windowId, { populate: true });
+    return { success: true, window: scMcpSerializeWindow(browserWindow) };
+  }
+
+  if (action === 'mcp_close_window') {
+    await chrome.windows.remove(command.windowId);
+    return { success: true, windowId: command.windowId };
+  }
+
   // Resolve target tab
   let targetTabId = tabId;
   if (!targetTabId) {
@@ -92,19 +139,6 @@ async function handleMcpCommand(command) {
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!activeTab) return { success: false, error: 'No active tab' };
     targetTabId = activeTab.id;
-  }
-
-  if (action === 'mcp_list_tabs') {
-    const tabs = await chrome.tabs.query({});
-    return {
-      success: true,
-      tabs: tabs.map(t => ({
-        id: t.id,
-        url: t.url,
-        title: t.title,
-        active: t.active,
-      })),
-    };
   }
 
   // Force-reload расширения по требованию (когда hot-reload spying не успел
@@ -308,6 +342,7 @@ async function handleMcpCommand(command) {
           modelTitle: model.title,
           isDeepResearch: model.isDeepResearch,
           systemInstruction,
+          keepTab: command.keepTab === true || command.keep_tab === true,
           status: 'pending',
           createdAt: Date.now(),
         };
@@ -482,10 +517,12 @@ async function handleMcpCommand(command) {
   }
 
   if (action === 'mcp_new_tab') {
-    const tab = await chrome.tabs.create({
+    const createProperties = {
       url: command.url || 'about:blank',
       active: command.background ? false : true,
-    });
+    };
+    if (Number.isInteger(command.windowId)) createProperties.windowId = command.windowId;
+    const tab = await chrome.tabs.create(createProperties);
     // Ждём load всегда (включая background:true) если задан URL — без этого
     // последующий tool call'у на этот tabId упадёт «No response from any frame»
     // (content-script ещё не инжектился). Background-вкладки Chrome грузит
@@ -502,7 +539,15 @@ async function handleMcpCommand(command) {
         setTimeout(() => { chrome.tabs.onUpdated.removeListener(l); resolve(); }, 10000);
       });
     }
-    return { success: true, tabId: tab.id, url: tab.url };
+    const currentTab = await chrome.tabs.get(tab.id);
+    const browserWindow = await chrome.windows.get(currentTab.windowId);
+    return {
+      success: true,
+      tabId: currentTab.id,
+      windowId: currentTab.windowId,
+      url: currentTab.url,
+      tab: scMcpSerializeTab(currentTab, browserWindow),
+    };
   }
 
   if (action === 'mcp_close_tab') {
@@ -513,8 +558,13 @@ async function handleMcpCommand(command) {
   if (action === 'mcp_focus_tab') {
     const tab = await chrome.tabs.get(targetTabId);
     await chrome.tabs.update(targetTabId, { active: true });
-    if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
-    return { success: true };
+    if (Number.isInteger(tab.windowId)) await chrome.windows.update(tab.windowId, { focused: true });
+    const currentTab = await chrome.tabs.get(targetTabId);
+    const browserWindow = await chrome.windows.get(currentTab.windowId);
+    return {
+      success: true,
+      tab: scMcpSerializeTab(currentTab, browserWindow),
+    };
   }
 
   if (action === 'mcp_reload_tab') {

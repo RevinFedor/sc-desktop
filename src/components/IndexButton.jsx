@@ -82,6 +82,7 @@ export default function IndexButton({ sourceId, status, onStart }) {
           from jittering. justify-center so the shorter idle label stays
           centred inside the reserved width. */}
       <button
+        data-index-start
         onClick={() => onStart?.(limit)}
         disabled={indexing || complete}
         className="h-9 px-4 min-w-[260px] inline-flex items-center justify-center rounded-md font-medium tabular-nums bg-emerald-700 text-white hover:bg-emerald-600 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed"

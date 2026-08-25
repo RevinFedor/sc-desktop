@@ -17,6 +17,9 @@ const VALID_TYPES = new Set(TYPE_ORDER)
 let timer = null
 let running = false
 let sessionGuardOff = null
+let schedulerDeps = null
+let schedulerEnabled = true
+let activeRun = null
 const blockedSessions = new Map()
 
 function yieldToEventLoop() {
@@ -126,11 +129,24 @@ function addToGroup(groups, row) {
 
 async function runTelegramAutoOnce({ db, jobRunner, indexJob, reason = 'timer' }) {
   wireSessionGuard(jobRunner)
+  if (!schedulerEnabled) {
+    console.log(`[TelegramAuto] skip ${reason}: master switch is off`)
+    return { ok: true, skipped: 'disabled' }
+  }
   if (running) {
     console.log(`[TelegramAuto] skip ${reason}: previous run is still active`)
     return { ok: true, skipped: 'running' }
   }
   running = true
+  const run = {
+    reason,
+    cancelled: false,
+    catchupId: null,
+    indexId: null,
+    jobRunner,
+    indexJob,
+  }
+  activeRun = run
   const started = Date.now()
   try {
     const rows = db.listTelegramAutoSources()
@@ -158,6 +174,7 @@ async function runTelegramAutoOnce({ db, jobRunner, indexJob, reason = 'timer' }
     let indexedSources = 0
     let skippedBlocked = 0
     for (const group of groups.values()) {
+      if (run.cancelled || !schedulerEnabled) break
       const block = blockedSession(group.session || null)
       if (block) {
         skippedBlocked += group.rows.length
@@ -181,8 +198,16 @@ async function runTelegramAutoOnce({ db, jobRunner, indexJob, reason = 'timer' }
         tg_session: group.session || null,
         auto: true,
       })
+      run.catchupId = catchupId
       const catchup = await waitForJob(jobRunner.subscribe, catchupId)
+      run.catchupId = null
       console.log(`[TelegramAuto] pull end job=${catchupId} status=${catchup.status}`)
+      // A cancel from Activity means «stop this automatic pass», not «skip
+      // this group and quietly start the next account/type group».
+      if (run.cancelled || catchup.status === 'cancelled' || catchup.status === 'interrupted') {
+        run.cancelled = true
+        break
+      }
       if (catchup.error_code === 'session_unauthorized') {
         blockSession(group.session || null, catchup.error)
         continue
@@ -195,6 +220,7 @@ async function runTelegramAutoOnce({ db, jobRunner, indexJob, reason = 'timer' }
         : new Map()
       const indexRows = group.rows.filter(r => !!r.tg_auto?.index)
       for (const row of indexRows) {
+        if (run.cancelled || !schedulerEnabled) break
         try {
           const counts = indexCounts.get(Number(row.id))
           if (counts) {
@@ -206,14 +232,20 @@ async function runTelegramAutoOnce({ db, jobRunner, indexJob, reason = 'timer' }
               continue
             }
           }
-          const res = indexJob.start({ sourceId: row.id, limit: null, origin: `telegram-auto:${reason}` })
+          const res = await indexJob.start({ sourceId: row.id, limit: null, origin: `telegram-auto:${reason}` })
           if (res && typeof res === 'object' && res.noop) {
             console.log(`[TelegramAuto] index noop source #${row.id} reason=${res.reason}`)
             await yieldToEventLoop()
             continue
           }
+          run.indexId = res
           const indexSnap = await waitForJob(indexJob.subscribe, res)
+          run.indexId = null
           console.log(`[TelegramAuto] index end source #${row.id} job=${res} status=${indexSnap.status}`)
+          if (indexSnap.status === 'cancelled' || indexSnap.status === 'interrupted') {
+            run.cancelled = true
+            break
+          }
           if (indexSnap.status === 'done') indexedSources += 1
           await yieldToEventLoop()
         } catch (err) {
@@ -222,27 +254,73 @@ async function runTelegramAutoOnce({ db, jobRunner, indexJob, reason = 'timer' }
       }
     }
 
-    console.log(`[TelegramAuto] ${reason}: done pulled=${pulledSources} indexed=${indexedSources} skipped_blocked=${skippedBlocked} skipped_unavailable=${skippedUnavailable} total_ms=${Date.now() - started}`)
-    return { ok: true, groups: groups.size, sources: rows.length, pulledSources, indexedSources, skippedBlocked, skippedUnavailable }
+    const outcome = run.cancelled ? 'cancelled' : 'done'
+    console.log(`[TelegramAuto] ${reason}: ${outcome} pulled=${pulledSources} indexed=${indexedSources} skipped_blocked=${skippedBlocked} skipped_unavailable=${skippedUnavailable} total_ms=${Date.now() - started}`)
+    return { ok: true, groups: groups.size, sources: rows.length, pulledSources, indexedSources, skippedBlocked, skippedUnavailable, cancelled: run.cancelled }
   } catch (err) {
     console.error(`[TelegramAuto] ${reason}: failed ${err?.message || err}`)
     return { ok: false, error: String(err?.message || err) }
   } finally {
+    if (activeRun === run) activeRun = null
     running = false
   }
 }
 
-function startTelegramAutoScheduler(deps) {
-  if (timer) return
-  wireSessionGuard(deps?.jobRunner)
-  const schedule = (delay, reason) => {
-    timer = setTimeout(async () => {
-      timer = null
-      await runTelegramAutoOnce({ ...deps, reason })
-      schedule(AUTO_INTERVAL_MS, 'timer')
-    }, delay)
+function scheduleTelegramAuto(delay, reason) {
+  if (!schedulerDeps || !schedulerEnabled || timer) return
+  timer = setTimeout(async () => {
+    timer = null
+    if (!schedulerEnabled || !schedulerDeps) return
+    await runTelegramAutoOnce({ ...schedulerDeps, reason })
+    scheduleTelegramAuto(AUTO_INTERVAL_MS, 'timer')
+  }, delay)
+  timer.unref?.()
+}
+
+function cancelActiveRun(reason = 'cancelled') {
+  const run = activeRun
+  if (!run) return false
+  run.cancelled = true
+  let requested = false
+  if (run.catchupId != null) {
+    requested = run.jobRunner?.cancelJob?.(run.catchupId) === true || requested
   }
-  schedule(AUTO_INITIAL_DELAY_MS, 'startup')
+  if (run.indexId != null) {
+    requested = run.indexJob?.cancelById?.(run.indexId) === true || requested
+  }
+  console.log(`[TelegramAuto] active pass cancel requested reason=${reason} catchup=${run.catchupId ?? '-'} index=${run.indexId ?? '-'}`)
+  return requested
+}
+
+function setTelegramAutoEnabled(enabled) {
+  const next = enabled !== false
+  if (schedulerEnabled === next) {
+    return { enabled: next, changed: false, cancel_requested: false }
+  }
+  schedulerEnabled = next
+  if (!next) {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+    const cancelRequested = cancelActiveRun('master-switch-off')
+    console.log(`[TelegramAuto] master switch off cancel_requested=${cancelRequested}`)
+    return { enabled: false, changed: true, cancel_requested: cancelRequested }
+  }
+  scheduleTelegramAuto(AUTO_INITIAL_DELAY_MS, 'enabled')
+  console.log(`[TelegramAuto] master switch on initial_ms=${AUTO_INITIAL_DELAY_MS}`)
+  return { enabled: true, changed: true, cancel_requested: false }
+}
+
+function startTelegramAutoScheduler(deps = {}) {
+  schedulerDeps = deps
+  schedulerEnabled = deps.enabled !== false
+  wireSessionGuard(deps?.jobRunner)
+  if (!schedulerEnabled) {
+    console.log('[TelegramAuto] scheduler disabled by master switch')
+    return
+  }
+  scheduleTelegramAuto(AUTO_INITIAL_DELAY_MS, 'startup')
   console.log(`[TelegramAuto] scheduler started initial_ms=${AUTO_INITIAL_DELAY_MS} interval_ms=${AUTO_INTERVAL_MS}`)
 }
 
@@ -251,6 +329,11 @@ function stopTelegramAutoScheduler() {
     clearTimeout(timer)
     timer = null
   }
+  cancelActiveRun('scheduler-stop')
+  schedulerDeps = null
+  schedulerEnabled = true
+  activeRun = null
+  running = false
   if (sessionGuardOff) {
     sessionGuardOff()
     sessionGuardOff = null
@@ -263,5 +346,6 @@ module.exports = {
   runTelegramAutoOnce,
   startTelegramAutoScheduler,
   stopTelegramAutoScheduler,
+  setTelegramAutoEnabled,
   clearTelegramAutoSessionBlock,
 }

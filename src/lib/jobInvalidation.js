@@ -33,7 +33,7 @@ export function wireJobInvalidation() {
   window.api.onJobUpdate(j => {
     if (!j) return
     const terminal = j.status === 'done' || j.status === 'error' || j.status === 'cancelled'
-    const progressing = j.status === 'running' || j.status === 'awaiting_ai'
+    const progressing = j.status === 'running' || j.status === 'awaiting_ai' || j.status === 'cancelling'
     if (!terminal && !progressing) return
 
     if (terminal) {
@@ -45,10 +45,14 @@ export function wireJobInvalidation() {
       const insideUmbrella = !!j.params?._folder_umbrella_id
       const keys = insideUmbrella ? [] : ['sources']
       if (j.source_id) {
-        keys.push(`source:${j.source_id}`, `items:${j.source_id}`, `jobs:${j.source_id}`)
+        // source:<id> reloads the full terminal snapshot, including jobs.
+        // Emitting jobs:<id> as well made SourceDetail issue a second history
+        // query for the same terminal event. Progress still uses jobs:<id>
+        // below because the heavy source snapshot must stay frozen mid-run.
+        keys.push(`source:${j.source_id}`, `items:${j.source_id}`)
       }
       // Folder-umbrella close → refresh folders list (last_fetched_at moved).
-      if (j.type === 'tg_folder_fetch') keys.push('folders')
+      if (j.type === 'tg_folder_fetch' || j.type === 'tg_folder_refresh') keys.push('folders')
       if (keys.length) invalidateMany(keys)
       return
     }

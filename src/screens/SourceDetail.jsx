@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react'
+import { Virtuoso } from 'react-virtuoso'
 import { RotateCw, Trash2, MessageCircle, Copy, Save, BarChart3, Settings, StickyNote, ListChecks, UserRound, TriangleAlert } from 'lucide-react'
 import { pushScreen, goHome } from '../lib/store'
 import PlatformLogo from '../components/PlatformLogo'
@@ -22,7 +23,8 @@ import NewRequestSplitButton from '../components/NewRequestSplitButton'
 import JobProgress, { cleanErrorMessage } from '../components/JobProgress'
 import BoostySourceDetail from '../components/BoostySourceDetail'
 import { refreshSources } from '../lib/sources'
-import { useJobs } from '../lib/jobs'
+import { useJobsSelector } from '../lib/jobs'
+import { jobsForSource, sameArrayItems } from '../lib/jobSelectorCore.mjs'
 import { useInvalidator } from '../lib/dataBus'
 import {
   loadLastUsedContent, loadLastUsedEngine, buildContentParams, lastUsedContentLabels,
@@ -91,7 +93,17 @@ export default function SourceDetail({ payload }) {
     if (!window.api?.onJobUpdate) return
     const off = window.api.onJobUpdate((job) => {
       if (job?.type === 'tg_index' && job.source_id === sourceId) {
-        refreshIdxStatus()
+        // The event already contains authoritative progress. Calling
+        // tg:indexStatus for every batch doubled IPC traffic and, after a
+        // terminal event, used to boot another worker just to read two counts.
+        const active = job.status === 'running' || job.status === 'cancelling'
+        setIdxStatus({
+          state: active ? 'running' : 'idle',
+          done: Number(job.items_done || 0),
+          total: Number(job.items_total || 0),
+          jobId: job.id,
+          dbId: job.db_id || null,
+        })
       }
     })
     return off
@@ -129,52 +141,66 @@ export default function SourceDetail({ payload }) {
   //   • jobs-only — on jobs:<id> (progress ticks, throttled). Updates the
   //     "История парсинга" row in place without re-rendering CoverageBars,
   //     ChatView, or the form panel.
-  // «История парсинга» — постраничная: сервер по умолчанию отдаёт 20 строк
-  // (SQL LIMIT), «показать ещё» докручивает jobsLimit и перечитывает только
-  // jobs-срез. Без этого записи старше 20-й были недостижимы вообще.
+  // «История парсинга» — cursor-постраничная и живёт отдельно от тяжёлого
+  // source payload. «Показать ещё» добавляет следующую страницу, не перечитывая
+  // весь уже показанный префикс.
   const JOBS_PAGE = 20
-  const [jobsLimit, setJobsLimit] = useState(JOBS_PAGE)
-  useEffect(() => { setJobsLimit(JOBS_PAGE) }, [sourceId])
+  const detailRequestSeq = useRef(0)
+  const jobsRequestSeq = useRef(0)
+  const [historyJobs, setHistoryJobs] = useState([])
+  const [historyCursor, setHistoryCursor] = useState(null)
+  const [historyHasMore, setHistoryHasMore] = useState(false)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [expandedHistoryIds, setExpandedHistoryIds] = useState(() => new Set())
+  useEffect(() => {
+    setHistoryJobs([])
+    setHistoryCursor(null)
+    setHistoryHasMore(false)
+    setExpandedHistoryIds(new Set())
+  }, [sourceId])
   async function reloadAll() {
     if (!window.api || !sourceId) return
-    const detail = await window.api.sourceDetail(sourceId)
-    // sourceDetail отдаёт первую страницу jobs (20). Если юзер уже раскрутил
-    // историю глубже — доберём её jobs-путём, не теряя позицию.
-    if (jobsLimit > JOBS_PAGE && window.api.jobsListForSource) {
-      try {
-        detail.jobs = await window.api.jobsListForSource({ id: sourceId, limit: jobsLimit })
-      } catch {}
-    }
+    const requestSeq = ++detailRequestSeq.current
+    const requestedSourceId = sourceId
+    const detail = await window.api.sourceDetail(requestedSourceId)
+    if (requestSeq !== detailRequestSeq.current || requestedSourceId !== sourceId) return
     setData(detail)
   }
-  async function reloadJobs(limit = jobsLimit) {
-    if (!window.api?.jobsListForSource || !sourceId) return
+  async function reloadJobs({ reset = false } = {}) {
+    if (!window.api?.jobsListForSourcePage || !sourceId) return
+    const requestSeq = ++jobsRequestSeq.current
+    const requestedSourceId = sourceId
+    const cursor = reset ? null : historyCursor
+    setHistoryLoading(true)
     try {
-      const jobs = await window.api.jobsListForSource({ id: sourceId, limit })
-      setData(prev => prev ? { ...prev, jobs } : prev)
+      const page = await window.api.jobsListForSourcePage({
+        id: requestedSourceId,
+        limit: JOBS_PAGE,
+        cursor,
+      })
+      if (requestSeq !== jobsRequestSeq.current || requestedSourceId !== sourceId) return
+      setHistoryJobs(prev => reset ? (page.jobs || []) : [...prev, ...(page.jobs || [])])
+      setHistoryCursor(page.nextCursor || null)
+      setHistoryHasMore(!!page.hasMore)
     } catch (err) {
       console.error('[SourceDetail] jobs reload failed', err)
+    } finally {
+      if (requestSeq === jobsRequestSeq.current) setHistoryLoading(false)
     }
   }
   function showMoreJobs() {
-    const next = jobsLimit + JOBS_PAGE
-    setJobsLimit(next)
-    reloadJobs(next)
+    if (!historyLoading && historyHasMore) reloadJobs({ reset: false })
   }
   // Keep the public name for callers (deleteJob, clearJobsHistory) — they
   // expect a heavy refresh after a destructive op.
   const reload = reloadAll
 
   const sourceVer = useInvalidator(`source:${sourceId}`)
-  const jobsVer   = useInvalidator(`jobs:${sourceId}`)
-  useEffect(() => { reloadAll() }, [sourceId, sourceVer])
-  // jobs-only path skips the first run (handled by reloadAll above).
-  const jobsVerFirst = useRef(true)
   useEffect(() => {
-    if (jobsVerFirst.current) { jobsVerFirst.current = false; return }
-    reloadJobs()
+    reloadAll()
+    reloadJobs({ reset: true })
     // eslint-disable-next-line
-  }, [jobsVer])
+  }, [sourceId, sourceVer])
 
   // Live in-memory snapshots — used to enrich each row in «История парсинга»
   // with the same per-kind progress that ActivityPanel shows. SourceDetail's
@@ -182,7 +208,10 @@ export default function SourceDetail({ payload }) {
   // they have no media_phase / resolve_scanned. Match by snapshot.db_id ==
   // db row id so a single running job appears live in BOTH places without
   // duplication.
-  const liveJobs = useJobs()
+  const liveJobs = useJobsSelector(
+    list => jobsForSource(list, sourceId),
+    sameArrayItems,
+  )
   const liveByDbId = React.useMemo(() => {
     const m = new Map()
     for (const j of liveJobs) {
@@ -190,6 +219,10 @@ export default function SourceDetail({ payload }) {
     }
     return m
   }, [liveJobs])
+  const visibleHistoryJobs = React.useMemo(
+    () => historyJobs.filter(isVisibleHistoryJobRow),
+    [historyJobs],
+  )
 
   // Is a quick catch-up fetch for THIS source already in flight? Drives the
   // split button's right-segment loader and disables re-launch. Matches any
@@ -198,7 +231,7 @@ export default function SourceDetail({ payload }) {
   const quickBusy = React.useMemo(
     () => liveJobs.some(j => j && j.source_id === sourceId
       && j.type === 'tg_fetch'
-      && (j.status === 'running' || j.status === 'awaiting_ai')
+      && (j.status === 'running' || j.status === 'awaiting_ai' || j.status === 'cancelling')
       && j.params?.mode !== 'media_only'),
     [liveJobs, sourceId],
   )
@@ -302,7 +335,7 @@ export default function SourceDetail({ payload }) {
     const yes = window.confirm('Очистить историю парсинга для этого источника? Сообщения останутся.')
     if (!yes) return
     await window.api.jobsClearForSource(sourceId)
-    reload()
+    await reloadJobs({ reset: true })
   }
 
   return (
@@ -617,7 +650,7 @@ export default function SourceDetail({ payload }) {
           <div className="mb-8">
             <div className="flex items-center mb-3">
               <div className="text-xs uppercase tracking-wider text-zinc-500">История парсинга</div>
-              {data.jobs && data.jobs.length > 0 && (
+              {historyJobs.length > 0 && (
                 <button
                   onClick={clearJobsHistory}
                   className="ml-auto text-zinc-500 hover:text-red-400"
@@ -626,39 +659,46 @@ export default function SourceDetail({ payload }) {
                 </button>
               )}
             </div>
-            {data.jobs && data.jobs.length > 0 ? (
-              <div className="rounded-md border border-zinc-800 bg-zinc-950 divide-y divide-zinc-800 max-h-80 overflow-auto">
-                {data.jobs.filter(isVisibleHistoryJobRow).map(j => (
-                  <JobHistoryRow
-                    key={j.id}
-                    job={j}
-                    source={s}
-                    liveJob={liveByDbId.get(j.id) || null}
-                    onDelete={async () => {
-                      await window.api.jobsDeleteOne(j.id)
-                      reload()
-                    }}
-                    onCancel={async () => {
-                      // Same IPC the ActivityPanel uses — kills the child
-                      // process; status will flip to 'cancelled' and reload
-                      // picks it up via the data bus.
-                      try { await window.api.cancelJob(j.id) } catch {}
-                      reload()
-                    }}
-                  />
-                ))}
-                {/* Сервер отдал ровно столько, сколько просили — почти
-                    наверняка есть хвост старше. Докрутка читает следующую
-                    страницу тем же jobs-путём. */}
-                {data.jobs.length >= jobsLimit && (
-                  <button
-                    onClick={showMoreJobs}
-                    className="w-full px-4 py-2 text-center text-zinc-500 hover:text-zinc-200 hover:bg-zinc-900/60"
-                    style={{ fontSize: '13px' }}
-                  >
-                    Показать ещё
-                  </button>
-                )}
+            {visibleHistoryJobs.length > 0 ? (
+              <div data-source-job-history className="rounded-md border border-zinc-800 bg-zinc-950 h-80 overflow-hidden">
+                <Virtuoso
+                  data={visibleHistoryJobs}
+                  defaultItemHeight={58}
+                  increaseViewportBy={120}
+                  computeItemKey={(_index, job) => job.id}
+                  components={{
+                    Footer: () => historyHasMore ? (
+                      <button
+                        onClick={showMoreJobs}
+                        disabled={historyLoading}
+                        className="w-full px-4 py-2 text-center text-zinc-500 hover:text-zinc-200 hover:bg-zinc-900/60 border-t border-zinc-800"
+                        style={{ fontSize: '13px' }}
+                      >
+                        {historyLoading ? 'Загружаю…' : 'Показать ещё'}
+                      </button>
+                    ) : null,
+                  }}
+                  itemContent={(_index, j) => (
+                    <JobHistoryRow
+                      job={j}
+                      source={s}
+                      liveJob={liveByDbId.get(j.id) || null}
+                      expanded={expandedHistoryIds.has(j.id)}
+                      onExpandedChange={(next) => setExpandedHistoryIds(previous => {
+                        const updated = new Set(previous)
+                        if (next) updated.add(j.id); else updated.delete(j.id)
+                        return updated
+                      })}
+                      onDelete={async () => {
+                        await window.api.jobsDeleteOne(j.id)
+                        await reloadJobs({ reset: true })
+                      }}
+                      onCancel={async () => {
+                        try { await window.api.cancelJob({ id: j.id, identity: 'db', type: j.type }) } catch {}
+                      }}
+                    />
+                  )}
+                />
               </div>
             ) : (
               <div className="text-zinc-600 italic">Ещё не было парсингов</div>
@@ -923,8 +963,7 @@ function telegramAnalysisBreakdown(analysis) {
     .filter(row => row.count > 0)
 }
 
-function JobHistoryRow({ job, source, liveJob, onDelete, onCancel }) {
-  const [expanded, setExpanded] = useState(false)
+function JobHistoryRow({ job, source, liveJob, onDelete, onCancel, expanded = false, onExpandedChange }) {
   let params = {}
   try { params = JSON.parse(job.parameters_json || '{}') } catch {}
   const dt = job.started_at ? new Date(job.started_at * 1000) : null
@@ -947,12 +986,12 @@ function JobHistoryRow({ job, source, liveJob, onDelete, onCancel }) {
   // Both YT and TK batch share the same shape, so the same inline panel works.
   const isBatch = job.type === 'yt_batch_transcribe' || job.type === 'tk_batch_transcribe'
   const handleClick = isBatch
-    ? () => setExpanded(v => !v)
-    : () => pushScreen('job-detail', { jobId: job.id, job })
+    ? () => onExpandedChange?.(!expanded)
+    : () => pushScreen('job-detail', { jobId: job.id, job, jobIdentity: 'db' })
 
-  const isLive = liveJob && (liveJob.status === 'running' || liveJob.status === 'awaiting_ai')
+  const isLive = liveJob && (liveJob.status === 'running' || liveJob.status === 'awaiting_ai' || liveJob.status === 'cancelling')
   return (
-    <div className={isBatch && expanded ? 'bg-zinc-950' : ''}>
+    <div data-job-history-row data-job-id={job.id} className={isBatch && expanded ? 'bg-zinc-950' : ''}>
       <div
         onClick={handleClick}
         className="px-4 py-2 flex items-center gap-3 group cursor-pointer hover:bg-zinc-900/60"
@@ -988,7 +1027,7 @@ function JobHistoryRow({ job, source, liveJob, onDelete, onCancel }) {
           </span>
         )}
         {onCancel && (eff.status === 'running' || eff.status === 'pending'
-                       || eff.status === 'awaiting_ai') && (
+                       || eff.status === 'awaiting_ai' || eff.status === 'cancelling') && (
           <button
             onClick={e => { e.stopPropagation(); onCancel() }}
             title="Остановить выполнение"
@@ -1177,37 +1216,41 @@ function BatchJobInlineDetail({ jobDbId, params, costUsd }) {
         </div>
       )}
 
-      <div className="rounded-md border border-zinc-800 divide-y divide-zinc-900 max-h-60 overflow-auto">
+      <div className="rounded-md border border-zinc-800 h-60 overflow-hidden">
         {items.length === 0 && (
           <div className="px-3 py-2 text-zinc-600 italic" style={{ fontSize: '14px' }}>Нет данных по видео</div>
         )}
-        {items.map((it) => (
-          // Строка с транскриптом кликабельна целиком — то же действие, что
-          // кнопка «Открыть» (паттерн «весь блок кликабелен», не только кнопка).
-          <div
-            key={it.external_id}
-            onClick={it.transcript_path
-              ? () => window.api?.openExternal?.(it.transcript_path)
-              : undefined}
-            role={it.transcript_path ? 'button' : undefined}
-            title={it.transcript_path ? 'Открыть транскрипт' : undefined}
-            className={`px-3 py-1.5 flex items-center gap-3 ${it.transcript_path ? 'cursor-pointer hover:bg-zinc-900/60' : ''}`}
-            style={{ fontSize: '14px' }}
-          >
-            <span className={`shrink-0 ${it.transcript_path ? 'text-emerald-400' : 'text-zinc-600'}`}>
-              {it.transcript_path ? '✓' : '—'}
-            </span>
-            <span className="text-zinc-300 truncate flex-1" title={it.title}>
-              {it.title || <code className="text-zinc-500">{it.external_id}</code>}
-            </span>
-            {it.transcript_path && (
-              <button
-                onClick={(e) => { e.stopPropagation(); window.api?.openExternal?.(it.transcript_path) }}
-                className="text-zinc-500 hover:text-zinc-200 shrink-0"
-              >Открыть</button>
+        {items.length > 0 && (
+          <Virtuoso
+            data={items}
+            defaultItemHeight={36}
+            increaseViewportBy={80}
+            computeItemKey={(_index, item) => item.external_id}
+            itemContent={(_index, item) => (
+              <div
+                data-batch-history-video-row
+                onClick={item.transcript_path ? () => window.api?.openExternal?.(item.transcript_path) : undefined}
+                role={item.transcript_path ? 'button' : undefined}
+                title={item.transcript_path ? 'Открыть транскрипт' : undefined}
+                className={`px-3 py-1.5 flex items-center gap-3 border-b border-zinc-900 last:border-b-0 ${item.transcript_path ? 'cursor-pointer hover:bg-zinc-900/60' : ''}`}
+                style={{ fontSize: '14px' }}
+              >
+                <span className={`shrink-0 ${item.transcript_path ? 'text-emerald-400' : 'text-zinc-600'}`}>
+                  {item.transcript_path ? '✓' : '—'}
+                </span>
+                <span className="text-zinc-300 truncate flex-1" title={item.title}>
+                  {item.title || <code className="text-zinc-500">{item.external_id}</code>}
+                </span>
+                {item.transcript_path && (
+                  <button
+                    onClick={(event) => { event.stopPropagation(); window.api?.openExternal?.(item.transcript_path) }}
+                    className="text-zinc-500 hover:text-zinc-200 shrink-0"
+                  >Открыть</button>
+                )}
+              </div>
             )}
-          </div>
-        ))}
+          />
+        )}
       </div>
     </div>
   )
@@ -1316,8 +1359,8 @@ function StatusDot({ status }) {
   // Active statuses get a small rotating ring instead of a static dot, so a
   // running job in "История парсинга" reads as "в процессе" without having
   // to compare timestamps. Done / error / cancelled remain plain dots.
-  if (status === 'running' || status === 'awaiting_ai' || status === 'pending') {
-    const ringColor = status === 'awaiting_ai' ? '#f59e0b' : '#10b981'
+  if (status === 'running' || status === 'awaiting_ai' || status === 'pending' || status === 'cancelling') {
+    const ringColor = status === 'awaiting_ai' || status === 'cancelling' ? '#f59e0b' : '#10b981'
     return (
       <span
         className="inline-block w-3 h-3 rounded-full shrink-0 animate-spin"
@@ -1504,25 +1547,15 @@ function CatchUpCommentsButton({ sourceId, handle, totalPosts, postsWithComments
   const [busy, setBusy] = React.useState(false)
   const remaining = Math.max(0, totalPosts - postsWithComments)
   async function go() {
-    if (busy || !window.api?.tgPostsWithComments || !window.api?.itemsList) return
+    if (busy || !window.api?.tgCatchUpComments) return
     setBusy(true)
     try {
-      // 1. Pull all post msg_ids from items, 2. subtract ones we have, 3. fire.
-      // No paging: TG channels rarely have >50k posts and items.external_id is
-      // an indexed column. Single SELECT is fine.
-      const itemsRes = await window.api.itemsList({
-        source_id: sourceId, limit: 100000, offset: 0,
-        order: 'published_at DESC',
-      })
-      const allIds = new Set((itemsRes || []).map(it => String(it.external_id)))
-      const covered = new Set((await window.api.tgPostsWithComments(sourceId)) || [])
-      const missing = []
-      for (const id of allIds) if (!covered.has(id)) missing.push(id)
-      if (missing.length === 0) return
+      // Python reads the missing post IDs from library.db in its own process.
+      // Large channels therefore send one source id through IPC/argv instead
+      // of tens of thousands of message ids.
       await window.api.tgCatchUpComments({
         target:         handle ? '@' + String(handle).replace(/^@/, '') : null,
         source_id:      sourceId,
-        post_ids:       missing.map(s => Number(s)).filter(Number.isFinite),
         comments_limit: 0,
       })
     } finally {

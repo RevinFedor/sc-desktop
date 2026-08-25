@@ -1,10 +1,12 @@
-import React, { useEffect, useState, useRef, useCallback, useLayoutEffect } from 'react'
+import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react'
+import { Virtuoso } from 'react-virtuoso'
 import Checkbox from './Checkbox'
 import Select from './Select'
 import { ENGINES } from './TelegramTypesPopover'
 import { useInvalidator } from '../lib/dataBus'
 import { useChatSelection } from '../lib/chatSelection'
-import { useJobs } from '../lib/jobs'
+import { useJobsSelector } from '../lib/jobs'
+import { jobsForSource, sameArrayItems } from '../lib/jobSelectorCore.mjs'
 import { Loader2, Mic, ScanEye, ScanText, Sparkles, Copy, RotateCw, ChevronDown, ChevronUp, X } from 'lucide-react'
 
 // Collapse long message bodies to this many chars; «Раскрыть» reveals the rest.
@@ -59,6 +61,7 @@ function formatBytes(n) {
 }
 
 const PAGE_SIZE = 100
+const FIRST_ITEM_INDEX_BASE = 1_000_000
 // Потолок FTS-выдачи (itemsSearch). Достигли — футер честно говорит про
 // обрезку, а не рапортует «200 результатов» как полный список.
 const FTS_LIMIT = 200
@@ -75,9 +78,10 @@ const TYPE_LABEL = {
 }
 const ALL_TYPES = ['text', 'voice', 'video', 'photo', 'audio', 'document', 'poll']
 
-export default function ChatView({ sourceId, platform = 'telegram' }) {
+function ChatView({ sourceId, platform = 'telegram' }) {
   const [items, setItems] = useState([])
   const [offset, setOffset] = useState(0)
+  const [cursor, setCursor] = useState(null)
   const [loading, setLoading] = useState(false)
   const [exhausted, setExhausted] = useState(false)
   const [query, setQuery] = useState('')
@@ -110,30 +114,29 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
   // [{type, count, ...}, ...] for the current topic (or whole source when topic=null)
   const [typeBreakdown, setTypeBreakdown] = useState([])
 
-  const sentinelRef = useRef(null)
-  const inFlightRef = useRef(false)
+  const inFlightRef = useRef(null)
+  const requestGenerationRef = useRef(0)
+  const itemsRef = useRef([])
+  const loadedIdsRef = useRef(new Set())
+  const virtuosoRef = useRef(null)
+  const [firstItemIndex, setFirstItemIndex] = useState(FIRST_ITEM_INDEX_BASE)
+  const [listEpoch, setListEpoch] = useState(0)
+  const [expandedIds, setExpandedIds] = useState(() => new Set())
   // ── Chat-style scroll (flipped mode) machinery ───────────────────────
-  // The scrollable list container (the max-h + overflow-auto div below).
-  const scrollRef = useRef(null)
   // While true, live messages appended by an active Telegram fetch keep the
   // viewport pinned to the bottom. User scroll-up flips it off.
   const stickToBottomRef = useRef(true)
-  // True once the initial jump-to-bottom for the current list happened.
-  // Gates the top sentinel: it is visible while the list mounts and would
-  // otherwise cascade-load every page before the user scrolls. reset()
-  // clears it so a new scope jumps to the bottom again.
-  const didInitialScrollRef = useRef(false)
-  // {prevScrollHeight, prevScrollTop} captured in loadPage right before the
-  // setItems commit that prepends older rows; consumed by the layout effect.
-  const anchorRef = useRef(null)
-  // items.length at the previous layout pass: 0 → this commit is the first
-  // fill (jump to bottom); >0 and grew → older page landed (compensate).
-  const prevCountRef = useRef(0)
   // One key drives everything in this view — topics, type breakdown, and
   // the items list itself. jobInvalidation.js bumps `items:<id>` whenever
   // a job for this source finishes, so the dropdown count and chip-row
   // refresh without us subscribing to job:update directly.
   const itemsVer = useInvalidator(`items:${sourceId}`)
+
+  useEffect(() => {
+    if (platform !== 'telegram' || !sourceId || !window.api?.jobsSetLiveSource) return
+    window.api.jobsSetLiveSource(sourceId).catch(() => {})
+    return () => { window.api.jobsSetLiveSource(null).catch(() => {}) }
+  }, [sourceId, platform])
 
   // ── On-demand media processing (Telegram only) ────────────────────────
   // Multi-select + per-row «перевести»/«копировать». Selection lives in the
@@ -149,11 +152,14 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
   // A row is «in flight» when some running job for this source currently has
   // media_phase[kind].current.msg_id === this row's external_id. Map keyed by
   // external_id(string) → { stage, engine, kind }. See fact-jobs.md::media_phase.
-  const liveJobs = useJobs()
+  const liveJobs = useJobsSelector(
+    jobs => jobsForSource(jobs, sourceId, { activeOnly: true }),
+    sameArrayItems,
+  )
   const liveFetchJobs = React.useMemo(
     () => liveJobs.filter(j => j && j.source_id === sourceId
       && j.type === 'tg_fetch'
-      && (j.status === 'running' || j.status === 'awaiting_ai')
+      && (j.status === 'running' || j.status === 'awaiting_ai' || j.status === 'cancelling')
       && j.params?.mode !== 'media_only'),
     [liveJobs, sourceId],
   )
@@ -175,7 +181,7 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
     const m = new Map()
     for (const j of liveJobs) {
       if (!j || j.source_id !== sourceId) continue
-      if (j.status !== 'running' && j.status !== 'awaiting_ai') continue
+      if (j.status !== 'running' && j.status !== 'awaiting_ai' && j.status !== 'cancelling') continue
       const mp = j.media_phase
       if (!mp) continue
       for (const kind of ['voice', 'photo', 'pdf']) {
@@ -191,7 +197,7 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
   // «идёт перевод…» note and disables re-launch to avoid duplicate work.
   const mediaJobRunning = React.useMemo(
     () => liveJobs.some(j => j && j.source_id === sourceId
-      && (j.status === 'running' || j.status === 'awaiting_ai')
+      && (j.status === 'running' || j.status === 'awaiting_ai' || j.status === 'cancelling')
       && j.params?.mode === 'media_only'),
     [liveJobs, sourceId],
   )
@@ -214,16 +220,23 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
     () => (flipped ? [...renderItems].reverse() : renderItems),
     [renderItems, flipped],
   )
-  // Ordered list of currently-rendered message ids — Shift-range select needs
-  // the VISUAL order to fill a contiguous run, so it's built from visualItems
-  // (chronological in flipped mode, newest-first otherwise).
-  const orderedIds = React.useMemo(() => visualItems.map(it => it.id), [visualItems])
+  const displayedItems = React.useMemo(
+    () => visualItems.filter(it => (
+      !searchActive || searchMode !== 'sem' || it._cos == null || it._cos >= semThreshold
+    )),
+    [visualItems, searchActive, searchMode, semThreshold],
+  )
+  // Ordered list of actually rendered message ids — Shift-range select must
+  // not include rows hidden by the semantic relevance threshold.
+  const orderedIds = React.useMemo(() => displayedItems.map(it => it.id), [displayedItems])
   // Prune selection to what's still visible whenever the rendered set changes
   // (filter / search / source switch drops rows).
   useEffect(() => {
     sel.pruneTo(new Set(orderedIds))
-    // eslint-disable-next-line
-  }, [orderedIds.join(',')])
+    // pruneTo is a stable module-level function exposed by the selection store.
+    // Depending on the memoized array avoids rebuilding a multi-thousand-ID
+    // join string on every unrelated render.
+  }, [orderedIds, sel.pruneTo])
   // Drop selection entirely when the source changes — ids belong to the old chat.
   useEffect(() => { sel.clear() /* eslint-disable-next-line */ }, [sourceId])
 
@@ -342,14 +355,19 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
   }, [sourceId, canProcess])
 
   const reset = useCallback(() => {
+    requestGenerationRef.current += 1
+    inFlightRef.current = null
+    itemsRef.current = []
+    loadedIdsRef.current = new Set()
     setItems([])
+    setLoading(false)
     setOffset(0)
+    setCursor(null)
     setExhausted(false)
-    // New list instance: the jump-to-bottom must run again, and any pending
-    // scroll anchor belongs to the old list.
-    didInitialScrollRef.current = false
+    setFirstItemIndex(FIRST_ITEM_INDEX_BASE)
+    setListEpoch(n => n + 1)
+    setExpandedIds(new Set())
     stickToBottomRef.current = true
-    anchorRef.current = null
   }, [])
 
   // Refresh topic list when source or items-version changes.
@@ -374,8 +392,9 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
 
   // Load page (or full search)
   const loadPage = useCallback(async () => {
-    if (inFlightRef.current || exhausted || !window.api) return
-    inFlightRef.current = true
+    const generation = requestGenerationRef.current
+    if (inFlightRef.current === generation || exhausted || !window.api) return
+    inFlightRef.current = generation
     setLoading(true)
     try {
       let rows
@@ -390,6 +409,7 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
             query: query.trim(),
             limit: semLimit,
           })
+          if (generation !== requestGenerationRef.current) return
           if (r?.error) {
             console.error('[ChatView] semantic search failed:', r.error)
             window.alert(`Семантический поиск не сработал: ${r.error}`)
@@ -403,46 +423,63 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
             query: query.trim(),
             limit: FTS_LIMIT,
           })
+          if (generation !== requestGenerationRef.current) return
         }
         setExhausted(true)
       } else {
-        rows = await window.api.itemsList({
+        const pageParams = {
           source_id: sourceId,
           limit: PAGE_SIZE,
-          offset,
           order: platform === 'telegram'
             ? 'published_at DESC'
             : (dateSort === 'asc' ? 'published_at ASC' : 'published_at DESC'),
           types: selectedTypes.size ? [...selectedTypes] : null,
           topic_id: selectedTopic,
-        })
-        if (rows.length < PAGE_SIZE) setExhausted(true)
-        setOffset(o => o + rows.length)
-      }
-      // Flipped (chat) mode: the fetched page is OLDER messages, rendered
-      // visually on top — content above the viewport grows. Capture scroll
-      // metrics synchronously, right before the setItems commit, so the
-      // layout effect below can pin the viewport to the same message.
-      if (flipped && scrollRef.current) {
-        anchorRef.current = {
-          prevScrollHeight: scrollRef.current.scrollHeight,
-          prevScrollTop: scrollRef.current.scrollTop,
         }
+        if (window.api.itemsListPage) {
+          const page = await window.api.itemsListPage({ ...pageParams, cursor })
+          rows = page?.items || []
+          if (generation !== requestGenerationRef.current) return
+          setCursor(page?.nextCursor || null)
+          setExhausted(!page?.hasMore)
+        } else {
+          rows = await window.api.itemsList({ ...pageParams, offset })
+          if (generation !== requestGenerationRef.current) return
+          if (rows.length < PAGE_SIZE) setExhausted(true)
+          setOffset(o => o + rows.length)
+        }
+        if (generation !== requestGenerationRef.current) return
       }
-      setItems(prev => {
-        if (searchActive) return rows
-        const seen = new Set(prev.map(it => it.id))
-        const fresh = rows.filter(r => !seen.has(r.id))
-        return fresh.length === rows.length ? [...prev, ...rows] : [...prev, ...fresh]
-      })
+      if (searchActive) {
+        loadedIdsRef.current = new Set(rows.map(row => row.id))
+        itemsRef.current = rows
+        setItems(rows)
+      } else {
+        const prev = itemsRef.current
+        const seen = loadedIdsRef.current
+        const fresh = rows.filter(row => {
+          if (seen.has(row.id)) return false
+          seen.add(row.id)
+          return true
+        })
+        const next = fresh.length === rows.length ? [...prev, ...rows] : [...prev, ...fresh]
+        // `items` stays newest-first, so a newly fetched older page appears at
+        // the start of visualItems after reversal. Virtuoso preserves the
+        // reading frame when firstItemIndex decreases by exactly that prepend.
+        if (flipped && fresh.length) setFirstItemIndex(index => index - fresh.length)
+        itemsRef.current = next
+        setItems(next)
+      }
     } catch (err) {
-      console.error('chat load failed', err)
+      if (generation === requestGenerationRef.current) console.error('chat load failed', err)
     } finally {
-      inFlightRef.current = false
-      setLoading(false)
+      if (inFlightRef.current === generation) {
+        inFlightRef.current = null
+        if (generation === requestGenerationRef.current) setLoading(false)
+      }
     }
     // eslint-disable-next-line
-  }, [sourceId, offset, exhausted, searchActive, searchMode, semLimit, query, selectedTypes, selectedTopic, flipped, dateSort, platform])
+  }, [sourceId, offset, cursor, exhausted, searchActive, searchMode, semLimit, query, selectedTypes, selectedTopic, flipped, dateSort, platform])
 
   // When the user navigates to a different source, the existing topic /
   // type-filter scope is meaningless (those ids belong to the previous
@@ -465,60 +502,45 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
   useEffect(() => {
     if (items.length === 0 && !loading && !exhausted) loadPage()
     // eslint-disable-next-line
-  }, [items.length, sourceId, selectedTopic, typesKey, itemsVer])
+  }, [items.length, sourceId, selectedTopic, typesKey, itemsVer, searchActive, searchMode, semLimit, query, loadPage, loading, exhausted])
 
-  // Infinite scroll. In flipped (chat) mode the sentinel sits at the TOP and
-  // is intersecting while the list mounts (before the initial jump-to-bottom)
-  // — gate it on didInitialScrollRef, otherwise it cascade-loads every page
-  // on open.
+  // A capped live tail eventually replaces one old row for each new row, so
+  // its length can stay constant. followOutput only reacts to count changes;
+  // this identity marker keeps a reader who is already at the bottom pinned
+  // through those same-length replacements without dragging a scrolled-up
+  // reader away from their position.
+  const liveTailMarker = liveTailItems[0]?.external_id || null
   useEffect(() => {
-    const node = sentinelRef.current
-    if (!node || searchActive) return
-    const obs = new IntersectionObserver(entries => {
-      if (!entries[0].isIntersecting || loading || exhausted) return
-      if (flipped && (items.length === 0 || !didInitialScrollRef.current)) return
-      loadPage()
-    }, { threshold: 0.1 })
-    obs.observe(node)
-    return () => obs.disconnect()
-  }, [loadPage, loading, exhausted, searchActive, flipped, items.length])
+    if (!flipped || !liveTailMarker || !stickToBottomRef.current || visualItems.length === 0) return
+    const frame = requestAnimationFrame(() => {
+      virtuosoRef.current?.scrollToIndex({
+        index: firstItemIndex + visualItems.length - 1,
+        align: 'end',
+        behavior: 'auto',
+      })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [liveTailMarker, flipped, firstItemIndex, visualItems.length])
 
-  useEffect(() => {
-    const el = scrollRef.current
-    if (!el || !flipped) return
-    const updateStickiness = () => {
-      stickToBottomRef.current = (el.scrollHeight - el.scrollTop - el.clientHeight) < 64
-    }
-    updateStickiness()
-    el.addEventListener('scroll', updateStickiness, { passive: true })
-    return () => el.removeEventListener('scroll', updateStickiness)
-  }, [flipped, sourceId])
-
-  // Chat-scroll anchoring (flipped mode only), before paint on every items
-  // commit:
-  //  • first fill (prevCount 0 → N) — jump to the bottom, newest visible,
-  //    как при открытии чата в Telegram;
-  //  • older page prepended (prevCount > 0, list grew) — restore
-  //    scrollTop = newScrollHeight − prevScrollHeight + prevScrollTop, so the
-  //    message under the cursor stays put (metrics captured in loadPage).
-  useLayoutEffect(() => {
-    const el = scrollRef.current
-    const prevCount = prevCountRef.current
-    prevCountRef.current = renderItems.length
-    if (!flipped || !el) { anchorRef.current = null; return }
-    if (renderItems.length === 0) return
-    if (prevCount === 0) {
-      el.scrollTop = el.scrollHeight
-      didInitialScrollRef.current = true
-      stickToBottomRef.current = true
-    } else if (renderItems.length > prevCount && anchorRef.current) {
-      const { prevScrollHeight, prevScrollTop } = anchorRef.current
-      el.scrollTop = el.scrollHeight - prevScrollHeight + prevScrollTop
-    } else if (renderItems.length > prevCount && stickToBottomRef.current) {
-      el.scrollTop = el.scrollHeight
-    }
-    anchorRef.current = null
-  }, [renderItems.length, flipped])
+  const listComponents = useMemo(() => ({
+    Header: () => flipped ? (
+      <div className="px-4 py-3 text-center text-xs text-zinc-600 border-b border-zinc-900">
+        {loading ? 'Загружаю…' : exhausted ? `Всё загружено (${items.length})` : 'Прокрутите вверх — ещё'}
+      </div>
+    ) : null,
+    Footer: () => (
+      <>
+        {platform === 'telegram' && liveFetchJobs.length > 0 && (
+          <LiveFetchFooter jobs={liveFetchJobs} liveCount={liveTailItems.length} searchActive={searchActive} />
+        )}
+        {!flipped && !searchActive && (
+          <div className="px-4 py-3 text-center text-xs text-zinc-600 border-t border-zinc-900">
+            {loading ? 'Загружаю…' : exhausted ? `Всё загружено (${items.length})` : 'Прокрутите вниз — ещё'}
+          </div>
+        )}
+      </>
+    ),
+  }), [flipped, loading, exhausted, items.length, platform, liveFetchJobs, liveTailItems.length, searchActive])
 
   function runSearch(mode) {
     if (!query.trim()) {
@@ -547,6 +569,17 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
     setSearchActive(false)
     reset()
   }
+
+  const setMessageExpanded = useCallback((id, expanded) => {
+    setExpandedIds(prev => {
+      const has = prev.has(id)
+      if (has === expanded) return prev
+      const next = new Set(prev)
+      if (expanded) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }, [])
 
   const isForum = topics.length > 1
   // Single-topic chat: show one informational chip with the topic name so the
@@ -716,34 +749,38 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
         </div>
       )}
 
-      <div ref={scrollRef} className="max-h-[480px] overflow-auto">
-        {renderItems.length === 0 && !loading && (
-          <div className="px-4 py-8 text-center text-zinc-600 italic text-sm">
-            {searchActive
-              ? 'Ничего не найдено'
-              : 'В этой коллекции нет сообщений (или они ещё не загружены)'}
+      <div data-chat-virtual-list className="h-[480px] min-h-0">
+        {displayedItems.length === 0 ? (
+          <div className="h-full px-4 py-8 flex items-center justify-center text-center text-zinc-600 italic text-sm">
+            {loading
+              ? 'Загружаю…'
+              : searchActive
+                ? 'Ничего не найдено'
+                : 'В этой коллекции нет сообщений (или они ещё не загружены)'}
           </div>
-        )}
-
-        {/* Flipped (chat) mode: the oldest edge is the TOP of the list, so the
-            load-more sentinel and the «всё загружено» boundary live above it. */}
-        {flipped && !exhausted && (
-          <div ref={sentinelRef} className="px-4 py-3 text-center text-xs text-zinc-600">
-            {loading ? 'Загружаю…' : 'Прокрутите вверх — ещё'}
-          </div>
-        )}
-        {flipped && exhausted && items.length > 0 && (
-          <div className="px-4 py-3 text-center text-xs text-zinc-600 border-b border-zinc-900">
-            Всё загружено ({items.length})
-          </div>
-        )}
-
-        <div className="divide-y divide-zinc-900">
-          {visualItems
-            .filter(it => !searchActive || searchMode !== 'sem' || it._cos == null || it._cos >= semThreshold)
-            .map(it => (
+        ) : (
+          <Virtuoso
+            key={`${sourceId}:${listEpoch}:${searchActive ? searchMode : 'feed'}`}
+            ref={virtuosoRef}
+            data={displayedItems}
+            firstItemIndex={firstItemIndex}
+            initialTopMostItemIndex={flipped ? displayedItems.length - 1 : 0}
+            alignToBottom={flipped}
+            followOutput={flipped ? (isAtBottom => isAtBottom ? 'auto' : false) : false}
+            atBottomThreshold={64}
+            atBottomStateChange={atBottom => { stickToBottomRef.current = atBottom }}
+            startReached={() => {
+              if (flipped && !searchActive && !loading && !exhausted) loadPage()
+            }}
+            endReached={() => {
+              if (!flipped && !searchActive && !loading && !exhausted) loadPage()
+            }}
+            defaultItemHeight={72}
+            increaseViewportBy={240}
+            computeItemKey={(index, item) => item?.id ?? index}
+            components={listComponents}
+            itemContent={(_index, it) => (
               <MessageRow
-                key={it.id}
                 item={it}
                 highlight={searchActive ? query : null}
                 platform={platform}
@@ -755,53 +792,37 @@ export default function ChatView({ sourceId, platform = 'telegram' }) {
                 }}
                 live={!!it.__live}
                 processing={processingByExtId.get(String(it.external_id)) || null}
+                expanded={expandedIds.has(it.id)}
+                onExpandedChange={expanded => setMessageExpanded(it.id, expanded)}
                 onTranscribe={!it.__live && MEDIA_KIND_BY_TYPE[it.type] ? () => runTranscribe([it]) : null}
                 onCopy={!it.__live ? () => runCopy([it]) : null}
               />
-            ))
-          }
-        </div>
-
-        {platform === 'telegram' && liveFetchJobs.length > 0 && (
-          <LiveFetchFooter jobs={liveFetchJobs} liveCount={liveTailItems.length} searchActive={searchActive} />
-        )}
-
-        {!flipped && !searchActive && !exhausted && (
-          <div ref={sentinelRef} className="px-4 py-3 text-center text-xs text-zinc-600">
-            {loading ? 'Загружаю…' : 'Прокрутите вниз — ещё'}
-          </div>
-        )}
-        {!flipped && exhausted && items.length > 0 && (
-          <div className="px-4 py-3 text-center text-xs text-zinc-600 border-t border-zinc-900">
-            {searchActive && searchMode === 'sem' ? (
-              // Heuristic: if we hit the requested ceiling, there are very
-              // likely more candidates below — let the user pull them. If
-              // we got fewer than the ceiling, the index is exhausted for
-              // this query.
-              items.length >= semLimit ? (
-                <button
-                  onClick={loadMoreSemantic}
-                  disabled={loading}
-                  className="px-4 py-1.5 rounded-md bg-emerald-900/60 text-emerald-200 hover:bg-emerald-800/80 disabled:opacity-50"
-                >
-                  {loading ? 'Загружаю…' : `Показать ещё +${SEM_PAGE}`}
-                </button>
-              ) : (
-                <>Всего {items.length} результатов · больше нет</>
-              )
-            ) : (
-              // FTS капится limit:200 на стороне запроса — если упёрлись в
-              // потолок, честно сказать про обрезку вместо «200 результатов»,
-              // которое читается как полный список.
-              searchActive
-                ? (items.length >= FTS_LIMIT
-                    ? `Показаны первые ${FTS_LIMIT} — уточните запрос, чтобы сузить`
-                    : `${items.length} результатов`)
-                : `Всё загружено (${items.length})`
             )}
-          </div>
+          />
         )}
       </div>
+
+      {searchActive && exhausted && items.length > 0 && (
+        <div className="px-4 py-3 text-center text-xs text-zinc-600 border-t border-zinc-900">
+          {searchMode === 'sem' ? (
+            items.length >= semLimit ? (
+              <button
+                onClick={loadMoreSemantic}
+                disabled={loading}
+                className="px-4 py-1.5 rounded-md bg-emerald-900/60 text-emerald-200 hover:bg-emerald-800/80 disabled:opacity-50"
+              >
+                {loading ? 'Загружаю…' : `Показать ещё +${SEM_PAGE}`}
+              </button>
+            ) : (
+              <>Всего {items.length} результатов · больше нет</>
+            )
+          ) : (
+            items.length >= FTS_LIMIT
+              ? `Показаны первые ${FTS_LIMIT} — уточните запрос, чтобы сузить`
+              : `${items.length} результатов`
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -1060,10 +1081,11 @@ function FiltersButton({ selected, onChange, breakdown }) {
   )
 }
 
-function MessageRow({
+const MessageRow = React.memo(function MessageRow({
   item, highlight, platform = 'telegram',
   selectable = false, selected = false, onToggleSelect = null,
   live = false, processing = null, onTranscribe = null, onCopy = null,
+  expanded = false, onExpandedChange = null,
 }) {
   const isYoutube   = platform === 'youtube'
   const isTiktok    = platform === 'tiktok'
@@ -1127,11 +1149,10 @@ function MessageRow({
   // wall of text. Search results keep their own Highlighted truncation (the
   // user is scanning for a hit, not reading the whole body), so the control is
   // plain-view only.
-  const [expanded, setExpanded] = useState(false)
   const isLong = !highlight && !!text && text.length > EXPAND_LIMIT
 
   return (
-    <div className={`px-4 py-2 hover:bg-zinc-900/60 flex gap-3 ${selected ? 'bg-emerald-950/20' : ''}`}>
+    <div data-chat-message-row data-message-id={item.id} className={`px-4 py-2 hover:bg-zinc-900/60 flex gap-3 ${selected ? 'bg-emerald-950/20' : ''}`}>
       {/* Left checkbox gutter — Telegram only. Click toggles; Shift-click fills
           the range (parent reads e.shiftKey). `passive` lets the wrapper own
           the click so Shift is observable. */}
@@ -1183,7 +1204,7 @@ function MessageRow({
             {isLong && expanded && (
               <div className="sticky top-0 z-10 py-1 mb-1 bg-zinc-950/95 backdrop-blur-sm border-b border-zinc-800/60 flex">
                 <button
-                  onClick={(e) => { e.stopPropagation(); setExpanded(false) }}
+                  onClick={(e) => { e.stopPropagation(); onExpandedChange?.(false) }}
                   className="inline-flex items-center gap-1 text-zinc-400 hover:text-zinc-200"
                   style={{ fontSize: '13px' }}
                 >
@@ -1198,7 +1219,7 @@ function MessageRow({
             </div>
             {isLong && !expanded && (
               <button
-                onClick={(e) => { e.stopPropagation(); setExpanded(true) }}
+                onClick={(e) => { e.stopPropagation(); onExpandedChange?.(true) }}
                 className="mt-0.5 inline-flex items-center gap-1 text-zinc-400 hover:text-zinc-200"
                 style={{ fontSize: '13px' }}
               >
@@ -1265,7 +1286,7 @@ function MessageRow({
       )}
     </div>
   )
-}
+})
 
 // Compact chip-row for parsed Telegram reactions. Reads the JSON-stringified
 // list from items.reactions; null means "not parsed by this fetch", empty
@@ -1319,3 +1340,5 @@ function Highlighted({ text, q }) {
 }
 
 function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
+
+export default React.memo(ChatView)

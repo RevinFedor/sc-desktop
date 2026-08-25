@@ -43,6 +43,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   const formatIcon  = document.getElementById('formatIcon');
   const formatText  = document.getElementById('formatText');
   const appTitle    = document.getElementById('appTitle');
+  const openVocabulary = document.getElementById('openVocabulary');
+
+  openVocabulary?.addEventListener('click', () => {
+    chrome.runtime.openOptionsPage(() => window.close());
+  });
 
   const titleYoutube    = document.getElementById('titleYoutube');
 
@@ -116,7 +121,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     chatgpt_show_in_text_field:  document.getElementById('yt_chatgpt_show_in_text_field'),
     chatgpt_model:               document.getElementById('yt_chatgpt_model'),
     chatgpt_effort:              document.getElementById('yt_chatgpt_effort'),
+    chatgpt_speed:               document.getElementById('yt_chatgpt_speed'),
   };
+  const ytChatgptSpeedRow = document.getElementById('yt_chatgpt_speed_row');
   const ytChatgptModeButtons = {
     chat: document.getElementById('yt_chatgpt_mode_chat'),
     work: document.getElementById('yt_chatgpt_mode_work'),
@@ -186,6 +193,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       : defaultChatgptEffort(mode, model);
     replaceChatgptOptions(ytInputs.chatgpt_model, models, model);
     replaceChatgptOptions(ytInputs.chatgpt_effort, efforts, effort);
+    ytChatgptSpeedRow.hidden = mode !== 'work';
+    if (mode === 'work') {
+      replaceChatgptOptions(
+        ytInputs.chatgpt_speed,
+        CHATGPT_WORK_SPEEDS,
+        youtubeState.chatgpt_work_speed || 'standard',
+      );
+    }
   }
 
   function saveVisibleChatgptPair() {
@@ -195,6 +210,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       chatgpt_mode: currentChatgptMode,
       [`chatgpt_${currentChatgptMode}_model`]: String(ytInputs.chatgpt_model.value || ''),
       [`chatgpt_${currentChatgptMode}_effort`]: String(ytInputs.chatgpt_effort.value || ''),
+      ...(currentChatgptMode === 'work'
+        ? { chatgpt_work_speed: String(ytInputs.chatgpt_speed.value || 'standard') }
+        : {}),
     });
   }
 
@@ -427,6 +445,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       chatgpt_mode:             currentChatgptMode,
       [`chatgpt_${currentChatgptMode}_model`]: String(ytInputs.chatgpt_model.value || ''),
       [`chatgpt_${currentChatgptMode}_effort`]: String(ytInputs.chatgpt_effort.value || ''),
+      ...(currentChatgptMode === 'work'
+        ? { chatgpt_work_speed: String(ytInputs.chatgpt_speed.value || 'standard') }
+        : {}),
     });
   }
 
@@ -636,6 +657,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     persistYoutube({ previousState });
   });
   ytInputs.chatgpt_effort.addEventListener('change', () => { persistYoutube(); });
+  ytInputs.chatgpt_speed.addEventListener('change', () => { persistYoutube(); });
 
   async function loadSettings() {
     const raw = await new Promise(resolve => chrome.storage.sync.get({

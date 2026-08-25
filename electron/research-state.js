@@ -65,6 +65,12 @@ function create({ provider, prompt, options, attachments }) {
 
 function get(id) { return jobs.get(id) || null }
 
+function remove(id) {
+  const existed = jobs.delete(id)
+  if (existed) events.emit('change', { id, removed: true })
+  return existed
+}
+
 // Найти active research по tabId. Используется CS recovery'м, когда страница
 // перезагрузилась без hash и без window.name (crash-restore, discard и т.п.):
 // CS у нас под рукой только tabId (через sender в SW), и hash был сброшен
@@ -164,6 +170,7 @@ function listAllForUi() {
     const reasoningText = normalizeReasoningText(r, sourcesMeta)
     const images = normalizeImageArray(r.images, 'output')
     const inputImages = normalizeInputImagesFromAttachments(j.attachments)
+    const inputFiles = normalizeInputFilesFromAttachments(j.attachments)
     // elapsed: от старта до done (или до now если ещё бежит).
     const endTs = j.doneAt || Date.now()
     const elapsedSec = j.createdAt ? Math.max(0, Math.round((endTs - j.createdAt) / 1000)) : null
@@ -196,6 +203,7 @@ function listAllForUi() {
       reasoningText: reasoningText || null,       // видимый thinking-summary ChatGPT
       images,
       inputImages,
+      inputFiles,
       imageCount: images.length,
       sources,
       sourcesMeta,
@@ -251,12 +259,32 @@ function normalizeReasoningText(result, sourcesMeta) {
 
 function normalizeInputImagesFromAttachments(attachments) {
   if (!Array.isArray(attachments)) return []
-  return normalizeImageArray(attachments.map((a) => ({
+  return normalizeImageArray(attachments
+    .filter((a) => String(a?.mime || '').startsWith('image/'))
+    .map((a) => ({
     file_path: a?.path,
     name: a?.name,
     content_type: a?.mime,
     bytes: a?.size,
   })), 'input')
+}
+
+function normalizeInputFilesFromAttachments(attachments) {
+  if (!Array.isArray(attachments)) return []
+  return attachments
+    .filter((a) => a?.path && !String(a?.mime || '').startsWith('image/'))
+    .map((a, i) => ({
+      role: 'input',
+      index: Number.isFinite(a?.index) ? a.index : i,
+      name: a?.name || path.basename(a.path),
+      filePath: a.path,
+      contentType: a?.mime || null,
+      bytes: Number.isFinite(a?.size) ? a.size : null,
+      lineStart: Number.isFinite(a?.line_start) ? a.line_start : null,
+      lineEnd: Number.isFinite(a?.line_end) ? a.line_end : null,
+      sourceLineCount: Number.isFinite(a?.source_line_count) ? a.source_line_count : null,
+      bundledCount: Number.isFinite(a?.bundled_count) ? a.bundled_count : null,
+    }))
 }
 
 function normalizeImageArray(raw, role) {
@@ -342,9 +370,12 @@ function chatgptModelLabel(options) {
     '5.6-sol': 'GPT-5.6 Sol',
     '5.6-terra': 'GPT-5.6 Terra',
     '5.6-luna': 'GPT-5.6 Luna',
+    'o3': 'o3',
   }
   const modelLabel = labels[model] || (/^\d/.test(model) ? `GPT-${model}` : model)
-  return `${modelLabel} · ${options?.effort || 'xhigh'}`
+  const parts = [modelLabel, options?.effort || (model === 'o3' ? 'medium' : 'xhigh')]
+  if (options?.mode === 'work') parts.push(options?.speed === 'fast' ? 'fast' : 'standard')
+  return parts.join(' · ')
 }
 
 // Очистка старья: research занимает <30 мин, но на дебаг (зависшие jobs)
@@ -369,4 +400,4 @@ function gc() {
 }
 setInterval(gc, 5 * 60 * 1000).unref?.()
 
-module.exports = { create, recreate, get, findByTabId, failAllByTabId, update, subscribe, publicSnapshot, listAllForUi, newRequestId, claudeModelLabel, chatgptModelLabel }
+module.exports = { create, recreate, get, remove, findByTabId, failAllByTabId, update, subscribe, publicSnapshot, listAllForUi, newRequestId, claudeModelLabel, chatgptModelLabel }

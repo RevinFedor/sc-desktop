@@ -1,6 +1,7 @@
 import React, {
   useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef,
 } from 'react'
+import { Virtuoso } from 'react-virtuoso'
 import {
   startYoutubeBatchTranscribe, watchJob,
 } from '../lib/jobs'
@@ -710,6 +711,30 @@ const YouTubeBatchPicker = forwardRef(function YouTubeBatchPicker({
   // the chips array (O(n²) total) and trigger a full list re-paint on each
   // checkbox toggle.
   const chipsSet = useMemo(() => new Set(chips.map(c => c.video_id)), [chips])
+  const youtubeListComponents = useMemo(() => ({
+    Footer: () => (
+      <>
+        {onLoadMore && (
+          <button
+            onClick={onLoadMore}
+            disabled={loadingMore}
+            className="w-full px-4 py-3 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900/60 disabled:text-zinc-600 disabled:hover:bg-transparent flex items-center justify-center gap-2 border-t border-zinc-900"
+            style={{ fontSize: '14px' }}
+          >
+            {loadingMore ? (
+              <><span className="inline-block w-3 h-3 rounded-full border-2 border-zinc-600 border-t-zinc-300 animate-spin" /><span>Загружаю…</span></>
+            ) : <span>{loadMoreLabel || '+ Показать ещё'}</span>}
+          </button>
+        )}
+        {reachedCeiling && !onLoadMore && videos.length > 0 && (
+          <div className="w-full px-4 py-3 text-zinc-500 text-center border-t border-zinc-900" style={{ fontSize: '13px' }}>
+            YouTube отдал всё что есть для этого запроса — <span className="text-zinc-300">{videos.length} видео</span>.
+            Чтобы получить больше — расширьте диапазон в самом YouTube или попробуйте убрать фильтры URL ↑
+          </div>
+        )}
+      </>
+    ),
+  }), [onLoadMore, loadingMore, loadMoreLabel, reachedCeiling, videos.length])
 
   // While a batch job is running, switch the panel to a progress view.
   if (batchJob && batchJob.status === 'running') {
@@ -1023,7 +1048,7 @@ const YouTubeBatchPicker = forwardRef(function YouTubeBatchPicker({
       )}
 
       {/* List */}
-      <div className={`${showSearchControls ? '' : 'border-y border-zinc-800'} divide-y divide-zinc-900 max-h-[400px] overflow-auto`}>
+      <div data-youtube-video-list className={`${showSearchControls ? '' : 'border-y border-zinc-800'} overflow-hidden`}>
         {!loaded && (
           <div className="px-4 py-6 text-center text-zinc-600 italic" style={{ fontSize: '14px' }}>
             Загружаем список…
@@ -1034,62 +1059,39 @@ const YouTubeBatchPicker = forwardRef(function YouTubeBatchPicker({
             {search ? 'Ничего не найдено' : (showSearchControls ? 'Ничего не найдено в выбранном диапазоне' : 'Канал пуст — сделайте Sync new')}
           </div>
         )}
-        {filtered.map(v => {
-          const cmt = commentsState.get(v.video_id) || null
-          const expanded = expandedCommentsId === v.video_id
-          return (
-            <React.Fragment key={v.video_id}>
-              <VideoRow
-                video={v}
-                inSel={selected.has(v.video_id) || chipsSet.has(v.video_id)}
-                done={!!v.transcript_path}
-                filtered={filtered}
-                onToggle={toggleVideo}
-                fullDate={!!showSearchControls}
-                commentsHit={cmt}
-                commentsExpanded={expanded}
-                onToggleComments={toggleComments}
-              />
-              {expanded && (
-                <div className="px-4 pb-3 -mt-1 bg-zinc-950/60">
-                  <YouTubeCommentsForm
-                    compact
-                    url={v.url || `https://www.youtube.com/watch?v=${v.video_id}`}
+        {loaded && filtered.length > 0 && (
+          <Virtuoso
+            style={{ height: Math.min(400, Math.max(64, filtered.length * 54 + (onLoadMore || reachedCeiling ? 48 : 0))) }}
+            data={filtered}
+            defaultItemHeight={54}
+            increaseViewportBy={160}
+            computeItemKey={(_index, video) => video.video_id}
+            components={youtubeListComponents}
+            itemContent={(_index, video) => {
+              const commentsHit = commentsState.get(video.video_id) || null
+              const expanded = expandedCommentsId === video.video_id
+              return (
+                <div data-youtube-video-row className="border-b border-zinc-900 last:border-b-0">
+                  <VideoRow
+                    video={video}
+                    inSel={selected.has(video.video_id) || chipsSet.has(video.video_id)}
+                    done={!!video.transcript_path}
+                    filtered={filtered}
+                    onToggle={toggleVideo}
+                    fullDate={!!showSearchControls}
+                    commentsHit={commentsHit}
+                    commentsExpanded={expanded}
+                    onToggleComments={toggleComments}
                   />
+                  {expanded && (
+                    <div className="px-4 pb-3 -mt-1 bg-zinc-950/60">
+                      <YouTubeCommentsForm compact url={video.url || `https://www.youtube.com/watch?v=${video.video_id}`} />
+                    </div>
+                  )}
                 </div>
-              )}
-            </React.Fragment>
-          )
-        })}
-        {onLoadMore && (
-          <button
-            onClick={onLoadMore}
-            disabled={loadingMore}
-            className="w-full px-4 py-3 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900/60 disabled:text-zinc-600 disabled:hover:bg-transparent flex items-center justify-center gap-2"
-            style={{ fontSize: '14px' }}
-          >
-            {loadingMore ? (
-              <>
-                <span className="inline-block w-3 h-3 rounded-full border-2 border-zinc-600 border-t-zinc-300 animate-spin" />
-                <span>Загружаю…</span>
-              </>
-            ) : (
-              <span>{loadMoreLabel || '+ Показать ещё'}</span>
-            )}
-          </button>
-        )}
-        {/* Ceiling notice — replaces "+30" so the user understands why we
-            stopped, instead of staring at a static list and clicking again. */}
-        {reachedCeiling && !onLoadMore && videos.length > 0 && (
-          <div
-            className="w-full px-4 py-3 text-zinc-500 text-center"
-            style={{ fontSize: '13px' }}
-          >
-            YouTube отдал всё что есть для этого запроса —{' '}
-            <span className="text-zinc-300">{videos.length} видео</span>.
-            Чтобы получить больше — расширьте диапазон в самом YouTube или
-            попробуйте убрать фильтры URL ↑
-          </div>
+              )
+            }}
+          />
         )}
       </div>
 

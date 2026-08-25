@@ -47,6 +47,10 @@
   ChatGPT. Gemini/Claude идут через autoscrape-вкладку, ChatGPT — через отдельный
   `sc-compose` handoff без MCP/research extraction. Прогресс — на самой кнопке и в YT-toast'ах
   (sending/searching/transcribing/opening/done/pasted/error).
+  На `/watch` и `/shorts` штатная кнопка CC также включает собственный
+  двуязычный learning-слой: навигация по репликам, автопауза, Azure Translator,
+  карточка слова и сохранение слов/фраз в локальную БД. Полный контракт —
+  `fact-youtube-learning.md`.
 
 ## Архитектура
 
@@ -413,7 +417,8 @@ page path не должен быть дополнительным source of trut
 | `model_title` | (string, default «Gemini 3 Flash Preview») Точное имя model-card'а |
 | `claude_project` / `claude_model` / `claude_post_project` | Claude-target настройки; живут рядом с Gemini-настройками и не стираются при переключении target'а |
 | `chatgpt_prompt` / `chatgpt_show_in_text_field` | Задача для composer и toggle быстрого разворачивания Pasted Text в поле; задача никогда не становится частью транскрипт-вложения |
-| `chatgpt_mode` / `chatgpt_chat_model` / `chatgpt_chat_effort` / `chatgpt_work_model` / `chatgpt_work_effort` | Отдельные пары Chat и Work. Плоские `chatgpt_model` / `chatgpt_effort` остаются совместимыми алиасами активного режима для старых content-script'ов |
+| `chatgpt_mode` / `chatgpt_chat_model` / `chatgpt_chat_effort` / `chatgpt_work_model` / `chatgpt_work_effort` | Отдельные пары Chat и Work. Chat не расходует недельную Work-квоту. Плоские `chatgpt_model` / `chatgpt_effort` остаются совместимыми алиасами активного режима для старых content-script'ов |
+| `chatgpt_work_speed` | `standard` (default) / `fast`. Fast = примерно 1,5× скорость и повышенный расход Work-квоты |
 
 Настройки target'ов хранятся параллельно. Popup показывает только карточку
 выбранной цели, но переключение селекта не теряет Gemini/Claude/ChatGPT

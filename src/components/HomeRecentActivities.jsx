@@ -1,5 +1,6 @@
 import React from 'react'
-import { useJobs } from '../lib/jobs'
+import { useJobsSelector } from '../lib/jobs'
+import { sameArrayItems } from '../lib/jobSelectorCore.mjs'
 import { pushScreen } from '../lib/store'
 import { useSources } from '../lib/sources'
 import PlatformLogo from './PlatformLogo'
@@ -79,12 +80,11 @@ function StatusDot({ status }) {
 }
 
 export default function HomeRecentActivities() {
-  const jobs = useJobs()
+  const visible = useJobsSelector(jobs => jobs.slice(0, 8), sameArrayItems)
   const sources = useSources()
 
   // Последние 8 — running выше, потом готовые по убыванию времени.
   // useJobs уже возвращает отсортированный список (последние сверху).
-  const visible = jobs.slice(0, 8)
   if (visible.length === 0) return null
 
   return (

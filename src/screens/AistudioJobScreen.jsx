@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { ChevronDown, ChevronUp, Copy, ExternalLink, FolderOpen, Image as ImageIcon, X } from 'lucide-react'
+import { ChevronDown, ChevronUp, Copy, ExternalLink, FileText, FolderOpen, Image as ImageIcon, X } from 'lucide-react'
 import { useAistudioJobs, clearAistudioJob, refreshAistudioJobs } from '../lib/aistudioJobs'
 import McpJobTimer, { hasMcpTimer } from '../components/McpJobTimer'
 
@@ -9,10 +9,13 @@ export default function AistudioJobScreen({ payload }) {
   const job = jobs.find(j => j.jobId === jobId) || null
   const [copyToast, setCopyToast] = useState('')
 
-  useEffect(() => { refreshAistudioJobs() }, [jobId])
+  // Navbar/history receive compact summaries. Pull full answers only when the
+  // user opens one detail screen; this preserves the complete postmortem UI
+  // without moving ~4.4 MB through a loopback poll every 1.5 seconds.
+  useEffect(() => { refreshAistudioJobs({ full: true }) }, [jobId])
 
-  // Bridge возвращает responseText через тот же endpoint /aistudio-jobs если
-  // job попал в storage с status=done. Renderer mirror тоже хранит — берём оттуда.
+  // Full refresh above hydrates responseText/sources for this screen. Compact
+  // push updates merge over that object without dropping its heavy fields.
 
   async function copyText(text) {
     const payload = text || job?.responseText
@@ -66,6 +69,7 @@ export default function AistudioJobScreen({ payload }) {
   const sourceActivityCount = sourceActivityItems(sourcesMeta, job).length
   const sourcesText = formatSourcesText(sources, sourcesMeta, job)
   const inputImages = normalizeJobImages(job.inputImages)
+  const inputFiles = normalizeJobFiles(job.inputFiles)
   const outputImages = normalizeJobImages(job.images)
   const chatTurns = buildChatTurns(jobs, job)
 
@@ -96,7 +100,7 @@ export default function AistudioJobScreen({ payload }) {
           (это шум — провайдер уже в заголовке, ответ виден ниже). */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
         <Meta label="Статус" value={statusLabel(job)} />
-        {job.mode && <Meta label="Режим" value={job.mode === 'search' ? 'Поиск' : 'Глубокое исследование'} />}
+        {job.mode && <Meta label="Режим" value={modeField(job.mode)} />}
         <Meta label="Модель" value={modelField(job)} />
         {(inputImages.length > 0 || outputImages.length > 0) && (
           <Meta
@@ -107,6 +111,7 @@ export default function AistudioJobScreen({ payload }) {
             ].filter(Boolean).join(' · ')}
           />
         )}
+        {inputFiles.length > 0 && <Meta label="Файлы" value={`вход ${inputFiles.length}`} />}
         {hasMcpTimer(job) && (
           <Meta label="Время" value={<McpJobTimer job={job} className="tabular-nums" />} />
         )}
@@ -135,6 +140,10 @@ export default function AistudioJobScreen({ payload }) {
           images={inputImages}
           onCopyPath={copyPath}
         />
+      )}
+
+      {inputFiles.length > 0 && (
+        <InputFileList files={inputFiles} onCopyPath={copyPath} />
       )}
 
       {hasAnswer && (
@@ -318,6 +327,7 @@ function ChatHistoryBlock({ turns, currentJobId, onCopyPath }) {
           const legacyParts = splitLegacyResearchResponse(turn.responseText)
           const answerText = displayAnswerText(turn, legacyParts)
           const inputImages = normalizeJobImages(turn.inputImages)
+          const inputFiles = normalizeJobFiles(turn.inputFiles)
           const outputImages = normalizeJobImages(turn.images)
           return (
             <div
@@ -339,6 +349,7 @@ function ChatHistoryBlock({ turns, currentJobId, onCopyPath }) {
                 </div>
               )}
               {inputImages.length > 0 && <InlineImageStrip label="Вход" images={inputImages} onCopyPath={onCopyPath} />}
+              {inputFiles.length > 0 && <InputFileList files={inputFiles} onCopyPath={onCopyPath} compact />}
               {answerText && (
                 <div className="mt-2">
                   <div className="text-[11px] text-zinc-600 mb-1">Ответ</div>
@@ -395,6 +406,66 @@ function normalizeJobImages(images) {
       }
     })
     .filter((img) => img.assetUrl || img.filePath)
+}
+
+function normalizeJobFiles(files) {
+  const arr = Array.isArray(files) ? files : []
+  return arr
+    .map((file, i) => {
+      const filePath = typeof file?.filePath === 'string' ? file.filePath
+        : typeof file?.file_path === 'string' ? file.file_path
+          : typeof file?.path === 'string' ? file.path
+            : ''
+      return {
+        ...file,
+        index: Number.isFinite(file?.index) ? file.index : i,
+        name: typeof file?.name === 'string' && file.name
+          ? file.name
+          : (filePath ? filePath.split('/').pop() : `file-${i + 1}`),
+        filePath: filePath || null,
+        bytes: Number.isFinite(file?.bytes) ? file.bytes : (Number.isFinite(file?.size) ? file.size : null),
+        lineStart: Number.isFinite(file?.lineStart) ? file.lineStart : (Number.isFinite(file?.line_start) ? file.line_start : null),
+        lineEnd: Number.isFinite(file?.lineEnd) ? file.lineEnd : (Number.isFinite(file?.line_end) ? file.line_end : null),
+        bundledCount: Number.isFinite(file?.bundledCount) ? file.bundledCount : (Number.isFinite(file?.bundled_count) ? file.bundled_count : null),
+      }
+    })
+    .filter((file) => file.filePath)
+}
+
+function InputFileList({ files, onCopyPath, compact = false }) {
+  if (!files.length) return null
+  return (
+    <div className={compact ? 'mt-2' : 'rounded border border-zinc-800 bg-zinc-950 p-3'}>
+      <div className="text-[11px] text-zinc-600 mb-1">
+        Входные файлы <span className="text-zinc-700">· {files.length}</span>
+      </div>
+      <div className="space-y-1">
+        {files.map((file, i) => {
+          const range = file.lineStart
+            ? `строки ${file.lineStart}–${file.lineEnd || 'конец'}`
+            : ''
+          const bundle = file.bundledCount ? `объединено ${file.bundledCount}` : ''
+          return (
+            <div key={`${file.filePath}-${i}`} className="flex min-w-0 items-center gap-2 text-xs text-zinc-300">
+              <FileText size={14} className="shrink-0 text-zinc-500" />
+              <span className="truncate" title={file.filePath}>{file.name}</span>
+              {(range || bundle || file.bytes != null) && (
+                <span className="shrink-0 text-zinc-600">
+                  {[range, bundle, formatBytes(file.bytes)].filter(Boolean).join(' · ')}
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={() => onCopyPath(file.filePath)}
+                className="ml-auto shrink-0 rounded p-1 text-zinc-500 hover:text-zinc-200"
+                title="Скопировать локальный путь"
+              ><Copy size={13} /></button>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
 }
 
 function buildChatTurns(jobs, current) {
@@ -585,6 +656,15 @@ function statusLabel(job) {
   return ({ done: 'готово', running: 'идёт', pending: 'ожидание', queued: 'в очереди', error: 'ошибка' })[job.status] || job.status
 }
 
+function modeField(mode) {
+  return ({
+    chat: 'Chat',
+    work: 'Work',
+    search: 'Поиск',
+    deep: 'Глубокое исследование',
+  })[mode] || mode
+}
+
 // Открыть вкладку research/aistudio в браузере. Через IPC (window.api), не
 // прямым fetch'ем на bridge — origin renderer'а не в CORS-allowlist'е, fetch
 // отсюда умирал «Failed to fetch» до сети (см. fact-research-ui.md).
@@ -616,7 +696,7 @@ function modelField(job) {
     if (job.provider === 'perplexity') return job.modelId === 'default' ? 'Gemini 3.1 Pro' : job.modelId
     if (job.provider === 'chatgpt') {
       const model = job.modelId || 'GPT-5.6 Sol · xhigh'
-      return /^GPT(?:-|\s)/.test(model) ? model : `GPT ${model}`
+      return /^(?:GPT(?:-|\s)|o3\b)/i.test(model) ? model : `GPT ${model}`
     }
     if (job.provider === 'claude') return job.modelId && job.modelId !== 'Research' ? job.modelId : 'Claude · Research'
     return 'Claude'

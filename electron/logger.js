@@ -13,9 +13,11 @@ const isDev = !app.isPackaged
 const TAG_RE = /^\[/
 
 function init() {
-  const LOG_DIR = isDev
-    ? path.join(__dirname, '..', 'logs')
-    : path.join(app.getPath('logs'))
+  const LOG_DIR = process.env.SC_DESKTOP_LOG_DIR
+    ? path.resolve(process.env.SC_DESKTOP_LOG_DIR)
+    : isDev
+      ? path.join(__dirname, '..', 'logs')
+      : path.join(app.getPath('logs'))
 
   try { fs.mkdirSync(LOG_DIR, { recursive: true }) } catch {}
 

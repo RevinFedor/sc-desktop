@@ -79,6 +79,7 @@ function Row({ job, active, onClose }) {
     ? 'border-zinc-700 hover:border-emerald-600'
     : 'border-zinc-800 hover:border-zinc-600'
   const inputImages = Array.isArray(job.inputImages) ? job.inputImages : []
+  const inputFiles = Array.isArray(job.inputFiles) ? job.inputFiles : []
   const outputImages = Array.isArray(job.images) ? job.images : []
   const thumbnails = [...outputImages, ...inputImages].filter(img => img?.assetUrl).slice(0, 3)
   return (
@@ -106,6 +107,7 @@ function Row({ job, active, onClose }) {
           {job.elapsedSec ? ` · ${formatElapsed(job.elapsedSec)}` : ''}
           {job.responseTextLen ? ` · ${job.responseTextLen} симв.` : ''}
           {inputImages.length ? ` · вход ${inputImages.length} карт.` : ''}
+          {inputFiles.length ? ` · вход ${inputFiles.length} файл.` : ''}
           {outputImages.length ? ` · ответ ${outputImages.length} карт.` : ''}
           {job.linkCount ? ` · ${job.linkCount} ссылок` : ''}
         </div>

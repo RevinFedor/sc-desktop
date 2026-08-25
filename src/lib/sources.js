@@ -5,6 +5,7 @@
 
 import { useSyncExternalStore } from 'react'
 import { subscribe as busSubscribe, invalidate } from './dataBus'
+import { createRefreshCoordinator } from './refreshCoordinator.mjs'
 
 let sources = []
 let firstLoadDone = false   // false until the first sourcesList() resolves
@@ -15,7 +16,7 @@ function emit() { subs.forEach(fn => fn()) }
 function snapshot() { return sources }
 export function isLoaded() { return firstLoadDone }
 
-async function refresh() {
+async function pullSources() {
   if (!window.api) return
   try {
     sources = await window.api.sourcesList()
@@ -24,6 +25,14 @@ async function refresh() {
   } catch (err) {
     console.error('sources refresh failed', err)
   }
+}
+
+const refreshCoordinator = createRefreshCoordinator(pullSources)
+let latestRefresh = Promise.resolve()
+
+function refresh() {
+  latestRefresh = refreshCoordinator.request()
+  return latestRefresh
 }
 
 function init() {
@@ -63,7 +72,17 @@ export function useSources(platform = null) {
 
 // Manual refresh button — bumps 'sources' so any listening hook reloads,
 // not just useSources. Single source of truth.
-export function refreshSources() { invalidate('sources'); return refresh() }
+export function refreshSources() {
+  if (!inited) {
+    init()
+    return latestRefresh
+  }
+  // invalidate() notifies the bus synchronously, so its subscriber has already
+  // assigned latestRefresh when this function returns. Do not call refresh()
+  // a second time — that old pattern issued duplicate full-library queries.
+  invalidate('sources')
+  return latestRefresh
+}
 
 // Non-hook snapshot — for plain-JS modules (store.js canonical breadcrumbs)
 // that need to resolve a source's platform outside React render.

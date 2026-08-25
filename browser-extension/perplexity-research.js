@@ -1068,6 +1068,7 @@
           try { stopKeepAlive(); } catch {}
       return;
     }
+    const keepTabAfterDone = scKeepResearchTabAfterDone(job.options);
 
     // MCP-плашка (общий research-badge.js). Тот же зелёный card что на
     // AI Studio — юзер видит «эта вкладка под research-job» на всех
@@ -1199,9 +1200,13 @@
           // (результат виден) — лучше «лишняя вкладка», чем зомби-running.
           if (confirmed) {
             try { stopKeepAlive(); } catch {}
-            try {
-              chrome.runtime.sendMessage({ __sc_close_self_tab: true, reason: 'research_done' });
-            } catch {}
+            if (keepTabAfterDone) {
+              log('done.keep_tab_open');
+            } else {
+              try {
+                chrome.runtime.sendMessage({ __sc_close_self_tab: true, reason: 'research_done' });
+              } catch {}
+            }
           } else {
             log('done.unconfirmed_keep_tab_open');
           }

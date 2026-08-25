@@ -60,7 +60,7 @@
 
 # SC Desktop — Electron GUI с локальными Python workers
 
-Electron + React + better-sqlite3 — desktop-приложение для парсинга/транскрипции медиа из Telegram, YouTube, Instagram, TikTok. Python-часть, нужная desktop'у, живёт в локальном `python-workers/`; внешний `cli-tools` / `SaliTools` больше не является runtime-зависимостью. Нативный iOS SC Desk использует тот же job engine через authenticated mobile API, а не отдельного бота/pipeline.
+Electron + React + better-sqlite3 — desktop-приложение для парсинга/транскрипции медиа из Telegram, YouTube, Instagram, TikTok и Boosty. Python-часть, нужная desktop'у, живёт в локальном `python-workers/`; внешний `cli-tools` / `SaliTools` больше не является runtime-зависимостью. Нативный iOS SC Desk использует тот же job engine через authenticated mobile API, а не отдельного бота/pipeline.
 
 <instructions>
 - **НЕ обновляй документацию без ЯВНОГО приказа пользователя.** Файлы `docs/knowledge/`, `docs/methodology/`, `fact-*`, `fix-*` — не создавать и не редактировать, пока пользователь прямо не попросил («обнови доки» и т.п.). Закончил фичу/фикс → остановись, не пиши доки «заодно» / «по итогам» / на каждой итерации. Причина: пользователь сначала сам проверяет код; документация по непроверенной итерации = мусор, который придётся откатывать. Это отдельный явный шаг. (Правило «новые UX-правила писать прямо в `переносимый-дизайн.md`» ниже относится к тому, КУДА писать, когда уже получен приказ — а не к тому, что писать можно без приказа.)

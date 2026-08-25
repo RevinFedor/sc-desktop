@@ -72,9 +72,12 @@ export default function App() {
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH)
   const [sidebarResizing, setSidebarResizing] = useState(false)
   const sidebarWidthRef = useRef(DEFAULT_SIDEBAR_WIDTH)
+  const workspaceGridRef = useRef(null)
+  const resizeLabelRef = useRef(null)
 
   useEffect(() => {
     sidebarWidthRef.current = sidebarWidth
+    workspaceGridRef.current?.style.setProperty('--library-sidebar-width', `${sidebarWidth}px`)
   }, [sidebarWidth])
 
   useEffect(() => {
@@ -108,7 +111,8 @@ export default function App() {
     const apply = (clientX) => {
       const next = clampSidebarWidth(startWidth + clientX - startX)
       sidebarWidthRef.current = next
-      setSidebarWidth(next)
+      workspaceGridRef.current?.style.setProperty('--library-sidebar-width', `${next}px`)
+      if (resizeLabelRef.current) resizeLabelRef.current.textContent = `${next}px`
       return next
     }
 
@@ -117,6 +121,7 @@ export default function App() {
       window.removeEventListener('pointerup', onUp)
       document.body.style.cursor = prevCursor
       document.body.style.userSelect = prevUserSelect
+      setSidebarWidth(finalWidth)
       setSidebarResizing(false)
       persistSidebarWidth(finalWidth)
     }
@@ -195,6 +200,12 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  const componentKey = screen.name === 'source-detail'
+    ? `source-detail:${screen.payload?.sourceId ?? 'missing'}`
+    : screen.name === 'job-detail'
+      ? `job-detail:${screen.payload?.jobId ?? screen.payload?.job?.id ?? 'missing'}`
+      : screen.name
+
   return (
     <div className="h-full flex flex-col">
       <TitleBar
@@ -206,8 +217,12 @@ export default function App() {
         closeMcpHistory={() => setMcpHistoryOpen(false)}
       />
       <div
+        ref={workspaceGridRef}
         className="flex-1 grid min-h-0 relative"
-        style={{ gridTemplateColumns: `${sidebarWidth}px minmax(0, 1fr)` }}
+        style={{
+          '--library-sidebar-width': `${sidebarWidth}px`,
+          gridTemplateColumns: 'var(--library-sidebar-width) minmax(0, 1fr)',
+        }}
       >
         <div className="relative min-w-0 min-h-0 h-full overflow-hidden">
           <LibrarySidebar />
@@ -226,7 +241,7 @@ export default function App() {
                 : 'w-px bg-transparent group-hover:w-[3px] group-hover:bg-zinc-500'
             }`} />
             {sidebarResizing && (
-              <span className="absolute top-2 left-3 px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-700 text-[11px] tabular-nums text-zinc-300 shadow-xl">
+              <span ref={resizeLabelRef} className="absolute top-2 left-3 px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-700 text-[11px] tabular-nums text-zinc-300 shadow-xl">
                 {sidebarWidth}px
               </span>
             )}
@@ -235,7 +250,7 @@ export default function App() {
         <div className="min-h-0 flex flex-col overflow-hidden">
           <Breadcrumbs />
           <div className="flex-1 min-h-0 overflow-hidden">
-            <Component payload={screen.payload} />
+            <Component key={componentKey} payload={screen.payload} />
           </div>
         </div>
 
@@ -247,7 +262,7 @@ export default function App() {
             activityOpen ? 'translate-x-0' : 'translate-x-full pointer-events-none'
           }`}
         >
-          <ActivityPanel />
+          <ActivityPanel mountedVisible={activityOpen} />
         </aside>
 
         {/* MCP-history panel — overlay on the right (то же что Activity,

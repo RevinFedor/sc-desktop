@@ -731,12 +731,7 @@
         transition: background 0.12s;
       `;
       b.innerHTML = `${icon}<span>${label}</span>`;
-      b.addEventListener('mousedown', e => e.stopPropagation());
-      b.addEventListener('click', e => {
-        e.preventDefault();
-        e.stopPropagation();
-        onClick();
-      });
+      scInstallNoPlaybackClick(b, onClick);
       return b;
     };
 
@@ -1218,6 +1213,9 @@
               chatgptMode: settings.chatgpt_mode || 'chat',
               chatgptModel: settings.chatgpt_model || '5.6-sol',
               chatgptEffort: settings.chatgpt_effort || 'xhigh',
+              chatgptSpeed: settings.chatgpt_mode === 'work'
+                ? (settings.chatgpt_work_speed || 'standard')
+                : null,
             },
           }, (resp) => {
             const lerr = chrome.runtime.lastError;
@@ -1359,11 +1357,7 @@
       // привязан к (url, wrap, autoAi) — но url там пустой строкой передан
       // на этапе создания, нам нужен динамический url из dataset.videoId.
       const newBtn = half.cloneNode(true);
-      newBtn.addEventListener('mousedown', e => e.stopPropagation());
-      newBtn.addEventListener('click', e => {
-        e.preventDefault();
-        e.stopPropagation();
-        e.stopImmediatePropagation();
+      scInstallNoPlaybackClick(newBtn, () => {
         const vid = pill.dataset.videoId;
         if (!vid) return;
         const url = `https://www.youtube.com/watch?v=${vid}`;
@@ -1559,11 +1553,7 @@
         for (const half of btn.querySelectorAll(':scope > button[data-sc-half]')) {
           const role = half.dataset.scHalf;
           const newBtn = half.cloneNode(true);
-          newBtn.addEventListener('mousedown', e => e.stopPropagation());
-          newBtn.addEventListener('click', e => {
-            e.preventDefault();
-            e.stopPropagation();
-            e.stopImmediatePropagation();
+          scInstallNoPlaybackClick(newBtn, () => {
             const currentVid = btn.dataset.videoId;
             if (!currentVid) return;
             const url = `https://www.youtube.com/watch?v=${currentVid}`;
@@ -1664,11 +1654,7 @@
       for (const half of btn.querySelectorAll(':scope > button[data-sc-half]')) {
         const role = half.dataset.scHalf;
         const newBtn = half.cloneNode(true);
-        newBtn.addEventListener('mousedown', e => e.stopPropagation());
-        newBtn.addEventListener('click', e => {
-          e.preventDefault();
-          e.stopPropagation();
-          e.stopImmediatePropagation();
+        scInstallNoPlaybackClick(newBtn, () => {
           const currentVid = btn.dataset.videoId;
           if (!currentVid) return;
           // Нормализуем в watch-форму — у sc-desktop единый кэш для shorts/watch.

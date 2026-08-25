@@ -50,7 +50,7 @@ const InstagramSingleReelForm = forwardRef(function InstagramSingleReelForm({ ur
     ;(async () => {
       try {
         const [s, c] = await Promise.all([
-          getInstagramSettings(),
+          getInstagramSettings({ validateToken: true }),
           lookupInstagramReel({ url, shortcode }),
         ])
         if (!alive) return

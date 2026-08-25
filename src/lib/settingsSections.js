@@ -2,6 +2,7 @@ export const SETTINGS_SECTIONS = [
   { id: 'main', label: 'Main' },
   { id: 'telegram', label: 'Telegram', platform: 'telegram' },
   { id: 'youtube', label: 'YouTube', platform: 'youtube' },
+  { id: 'boosty', label: 'Boosty', platform: 'boosty' },
   { id: 'instagram', label: 'Instagram', platform: 'instagram' },
   { id: 'reddit', label: 'Reddit', platform: 'reddit' },
   { id: 'tiktok', label: 'TikTok', platform: 'tiktok' },

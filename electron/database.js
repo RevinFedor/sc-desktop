@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS items (
   likes               INTEGER,
   comments            INTEGER,
   media_path          TEXT,
+  video_path          TEXT,
   thumbnail_path      TEXT,
   transcript_path     TEXT,
   download_status     TEXT NOT NULL DEFAULT 'none',
@@ -95,6 +96,7 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE INDEX IF NOT EXISTS idx_items_source     ON items(source_id);
 CREATE INDEX IF NOT EXISTS idx_items_published  ON items(published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_items_source_published ON items(source_id, published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_items_source_published_id ON items(source_id, published_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_items_source_caption_present ON items(source_id)
   WHERE caption IS NOT NULL AND length(trim(caption)) > 0;
 CREATE INDEX IF NOT EXISTS idx_items_status     ON items(download_status, transcribe_status);
@@ -120,6 +122,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_source_started ON jobs(source_id, started_at DESC, id DESC);
 
 -- coverage: which date×type×depth slices we have for each source.
 -- Multiple rows per source are merged at query time (UI picks max depth per slice).
@@ -194,6 +197,61 @@ CREATE TABLE IF NOT EXISTS folder_sources (
 );
 
 CREATE INDEX IF NOT EXISTS idx_folder_sources_source ON folder_sources(source_id);
+
+-- Azure Translator responses are cached locally so reopening the same video
+-- or dictionary card does not spend the character quota again. response_json
+-- deliberately stores the provider response shape: translate and dictionary
+-- return different payloads, but share the same deterministic cache contract.
+CREATE TABLE IF NOT EXISTS translation_cache (
+  cache_key     TEXT PRIMARY KEY,
+  operation     TEXT NOT NULL CHECK(operation IN ('translate', 'dictionary')),
+  source_lang   TEXT NOT NULL,
+  target_lang   TEXT NOT NULL,
+  source_text   TEXT NOT NULL,
+  response_json TEXT NOT NULL,
+  provider      TEXT NOT NULL DEFAULT 'azure',
+  created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at    INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_translation_cache_lookup
+  ON translation_cache(operation, source_lang, target_lang);
+
+-- One vocabulary row per normalized word/phrase. Contexts are separate rows:
+-- saving the same word from another video must add an example, not overwrite
+-- the first occurrence.
+CREATE TABLE IF NOT EXISTS learning_entries (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind            TEXT NOT NULL CHECK(kind IN ('word', 'phrase')),
+  state           TEXT NOT NULL DEFAULT 'saved'
+                    CHECK(state IN ('saved', 'known', 'ignored')),
+  source_lang     TEXT NOT NULL,
+  target_lang     TEXT NOT NULL,
+  source_text     TEXT NOT NULL,
+  normalized_text TEXT NOT NULL,
+  translation     TEXT,
+  metadata_json   TEXT,
+  created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(kind, source_lang, target_lang, normalized_text)
+);
+CREATE INDEX IF NOT EXISTS idx_learning_entries_state
+  ON learning_entries(state, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS learning_examples (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id            INTEGER NOT NULL REFERENCES learning_entries(id) ON DELETE CASCADE,
+  video_id            TEXT NOT NULL DEFAULT '',
+  video_url           TEXT,
+  video_title         TEXT,
+  cue_start_ms        INTEGER NOT NULL DEFAULT -1,
+  cue_end_ms          INTEGER,
+  source_text         TEXT NOT NULL,
+  translated_text     TEXT,
+  created_at          INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(entry_id, video_id, cue_start_ms, source_text)
+);
+CREATE INDEX IF NOT EXISTS idx_learning_examples_entry
+  ON learning_examples(entry_id, cue_start_ms);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
   caption, transcript,
@@ -308,6 +366,7 @@ function getDb() {
   // Defensive: add columns if upgrading from earlier dev DB.
   try { _db.exec("ALTER TABLE items ADD COLUMN sender TEXT") } catch {}
   try { _db.exec("ALTER TABLE items ADD COLUMN has_media INTEGER NOT NULL DEFAULT 0") } catch {}
+  try { _db.exec("ALTER TABLE items ADD COLUMN video_path TEXT") } catch {}
   try { _db.exec("ALTER TABLE items ADD COLUMN topic_id INTEGER") } catch {}
   try { _db.exec("ALTER TABLE items ADD COLUMN topic_title TEXT") } catch {}
   try { _db.exec("CREATE INDEX IF NOT EXISTS idx_items_topic ON items(source_id, topic_id)") } catch {}
@@ -686,6 +745,61 @@ function setSourceSession(sourceId, sessionName) {
 function listSources(platform = null) {
   const db = getDb()
   const hasVec = itemsVecAvailable(db)
+  if (platform) {
+    const indexedCte = hasVec ? `,
+      vector_stats AS (
+        SELECT i.source_id, COUNT(*) AS semantic_indexed_count
+          FROM items_vec v
+          JOIN items i ON i.id = v.item_id
+          JOIN wanted_sources w ON w.id = i.source_id
+         GROUP BY i.source_id
+      )
+    ` : ''
+    const indexedJoin = hasVec ? 'LEFT JOIN vector_stats iv ON iv.source_id = s.id' : ''
+    const indexedExpr = hasVec ? 'COALESCE(iv.semantic_indexed_count, 0)' : '0'
+    return db.prepare(`
+      WITH wanted_sources AS (
+        SELECT * FROM sources WHERE platform = ?
+      ),
+      item_stats AS (
+        SELECT i.source_id,
+               COUNT(*) AS items_count,
+               SUM(CASE WHEN i.type='boosty_post' THEN 1 ELSE 0 END) AS boosty_posts_n,
+               SUM(CASE WHEN i.type='boosty_video' THEN 1 ELSE 0 END) AS boosty_videos_n,
+               SUM(CASE WHEN i.type='boosty_video' AND i.transcribe_status='done' THEN 1 ELSE 0 END) AS boosty_transcribed_n,
+               SUM(CASE WHEN i.caption IS NOT NULL AND length(trim(i.caption)) > 0 THEN 1 ELSE 0 END) AS semantic_indexable_count,
+               MAX(i.published_at) AS last_item_at,
+               SUM(CASE WHEN i.type='text' THEN 1 ELSE 0 END) AS text_n,
+               SUM(CASE WHEN i.type='voice' THEN 1 ELSE 0 END) AS voice_n,
+               SUM(CASE WHEN i.type='video' THEN 1 ELSE 0 END) AS video_n,
+               SUM(CASE WHEN i.type='photo' THEN 1 ELSE 0 END) AS photo_n,
+               SUM(CASE WHEN i.type='audio' THEN 1 ELSE 0 END) AS audio_n,
+               SUM(CASE WHEN i.type='document' THEN 1 ELSE 0 END) AS document_n
+          FROM items i
+          JOIN wanted_sources w ON w.id = i.source_id
+         GROUP BY i.source_id
+      )
+      ${indexedCte}
+      SELECT s.*,
+        CASE WHEN s.platform='boosty' THEN COALESCE(ia.boosty_posts_n, 0) ELSE COALESCE(ia.items_count, 0) END AS items_count,
+        COALESCE(ia.boosty_posts_n, 0) AS boosty_posts_count,
+        COALESCE(ia.boosty_videos_n, 0) AS boosty_videos_count,
+        COALESCE(ia.boosty_transcribed_n, 0) AS boosty_transcribed_count,
+        COALESCE(ia.semantic_indexable_count, 0) AS semantic_indexable_count,
+        ${indexedExpr} AS semantic_indexed_count,
+        ia.last_item_at AS last_item_at,
+        COALESCE(ia.text_n, 0) AS text_n,
+        COALESCE(ia.voice_n, 0) AS voice_n,
+        COALESCE(ia.video_n, 0) AS video_n,
+        COALESCE(ia.photo_n, 0) AS photo_n,
+        COALESCE(ia.audio_n, 0) AS audio_n,
+        COALESCE(ia.document_n, 0) AS document_n
+      FROM wanted_sources s
+      LEFT JOIN item_stats ia ON ia.source_id = s.id
+      ${indexedJoin}
+      ORDER BY s.platform, COALESCE(s.last_synced_at, 0) DESC
+    `).all(platform)
+  }
   const indexedExpr = hasVec ? `COALESCE(iv.semantic_indexed_count, 0)` : `0`
   const itemStatsJoin = `
     LEFT JOIN (
@@ -738,7 +852,7 @@ function listSources(platform = null) {
     ${platform ? 'WHERE s.platform = ?' : ''}
     ORDER BY s.platform, COALESCE(s.last_synced_at, 0) DESC
   `
-  return platform ? db.prepare(sql).all(platform) : db.prepare(sql).all()
+  return db.prepare(sql).all()
 }
 
 /**
@@ -905,26 +1019,35 @@ function semanticIndexCountsForSources(sourceIds) {
   if (!ids.length) return new Map()
   const placeholders = ids.map(() => '?').join(',')
   const hasVec = itemsVecAvailable(db)
-  const indexedJoin = hasVec ? `
-    LEFT JOIN (
+  const vectorCte = hasVec ? `,
+    vector_counts AS (
       SELECT i.source_id, COUNT(*) AS semantic_indexed_count
         FROM items_vec v
         JOIN items i ON i.id = v.item_id
+        JOIN wanted_sources w ON w.id = i.source_id
        GROUP BY i.source_id
-    ) iv ON iv.source_id = s.id
+    )
   ` : ''
-  const indexedExpr = hasVec ? 'COALESCE(iv.semantic_indexed_count, 0)' : '0'
+  const vectorJoin = hasVec ? 'LEFT JOIN vector_counts vc ON vc.source_id = w.id' : ''
+  const indexedExpr = hasVec ? 'COALESCE(vc.semantic_indexed_count, 0)' : '0'
   const rows = db.prepare(`
-    SELECT s.id,
-      (SELECT COUNT(*)
-         FROM items i
-        WHERE i.source_id = s.id
-          AND i.caption IS NOT NULL
-          AND length(trim(i.caption)) > 0) AS semantic_indexable_count,
+    WITH wanted_sources AS (
+      SELECT id FROM sources WHERE id IN (${placeholders})
+    ),
+    item_counts AS (
+      SELECT i.source_id, COUNT(*) AS semantic_indexable_count
+        FROM items i
+        JOIN wanted_sources w ON w.id = i.source_id
+       WHERE i.caption IS NOT NULL AND length(trim(i.caption)) > 0
+       GROUP BY i.source_id
+    )
+    ${vectorCte}
+    SELECT w.id,
+      COALESCE(ic.semantic_indexable_count, 0) AS semantic_indexable_count,
       ${indexedExpr} AS semantic_indexed_count
-    FROM sources s
-    ${indexedJoin}
-    WHERE s.id IN (${placeholders})
+    FROM wanted_sources w
+    LEFT JOIN item_counts ic ON ic.source_id = w.id
+    ${vectorJoin}
   `).all(...ids)
   return new Map(rows.map(r => [Number(r.id), {
     semantic_indexable_count: Number(r.semantic_indexable_count) || 0,
@@ -1035,7 +1158,7 @@ function _upsertWebChannel(platform, { channel_id, handle, display_name, avatar_
 function upsertItem({
   source_id, external_id, type, url, title, caption,
   published_at, duration_seconds, views, likes, comments,
-  media_path, thumbnail_path,
+  media_path, video_path, thumbnail_path,
   sender, has_media, raw_meta, topic_id, topic_title,
   parent_external_id, depth, reply_resolved,
   reactions, reactions_resolved,
@@ -1059,11 +1182,11 @@ function upsertItem({
   db.prepare(`
     INSERT INTO items (
       source_id, external_id, type, url, title, caption, published_at,
-      duration_seconds, views, likes, comments, media_path, thumbnail_path,
+      duration_seconds, views, likes, comments, media_path, video_path, thumbnail_path,
       sender, has_media, raw_meta_json,
       topic_id, topic_title, parent_external_id, depth, reply_resolved,
       reactions, reactions_resolved
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(source_id, external_id) DO UPDATE SET
       type             = COALESCE(excluded.type,             items.type),
       url              = COALESCE(excluded.url,              items.url),
@@ -1089,6 +1212,7 @@ function upsertItem({
       likes            = COALESCE(excluded.likes,            items.likes),
       comments         = COALESCE(excluded.comments,         items.comments),
       media_path       = COALESCE(excluded.media_path,       items.media_path),
+      video_path       = COALESCE(excluded.video_path,       items.video_path),
       thumbnail_path   = COALESCE(excluded.thumbnail_path,   items.thumbnail_path),
       sender           = COALESCE(excluded.sender,           items.sender),
       has_media        = COALESCE(excluded.has_media,        items.has_media),
@@ -1105,7 +1229,7 @@ function upsertItem({
     source_id, external_id, type, url || null, title || null, caption || null,
     published_at || null, duration_seconds || null,
     views || null, likes || null, comments || null,
-    media_path || null, thumbnail_path || null,
+    media_path || null, video_path || null, thumbnail_path || null,
     sender || null, has_media ? 1 : 0, raw_meta_json,
     topic_id != null ? topic_id : null,
     topic_title || null,
@@ -1376,6 +1500,15 @@ function markItemDownloaded({ source_id, external_id, media_path }) {
   return info.changes > 0
 }
 
+function markItemVideoDownloaded({ source_id, external_id, video_path }) {
+  const info = getDb().prepare(`
+    UPDATE items
+       SET video_path = ?, updated_at = unixepoch()
+     WHERE source_id = ? AND external_id = ?
+  `).run(video_path || null, source_id, String(external_id))
+  return info.changes > 0
+}
+
 function markItemDownloadError({ source_id, external_id, error }) {
   const info = getDb().prepare(`
     UPDATE items
@@ -1503,6 +1636,55 @@ function listItems({ source_id, limit = 200, offset = 0, order = 'published_at D
   params.push(limit, offset)
   return db.prepare(`SELECT * FROM items WHERE ${where} ORDER BY ${safeOrder} LIMIT ? OFFSET ?`)
            .all(...params)
+}
+
+function listItemsPage({ source_id, limit = 100, order = 'published_at DESC',
+                         type = null, types = null, topic_id = null, cursor = null }) {
+  const db = getDb()
+  const direction = order === 'published_at ASC' ? 'ASC' : 'DESC'
+  const params = [source_id]
+  const conds = ['source_id = ?']
+  const typeList = Array.isArray(types) && types.length ? types : (type ? [type] : null)
+  if (typeList) {
+    conds.push(`type IN (${typeList.map(() => '?').join(',')})`)
+    params.push(...typeList)
+  }
+  if (topic_id != null) {
+    conds.push('topic_id = ?')
+    params.push(topic_id)
+  }
+  if (cursor && Number.isFinite(Number(cursor.id))) {
+    const id = Number(cursor.id)
+    if (cursor.published_at == null) {
+      conds.push(direction === 'ASC'
+        ? '((published_at IS NULL AND id > ?) OR published_at IS NOT NULL)'
+        : '(published_at IS NULL AND id < ?)')
+      params.push(id)
+    } else {
+      const ts = Number(cursor.published_at)
+      conds.push(direction === 'ASC'
+        ? '(published_at > ? OR (published_at = ? AND id > ?))'
+        : '(published_at < ? OR (published_at = ? AND id < ?) OR published_at IS NULL)')
+      params.push(ts, ts, id)
+    }
+  }
+  const pageSize = Math.max(1, Math.min(Number(limit) || 100, 500))
+  const rows = db.prepare(`
+    SELECT * FROM items
+     WHERE ${conds.join(' AND ')}
+     ORDER BY published_at ${direction}, id ${direction}
+     LIMIT ?
+  `).all(...params, pageSize + 1)
+  const hasMore = rows.length > pageSize
+  const items = hasMore ? rows.slice(0, pageSize) : rows
+  const last = items[items.length - 1]
+  return {
+    items,
+    hasMore,
+    nextCursor: hasMore && last
+      ? { published_at: last.published_at == null ? null : Number(last.published_at), id: Number(last.id) }
+      : null,
+  }
 }
 
 /**
@@ -2106,6 +2288,39 @@ function listJobsForSource(source_id, limit = 20) {
            .all(source_id, limit)
 }
 
+function listJobsForSourcePage(source_id, { limit = 20, cursor = null } = {}) {
+  const db = getDb()
+  const params = [source_id]
+  let cursorWhere = ''
+  if (cursor && Number.isFinite(Number(cursor.id))) {
+    if (cursor.started_at == null) {
+      cursorWhere = 'AND started_at IS NULL AND id < ?'
+      params.push(Number(cursor.id))
+    } else {
+      const started = Number(cursor.started_at)
+      cursorWhere = 'AND (started_at < ? OR (started_at = ? AND id < ?) OR started_at IS NULL)'
+      params.push(started, started, Number(cursor.id))
+    }
+  }
+  const pageSize = Math.max(1, Math.min(Number(limit) || 20, 100))
+  const rows = db.prepare(`
+    SELECT * FROM jobs
+     WHERE source_id = ? ${cursorWhere}
+     ORDER BY started_at DESC, id DESC
+     LIMIT ?
+  `).all(...params, pageSize + 1)
+  const hasMore = rows.length > pageSize
+  const jobs = hasMore ? rows.slice(0, pageSize) : rows
+  const last = jobs[jobs.length - 1]
+  return {
+    jobs,
+    hasMore,
+    nextCursor: hasMore && last
+      ? { started_at: last.started_at == null ? null : Number(last.started_at), id: Number(last.id) }
+      : null,
+  }
+}
+
 /**
  * Latest successful Telegram pre-analysis for a source.
  *
@@ -2627,7 +2842,7 @@ function vectorCountForSource(source_id) {
  *                 count and the on-disk measurement.
  *
  * Returns { text_bytes, index_vectors, index_bytes, media_paths[],
- *           transcript_paths[] }.
+ *           video_paths[], transcript_paths[] }.
  */
 function storageBreakdownForSource(source_id) {
   const db = getDb()
@@ -2640,6 +2855,10 @@ function storageBreakdownForSource(source_id) {
     SELECT media_path FROM items
      WHERE source_id = ? AND media_path IS NOT NULL
   `).all(source_id).map(r => r.media_path)
+  const videos = db.prepare(`
+    SELECT video_path FROM items
+     WHERE source_id = ? AND video_path IS NOT NULL
+  `).all(source_id).map(r => r.video_path)
   const transcripts = db.prepare(`
     SELECT transcript_path FROM items
      WHERE source_id = ? AND transcript_path IS NOT NULL
@@ -2653,6 +2872,7 @@ function storageBreakdownForSource(source_id) {
     index_vectors: vectors,
     index_bytes:   vectors * EMBEDDING_DIM * 4,   // float32 = 4 bytes/dim
     media_paths:       media,
+    video_paths:       videos,
     transcript_paths:  transcripts,
     thumbnail_paths:   thumbnails,
   }
@@ -3031,7 +3251,8 @@ function updateFolderParams(id, patch) {
   }
   if (patch.default_period_days !== undefined) {
     fields.push('default_period_days = ?')
-    values.push(Number(patch.default_period_days) || 7)
+    const days = Number(patch.default_period_days)
+    values.push(Number.isFinite(days) ? days : 7)
   }
   if (patch.default_types_json !== undefined) {
     fields.push('default_types_json = ?')
@@ -3053,15 +3274,19 @@ function setFolderSources(folder_id, sourceIds) {
   const db = getDb()
   const now = Math.floor(Date.now() / 1000)
   const tx = db.transaction((ids) => {
-    db.prepare(`DELETE FROM folder_sources WHERE folder_id = ?`).run(folder_id)
-    const stmt = db.prepare(`
+    const desired = new Set(ids.map(Number).filter(Number.isFinite))
+    const existing = db.prepare(`SELECT source_id FROM folder_sources WHERE folder_id = ?`)
+      .all(folder_id)
+    const remove = db.prepare(`DELETE FROM folder_sources WHERE folder_id = ? AND source_id = ?`)
+    for (const row of existing) {
+      if (!desired.has(Number(row.source_id))) remove.run(folder_id, row.source_id)
+      else desired.delete(Number(row.source_id))
+    }
+    const insert = db.prepare(`
       INSERT OR IGNORE INTO folder_sources (folder_id, source_id, added_at)
       VALUES (?, ?, ?)
     `)
-    for (const sid of ids) {
-      if (!Number.isFinite(Number(sid))) continue
-      stmt.run(folder_id, Number(sid), now)
-    }
+    for (const sid of desired) insert.run(folder_id, sid, now)
   })
   tx(sourceIds || [])
 }
@@ -3076,54 +3301,45 @@ function setFolderSources(folder_id, sourceIds) {
 // idx_items_type so cost is one index seek per source.
 function listFolderSources(folder_id) {
   const db = getDb()
-  const hasVec = itemsVecAvailable(db)
-  const indexedExpr = hasVec ? `COALESCE(iv.semantic_indexed_count, 0)` : `0`
-  const itemStatsJoin = `
-    LEFT JOIN (
-      SELECT source_id,
-             COUNT(*) AS items_count,
-             SUM(CASE WHEN caption IS NOT NULL AND length(trim(caption)) > 0 THEN 1 ELSE 0 END) AS semantic_indexable_count,
-             MAX(published_at) AS last_item_at,
-             SUM(CASE WHEN type='text'     THEN 1 ELSE 0 END) AS text_n,
-             SUM(CASE WHEN type='voice'    THEN 1 ELSE 0 END) AS voice_n,
-             SUM(CASE WHEN type='video'    THEN 1 ELSE 0 END) AS video_n,
-             SUM(CASE WHEN type='photo'    THEN 1 ELSE 0 END) AS photo_n,
-             SUM(CASE WHEN type='audio'    THEN 1 ELSE 0 END) AS audio_n,
-             SUM(CASE WHEN type='document' THEN 1 ELSE 0 END) AS document_n
-        FROM items
-       GROUP BY source_id
-    ) ia ON ia.source_id = s.id
-  `
-  const indexedJoin = hasVec ? `
-    LEFT JOIN (
-      SELECT i.source_id, COUNT(*) AS semantic_indexed_count
-        FROM items_vec v
-        JOIN items i ON i.id = v.item_id
-       GROUP BY i.source_id
-    ) iv ON iv.source_id = s.id
-  ` : ''
   return db.prepare(`
-    SELECT s.*,
+    WITH members AS (
+      SELECT s.*, fs.added_at AS folder_added_at
+        FROM folder_sources fs
+        JOIN sources s ON s.id = fs.source_id
+       WHERE fs.folder_id = ?
+    ),
+    item_stats AS (
+      SELECT i.source_id,
+             COUNT(*) AS items_count,
+             SUM(CASE WHEN i.caption IS NOT NULL AND length(trim(i.caption)) > 0 THEN 1 ELSE 0 END) AS semantic_indexable_count,
+             MAX(i.published_at) AS last_item_at,
+             SUM(CASE WHEN i.type='text' THEN 1 ELSE 0 END) AS text_n,
+             SUM(CASE WHEN i.type='voice' THEN 1 ELSE 0 END) AS voice_n,
+             SUM(CASE WHEN i.type='video' THEN 1 ELSE 0 END) AS video_n,
+             SUM(CASE WHEN i.type='photo' THEN 1 ELSE 0 END) AS photo_n,
+             SUM(CASE WHEN i.type='audio' THEN 1 ELSE 0 END) AS audio_n,
+             SUM(CASE WHEN i.type='document' THEN 1 ELSE 0 END) AS document_n
+        FROM items i
+        JOIN members m ON m.id = i.source_id
+       GROUP BY i.source_id
+    )
+    SELECT m.*,
       COALESCE(ia.items_count, 0) AS items_count,
       COALESCE(ia.semantic_indexable_count, 0) AS semantic_indexable_count,
-      ${indexedExpr} AS semantic_indexed_count,
+      0 AS semantic_indexed_count,
       ia.last_item_at AS last_item_at,
       COALESCE(ia.text_n, 0) AS text_n,
       COALESCE(ia.voice_n, 0) AS voice_n,
       COALESCE(ia.video_n, 0) AS video_n,
       COALESCE(ia.photo_n, 0) AS photo_n,
       COALESCE(ia.audio_n, 0) AS audio_n,
-      COALESCE(ia.document_n, 0) AS document_n,
-      fs.added_at AS folder_added_at
-    FROM folder_sources fs
-    JOIN sources s ON s.id = fs.source_id
-    ${itemStatsJoin}
-    ${indexedJoin}
-    WHERE fs.folder_id = ?
+      COALESCE(ia.document_n, 0) AS document_n
+    FROM members m
+    LEFT JOIN item_stats ia ON ia.source_id = m.id
     -- Свежий пост вверху, пустые/неспарсенные чаты в конец (last_item_at = NULL).
     -- Telethon-порядок (fs.added_at) — стабильный fallback при равенстве, чтобы
     -- список не «прыгал» между перерендерами при одинаковых датах.
-    ORDER BY last_item_at IS NULL, last_item_at DESC, fs.added_at ASC, s.id ASC
+    ORDER BY last_item_at IS NULL, last_item_at DESC, m.folder_added_at ASC, m.id ASC
   `).all(folder_id)
 }
 
@@ -3227,6 +3443,7 @@ function normalizeResearchHistoryRow(row) {
   const reasoningText = normalizeResearchReasoningText(result, sourcesMeta)
   const images = normalizeResearchImages(result?.images, 'output')
   const inputImages = normalizeResearchImages(result?.input_images, 'input')
+  const inputFiles = normalizeResearchFiles(result?.input_files)
   return {
     ...base,
     responseText: responseText || null,
@@ -3237,6 +3454,7 @@ function normalizeResearchHistoryRow(row) {
     reasoningText: reasoningText || null,
     images,
     inputImages,
+    inputFiles,
     imageCount: images.length,
     sources,
     sourcesMeta,
@@ -3329,6 +3547,32 @@ function normalizeResearchImages(raw, role) {
     .filter((img) => img.assetUrl || img.filePath)
 }
 
+function normalizeResearchFiles(raw) {
+  const arr = Array.isArray(raw) ? raw : []
+  return arr
+    .map((it, i) => {
+      const filePath = typeof it?.file_path === 'string' ? it.file_path
+        : typeof it?.filePath === 'string' ? it.filePath
+          : typeof it?.path === 'string' ? it.path
+            : ''
+      return {
+        role: 'input',
+        index: Number.isFinite(it?.index) ? it.index : i,
+        name: typeof it?.name === 'string' && it.name
+          ? it.name
+          : (filePath ? path.basename(filePath) : `file-${i + 1}`),
+        filePath: filePath || null,
+        contentType: it?.content_type || it?.contentType || it?.mime || null,
+        bytes: Number.isFinite(it?.bytes) ? it.bytes : (Number.isFinite(it?.size) ? it.size : null),
+        lineStart: Number.isFinite(it?.line_start) ? it.line_start : (Number.isFinite(it?.lineStart) ? it.lineStart : null),
+        lineEnd: Number.isFinite(it?.line_end) ? it.line_end : (Number.isFinite(it?.lineEnd) ? it.lineEnd : null),
+        sourceLineCount: Number.isFinite(it?.source_line_count) ? it.source_line_count : null,
+        bundledCount: Number.isFinite(it?.bundled_count) ? it.bundled_count : null,
+      }
+    })
+    .filter((file) => file.filePath)
+}
+
 function assetUrlForResearchFile(filePath) {
   if (!filePath || typeof filePath !== 'string') return ''
   const abs = path.resolve(filePath)
@@ -3412,9 +3656,201 @@ function setUiPreference(key, value) {
   return { ok: true }
 }
 
+function getTranslationCache(cacheKey) {
+  if (typeof cacheKey !== 'string' || !cacheKey || cacheKey.length > 128) return null
+  const row = getDb().prepare(`
+    SELECT cache_key, operation, source_lang, target_lang, source_text,
+           response_json, provider, created_at, updated_at
+      FROM translation_cache
+     WHERE cache_key = ?
+  `).get(cacheKey)
+  if (!row) return null
+  try {
+    return { ...row, response: JSON.parse(row.response_json) }
+  } catch {
+    return null
+  }
+}
+
+function upsertTranslationCache({
+  cacheKey,
+  operation,
+  sourceLang,
+  targetLang,
+  sourceText,
+  response,
+  provider = 'azure',
+}) {
+  if (typeof cacheKey !== 'string' || !cacheKey || cacheKey.length > 128) {
+    throw new Error('invalid translation cache key')
+  }
+  if (operation !== 'translate' && operation !== 'dictionary') {
+    throw new Error('invalid translation operation')
+  }
+  getDb().prepare(`
+    INSERT INTO translation_cache (
+      cache_key, operation, source_lang, target_lang, source_text,
+      response_json, provider, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
+    ON CONFLICT(cache_key) DO UPDATE SET
+      response_json = excluded.response_json,
+      provider = excluded.provider,
+      updated_at = unixepoch()
+  `).run(
+    cacheKey,
+    operation,
+    String(sourceLang || 'auto').slice(0, 32),
+    String(targetLang || '').slice(0, 32),
+    String(sourceText || '').slice(0, 10_000),
+    JSON.stringify(response),
+    String(provider || 'azure').slice(0, 40),
+  )
+  return getTranslationCache(cacheKey)
+}
+
+function normalizeLearningText(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase()
+}
+
+function cleanLearningString(value, maxLength, fallback = '') {
+  const text = typeof value === 'string' ? value.trim() : fallback
+  return text.slice(0, maxLength)
+}
+
+function upsertLearningEntry(payload = {}) {
+  const kind = payload.kind === 'phrase' ? 'phrase' : 'word'
+  const state = ['saved', 'known', 'ignored'].includes(payload.state)
+    ? payload.state
+    : 'saved'
+  const sourceText = cleanLearningString(payload.sourceText, 5_000)
+  const normalizedText = normalizeLearningText(payload.normalizedText || sourceText)
+  const sourceLang = cleanLearningString(payload.sourceLang, 32, 'auto') || 'auto'
+  const targetLang = cleanLearningString(payload.targetLang, 32)
+  if (!sourceText || !normalizedText || !targetLang) {
+    throw new Error('word/phrase, normalized text and target language are required')
+  }
+  const translation = cleanLearningString(payload.translation, 5_000) || null
+  const metadataJson = payload.metadata && typeof payload.metadata === 'object'
+    ? JSON.stringify(payload.metadata)
+    : null
+  const context = payload.context && typeof payload.context === 'object'
+    ? payload.context
+    : null
+
+  return getDb().transaction(() => {
+    getDb().prepare(`
+      INSERT INTO learning_entries (
+        kind, state, source_lang, target_lang, source_text,
+        normalized_text, translation, metadata_json, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+      ON CONFLICT(kind, source_lang, target_lang, normalized_text) DO UPDATE SET
+        state = excluded.state,
+        source_text = excluded.source_text,
+        translation = CASE
+          WHEN excluded.translation IS NOT NULL AND length(trim(excluded.translation)) > 0
+          THEN excluded.translation ELSE learning_entries.translation END,
+        metadata_json = COALESCE(excluded.metadata_json, learning_entries.metadata_json),
+        updated_at = unixepoch()
+    `).run(
+      kind, state, sourceLang, targetLang, sourceText,
+      normalizedText, translation, metadataJson,
+    )
+
+    const entry = getDb().prepare(`
+      SELECT * FROM learning_entries
+       WHERE kind = ? AND source_lang = ? AND target_lang = ? AND normalized_text = ?
+    `).get(kind, sourceLang, targetLang, normalizedText)
+
+    const contextText = cleanLearningString(context?.sourceText, 10_000)
+    if (entry && contextText) {
+      getDb().prepare(`
+        INSERT INTO learning_examples (
+          entry_id, video_id, video_url, video_title, cue_start_ms,
+          cue_end_ms, source_text, translated_text
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(entry_id, video_id, cue_start_ms, source_text) DO UPDATE SET
+          video_url = COALESCE(excluded.video_url, learning_examples.video_url),
+          video_title = COALESCE(excluded.video_title, learning_examples.video_title),
+          cue_end_ms = COALESCE(excluded.cue_end_ms, learning_examples.cue_end_ms),
+          translated_text = CASE
+            WHEN excluded.translated_text IS NOT NULL AND length(trim(excluded.translated_text)) > 0
+            THEN excluded.translated_text ELSE learning_examples.translated_text END
+      `).run(
+        entry.id,
+        cleanLearningString(context.videoId, 64),
+        cleanLearningString(context.videoUrl, 2_048) || null,
+        cleanLearningString(context.videoTitle, 1_000) || null,
+        Number.isFinite(Number(context.startMs)) ? Math.round(Number(context.startMs)) : -1,
+        Number.isFinite(Number(context.endMs)) ? Math.round(Number(context.endMs)) : null,
+        contextText,
+        cleanLearningString(context.translation, 10_000) || null,
+      )
+    }
+
+    const examplesCount = entry
+      ? getDb().prepare(`SELECT COUNT(*) AS count FROM learning_examples WHERE entry_id = ?`).get(entry.id).count
+      : 0
+    return { entry, examples_count: Number(examplesCount || 0) }
+  })()
+}
+
+function getLearningEntry({ kind = 'word', sourceLang = 'auto', targetLang, normalizedText }) {
+  const normalized = normalizeLearningText(normalizedText)
+  if (!normalized || !targetLang) return null
+  return getDb().prepare(`
+    SELECT * FROM learning_entries
+     WHERE kind = ? AND source_lang = ? AND target_lang = ? AND normalized_text = ?
+  `).get(
+    kind === 'phrase' ? 'phrase' : 'word',
+    String(sourceLang || 'auto').slice(0, 32),
+    String(targetLang).slice(0, 32),
+    normalized,
+  ) || null
+}
+
+function listLearningExamples(entryId, limit = 20) {
+  const n = Math.max(1, Math.min(100, Number(limit) || 20))
+  return getDb().prepare(`
+    SELECT * FROM learning_examples
+     WHERE entry_id = ?
+     ORDER BY created_at DESC, id DESC
+     LIMIT ?
+  `).all(Number(entryId), n)
+}
+
+function listLearningEntries(limit = 5000) {
+  const n = Math.max(1, Math.min(5000, Number(limit) || 5000))
+  const entries = getDb().prepare(`
+    SELECT * FROM learning_entries
+     ORDER BY updated_at DESC, id DESC
+     LIMIT ?
+  `).all(n)
+  if (!entries.length) return []
+  const examplesByEntry = new Map()
+  const rows = getDb().prepare(`
+    SELECT * FROM learning_examples
+     WHERE entry_id IN (${entries.map(() => '?').join(',')})
+     ORDER BY created_at DESC, id DESC
+  `).all(...entries.map((entry) => entry.id))
+  for (const row of rows) {
+    if (!examplesByEntry.has(row.entry_id)) examplesByEntry.set(row.entry_id, [])
+    examplesByEntry.get(row.entry_id).push(row)
+  }
+  return entries.map((entry) => ({
+    ...entry,
+    examples: examplesByEntry.get(entry.id) || [],
+  }))
+}
+
 module.exports = {
   upsertResearchJob, listResearchJobs, deleteResearchJob,
   getUiPreference, setUiPreference,
+  getTranslationCache, upsertTranslationCache,
+  upsertLearningEntry, getLearningEntry, listLearningExamples, listLearningEntries,
   getDb, close,
   // sources
   upsertSource, setSourceSession, upsertYoutubeChannel, upsertTiktokChannel, upsertBoostyChannel,
@@ -3425,8 +3861,8 @@ module.exports = {
   semanticIndexCountsForSources,
   // items
   upsertItem, bulkUpsertItems, upsertBoostyCatalog, setItemThumbnailPath, listBoostyItems, listBoostyVideos,
-  markItemDownloaded, markItemDownloadError, markItemTranscribeError, clearItemMediaPaths,
-  listItems, listSourceTopics,
+  markItemDownloaded, markItemVideoDownloaded, markItemDownloadError, markItemTranscribeError, clearItemMediaPaths,
+  listItems, listItemsPage, listSourceTopics,
   itemTypeBreakdown, telegramMediaEstimate, socialSourceOverview, senderBreakdown,
   itemsDateRange,
   assemblyEstimate, assemblyTranscriptPaths, assemblyFetch,
@@ -3437,7 +3873,7 @@ module.exports = {
   bulkInsertComments, countCommentsBySource,
   listCommentsForPosts, listPostsWithComments, setSourceHasDiscussion,
   // jobs
-  recordJob, updateJob, listJobsForSource, latestTelegramAnalysisForSource, listSourcelessJobs,
+  recordJob, updateJob, listJobsForSource, listJobsForSourcePage, latestTelegramAnalysisForSource, listSourcelessJobs,
   markStuckRunningAsInterrupted, findRunningJobForSource,
   findDoneYoutubeJob, findDoneTiktokJob,
   findYoutubeTranscriptForVideo, findTiktokTranscriptForVideo,

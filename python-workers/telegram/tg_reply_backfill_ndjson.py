@@ -45,6 +45,7 @@ if sys.platform == 'darwin':
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
 from credentials import telegram_credentials
+from library_db import open_db, pending_reply_external_ids
 
 try:
     TELEGRAM_API_ID, TELEGRAM_API_HASH = telegram_credentials()
@@ -266,6 +267,12 @@ async def run(target, ids):
 
 
 def _parse_ids(args):
+    if args.source_id:
+        conn = open_db()
+        try:
+            return pending_reply_external_ids(conn, args.source_id, args.limit)
+        finally:
+            conn.close()
     if args.ids_file:
         raw = Path(args.ids_file).read_text("utf-8")
     else:
@@ -286,6 +293,10 @@ def main():
     ap.add_argument("target")
     ap.add_argument("--ids", help="comma-separated message ids")
     ap.add_argument("--ids-file", help="file with one id per line (or comma-separated)")
+    ap.add_argument("--source-id", type=int,
+                    help="Read pending message ids from library.db in this subprocess")
+    ap.add_argument("--limit", type=int, default=5000,
+                    help="Maximum DB-backed IDs (default 5000, max 50000)")
     ap.add_argument("--session", default=None,
                     help="Session name (overrides settings.json) — Electron "
                          "passes its spawn-time snapshot.")
@@ -295,10 +306,15 @@ def main():
         global SESSION_PATH
         SESSION_PATH = _resolve_session_path(args.session)
 
-    ids = _parse_ids(args)
-    if not ids:
-        emit({"type": "error", "message": "no ids provided"})
+    try:
+        ids = _parse_ids(args)
+    except Exception as ex:
+        emit({"type": "error", "message": f"cannot read pending ids: {ex}"})
         sys.exit(2)
+    emit({"type": "backfill-plan", "items_total": len(ids)})
+    if not ids:
+        emit({"type": "done", "items_total": 0, "duration_sec": 0})
+        sys.exit(0)
 
     sys.exit(asyncio.run(run(args.target, ids)))
 

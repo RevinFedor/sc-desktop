@@ -27,11 +27,13 @@ crumbFor даёт label «Новый research».
   `GET /pplx-models` (фолбэк на статический если реестр ещё не зарегистрирован).
 - **AI Studio** — Модель (фиксированный список Gemini/DR из реестра).
 - **ChatGPT** — Режим `Chat`/`Work`, затем модель и интеллект, допустимые именно
-  для выбранного режима: Chat даёт `GPT-5.5 Instant` или `GPT-5.6 Sol`, Work —
-  `GPT-5.6 Sol/Terra/Luna` и уровни до `Max`/`Ultra`. Это ручной per-run инструмент
+  для выбранного режима: Chat даёт `GPT-5.5`, `GPT-5.6 Sol` и временный `o3`, Work —
+  `GPT-5.6 Sol/Terra/Luna`, уровни до `Max`/`Ultra` и отдельную скорость
+  `Стандартный/Быстро`. Форма прямо предупреждает: Chat не расходует недельную
+  Work-квоту, Work расходует, а Fast — быстрее. Это ручной per-run инструмент
   проверки: выбор не дублирует и не сохраняет YouTube-настройки extension popup.
-  Сейчас стартовые значения формы — Chat / Sol / xhigh; вызывающий
-  `external-research` skill отдельно выбирает Work / Sol / Max. Зеркала реестров CS —
+  Сейчас стартовые значения формы и `external-research` skill — Chat / Sol / xhigh;
+  Work выбирается явно. Зеркала реестров CS —
   `fact-chatgpt-research.md::Параметры`.
 
 **Запуск — через main-process IPC (`window.api.researchStart/Status/PplxModels`), НЕ
@@ -75,8 +77,9 @@ focus-tab/close-tab/open-url в main). Direct-fetch'ей из renderer'а на b
   по `jobId` (RAM приоритетнее БД для того же id). Этим питаются и попап, и History-панель.
 - `result_json` хранит structured-result целиком, не только `response_text`. Для ChatGPT
   image-flow это критично: `response_text` может быть пустым, а настоящий результат лежит
-  в `result.images[]`. Входные attachments на persist дополняются как `input_images[]`,
-  чтобы detail-screen показывал не только «что ответили», но и «что отправили».
+  в `result.images[]`. Входные attachments на persist разделяются на `input_images[]`
+  и `input_files[]`; detail-screen показывает имя, локальный путь и выбранный диапазон,
+  чтобы было видно не только «что ответили», но и «что отправили».
 - Для ChatGPT sources panel хранит два разных слоя: URL-ссылки в `result.sources[]` и
   agentic activity/tool steps в `result.source_activity[]` /
   `result.sources_meta.activity_items[]` (например «Тестирование загрузки данных с GitHub»

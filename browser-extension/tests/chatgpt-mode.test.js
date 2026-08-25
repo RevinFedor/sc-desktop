@@ -9,6 +9,8 @@ const exportMarker = "  if (document.readyState === 'loading') {";
 const instrumented = source.replace(exportMarker, `
   globalThis.__chatgptModeExports = {
     modeFromControlText,
+    isTemporaryChatPage,
+    ensureChatgptModeSelected,
     modeFromControl,
     isModeControlChecked,
     chatgptModeControls,
@@ -16,6 +18,13 @@ const instrumented = source.replace(exportMarker, `
     modelKeyFromText,
     resolveModel,
     modelDisplay,
+    currentModelKeyFromOpenMenu,
+    findEffortSubTrigger,
+    resolveEffort,
+    resolveSpeed,
+    speedLabel,
+    latestApiTurnSnapshotFromData,
+    terminalProofForCurrentPage,
     normalizeComposeDocument,
     normalizeComposeJobPayload,
     composeDocumentFile,
@@ -52,6 +61,7 @@ const context = vm.createContext({
   performance,
   document: documentMock,
   window: {},
+  location: { href: 'https://chatgpt.com/', hash: '', search: '' },
   chrome: {
     runtime: {
       lastError: null,
@@ -68,12 +78,21 @@ vm.runInContext(instrumented, context);
 
 const {
   modeFromControlText,
+  isTemporaryChatPage,
+  ensureChatgptModeSelected,
   isModeControlChecked,
   chatgptModeControls,
   currentChatgptMode,
   modelKeyFromText,
   resolveModel,
   modelDisplay,
+  currentModelKeyFromOpenMenu,
+  findEffortSubTrigger,
+  resolveEffort,
+  resolveSpeed,
+  speedLabel,
+  latestApiTurnSnapshotFromData,
+  terminalProofForCurrentPage,
   normalizeComposeDocument,
   normalizeComposeJobPayload,
   composeDocumentFile,
@@ -107,6 +126,36 @@ test('ChatGPT mode labels support current Russian and English naming', () => {
     assert.equal(modeFromControlText(label), 'work', label);
   }
   assert.equal(modeFromControlText('Новый чат'), null);
+});
+
+test('temporary chat is already Chat and rejects Work without waiting for a missing toggle', async () => {
+  context.window.location = { href: 'https://chatgpt.com/?temporary-chat=true&sc-compose=test' };
+  context.location.href = context.window.location.href;
+  context.location.search = '?temporary-chat=true&sc-compose=test';
+  assert.equal(isTemporaryChatPage(), true);
+  assert.equal(await ensureChatgptModeSelected('chat'), true);
+  assert.equal(await ensureChatgptModeSelected('work'), false);
+  context.window.location = { href: 'https://chatgpt.com/' };
+  context.location.href = context.window.location.href;
+  context.location.search = '';
+});
+
+test('temporary chat accepts the already-proven DOM final when no conversation URL exists', () => {
+  context.window.location = { href: 'https://chatgpt.com/?temporary-chat=true' };
+  context.location.href = context.window.location.href;
+  context.location.search = '?temporary-chat=true';
+
+  const temporary = terminalProofForCurrentPage({ ready: false, reason: 'conversation_url_pending' });
+  assert.equal(temporary.ready, true);
+  assert.equal(temporary.fallback, true);
+  assert.equal(temporary.reason, 'temporary_chat_dom_final');
+
+  context.window.location = { href: 'https://chatgpt.com/' };
+  context.location.href = context.window.location.href;
+  context.location.search = '';
+  const ordinary = terminalProofForCurrentPage({ ready: false, reason: 'conversation_url_pending' });
+  assert.equal(ordinary.ready, false);
+  assert.equal(ordinary.fallback, undefined);
 });
 
 test('selected mode supports radio, tab and generic toggle state attributes', () => {
@@ -144,6 +193,107 @@ test('GPT-5.6 model labels distinguish Sol, Terra and Luna', () => {
   assert.equal(modelKeyFromText('Terra'), '5.6-terra');
   assert.equal(modelKeyFromText('Luna'), '5.6-luna');
   assert.equal(modelKeyFromText('GPT-5.5 Instant'), '5.5');
+  assert.equal(modelKeyFromText('o3 Доступна до 26 августа'), 'o3');
+});
+
+test('current ChatGPT effort submenu uses the Усилие label', () => {
+  const effort = control('УсилиеОчень высокий', { role: 'menuitem', 'aria-haspopup': 'menu' });
+  documentMock.controls = [effort];
+  assert.equal(findEffortSubTrigger(), effort);
+});
+
+test('retired Pro detail aliases collapse to the single current Pro option', () => {
+  assert.equal(resolveEffort('pro-extended'), 'pro');
+  assert.equal(resolveEffort('Pro расширенный'), 'pro');
+});
+
+test('Work speed defaults to quota-safer standard mode', () => {
+  assert.equal(resolveSpeed(), 'standard');
+  assert.equal(resolveSpeed('быстро'), 'fast');
+  assert.equal(speedLabel('fast'), 'Быстро');
+});
+
+test('API terminal proof ignores commentary and returns only the final channel', () => {
+  const userId = 'user';
+  const contextId = 'context';
+  const commentaryId = 'commentary';
+  const finalId = 'final';
+  const data = {
+    title: 'Work test',
+    current_node: finalId,
+    mapping: {
+      [userId]: {
+        id: userId,
+        parent: null,
+        message: {
+          author: { role: 'user' },
+          content: { content_type: 'text', parts: ['task'] },
+        },
+      },
+      [contextId]: {
+        id: contextId,
+        parent: userId,
+        message: {
+          author: { role: 'tool' },
+          content: { content_type: 'context_stuff', parts: ['file contents must not leak'] },
+          metadata: {},
+        },
+      },
+      [commentaryId]: {
+        id: commentaryId,
+        parent: contextId,
+        message: {
+          author: { role: 'assistant' },
+          channel: 'commentary',
+          end_turn: false,
+          status: 'finished_successfully',
+          content: { content_type: 'text', parts: ['Думаю'] },
+          metadata: { is_thinking_preamble_message: true },
+        },
+      },
+      [finalId]: {
+        id: finalId,
+        parent: commentaryId,
+        message: {
+          author: { role: 'assistant' },
+          channel: 'final',
+          end_turn: true,
+          status: 'finished_successfully',
+          content: { content_type: 'text', parts: ['Полный финальный ответ'] },
+          metadata: {},
+        },
+      },
+    },
+  };
+
+  const snapshot = latestApiTurnSnapshotFromData(data);
+  assert.equal(snapshot.ready, true);
+  assert.equal(snapshot.message_id, finalId);
+  assert.equal(snapshot.text, 'Полный финальный ответ');
+  assert.equal(snapshot.reasoning_text, 'Думаю');
+  assert.deepEqual(Array.from(snapshot.activity_items), []);
+});
+
+test('API terminal proof stays pending while Work has commentary only', () => {
+  const data = {
+    current_node: 'commentary',
+    mapping: {
+      user: {
+        id: 'user', parent: null,
+        message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['task'] } },
+      },
+      commentary: {
+        id: 'commentary', parent: 'user',
+        message: {
+          author: { role: 'assistant' }, channel: 'commentary', end_turn: false,
+          status: 'finished_successfully', content: { content_type: 'text', parts: ['Думаю'] }, metadata: {},
+        },
+      },
+    },
+  };
+  const snapshot = latestApiTurnSnapshotFromData(data);
+  assert.equal(snapshot.ready, false);
+  assert.equal(snapshot.text, '');
 });
 
 test('legacy numeric GPT-5.6 resolves to Sol', () => {

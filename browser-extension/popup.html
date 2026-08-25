@@ -34,6 +34,14 @@
       -webkit-text-fill-color: transparent;
       margin-bottom: 14px;
     }
+    .popup-head { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+    .popup-head h1 { margin:0; flex:1; }
+    .vocabulary-btn {
+      border:1px solid var(--border-color); border-radius:7px; padding:7px 10px;
+      background:var(--card-bg); color:var(--text-primary); font:600 12px inherit;
+      cursor:pointer;
+    }
+    .vocabulary-btn:hover { border-color:var(--accent-color); background:rgba(102,126,234,.12); }
 
     .content {
       background-color: var(--card-bg);
@@ -486,7 +494,10 @@
 
 <body>
   <div class="container">
-    <h1 id="appTitle">SC Browser Parser</h1>
+    <div class="popup-head">
+      <h1 id="appTitle">SC Browser Parser</h1>
+      <button type="button" id="openVocabulary" class="vocabulary-btn">Словарь / карточки</button>
+    </div>
 
     <div class="content">
       <div id="status" class="status inactive">
@@ -757,6 +768,10 @@
                   <label>Effort</label>
                   <select id="yt_chatgpt_effort" class="ta-input" style="min-height: auto; font-family: inherit; padding: 6px 8px;"></select>
                 </div>
+              </div>
+              <div class="field-row" id="yt_chatgpt_speed_row" hidden>
+                <label title="Стандартный — обычный расход недельной квоты Work. Быстро — примерно 1,5× скорость и повышенный расход.">Скорость Work</label>
+                <select id="yt_chatgpt_speed" class="ta-input" style="min-height: auto; font-family: inherit; padding: 6px 8px;"></select>
               </div>
             </div>
           </div>

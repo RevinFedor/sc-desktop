@@ -20,6 +20,12 @@ export default defineConfig({
     tailwindcss(),
   ],
   base: './',
+  // This repository contains vendored apps under packages/. Vite's default
+  // HTML discovery can walk their demo pages after a lockfile change and then
+  // fail on dependencies that are intentionally private to those packages.
+  optimizeDeps: {
+    entries: ['index.html'],
+  },
   server: {
     port: 5156,
     strictPort: true,

@@ -1,7 +1,53 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 
-const { patchExtensionYoutubeSettings, sanitizeExtensionYoutube } = require('./app-settings')
+const {
+  patchAppSettings,
+  patchExtensionYoutubeSettings,
+  publicAppSettings,
+  sanitizeBoostySettings,
+  sanitizeExtensionYoutube,
+} = require('./app-settings')
+
+test('Main defaults external research tab auto-close to off', () => {
+  assert.equal(publicAppSettings({}).main.external_research_auto_close, false)
+  assert.equal(
+    publicAppSettings({ main: { external_research_auto_close: true } }).main.external_research_auto_close,
+    true,
+  )
+})
+
+test('Main persists the external research auto-close toggle without touching other sections', () => {
+  let stored = { telegram: { session: 'keep-me' } }
+  const result = patchAppSettings(
+    () => structuredClone(stored),
+    next => { stored = structuredClone(next); return { ok: true } },
+    { section: 'main', patch: { external_research_auto_close: false } },
+  )
+  assert.equal(result.external_research_auto_close, false)
+  assert.equal(stored.main.external_research_auto_close, false)
+  assert.equal(stored.telegram.session, 'keep-me')
+})
+
+test('Telegram auto master switch defaults on and persists explicit off', () => {
+  assert.equal(publicAppSettings({}).telegram.auto_enabled, true)
+  assert.equal(
+    publicAppSettings({ telegram: { auto_enabled: false } }).telegram.auto_enabled,
+    false,
+  )
+
+  let stored = { telegram: { session: 'keep-me', engine: 'gemini' } }
+  const result = patchAppSettings(
+    () => structuredClone(stored),
+    next => { stored = structuredClone(next); return { ok: true } },
+    { section: 'telegram', patch: { auto_enabled: false } },
+  )
+
+  assert.equal(result.auto_enabled, false)
+  assert.equal(stored.telegram.auto_enabled, false)
+  assert.equal(stored.telegram.session, 'keep-me')
+  assert.equal(stored.telegram.engine, 'gemini')
+})
 
 test('desktop accepts all GPT-5.6 Work tiers with Max and Ultra capabilities', () => {
   const max = sanitizeExtensionYoutube({
@@ -60,6 +106,27 @@ test('desktop defaults inline transcript mode on and preserves explicit off', ()
   )
 })
 
+test('desktop accepts current Chat o3 and Instant on GPT-5.6', () => {
+  const o3 = sanitizeExtensionYoutube({
+    chatgpt_chat_model: 'o3',
+    chatgpt_chat_effort: 'medium',
+  })
+  assert.equal(o3.chatgpt_chat_model, 'o3')
+  assert.equal(o3.chatgpt_chat_effort, 'medium')
+
+  const instant = sanitizeExtensionYoutube({
+    chatgpt_chat_model: '5.6-sol',
+    chatgpt_chat_effort: 'instant',
+  })
+  assert.equal(instant.chatgpt_chat_effort, 'instant')
+})
+
+test('desktop defaults Work speed to standard and preserves explicit fast', () => {
+  assert.equal(sanitizeExtensionYoutube({}).chatgpt_work_speed, 'standard')
+  assert.equal(sanitizeExtensionYoutube({ chatgpt_work_speed: 'fast' }).chatgpt_work_speed, 'fast')
+  assert.equal(sanitizeExtensionYoutube({ chatgpt_work_speed: 'unknown' }).chatgpt_work_speed, 'standard')
+})
+
 test('desktop persists the inline transcript toggle in extension settings', () => {
   let stored = {
     browser_extension: {
@@ -82,4 +149,33 @@ test('desktop persists the inline transcript toggle in extension settings', () =
 
   assert.equal(result.chatgpt_show_in_text_field, false)
   assert.equal(stored.browser_extension.youtube.chatgpt_show_in_text_field, false)
+})
+
+test('Boosty storage settings keep explicit folders and default video archive off', () => {
+  assert.deepEqual(sanitizeBoostySettings({}), {
+    audio_dir: '',
+    video_dir: '',
+    save_video: false,
+  })
+  assert.deepEqual(sanitizeBoostySettings({
+    audio_dir: '  /Volumes/digma512/SC Desktop/Boosty/audio  ',
+    video_dir: '/Volumes/digma512/SC Desktop/Boosty/video',
+    save_video: true,
+  }), {
+    audio_dir: '/Volumes/digma512/SC Desktop/Boosty/audio',
+    video_dir: '/Volumes/digma512/SC Desktop/Boosty/video',
+    save_video: true,
+  })
+})
+
+test('desktop patches only the Boosty settings section', () => {
+  let stored = { telegram: { session: 'keep-me' } }
+  const result = patchAppSettings(
+    () => structuredClone(stored),
+    next => { stored = structuredClone(next); return { ok: true } },
+    { section: 'boosty', patch: { audio_dir: '/Volumes/digma512/audio', save_video: true } },
+  )
+  assert.equal(result.audio_dir, '/Volumes/digma512/audio')
+  assert.equal(result.save_video, true)
+  assert.equal(stored.telegram.session, 'keep-me')
 })

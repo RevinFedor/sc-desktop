@@ -61,15 +61,17 @@ Listener намеренно привязан только к `127.0.0.1:7898`. �
 ```
 iPhone
   → https://sc.f9922.tech
-  → nginx на 94.242.59.5
+  → nginx на отдельном Timeweb VPS 188.225.24.118
   → reverse SSH :7898
   → 127.0.0.1:7898 на Mac
   → Electron main / обычные job-runner pipelines
 ```
 
-LaunchAgent `~/Library/LaunchAgents/tech.f9922.sc.tunnel.plist` держит
-`autossh -R 7898:127.0.0.1:7898 root@94.242.59.5` через `KeepAlive` и
-`RunAtLoad`. DNS A-record `sc.f9922.tech` указывает на VPS. Nginx завершает TLS,
+LaunchAgent `~/Library/LaunchAgents/tech.f9922.sc.tunnel.timeweb.plist` держит
+`autossh -R 7898:127.0.0.1:7898 root@188.225.24.118` через `KeepAlive` и
+`RunAtLoad`. Во время 24-часового DNS cutover прежний tunnel остаётся параллельно живым,
+чтобы клиенты с закэшированным A-record не теряли API. Nginx завершает TLS на canonical
+443, а 8443 временно сохраняется для старой iOS-сборки,
 отключает proxy buffering для SSE, держит длинные read/send timeouts и при
 недоступном Mac возвращает JSON 503. Сервер не надо открывать на `0.0.0.0` и
 не надо делать iPhone зависимым от одной Wi‑Fi сети.

@@ -35,7 +35,6 @@ import time
 import argparse
 import contextlib
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Shared deps (gemini_utils for AI path)
@@ -79,6 +78,14 @@ def extract_video_id(url):
     return None
 
 
+def _format_timestamp_ms(seconds):
+    total_ms = max(0, int(round(float(seconds) * 1000)))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, milliseconds = divmod(remainder, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
+
+
 def _try_transcript_api(url, lang, with_ts):
     """Fast path: youtube-transcript-api. May fail to import on this venv
     (Python 3.14 + homebrew expat conflict) — caught and ignored."""
@@ -89,47 +96,52 @@ def _try_transcript_api(url, lang, with_ts):
         from youtube_transcript_api import YouTubeTranscriptApi
     except Exception:
         return None
-    try:
-        import requests
-        session = requests.Session()
+    import requests
+
+    class TimeoutSession(requests.Session):
+        def request(self, *args, **kwargs):
+            kwargs.setdefault("timeout", 6)
+            return super().request(*args, **kwargs)
+
+    langs = [lang]
+    for fb in ("ru", "en"):
+        if fb not in langs:
+            langs.append(fb)
+
+    # Public captions do not require an account. Avoid importing unrelated
+    # Firefox cookies into a Yandex-browser flow; stale consent/account
+    # cookies made this fast path intermittent. One retry absorbs an ordinary
+    # short network reset before the much slower yt-dlp fallback is started.
+    for attempt in range(2):
         try:
-            import browser_cookie3
-            session.cookies = browser_cookie3.firefox(domain_name="youtube.com")
-        except Exception:
-            pass
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:141.0) "
-                          "Gecko/20100101 Firefox/141.0",
-        })
-        api = YouTubeTranscriptApi(http_client=session)
-        langs = [lang]
-        for fb in ("ru", "en"):
-            if fb not in langs:
-                langs.append(fb)
-        snippets = list(api.fetch(vid, languages=langs))
-        if not snippets:
-            return None
+            session = TimeoutSession()
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:141.0) "
+                              "Gecko/20100101 Firefox/141.0",
+            })
+            snippets = list(YouTubeTranscriptApi(http_client=session).fetch(vid, languages=langs))
+            if not snippets:
+                return None
 
-        if with_ts:
-            lines = []
+            if with_ts:
+                lines = []
+                for s in snippets:
+                    ts = _format_timestamp_ms(s.start)
+                    text = s.text.replace("\n", " ").strip()
+                    if text:
+                        lines.append(f"[{ts}] {text}")
+                return "\n".join(lines)
+
+            out = []
             for s in snippets:
-                total = int(s.start)
-                h, rem = divmod(total, 3600)
-                m, sec = divmod(rem, 60)
-                ts = f"{h:02d}:{m:02d}:{sec:02d}"
                 text = s.text.replace("\n", " ").strip()
-                if text:
-                    lines.append(f"[{ts}] {text}")
-            return "\n".join(lines)
-
-        out = []
-        for s in snippets:
-            text = s.text.replace("\n", " ").strip()
-            if text and (not out or out[-1] != text):
-                out.append(text)
-        return "\n".join(out)
-    except Exception:
-        return None
+                if text and (not out or out[-1] != text):
+                    out.append(text)
+            return "\n".join(out)
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.2)
+    return None
 
 
 def _read_and_clean_srt(path, with_ts=False):
@@ -148,8 +160,8 @@ def _read_and_clean_srt(path, with_ts=False):
                           lines[1] if len(lines) > 1 else "")
             if not tm:
                 continue
-            ts = tm.group(1)
             start_s, start_ms = tm.group(1), int(tm.group(2))
+            ts = f"{start_s}.{start_ms:03d}"
             end_s, end_ms = tm.group(3), int(tm.group(4))
             h1, m1, s1 = map(int, start_s.split(":"))
             h2, m2, s2 = map(int, end_s.split(":"))
@@ -211,22 +223,19 @@ def _try_yt_dlp_subs(url, lang, with_ts=False):
 
 
 def extract_subtitles(url, preferred_lang="ru", with_ts=False):
-    """Race youtube-transcript-api ⨉ yt-dlp; return first non-empty result."""
-    pool = ThreadPoolExecutor(max_workers=2)
-    api_fut = pool.submit(_try_transcript_api, url, preferred_lang, with_ts)
-    yt_fut  = pool.submit(_try_yt_dlp_subs,    url, preferred_lang, with_ts)
-    winner = None
-    for fut in as_completed([api_fut, yt_fut]):
-        try:
-            res = fut.result()
-        except Exception:
-            res = None
-        if res:
-            winner = res
-            break
-    pool.shutdown(wait=False, cancel_futures=True)
-    if winner:
-        return winner
+    """Use the fast transcript API first, then start yt-dlp only if needed.
+
+    A ThreadPool race cannot make the worker finish early: Python waits for
+    the losing yt-dlp thread while shutting down. That made a two-second API
+    result look like a roughly twenty-second load in the browser.
+    """
+    result = _try_transcript_api(url, preferred_lang, with_ts)
+    if result:
+        return result
+
+    result = _try_yt_dlp_subs(url, preferred_lang, with_ts)
+    if result:
+        return result
 
     # Try alternative language (so ru-only videos still work when --lang en)
     for fb in ("ru", "en"):
@@ -437,6 +446,9 @@ def main(argv):
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--lang", default="ru")
     ap.add_argument("--with-ts", action="store_true")
+    ap.add_argument("--captions-only", action="store_true",
+                    help="Skip yt-dlp metadata when the caller only needs existing captions")
+    ap.add_argument("--title", default="")
     ap.add_argument("--ai", action="store_true",
                     help="Force AI transcription (skip subs check)")
     ap.add_argument("--engine", default="gemini", choices=("gemini", "assemblyai"))
@@ -448,12 +460,24 @@ def main(argv):
         emit({"type": "error", "message": f"Cannot extract video id from {args.url}"})
         return 2
 
-    emit({"type": "metadata_start"})
-    with silenced():
-        meta, meta_err = fetch_meta(args.url)
-    if not meta or not meta.get("id"):
-        emit({"type": "error", "message": f"yt-dlp metadata fetch failed: {meta_err or 'no metadata'}"})
-        return 3
+    if args.captions_only and not args.ai:
+        meta = {
+            "id": vid,
+            "title": args.title.strip() or vid,
+            "duration_sec": 0,
+            "channel": "",
+            "channel_id": None,
+            "channel_url": None,
+            "uploader_id": None,
+            "webpage_url": args.url,
+        }
+    else:
+        emit({"type": "metadata_start"})
+        with silenced():
+            meta, meta_err = fetch_meta(args.url)
+        if not meta or not meta.get("id"):
+            emit({"type": "error", "message": f"yt-dlp metadata fetch failed: {meta_err or 'no metadata'}"})
+            return 3
     emit({
         "type": "video",
         "video_id":     meta["id"],

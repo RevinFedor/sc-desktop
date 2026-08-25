@@ -37,6 +37,7 @@ test('YouTube ChatGPT defaults to Chat with separate Chat and Work pairs', () =>
   assert.equal(settings.chatgpt_chat_effort, 'xhigh');
   assert.equal(settings.chatgpt_work_model, '5.6-sol');
   assert.equal(settings.chatgpt_work_effort, 'xhigh');
+  assert.equal(settings.chatgpt_work_speed, 'standard');
   assert.equal(settings.chatgpt_show_in_text_field, true);
   assert.equal(settings.chatgpt_model, settings.chatgpt_chat_model);
   assert.equal(settings.chatgpt_effort, settings.chatgpt_chat_effort);
@@ -73,13 +74,20 @@ test('active aliases follow Work while both mode-specific pairs remain intact', 
   assert.equal(settings.preferred_lang, 'en');
 });
 
-test('Chat and Work expose current GPT-5.5 and GPT-5.6 capabilities', () => {
-  assert.deepEqual(Array.from(chatgptModelsForMode('chat'), m => m.id), ['5.5', '5.6-sol']);
+test('Chat and Work expose the live model and effort capabilities', () => {
+  assert.deepEqual(Array.from(chatgptModelsForMode('chat'), m => m.id), ['5.5', '5.6-sol', 'o3']);
   assert.deepEqual(Array.from(chatgptModelsForMode('work'), m => m.id), ['5.6-sol', '5.6-terra', '5.6-luna']);
   assert.deepEqual(Array.from(chatgptEffortsFor('chat', '5.5'), e => e.id), ['instant']);
-  assert.deepEqual(Array.from(chatgptEffortsFor('chat', '5.6-sol'), e => e.id), ['medium', 'high', 'xhigh', 'pro']);
+  assert.deepEqual(Array.from(chatgptEffortsFor('chat', '5.6-sol'), e => e.id), ['instant', 'medium', 'high', 'xhigh', 'pro']);
+  assert.deepEqual(Array.from(chatgptEffortsFor('chat', 'o3'), e => e.id), ['medium']);
   assert.deepEqual(Array.from(chatgptEffortsFor('work', '5.6-sol'), e => e.id), ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
   assert.deepEqual(Array.from(chatgptEffortsFor('work', '5.6-terra'), e => e.id), ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+});
+
+test('Work speed is explicit and defaults to standard instead of costly fast', () => {
+  assert.equal(sanitizeYoutubeSettings({}).chatgpt_work_speed, 'standard');
+  assert.equal(sanitizeYoutubeSettings({ chatgpt_work_speed: 'fast' }).chatgpt_work_speed, 'fast');
+  assert.equal(sanitizeYoutubeSettings({ chatgpt_work_speed: 'unknown' }).chatgpt_work_speed, 'standard');
 });
 
 test('unavailable model and effort combinations clamp without leaking across modes', () => {

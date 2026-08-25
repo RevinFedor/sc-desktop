@@ -42,7 +42,7 @@ contextBridge.exposeInMainWorld('api', {
   tgDeleteSession:     (name)     => ipcRenderer.invoke('tg:deleteSession', name),
 
   // Instagram settings + session inventory + profile fetch.
-  igGetSettings:    ()         => ipcRenderer.invoke('ig:getSettings'),
+  igGetSettings:    (options)  => ipcRenderer.invoke('ig:getSettings', options || {}),
   igSetBackend:     (payload)  => ipcRenderer.invoke('ig:setBackend', payload),
   igSetApifyToken:  (token)    => ipcRenderer.invoke('ig:setApifyToken', token),
   igListSessions:   ()         => ipcRenderer.invoke('ig:listSessions'),
@@ -105,6 +105,7 @@ contextBridge.exposeInMainWorld('api', {
   boostyPosts:          (payload) => ipcRenderer.invoke('boosty:posts', payload),
   boostyDeleteAudio:    (payload) => ipcRenderer.invoke('boosty:deleteAudio', payload),
   boostyPlatformStorage:()        => ipcRenderer.invoke('boosty:platformStorage'),
+  boostyStorageConfig: ()         => ipcRenderer.invoke('boosty:storageConfig'),
   boostyDeletePlatformAudio:()    => ipcRenderer.invoke('boosty:deletePlatformAudio'),
   boostyCopyTranscripts:(payload) => ipcRenderer.invoke('boosty:copyTranscripts', payload),
   boostySingle:         (params)  => ipcRenderer.invoke('boosty:single', params),
@@ -113,10 +114,11 @@ contextBridge.exposeInMainWorld('api', {
   localTranscribe:  (params)  => ipcRenderer.invoke('local:transcribe', params),
   copyText:       (text)    => ipcRenderer.invoke('clipboard:writeText', text),
   jobsList:       ()       => ipcRenderer.invoke('jobs:list'),
+  jobsSetLiveSource: (sourceId) => ipcRenderer.invoke('jobs:setLiveSource', sourceId),
 
   // AI Studio MCP jobs зеркало из browser-bridge (RAM-only, перезапуск
   // sc-desktop = очистка; CS auto-восстановит на следующем log-event).
-  aistudioListJobs: () => ipcRenderer.invoke('aistudio:listJobs'),
+  aistudioListJobs: (options) => ipcRenderer.invoke('aistudio:listJobs', options || {}),
   aistudioClearJob: (payload) => ipcRenderer.invoke('aistudio:clearJob', payload),
   aistudioSetKeepTab: (payload) => ipcRenderer.invoke('aistudio:setKeepTab', payload),
 
@@ -134,7 +136,7 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('aistudio:update', handler)
     return () => ipcRenderer.removeListener('aistudio:update', handler)
   },
-  jobDetail:      (id)     => ipcRenderer.invoke('jobs:detail', id),
+  jobDetail:      (payload) => ipcRenderer.invoke('jobs:detail', payload),
   jobSetAutoIndexAfterFetch: (payload) => ipcRenderer.invoke('jobs:setAutoIndexAfterFetch', payload),
   cancelJob:      (id)     => ipcRenderer.invoke('jobs:cancel', id),
   copyFile:       (path)   => ipcRenderer.invoke('jobs:copyFile', path),
@@ -148,13 +150,18 @@ contextBridge.exposeInMainWorld('api', {
   uiPreferenceSet: (key, value) => ipcRenderer.invoke('ui:setPreference', { key, value }),
   sourcesList:   (platform) => ipcRenderer.invoke('sources:list', platform),
   sourceGet:     (id)       => ipcRenderer.invoke('sources:get', id),
+  sourceFindTelegram: (target) => ipcRenderer.invoke('sources:findTelegram', target),
   sourceDetail:  (id)       => ipcRenderer.invoke('sources:detail', id),
   sourceSocialOverview: (id) => ipcRenderer.invoke('sources:socialOverview', id),
   sourceStorage: (id)       => ipcRenderer.invoke('sources:storage', id),
   storageOpenRoot: (dir)    => ipcRenderer.invoke('storage:openRoot', dir),
+  storagePathInfo: (dir)    => ipcRenderer.invoke('storage:pathInfo', dir),
+  storageChooseDirectory: (payload) => ipcRenderer.invoke('storage:chooseDirectory', payload),
   // Принимает голый id или {id, limit} — см. main.js handler.
   jobsListForSource: (payload) => ipcRenderer.invoke('jobs:listForSource', payload),
+  jobsListForSourcePage: (payload) => ipcRenderer.invoke('jobs:listForSourcePage', payload),
   itemsList:     (params)   => ipcRenderer.invoke('items:list', params),
+  itemsListPage: (params)   => ipcRenderer.invoke('items:listPage', params),
   itemsSearch:   (params)   => ipcRenderer.invoke('items:search', params),
   itemsTopics:   (sourceId) => ipcRenderer.invoke('items:topics', sourceId),
   itemsTypeBreakdown: (params) => ipcRenderer.invoke('items:typeBreakdown', params),

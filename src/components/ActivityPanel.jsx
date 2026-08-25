@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { ArrowRight } from 'lucide-react'
-import { useJobs, cancelJob } from '../lib/jobs'
+import { useJobsSelector, cancelJob } from '../lib/jobs'
+import { EMPTY_JOBS, sameArrayItems } from '../lib/jobSelectorCore.mjs'
 import { pushScreen, closeActivity } from '../lib/store'
 import { useSources } from '../lib/sources'
 import { useFolders } from '../lib/folders'
@@ -11,8 +12,20 @@ import JobProgress from './JobProgress'
 // только про rendering: не рисовать сотни карточек, пока юзер не доскроллил.
 const HISTORY_PAGE = 15
 
-export default function ActivityPanel() {
-  const jobs = useJobs()
+export default function ActivityPanel({ mountedVisible = true }) {
+  // The panel stays mounted for its slide animation, but while translated
+  // off-screen it must be inert from a render-cost perspective. Rehydrate the
+  // current snapshot synchronously when the user opens it.
+  const selectedJobs = useJobsSelector(
+    list => mountedVisible ? list : EMPTY_JOBS,
+    sameArrayItems,
+  )
+  const frozenJobsRef = useRef(EMPTY_JOBS)
+  if (mountedVisible) frozenJobsRef.current = selectedJobs
+  // Keep the last rendered rows/scroll geometry while hidden, but stop
+  // receiving new job snapshots. Opening rehydrates from the current store in
+  // the same render, so no progress event is required to wake the panel.
+  const jobs = mountedVisible ? selectedJobs : frozenJobsRef.current
   // Hide per-chat children of a folder fetch — the umbrella row already
   // shows aggregate progress ("3/12 чатов") and the per-chat detail lives
   // on TelegramScreen itself (↻ парсю · ✓ N · ✗ ошибка). Showing 12+ rows
@@ -72,7 +85,7 @@ export default function ActivityPanel() {
 }
 
 export function isActiveRequestJob(job) {
-  return job?.status === 'running' || job?.status === 'awaiting_ai'
+  return job?.status === 'running' || job?.status === 'awaiting_ai' || job?.status === 'cancelling'
 }
 
 export function isVisibleRequestJob(job) {
@@ -83,6 +96,8 @@ export function isVisibleRequestJob(job) {
 
 export function RequestJobRow({ job, active, onClose = closeActivity }) {
   const sources = useSources()
+  const [cancelError, setCancelError] = useState(null)
+  const cancelling = job.status === 'cancelling'
   const cleanHandle = String(job.target || '').replace(/^@/, '')
   // Match strategy: tg by handle, YouTube types by source_id when available.
   // yt_transcribe (single) is sourceless so it stays unlinked.
@@ -116,11 +131,12 @@ export function RequestJobRow({ job, active, onClose = closeActivity }) {
 
   return (
     <div
+      data-request-job-id={job.id}
       onClick={onRowClick}
       className="rounded-md bg-zinc-900 border border-zinc-800 px-3 py-2 cursor-pointer hover:border-zinc-600 transition-colors"
     >
       <div className="flex items-center gap-2 min-w-0">
-        <StatusDot status={active ? 'running' : job.status} />
+        <StatusDot status={job.status} />
         {/* min-w-0 + flex-1 — длинный label сжимается с «…», а время справа
             никогда не переносится на вторую строку («17 ч / назад»). */}
         <span className="text-zinc-300 truncate flex-1 min-w-0">{labelFor(job.type, job)}</span>
@@ -176,12 +192,27 @@ export function RequestJobRow({ job, active, onClose = closeActivity }) {
       {active && (
         <div className="mt-1 flex justify-end">
           <button
-            onClick={(e) => { e.stopPropagation(); cancelJob(job.id) }}
-            className="text-xs text-zinc-500 hover:text-red-400"
+            data-cancel-job
+            onClick={async (e) => {
+              e.stopPropagation()
+              if (cancelling) return
+              setCancelError(null)
+              try {
+                const ok = await cancelJob(job.id, { identity: 'live', type: job.type })
+                if (ok !== true) setCancelError('Не удалось остановить')
+              } catch {
+                setCancelError('Не удалось остановить')
+              }
+            }}
+            disabled={cancelling}
+            className="text-xs text-zinc-500 hover:text-red-400 disabled:text-amber-400 disabled:cursor-wait"
           >
-            Отмена
+            {cancelling ? 'Отменяю…' : 'Отмена'}
           </button>
         </div>
+      )}
+      {cancelError && (
+        <div className="text-xs text-red-400 mt-1 text-right">{cancelError}</div>
       )}
     </div>
   )
@@ -215,8 +246,9 @@ function FolderRowBody({ job, active }) {
   const fid = job.tg_folder?.folder_id
   const folder = folders.find(f => f.id === fid)
   const isCatchUp = job.type === 'tg_catchup'
+  const isAuto = isCatchUp && job.params?.auto === true
   const folderTitle = isCatchUp
-    ? `${job.tg_folder?.total_chats || 0} выбранных чатов`
+    ? `${job.tg_folder?.total_chats || 0} ${isAuto ? 'авто-чатов' : 'выбранных чатов'}`
     : (folder?.title || job.entity_title || `папка #${fid ?? '?'}`)
   const done  = job.tg_folder?.done_chats || 0
   const total = job.tg_folder?.total_chats || job.items_total || 0
@@ -248,6 +280,7 @@ function StatusDot({ status }) {
   const color = {
     running:     '#10b981',
     awaiting_ai: '#f59e0b',
+    cancelling:  '#f59e0b',
     done:        '#71717a',
     error:       '#ef4444',
     cancelled:   '#a1a1aa',
@@ -268,6 +301,9 @@ function labelFor(type, job) {
   // channel fetch. Disambiguate by the media_only param marker.
   if (type === 'tg_fetch' && job?.params?.mode === 'media_only') {
     return 'Telegram · перевод медиа'
+  }
+  if (type === 'tg_catchup' && job?.params?.auto === true) {
+    return 'Telegram · автообновление'
   }
   return ({
     tg_fetch:             'Telegram · парсинг',

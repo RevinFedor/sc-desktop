@@ -43,6 +43,7 @@ export default function NewRequestSplitButton({
       >
         {/* Left — toggle form. Fixed width keeps the row stable. */}
         <button
+          data-new-request-form-toggle
           type="button"
           onClick={onToggle}
           title="Открыть форму с параметрами запроса"

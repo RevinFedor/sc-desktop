@@ -7,6 +7,7 @@ const path = require('node:path')
 const fs = require('node:fs')
 const os = require('node:os')
 const readline = require('node:readline')
+const { randomUUID } = require('node:crypto')
 let electronApp = null
 try {
   electronApp = require('electron').app || null
@@ -14,7 +15,19 @@ try {
   electronApp = null
 }
 const db = require('./database')
+const dbRead = require('./database-read-client')
 const { formatCommentsBlock } = require('./assemble')
+const {
+  finalizeTelegramJob,
+  finalizeCatalogJob,
+  syncTelegramFolder,
+  pruneTelegramFolders,
+  applyTelegramReplyUpdates,
+  persistItemMutation,
+  finalizeBatchJob,
+} = require('./telegram-finalizer-client')
+const { resolveTelegramProcessOutcome } = require('./telegram-lifecycle')
+const { boundedTail } = require('./job-snapshot-policy')
 const {
   TELEGRAM_SOURCE_UNAVAILABLE,
   telegramStableTarget,
@@ -72,6 +85,7 @@ const IG_TRANSCRIPTS_DIR = path.join(LIB_ROOT, 'transcripts', 'instagram')
 const LOCAL_TRANSCRIPTS_DIR = path.join(LIB_ROOT, 'transcripts', 'local')
 const BOOSTY_TRANSCRIPTS_DIR = path.join(LIB_ROOT, 'transcripts', 'boosty')
 const BOOSTY_MEDIA_DIR = path.join(LIB_ROOT, 'media', 'boosty')
+const BOOSTY_VIDEO_DIR = path.join(LIB_ROOT, 'videos', 'boosty')
 const BOOSTY_THUMBNAILS_DIR = path.join(LIB_ROOT, 'thumbnails', 'boosty')
 const BOOSTY_TMP_DIR = path.join(LIB_ROOT, 'tmp', 'boosty')
 try { fs.mkdirSync(JOBS_DIR, { recursive: true }) } catch {}
@@ -83,6 +97,7 @@ try { fs.mkdirSync(IG_TRANSCRIPTS_DIR, { recursive: true }) } catch {}
 try { fs.mkdirSync(LOCAL_TRANSCRIPTS_DIR, { recursive: true }) } catch {}
 try { fs.mkdirSync(BOOSTY_TRANSCRIPTS_DIR, { recursive: true }) } catch {}
 try { fs.mkdirSync(BOOSTY_MEDIA_DIR, { recursive: true }) } catch {}
+try { fs.mkdirSync(BOOSTY_VIDEO_DIR, { recursive: true }) } catch {}
 try { fs.mkdirSync(BOOSTY_THUMBNAILS_DIR, { recursive: true }) } catch {}
 try { fs.mkdirSync(BOOSTY_TMP_DIR, { recursive: true }) } catch {}
 
@@ -93,6 +108,25 @@ function readScSettings() {
     return JSON.parse(fs.readFileSync(SC_SETTINGS_PATH, 'utf8'))
   } catch {
     return {}
+  }
+}
+
+function configuredStoragePath(value, fallback) {
+  const clean = typeof value === 'string' ? value.trim() : ''
+  if (!clean) return fallback
+  if (clean === '~') return os.homedir()
+  if (clean.startsWith('~/')) return path.join(os.homedir(), clean.slice(2))
+  return path.isAbsolute(clean) ? path.normalize(clean) : path.resolve(LIB_ROOT, clean)
+}
+
+function getBoostyStorageConfig() {
+  const settings = readScSettings()
+  const boosty = settings?.boosty && typeof settings.boosty === 'object' ? settings.boosty : {}
+  return {
+    audio_dir: configuredStoragePath(boosty.audio_dir, BOOSTY_MEDIA_DIR),
+    video_dir: configuredStoragePath(boosty.video_dir, BOOSTY_VIDEO_DIR),
+    save_video: boosty.save_video === true,
+    transcript_dir: BOOSTY_TRANSCRIPTS_DIR,
   }
 }
 
@@ -183,6 +217,7 @@ function isPlainTelegramHistoryFetch(params = {}) {
   if (params.include_comments) return false
   if (Array.isArray(params.topic_ids) && params.topic_ids.length > 0) return false
   if (Array.isArray(params._comments_only_post_ids) && params._comments_only_post_ids.length > 0) return false
+  if (params._comments_only_source_id) return false
   if (Array.isArray(params._media_only_msg_ids) && params._media_only_msg_ids.length > 0) return false
   return true
 }
@@ -304,11 +339,11 @@ function persistTelegramUnavailableFailure(job, context) {
   }
 }
 
-function telegramSessionForFetchParams(params = {}) {
+function telegramSessionForFetchParams(params = {}, knownSource = null) {
   const explicit = params._tg_session_override || params.tg_session || params.session || null
   if (explicit && typeof explicit === 'string' && explicit.trim()) return explicit.trim()
 
-  const src = telegramSourceForFetchParams(params)
+  const src = knownSource || telegramSourceForFetchParams(params)
   if (src && src.tg_session_conflict) {
     throw new Error('У этого Telegram-чата конфликт аккаунтов — выбери аккаунт в строке чата и запусти снова.')
   }
@@ -458,6 +493,7 @@ function telegramCoveragePlannerAllowed(params = {}) {
   if (params.redo_processed) return false
   if (params.include_comments) return false
   if (Array.isArray(params._comments_only_post_ids) && params._comments_only_post_ids.length > 0) return false
+  if (params._comments_only_source_id) return false
   if (Array.isArray(params._media_only_msg_ids) && params._media_only_msg_ids.length > 0) return false
   if (Array.isArray(params.topic_ids) && params.topic_ids.length > 0) return false
   if (params.process_voice || params.process_photo || params.process_docs) return false
@@ -469,6 +505,7 @@ function isSourceWideTelegramCoverageParams(params = {}) {
   if (params._range_plan_parent) return false
   if (params.mode === 'single' || params.mode === 'media_only') return false
   if (Array.isArray(params._comments_only_post_ids) && params._comments_only_post_ids.length > 0) return false
+  if (params._comments_only_source_id) return false
   if (Array.isArray(params._media_only_msg_ids) && params._media_only_msg_ids.length > 0) return false
   if (Array.isArray(params.topic_ids) && params.topic_ids.length > 0) return false
   return true
@@ -828,10 +865,28 @@ const jobs = new Map()              // id -> {id, type, target, status, items, t
 const listeners = new Set()         // (job) => void
 const eventListeners = new Set()    // (jobId, event) => void
 const TG_LIVE_ITEMS_TAIL = 120
+const TG_LIVE_ITEMS_MAX_BYTES = 64 * 1024
 
 function emit(job) {
-  for (const fn of listeners) {
-    try { fn(snapshot(job)) } catch (e) { /* swallow */ }
+  if (!job.run_id) job.run_id = randomUUID()
+  job.revision = Number(job.revision || 0) + 1
+  if (isTerminalStatus(job.status)) job.phase = 'terminal'
+  else if (job.status === 'cancelling') job.phase = 'cancelling'
+  else if (!job.phase || job.phase === 'terminal' || job.phase === 'cancelling') job.phase = 'running'
+  // Build one projection per revision. The old loop called snapshot(job) once
+  // per listener, repeatedly mapping/sorting the 120-item Telegram live tail.
+  const slim = snapshot(job, { includeLiveItems: false })
+  let full = null
+  for (const listener of listeners) {
+    const includeLiveItems = typeof listener.includeLiveItems === 'function'
+      ? listener.includeLiveItems(job)
+      : listener.includeLiveItems === true
+    const projected = includeLiveItems
+      ? (full || (full = snapshot(job, { includeLiveItems: true })))
+      : slim
+    try { listener.fn(projected) } catch (e) {
+      console.error('[Jobs] listener failed', e)
+    }
   }
 }
 
@@ -841,9 +896,12 @@ function emitEvent(job, event) {
   }
 }
 
-function snapshot(j) {
+function snapshot(j, { includeLiveItems = false } = {}) {
   return {
     id: j.id,
+    run_id: j.run_id || null,
+    revision: Number(j.revision || 0),
+    phase: j.phase || null,
     // SQLite jobs.id of the persisted row (same job, different id space —
     // see fact-jobs.md::Pending row). Renderer paths that started from a
     // DB row (SourceDetail history) match against this; live ids are matched
@@ -919,7 +977,7 @@ function snapshot(j) {
     has_discussion: j.has_discussion === true ? true
                   : j.has_discussion === false ? false
                   : null,
-    tg_live_items: publicTelegramLiveItems(j),
+    tg_live_items: includeLiveItems ? publicTelegramLiveItems(j) : null,
     tg_current_item: publicTelegramLiveItem(j.tg_current_item, j),
   }
 }
@@ -961,7 +1019,12 @@ function publicTelegramLiveItems(j) {
   if (j.status !== 'running' && j.status !== 'awaiting_ai') return null
   if (!Array.isArray(j.items) || j.items.length === 0) return []
 
-  return j.items.slice(-TG_LIVE_ITEMS_TAIL).map(it => publicTelegramLiveItem(it, j)).sort((a, b) => {
+  const selected = boundedTail(
+    j.items,
+    item => publicTelegramLiveItem(item, j),
+    { maxCount: TG_LIVE_ITEMS_TAIL, maxBytes: TG_LIVE_ITEMS_MAX_BYTES },
+  )
+  return selected.sort((a, b) => {
     const at = a.published_at || 0
     const bt = b.published_at || 0
     if (bt !== at) return bt - at
@@ -969,8 +1032,11 @@ function publicTelegramLiveItems(j) {
   })
 }
 
-function listJobs() {
-  const live = [...jobs.values()].map(snapshot)
+function listJobs(historyRows = null) {
+  const workerHistory = historyRows && typeof historyRows === 'object' ? historyRows : null
+  // Initial hydration stays slim. ChatView explicitly attaches to one source
+  // and receives its current bounded tail plus subsequent live snapshots.
+  const live = [...jobs.values()].map(job => snapshot(job, { includeLiveItems: false }))
   // Augment with YouTube single-video jobs from the DB so Activity 'Recent'
   // restores across app restarts. yt_transcribe rows now carry source_id
   // (channel-of-the-video); we still want them in Recent because they were
@@ -978,10 +1044,11 @@ function listJobs() {
   // source_id IS NULL.
   let historic = []
   try {
-    const dbCon = db.getDb()
-    const rows = dbCon.prepare(
-      `SELECT * FROM jobs WHERE type = 'yt_transcribe' ORDER BY started_at DESC LIMIT 150`
-    ).all()
+    const rows = workerHistory
+      ? (workerHistory.youtube || [])
+      : db.getDb().prepare(
+          `SELECT * FROM jobs WHERE type = 'yt_transcribe' ORDER BY started_at DESC LIMIT 150`
+        ).all()
     historic = rows
       // skip the ones already alive in the Map (would dup if jobId == row.id;
       // they aren't since DB ids are independent from in-memory ids, but a
@@ -993,7 +1060,9 @@ function listJobs() {
   }
   let historicLocal = []
   try {
-    const rows = db.listSourcelessJobs({ type: 'local_transcribe', limit: 150 })
+    const rows = workerHistory
+      ? (workerHistory.local || [])
+      : db.listSourcelessJobs({ type: 'local_transcribe', limit: 150 })
     historicLocal = rows
       .filter(row => !live.some(j => j.file_path && j.file_path === row.file_path))
       .map(rowToLocalSnapshot)
@@ -1002,7 +1071,9 @@ function listJobs() {
   }
   let historicRutube = []
   try {
-    const rows = db.listSourcelessJobs({ type: 'rutube_transcribe', limit: 150 })
+    const rows = workerHistory
+      ? (workerHistory.rutube || [])
+      : db.listSourcelessJobs({ type: 'rutube_transcribe', limit: 150 })
     historicRutube = rows
       .filter(row => {
         let params = null
@@ -1020,7 +1091,9 @@ function listJobs() {
   }
   let historicBoosty = []
   try {
-    const rows = db.listSourcelessJobs({ type: 'boosty_transcribe', limit: 150 })
+    const rows = workerHistory
+      ? (workerHistory.boosty || [])
+      : db.listSourcelessJobs({ type: 'boosty_transcribe', limit: 150 })
     historicBoosty = rows
       .filter(row => !live.some(j => j.file_path && j.file_path === row.file_path))
       .map(rowToBoostySnapshot)
@@ -1033,7 +1106,9 @@ function listJobs() {
   // single / local-file restoration paths.
   let historicTgSingle = []
   try {
-    const rows = db.listSourcelessJobs({ type: 'tg_fetch', limit: 150 })
+    const rows = workerHistory
+      ? (workerHistory.telegramSingle || [])
+      : db.listSourcelessJobs({ type: 'tg_fetch', limit: 150 })
     // Dedup by file_path: a live single-message job that already finished
     // gets a DB row written in the close-handler; without this filter
     // listJobs returns both shapes for the *same* result and the renderer
@@ -1055,7 +1130,9 @@ function listJobs() {
   // shape JobDetail expects.
   let historicYtBatch = []
   try {
-    const rows = db.listSourcelessJobs({ type: 'yt_batch_transcribe', limit: 150 })
+    const rows = workerHistory
+      ? (workerHistory.youtubeBatch || [])
+      : db.listSourcelessJobs({ type: 'yt_batch_transcribe', limit: 150 })
     historicYtBatch = rows
       .filter(row => !live.some(j => j.id === row.id))
       .map(rowToHistoricSnapshot)
@@ -1064,7 +1141,9 @@ function listJobs() {
   }
   let historicIgBatch = []
   try {
-    const rows = db.listSourcelessJobs({ type: 'ig_batch_transcribe', limit: 150 })
+    const rows = workerHistory
+      ? (workerHistory.instagramBatch || [])
+      : db.listSourcelessJobs({ type: 'ig_batch_transcribe', limit: 150 })
     historicIgBatch = rows
       .filter(row => {
         let p = null
@@ -1088,10 +1167,11 @@ function listJobs() {
   // whether they're now bound to a source via the new single-flow.
   let historicYtComments = []
   try {
-    const dbCon = db.getDb()
-    const rows = dbCon.prepare(
-      `SELECT * FROM jobs WHERE type = 'yt_comments' ORDER BY started_at DESC LIMIT 150`
-    ).all()
+    const rows = workerHistory
+      ? (workerHistory.youtubeComments || [])
+      : db.getDb().prepare(
+          `SELECT * FROM jobs WHERE type = 'yt_comments' ORDER BY started_at DESC LIMIT 150`
+        ).all()
     historicYtComments = rows
       .filter(row => !live.some(j => j.file_path && j.file_path === row.file_path))
       .map(rowToYoutubeCommentsSnapshot)
@@ -1102,7 +1182,9 @@ function listJobs() {
   // (search batch) variants. listSourcelessJobs covers the search ones.
   let historicYtBatchComments = []
   try {
-    const rows = db.listSourcelessJobs({ type: 'yt_batch_comments', limit: 150 })
+    const rows = workerHistory
+      ? (workerHistory.youtubeBatchComments || [])
+      : db.listSourcelessJobs({ type: 'yt_batch_comments', limit: 150 })
     historicYtBatchComments = rows
       .filter(row => !live.some(j => j.id === row.id))
       .map(rowToHistoricSnapshot)
@@ -1324,7 +1406,22 @@ function rowToTgSingleSnapshot(row) {
   }
 }
 
-function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn) }
+function subscribe(fn, options = {}) {
+  const listener = { fn, includeLiveItems: options.includeLiveItems || false }
+  listeners.add(listener)
+  return () => listeners.delete(listener)
+}
+
+function liveSnapshotsForSource(sourceId) {
+  const wanted = Number(sourceId)
+  const out = []
+  for (const job of jobs.values()) {
+    if (Number(job.source_id) !== wanted) continue
+    if (job.status !== 'running' && job.status !== 'awaiting_ai' && job.status !== 'cancelling') continue
+    out.push(snapshot(job, { includeLiveItems: true }))
+  }
+  return out
+}
 function subscribeEvents(fn) { eventListeners.add(fn); return () => eventListeners.delete(fn) }
 
 function markJobClosed(job) {
@@ -1334,6 +1431,31 @@ function markJobClosed(job) {
     try { job._resolveClose(snapshot(job)) } catch {}
     job._resolveClose = null
   }
+}
+
+function queueJobPersistence(job, label, task, fallback) {
+  if (!job) return Promise.resolve()
+  const previous = job._persistenceQueue || Promise.resolve()
+  const next = previous.then(async () => {
+    try {
+      return await task()
+    } catch (error) {
+      console.error(`[Jobs] ${label} persistence worker failed; falling back to main`, error)
+      if (typeof fallback === 'function') return fallback()
+      throw error
+    }
+  }).catch(error => {
+    job._persistenceError = job._persistenceError || String(error?.message || error)
+    console.error(`[Jobs] ${label} persistence failed`, error)
+  })
+  job._persistenceQueue = next
+  return next
+}
+
+async function waitForJobPersistence(job) {
+  if (!job?._persistenceQueue) return
+  await job._persistenceQueue
+  delete job._persistenceQueue
 }
 
 function findLiveJobByIdOrDbId(id) {
@@ -1351,7 +1473,7 @@ function findLiveJobByIdOrDbId(id) {
   return j || null
 }
 
-function startAutoIndexAfterTelegramFetch(job) {
+async function startAutoIndexAfterTelegramFetch(job) {
   if (!job || job.type !== 'tg_fetch') return null
   if (job.status !== 'done' || job.params?._auto_index_after_fetch !== true) return null
   if (job.params?._auto_index_after_fetch_started
@@ -1369,7 +1491,7 @@ function startAutoIndexAfterTelegramFetch(job) {
 
   try {
     const indexJob = require('./index-job')
-    const result = indexJob.start({
+    const result = await indexJob.start({
       sourceId: Number(job.source_id),
       limit: null,
       origin: 'tg-fetch-auto-rag',
@@ -1417,7 +1539,7 @@ function patchAutoIndexParams(params, enabled) {
   return next
 }
 
-function setAutoIndexAfterFetch(id, enabled) {
+async function setAutoIndexAfterFetch(id, enabled) {
   const on = enabled === true
   const live = findLiveJobByIdOrDbId(id)
   if (live) {
@@ -1429,7 +1551,7 @@ function setAutoIndexAfterFetch(id, enabled) {
     if (live.dbRowId) {
       try { db.updateJob(live.dbRowId, { params: live.params }) } catch {}
     }
-    const auto = on ? startAutoIndexAfterTelegramFetch(live) : null
+    const auto = on ? await startAutoIndexAfterTelegramFetch(live) : null
     emit(live)
     return { ok: true, enabled: on, auto, job: snapshot(live) }
   }
@@ -1454,7 +1576,7 @@ function setAutoIndexAfterFetch(id, enabled) {
       params: patchAutoIndexParams(params, on),
     }
     db.updateJob(row.id, { params: pseudoJob.params })
-    const auto = on ? startAutoIndexAfterTelegramFetch(pseudoJob) : null
+    const auto = on ? await startAutoIndexAfterTelegramFetch(pseudoJob) : null
     const job = getJobDetail(row.id)
     return { ok: true, enabled: on, auto, job }
   } catch (err) {
@@ -1751,7 +1873,7 @@ function startTelegramFetch(params) {
   // --session (иначе Python перечитал бы settings.json сам — окно гонки, в
   // котором переключение сессии в UI ретаргетит уже-спавнящийся fetch, и
   // job.tg_session разошёлся бы с реально использованной сессией).
-  const tgSession = telegramSessionForFetchParams(params)
+  const tgSession = telegramSessionForFetchParams(params, telegramSource)
   const args = [
     path.join(WORKERS_ROOT, 'telegram', 'tg_fetch_json.py'),
     workerTarget,
@@ -1801,6 +1923,13 @@ function startTelegramFetch(params) {
       args.push('--comments-limit', String(params.comments_limit))
     }
   }
+  if (params._comments_only_source_id) {
+    args.push('--include-comments')
+    args.push('--comments-only-source-id', String(params._comments_only_source_id))
+    if (params.comments_limit && params.comments_limit > 0) {
+      args.push('--comments-limit', String(params.comments_limit))
+    }
+  }
   // On-demand media (re)processing of specific ALREADY-SAVED messages. The
   // user ticked voice/photo/doc rows in ChatView and pressed «перевести».
   // Python switches to mode=media_only: get_messages(ids=[...]) + process_media
@@ -1819,7 +1948,7 @@ function startTelegramFetch(params) {
       for (const existing of jobs.values()) {
         if (existing?.type !== 'tg_fetch') continue
         if (Number(existing.source_id) !== Number(knownSourceId)) continue
-        if (existing.status !== 'running' && existing.status !== 'awaiting_ai') continue
+        if (existing.status !== 'running' && existing.status !== 'awaiting_ai' && existing.status !== 'cancelling') continue
         console.warn(`[Jobs] tg_fetch duplicate source #${knownSourceId} → reuse live #${existing.id} db #${existing.dbRowId || '-'}`)
         return existing.id
       }
@@ -1830,10 +1959,10 @@ function startTelegramFetch(params) {
   }
 
   // Skip-already-processed wiring. The user has a toggle «парсить заново»
-  // (default OFF). When OFF, we collect external_ids that already have
-  // transcribe_status='done' for this source, write them to a temp JSON
-  // file, and tell Python to short-circuit those msg_ids before download +
-  // AI. Path is jobs Map's _skip_file so we can clean up on close.
+  // (default OFF). Python reads the potentially huge ID map from library.db in
+  // its own process. Previously Electron main selected, materialised,
+  // JSON-stringified and wrote tens of thousands of IDs before spawn, freezing
+  // the Parse click even though the actual fetch was asynchronous.
   const wantsAi = !!(params.process_voice || params.process_photo || params.process_docs)
   const allowReprocess = !!params.redo_processed
   // Ephemeral flows DO want re-processing every time:
@@ -1846,31 +1975,15 @@ function startTelegramFetch(params) {
   const isEphemeral = isSingle
                        || (Array.isArray(params._comments_only_post_ids)
                            && params._comments_only_post_ids.length > 0)
+                       || !!params._comments_only_source_id
                        // media-only: the user explicitly asked to (re)process
                        // these exact ids, possibly with a different engine.
                        // Building a skip-set would no-op the whole request.
                        || isMediaOnly
-  let skipFilePath = null
+  let skipFilePath = null // legacy cleanup field; new runs do not create one
   if (wantsAi && !allowReprocess && !isEphemeral) {
-    const skipStartedMs = Date.now()
-    try {
-      const src = telegramSource || db.findTelegramSourceByTarget(params.target)
-      if (src && src.id) {
-        const groups = db.listProcessedExternalIdsByKind(src.id)
-        const nVoice = Object.keys(groups.voice || {}).length
-        const nPhoto = Object.keys(groups.photo || {}).length
-        const nPdf   = Object.keys(groups.pdf   || {}).length
-        if (nVoice + nPhoto + nPdf > 0) {
-          skipFilePath = path.join(os.tmpdir(), `tg_skip_${id}.json`)
-          fs.writeFileSync(skipFilePath, JSON.stringify({
-            voice: groups.voice, photo: groups.photo, pdf: groups.pdf,
-          }))
-          args.push('--skip-processed-file', skipFilePath)
-          console.log(`[Jobs] tg_fetch #${id} skip-processed: voice=${nVoice} photo=${nPhoto} pdf=${nPdf} setup_ms=${Date.now() - skipStartedMs}`)
-        }
-      }
-    } catch (err) {
-      console.error('[Jobs] skip-processed setup failed', err)
+    if (telegramSource?.id) {
+      args.push('--skip-processed-source-id', String(telegramSource.id))
     }
   }
 
@@ -1972,19 +2085,34 @@ function startTelegramFetch(params) {
 
   child.on('close', async code => {
     const closeStartedMs = Date.now()
-    if (job.status === 'running') {
-      if (code === 0) {
-        job.status = 'done'
-      } else {
-        job.status = 'error'
-        job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
-      }
+    if (job._cancelEscalationTimer) {
+      clearTimeout(job._cancelEscalationTimer)
+      job._cancelEscalationTimer = null
     }
-    job.finished_at = Math.floor(Date.now() / 1000)
-    const dur = job.finished_at - job.started_at
+    job.worker_finished_at = Math.floor(Date.now() / 1000)
+    const cancelRequested = job._cancelRequested === true
+      || job.status === 'cancelled'
+      || job.status === 'cancelling'
+    const processOutcome = resolveTelegramProcessOutcome({
+      cancelRequested,
+      exitCode: code,
+      protocolDone: job._protocolDone === true,
+      protocolError: job._protocolError === true,
+      error: job.error || null,
+      stderrTail,
+    })
+    let outcomeStatus = processOutcome.status
+    job.error = processOutcome.error
+    if (processOutcome.errorCode) job.error_code = job.error_code || processOutcome.errorCode
+    // The suspicious-empty guard expects a candidate terminal outcome. Nothing
+    // is emitted in this temporary state; public terminal status is published
+    // only after persistence and the final jobs-row update succeed.
+    job.status = outcomeStatus
+    if (maybePromoteSuspiciousEmptyTelegramFetch(job)) outcomeStatus = job.status
+    job._finalOutcome = outcomeStatus
+    const dur = job.worker_finished_at - job.started_at
     const closeItemCount = Array.isArray(job.items) ? job.items.length : 0
-    console.log(`[Jobs] close #${id} begin status=${job.status} code=${code} items=${closeItemCount} db #${job.dbRowId || '-'} source #${job.source_id || '-'}`)
-    if (maybePromoteSuspiciousEmptyTelegramFetch(job)) emit(job)
+    console.log(`[Jobs] close #${id} begin outcome=${outcomeStatus} code=${code} done_seen=${job._protocolDone ? 1 : 0} items=${closeItemCount} db #${job.dbRowId || '-'} source #${job.source_id || '-'}`)
     persistTelegramUnavailableFailure(job, `tg_fetch #${id}`)
 
     // Clean up the skip-processed JSON file (best-effort; missing file ok).
@@ -1995,15 +2123,86 @@ function startTelegramFetch(params) {
     if (isAutoEmptyCatchUpFetch(job)
         && suppressJobHistoryRow(job, 'auto empty catchup')) {
       delete job.items
+      job.phase = 'terminal'
+      job.status = outcomeStatus
+      job.finished_at = Math.floor(Date.now() / 1000)
       console.log(`[Jobs] end #${id} status=${job.status} items=${job.items_done} duration=${dur}s history=suppressed close_ms=${Date.now() - closeStartedMs}`)
       emit(job)
       markJobClosed(job)
       return
     }
 
+    job.phase = 'finalizing'
+    job.status = outcomeStatus === 'cancelled' ? 'cancelling' : 'running'
+    job.finished_at = null
+    emit(job)
+
+    let finalizerResult = null
+    let finalizerFallbackError = null
+    const isSingle = job.params?.mode === 'single'
+    const isMediaOnlyJob = job.params?.mode === 'media_only'
+    const fname = isMediaOnlyJob ? null : jobFileName(job, { single: isSingle })
+    const finalFilePath = fname ? path.join(JOBS_DIR, fname) : null
+    const commentsFilePath = isSingle && fname
+      ? path.join(JOBS_DIR, fname.replace(/\.txt$/, '_comments.txt'))
+      : null
+    const workerSummary = {
+      id: job.id,
+      type: job.type,
+      target: job.target,
+      params: job.params,
+      entity: { title: job.entity_title, kind: job.entity_kind },
+      status: outcomeStatus,
+      error: job.error || null,
+      warning: job.warning || null,
+      started_at: job.started_at,
+      finished_at: job.worker_finished_at,
+      duration_sec: dur,
+      items_total: closeItemCount,
+      type_breakdown: job.type_breakdown,
+    }
+    try {
+      finalizerResult = await finalizeTelegramJob({
+        id: job.id,
+        source_id: job.source_id || null,
+        dbRowId: job.dbRowId || null,
+        items: Array.isArray(job.items) ? job.items : [],
+        params: job.params || {},
+        outcomeStatus,
+        type_breakdown: job.type_breakdown || {},
+        mediaResults: Array.isArray(job.tg_media_results) ? job.tg_media_results : [],
+        tg_voice: job.tg_voice || null,
+        commentsBuffer: Array.isArray(job.tg_comments_buffer) ? job.tg_comments_buffer : [],
+        isSingle,
+        isMediaOnly: isMediaOnlyJob,
+        filePath: finalFilePath,
+        commentsFilePath,
+        summary: workerSummary,
+      }, {
+        onProgress: info => {
+          updateTelegramSavingProgress(job, info)
+          job.params = persistTelegramProgressParams(job)
+          emit(job)
+        },
+      })
+      job.file_path = finalizerResult.file_path || null
+      job.file_path_comments = finalizerResult.file_path_comments || null
+      delete job.tg_comments_buffer
+      console.log(`[TelegramFinalizer] #${id} worker rows=${finalizerResult.rows || 0} media=${finalizerResult.mediaApplied || 0} took ${finalizerResult.durationMs || 0}ms`)
+    } catch (err) {
+      // Idempotent fallback preserves capability if a packaged worker cannot
+      // start. The worker writes sidecars atomically; repeated item/media
+      // upserts are already idempotent. This path is intentionally loud so a
+      // performance regression cannot masquerade as normal operation.
+      finalizerFallbackError = err
+      console.error(`[TelegramFinalizer] #${id} worker failed; falling back to main`, err)
+    }
+
+    let finalizeFailure = null
+
     // 1. Persist all items into SQLite (idempotent UPSERT — re-fetches don't dup).
     try {
-      if (job.source_id && job.items.length) {
+      if (!finalizerResult && job.source_id && job.items.length) {
         const prepareRowsStartedMs = Date.now()
         const rows = job.items.map(it => ({
           source_id:        job.source_id,
@@ -2057,7 +2256,7 @@ function startTelegramFetch(params) {
       // job.items.length — otherwise on-demand transcription would silently
       // drop its results.
       const stash = Array.isArray(job.tg_media_results) ? job.tg_media_results : []
-      if (job.source_id && stash.length) {
+      if (!finalizerResult && job.source_id && stash.length) {
         const mediaStartedMs = Date.now()
         let applied = 0
         for (const r of stash) {
@@ -2078,6 +2277,7 @@ function startTelegramFetch(params) {
       }
     } catch (err) {
       console.error('[Jobs] DB write failed', err)
+      finalizeFailure = finalizeFailure || err
     }
 
     // 2. Per-type coverage records (the jobs row itself is finalised AFTER
@@ -2089,7 +2289,7 @@ function startTelegramFetch(params) {
         && (job.params?.mode || '') === 'from_date'
       const coverageDateFrom = useRequestedDateRange ? job.tg_requested_range.start : job.date_min
       const coverageDateTo = useRequestedDateRange ? job.tg_requested_range.end : job.date_max
-      if (job.source_id && job.status === 'done' && job.dbRowId
+      if (job.source_id && outcomeStatus === 'done' && job.dbRowId
           && coverageTypes.length
           && Number.isFinite(Number(coverageDateFrom))
           && Number.isFinite(Number(coverageDateTo))) {
@@ -2111,6 +2311,7 @@ function startTelegramFetch(params) {
       }
     } catch (err) {
       console.error('[Jobs] coverage write failed', err)
+      finalizeFailure = finalizeFailure || err
     }
 
     // 3. Flush sidecar file. Two shapes depending on intent:
@@ -2123,15 +2324,17 @@ function startTelegramFetch(params) {
     //      re-process via "Open in Sublime" and the structure is preserved.
     const saveStartedMs = Date.now()
     try {
-      const isSingle = job.params?.mode === 'single'
+      if (finalizerResult) {
+        // DB and sidecars were finalized in the worker. Keep the compact
+        // params hydration below in main because it is tiny and feeds the
+        // existing historic JobDetail contract.
+      } else {
       // Media-only re-processing has no meaningful sidecar to write — the
       // results are appended directly into the existing items' captions (replay
       // above), and job.items is empty. A JSON dump of {summary, items:[]} would
       // just be a dead file in jobs/. Skip the write; the params-persist below
       // still runs so the historic JobDetail keeps its media_phase drill-down.
-      const isMediaOnlyJob = job.params?.mode === 'media_only'
-      const fname = isMediaOnlyJob ? null : jobFileName(job, { single: isSingle })
-      const fpath = isMediaOnlyJob ? null : path.join(JOBS_DIR, fname)
+      const fpath = finalFilePath
       if (isMediaOnlyJob) {
         // no file
       } else if (isSingle) {
@@ -2165,7 +2368,7 @@ function startTelegramFetch(params) {
         // suppress the file and the button would render disabled, looking
         // identical to «we didn't try». On error/cancel we skip — there's
         // no «we tried» signal to confirm.
-        if (job.params?.include_comments && job.status === 'done') {
+        if (job.params?.include_comments && outcomeStatus === 'done') {
           const cBuf = Array.isArray(job.tg_comments_buffer) ? job.tg_comments_buffer : []
           const cName = fname.replace(/\.txt$/, '_comments.txt')
           const cPath = path.join(JOBS_DIR, cName)
@@ -2188,11 +2391,11 @@ function startTelegramFetch(params) {
           target: job.target,
           params: job.params,
           entity: { title: job.entity_title, kind: job.entity_kind },
-          status: job.status,
+          status: outcomeStatus,
           error: job.error || null,
           warning: job.warning || null,
           started_at: job.started_at,
-          finished_at: job.finished_at,
+          finished_at: job.worker_finished_at,
           duration_sec: dur,
           items_total: job.items.length,
           type_breakdown: job.type_breakdown,
@@ -2205,6 +2408,7 @@ function startTelegramFetch(params) {
         console.log(`[Jobs] close #${id} sidecar json items=${job.items.length} stringify_ms=${stringifyMs} write_ms=${Date.now() - writeStartedMs}`)
       }
       job.file_path = fpath
+      }
       // Snapshot key fields into params so the historic-row hydration path
       // (rowToTgSingleSnapshot) can render the JobDetail header without
       // re-reading the txt. Keeps restoration cheap and offline-safe.
@@ -2240,10 +2444,22 @@ function startTelegramFetch(params) {
       } catch (err) {
         console.error('[Jobs] media_phase persist failed', err)
       }
-      console.log(`[Jobs] saved #${id} → ${fpath} (${Date.now() - saveStartedMs}ms)`)
+      console.log(`[Jobs] saved #${id} → ${job.file_path || '-'} (${Date.now() - saveStartedMs}ms)`)
     } catch (err) {
       console.error(`[Jobs] save failed after ${Date.now() - saveStartedMs}ms`, err)
+      finalizeFailure = finalizeFailure || err
     }
+
+    if (outcomeStatus === 'done' && finalizeFailure) {
+      outcomeStatus = 'error'
+      job.error_code = 'finalize_failed'
+      job.error = `Не удалось сохранить результат: ${finalizeFailure.message || finalizeFailure}`
+    }
+    job.status = outcomeStatus
+    job.phase = 'terminal'
+    job.finished_at = Math.floor(Date.now() / 1000)
+    finishTelegramProgress(job)
+    job.params = persistTelegramProgressParams(job)
 
     // Finalise the jobs row (started as status='running' on entity-resolve).
     // Single UPDATE — same id throughout the job lifecycle.
@@ -2279,16 +2495,23 @@ function startTelegramFetch(params) {
       }
     } catch (err) {
       console.error('[Jobs] updateJob (final) failed', err)
+      if (job.status === 'done') {
+        job.status = 'error'
+        job.error_code = 'finalize_failed'
+        job.error = `Результат сохранён, но не удалось завершить запись задачи: ${err.message || err}`
+      }
     }
-
-    startAutoIndexAfterTelegramFetch(job)
 
     // Free memory.
     delete job.items
 
-    console.log(`[Jobs] end #${id} status=${job.status} items=${job.items_done} duration=${dur}s close_ms=${Date.now() - closeStartedMs}ms${job.error ? ' error=' + job.error : ''}`)
+    console.log(`[Jobs] end #${id} status=${job.status} items=${job.items_done} duration=${dur}s close_ms=${Date.now() - closeStartedMs}ms finalizer=${finalizerResult ? 'worker' : finalizerFallbackError ? 'main-fallback' : 'main'}${job.error ? ' error=' + job.error : ''}`)
     emit(job)
     markJobClosed(job)
+    // Auto-index begins only after the durable terminal revision is visible to
+    // every consumer. Selection/embedding run in index-worker, so this does not
+    // block main or the Telegram close promise.
+    void startAutoIndexAfterTelegramFetch(job)
   })
 
   return id
@@ -2306,8 +2529,8 @@ function startTelegramFetch(params) {
  * independently) means a cancel keeps everything fetched so far.
  */
 function startTelegramCommentsCatchUp(params) {
-  if (!Array.isArray(params.post_ids) || params.post_ids.length === 0) {
-    throw new Error('post_ids required')
+  if (!params.source_id && (!Array.isArray(params.post_ids) || params.post_ids.length === 0)) {
+    throw new Error('source_id or post_ids required')
   }
   return startTelegramFetch({
     target:                    params.target,
@@ -2315,7 +2538,8 @@ function startTelegramCommentsCatchUp(params) {
     limit:                     1,                    // dummy; iter loop is skipped
     include_comments:          true,
     comments_limit:            params.comments_limit || 0,
-    _comments_only_post_ids:   params.post_ids,      // forwarded below
+    _comments_only_source_id:  params.source_id || null,
+    _comments_only_post_ids:   params.source_id ? null : params.post_ids,
     _source_id:                params.source_id || null,
   })
 }
@@ -2663,11 +2887,14 @@ function handleEvent(job, evt) {
       console.warn(`[Jobs] tg comment_error post=${evt.post_id}: ${evt.message}`)
       break
     case 'done':
-      job.status = 'done'
+      // Protocol done is not durable completion. Python still has to close and
+      // Electron still has to commit SQLite + sidecars. Keep the public job
+      // active until child.on('close') receives finalizer acknowledgement.
+      job._protocolDone = true
+      job.phase = 'draining'
       job.items_total = evt.items_total
       job.items_done = evt.items_total
       job.tg_current_item = null
-      job.finished_at = Math.floor(Date.now() / 1000)
       if (job.tg_progress) persistTelegramProgressParams(job)
       // Comments pass summary — surface in JobDetail.
       if (evt.comments_collected != null) {
@@ -2691,6 +2918,7 @@ function handleEvent(job, evt) {
       emit(job)
       break
     case 'error':
+      job._protocolError = true
       job.error = evt.message
       // Machine token (e.g. "session_unauthorized") so the renderer can react
       // structurally — surface a global toast with a «Настройки» action —
@@ -2862,7 +3090,7 @@ function jobFileName(job, { single = false } = {}) {
   return `${date}_tg_${safe(job.target)}_${job.id}.${ext}`
 }
 
-function getJobDetail(id) {
+function getJobDetail(id, { identity = null } = {}) {
   // Historic sourceless jobs use 'db-<rowId>' string ids (see listJobs).
   // Look up the row directly and dispatch by type — listSourcelessJobs is
   // type-scoped, so a one-shot fetch by primary key is both faster and
@@ -2890,13 +3118,16 @@ function getJobDetail(id) {
   // in-memory ones (the two sequences are independent). Same trick as
   // cancelJob; without this you get «Loading job…» forever in JobDetail
   // for a STILL-RUNNING fetch opened from history.
-  let j = jobs.get(id)
-  if (!j) {
-    for (const candidate of jobs.values()) {
-      if (candidate.dbRowId === id) { j = candidate; break }
+  let j = null
+  if (identity !== 'db') {
+    j = jobs.get(id)
+    if (!j) {
+      for (const candidate of jobs.values()) {
+        if (candidate.dbRowId === id) { j = candidate; break }
+      }
     }
   }
-  if (j) return snapshot(j)
+  if (j) return snapshot(j, { includeLiveItems: true })
   // Otherwise fall back to the DB row — happens for any historical job
   // opened from SourceDetail's «История парсинга» (tg_fetch, ig_profile_fetch,
   // ig_batch_transcribe, yt_batch_transcribe …). Without this, JobDetail
@@ -3020,26 +3251,26 @@ function rowToHistoricSnapshot(row) {
   return base
 }
 
-function cancelJob(id) {
+function cancelJob(id, { identity = null, type = null } = {}) {
   const numericId = Number(id)
   const requestedId = Number.isFinite(numericId) ? numericId : id
   console.log(`[Jobs] cancel requested id=${id}`)
 
-  // tg_index lives in indexJob's own Map (different lifecycle — Node-only,
-  // no Python child). The renderer's "Cancel" button in ActivityPanel
-  // routes everything through this single function, so we have to ask
-  // indexJob whether `id` belongs to it before falling through to the
-  // tg_fetch/yt/etc. path.
-  try {
-    const indexJob = require('./index-job')
-    if (indexJob && typeof indexJob.cancelById === 'function') {
-      if (indexJob.cancelById(requestedId)) {
+  const cancelIndex = () => {
+    try {
+      const indexJob = require('./index-job')
+      if (indexJob && typeof indexJob.cancelById === 'function' && indexJob.cancelById(requestedId)) {
         console.log(`[Jobs] cancel id=${id} handled by tg_index`)
         return true
       }
+    } catch (err) {
+      console.error('[Jobs] cancel tg_index route failed', err && err.message || err)
     }
-  } catch (err) {
-    console.error('[Jobs] cancel tg_index route failed', err && err.message || err)
+    return false
+  }
+  if ((typeof requestedId === 'string' && requestedId.startsWith('index-'))
+      || (identity === 'db' && type === 'tg_index')) {
+    return cancelIndex()
   }
 
   // ActivityPanel sends in-memory `j.id`; SourceDetail's «История парсинга»
@@ -3050,13 +3281,14 @@ function cancelJob(id) {
   // live jobs by dbRowId. Without this fallback the Stop button in History
   // silently no-ops while the same button in Activity works fine — same
   // job, two different ids. fact-jobs.md::Pending row context.
-  let j = jobs.get(requestedId)
+  let j = identity === 'db' ? null : jobs.get(requestedId)
   if (!j) {
     for (const candidate of jobs.values()) {
       if (candidate.dbRowId === requestedId) { j = candidate; break }
     }
   }
   if (!j) {
+    if (identity !== 'db' && cancelIndex()) return true
     const active = Array.from(jobs.values())
       .map(job => `live #${job.id}/db #${job.dbRowId || '-'}/${job.type}`)
       .join(', ')
@@ -3064,14 +3296,42 @@ function cancelJob(id) {
     return false
   }
   console.log(`[Jobs] cancel id=${id} matched live #${j.id} db #${j.dbRowId || '-'} type=${j.type} source #${j.source_id || '-'}`)
-  if (typeof j.cancel === 'function') {
-    try { j.cancel() } catch (err) { console.error('[Jobs] custom cancel failed', err) }
-    j.status = 'cancelled'
-    j.finished_at = Math.floor(Date.now() / 1000)
-    if (j.dbRowId) {
-      try { db.updateJob(j.dbRowId, { status: 'cancelled', finished_at: j.finished_at, items_done: j.items_done || 0, params: j.params || null }) } catch {}
-    }
+  // Telegram cancellation remains non-terminal until the subprocess closes
+  // and all received rows have been durably finalized. This prevents folder
+  // umbrellas from starting the next child over a still-running Telethon
+  // process or an in-flight SQLite commit.
+  const deferTerminalUntilClose = new Set([
+    'tg_fetch', 'tg_reply_backfill', 'tg_folder_refresh',
+    'yt_channel_fetch', 'yt_batch_transcribe',
+    'tk_channel_fetch', 'tk_batch_transcribe',
+    'ig_profile_fetch', 'ig_batch_transcribe',
+    'rd_thread_fetch', 'rd_search',
+    'boosty_channel_fetch', 'boosty_batch_transcribe',
+  ])
+  if (deferTerminalUntilClose.has(j.type) && j.child && !j.child.killed) {
+    j._cancelRequested = true
+    j.phase = 'cancelling'
+    j.status = 'cancelling'
+    try { j.child.kill('SIGTERM') }
+    catch (err) { console.error('[Jobs] child SIGTERM failed', err) }
+    j._cancelEscalationTimer = setTimeout(() => {
+      if (!j.child || j.child.exitCode != null) return
+      console.warn(`[Jobs] cancel escalate live #${j.id} pid=${j.child.pid || '-'} → SIGKILL`)
+      try { j.child.kill('SIGKILL') } catch {}
+    }, 5000)
+    j._cancelEscalationTimer.unref?.()
     emit(j)
+    return true
+  }
+  if (typeof j.cancel === 'function') {
+    j._cancelRequested = true
+    j.status = 'cancelling'
+    j.phase = 'cancelling'
+    emit(j)
+    // Mark the umbrella before invoking its hook. The hook can synchronously
+    // cancel a child and cause subscribers to run; they must already see that
+    // the parent is stopping, otherwise the loop can advance to the next chat.
+    try { j.cancel() } catch (err) { console.error('[Jobs] custom cancel failed', err) }
     return true
   }
   if (j.child && !j.child.killed) {
@@ -3259,6 +3519,79 @@ function startTelegramFolderRefresh(options = {}) {
   emit(job)
 
   let stderrTail = ''
+  let folderPersistenceQueue = Promise.resolve()
+  let folderPersistenceErrors = 0
+
+  function persistFolderOnMain(evt) {
+    const sourceIds = []
+    for (const chat of (evt.chats || [])) {
+      try {
+        const sourceId = db.upsertSource({
+          platform: 'telegram',
+          handle: chat.handle,
+          display_name: chat.title || null,
+          external_id: chat.tg_id != null ? String(chat.tg_id) : null,
+          avatar_url: chat.avatar_path || null,
+          meta: {
+            kind: chat.kind,
+            username: chat.username || null,
+            via_folder_id: evt.filter_id,
+          },
+          is_explicit: false,
+          tg_session: job.tg_session || null,
+        })
+        clearTelegramUnavailableAfterLiveResolve(sourceId, `tg_folder_refresh #${job.id}`)
+        sourceIds.push(sourceId)
+      } catch (error) {
+        console.error('[FolderRefresh] fallback upsertSource failed', chat.handle, error)
+      }
+    }
+    const folderId = db.upsertFolder({
+      tg_filter_id: evt.filter_id,
+      title: evt.title,
+      tg_session: job.tg_session || null,
+    })
+    db.setFolderSources(folderId, sourceIds)
+    return { folderId, sourceIds, fallback: true }
+  }
+
+  function enqueueFolderPersistence(evt) {
+    job.tg_folder_refresh.current_title = evt.title
+    emit(job)
+    folderPersistenceQueue = folderPersistenceQueue.then(async () => {
+      const started = Date.now()
+      let result
+      try {
+        result = await syncTelegramFolder({
+          filter_id: evt.filter_id,
+          title: evt.title,
+          chats: evt.chats || [],
+          tg_session: job.tg_session || null,
+        })
+      } catch (error) {
+        // Capability-preserving fallback for a missing packaged worker. It is
+        // deliberately loud because normal folder persistence must stay off
+        // main; the old synchronous path remains only as recovery.
+        console.error('[FolderRefresh] persistence worker failed; falling back to main', error)
+        result = persistFolderOnMain(evt)
+      }
+      if (result?.errors?.length) {
+        folderPersistenceErrors += result.errors.length
+        console.error(`[FolderRefresh] ${result.errors.length} chat row(s) failed in ${evt.title}`)
+      }
+      job.seenTgIds.add(evt.filter_id)
+      job.tg_folder_refresh.synced += 1
+      console.log(`[FolderRefresh] persisted filter=${evt.filter_id} chats=${result?.sourceIds?.length || 0} worker=${result?.fallback ? 0 : 1} took ${Date.now() - started}ms`)
+    }).catch(error => {
+      folderPersistenceErrors += 1
+      console.error('[FolderRefresh] folder persistence failed', evt.title, error)
+    }).finally(() => {
+      job.tg_folder_refresh.done_folders += 1
+      job.items_done = job.tg_folder_refresh.done_folders
+      emit(job)
+    })
+  }
+
   const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
   rl.on('line', line => {
     if (!line.trim()) return
@@ -3270,52 +3603,20 @@ function startTelegramFolderRefresh(options = {}) {
       return
     }
     if (evt.type === 'folder') {
-      // Upsert this folder's chats + the folder row + the join. Same code
-      // path as the legacy synchronous handler — duplicated here so progress
-      // visibly moves in lockstep with completion, not in a final burst.
-      const sourceIds = []
-      for (const chat of (evt.chats || [])) {
-        try {
-          const sid = db.upsertSource({
-            platform:     'telegram',
-            handle:       chat.handle,
-            display_name: chat.title || null,
-            external_id:  chat.tg_id != null ? String(chat.tg_id) : null,
-            avatar_url:   chat.avatar_path || null,
-            meta:         { kind: chat.kind, username: chat.username || null,
-                            via_folder_id: evt.filter_id },
-            is_explicit:  false,
-            tg_session:   job.tg_session || null,
-          })
-          // Appearing in a live iter_dialogs folder sweep is a successful
-          // control probe for this exact account/source.
-          clearTelegramUnavailableAfterLiveResolve(sid, `tg_folder_refresh #${job.id}`)
-          sourceIds.push(sid)
-        } catch (err) {
-          console.error('[FolderRefresh] upsertSource failed', chat.handle, err)
-        }
-      }
-      try {
-        const fid = db.upsertFolder({
-          tg_filter_id: evt.filter_id,
-          title:        evt.title,
-          tg_session:   job.tg_session || null,
-        })
-        db.setFolderSources(fid, sourceIds)
-        job.seenTgIds.add(evt.filter_id)
-        job.tg_folder_refresh.synced += 1
-      } catch (err) {
-        console.error('[FolderRefresh] folder upsert failed', evt.title, err)
-      }
-      job.tg_folder_refresh.done_folders += 1
-      job.tg_folder_refresh.current_title = evt.title
-      job.items_done = job.tg_folder_refresh.done_folders
-      emit(job)
+      // A folder can contain hundreds or thousands of dialogs. Queue the DB
+      // transaction in the Telegram persistence worker and keep stdout
+      // draining; terminal status waits for this queue below.
+      enqueueFolderPersistence(evt)
       return
     }
     if (evt.type === 'error') {
       job.error = evt.message
+      job._protocolError = true
       if (evt.code) job.error_code = evt.code
+      return
+    }
+    if (evt.type === 'done') {
+      job._protocolDone = true
     }
   })
   child.stderr.on('data', chunk => {
@@ -3323,13 +3624,23 @@ function startTelegramFolderRefresh(options = {}) {
   })
 
   child.on('close', code => {
-    if (job.status === 'running') {
-      if (code === 0) job.status = 'done'
-      else {
-        job.status = 'error'
-        job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
-      }
+    void (async () => {
+    await folderPersistenceQueue
+    if (job._cancelEscalationTimer) {
+      clearTimeout(job._cancelEscalationTimer)
+      job._cancelEscalationTimer = null
     }
+    const outcome = resolveTelegramProcessOutcome({
+      cancelRequested: job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled',
+      exitCode: code,
+      protocolDone: job._protocolDone === true,
+      protocolError: job._protocolError === true,
+      error: job.error || null,
+      stderrTail,
+    })
+    job.status = outcome.status
+    job.error = outcome.error
+    if (outcome.errorCode) job.error_code = job.error_code || outcome.errorCode
     job.finished_at = Math.floor(Date.now() / 1000)
 
     // Prune: any folder in the local DB whose tg_filter_id wasn't seen in
@@ -3345,16 +3656,25 @@ function startTelegramFolderRefresh(options = {}) {
     // живут до refresh'а под своим аккаунтом.
     if (job.status === 'done' && job.tg_session) {
       try {
-        const local = db.listFolders()
-        for (const lf of local) {
-          if (lf.tg_session !== job.tg_session) continue
-          if (lf.tg_filter_id != null && !job.seenTgIds.has(lf.tg_filter_id)) {
-            db.deleteFolder(lf.id)
-            job.tg_folder_refresh.removed += 1
-          }
-        }
+        const result = await pruneTelegramFolders({
+          tg_session: job.tg_session,
+          seen_filter_ids: [...job.seenTgIds],
+        })
+        job.tg_folder_refresh.removed += Number(result?.removed || 0)
       } catch (err) {
-        console.error('[FolderRefresh] prune failed', err)
+        console.error('[FolderRefresh] prune worker failed; falling back to main', err)
+        try {
+          const local = db.listFolders()
+          for (const lf of local) {
+            if (lf.tg_session !== job.tg_session) continue
+            if (lf.tg_filter_id != null && !job.seenTgIds.has(lf.tg_filter_id)) {
+              db.deleteFolder(lf.id)
+              job.tg_folder_refresh.removed += 1
+            }
+          }
+        } catch (fallbackError) {
+          console.error('[FolderRefresh] prune fallback failed', fallbackError)
+        }
       }
     }
 
@@ -3377,8 +3697,18 @@ function startTelegramFolderRefresh(options = {}) {
       console.error('[Jobs] tg_folder_refresh recordJob failed', err)
     }
 
-    console.log(`[Jobs] end tg_folder_refresh #${id} status=${job.status} synced=${job.tg_folder_refresh.synced} removed=${job.tg_folder_refresh.removed}`)
+    console.log(`[Jobs] end tg_folder_refresh #${id} status=${job.status} synced=${job.tg_folder_refresh.synced} removed=${job.tg_folder_refresh.removed} persistence_errors=${folderPersistenceErrors}`)
     emit(job)
+    markJobClosed(job)
+    })().catch(error => {
+      job.status = 'error'
+      job.error = String(error?.message || error)
+      job.finished_at = Math.floor(Date.now() / 1000)
+      delete job.seenTgIds
+      console.error(`[Jobs] tg_folder_refresh #${id} close failed`, error)
+      emit(job)
+      markJobClosed(job)
+    })
   })
 
   return id
@@ -3416,7 +3746,7 @@ function startTelegramReplyBackfill(params) {
   // to refuse upfront than to ride a 30s busy-wait. Caller (auto-backfill
   // hook in tg:index) silently swallows the error.
   for (const j of jobs.values()) {
-    if (j.status !== 'running') continue
+    if (j.status !== 'running' && j.status !== 'cancelling') continue
     if (j.source_id !== sourceId) continue
     if (j.type === 'tg_fetch' || j.type === 'tg_reply_backfill' ||
         j.type === 'tg_folder_fetch' || j.type === 'tg_preview' ||
@@ -3426,8 +3756,7 @@ function startTelegramReplyBackfill(params) {
     }
   }
 
-  const pending = db.listItemsMissingParent(sourceId, limit)
-  if (!pending.length) {
+  if (params._known_empty === true) {
     // Synthesize a no-op "done" job so the UI can show "ничего не нужно
     // дотягивать" without special-casing the call site.
     const job = {
@@ -3436,7 +3765,7 @@ function startTelegramReplyBackfill(params) {
       items_done: 0, items_total: 0,
       started_at: Math.floor(Date.now() / 1000),
       finished_at: Math.floor(Date.now() / 1000),
-      params: { ...params },
+      params: Object.fromEntries(Object.entries(params).filter(([key]) => !key.startsWith('_runtime_') && key !== '_known_empty')),
       tg_reply_backfill: { resolved: 0, with_parent: 0, no_parent: 0 },
     }
     jobs.set(id, job)
@@ -3444,14 +3773,13 @@ function startTelegramReplyBackfill(params) {
     return id
   }
 
-  const ids = pending.map(r => r.external_id).join(',')
   // Backfill ходит по СУЩЕСТВУЮЩЕМУ source — правильная сессия не «активная
   // сейчас», а та, к которой чат привязан (sources.tg_session). Активная —
   // только fallback для legacy-строк без привязки.
   let tgSession = null
-  let telegramSource = null
+  let telegramSource = params._runtime_source || null
   try {
-    telegramSource = db.getSource(sourceId) || null
+    if (!telegramSource) telegramSource = db.getSource(sourceId) || null
     tgSession = telegramSource?.tg_session || null
   } catch {}
   if (!tgSession) tgSession = activeTgSession()
@@ -3459,11 +3787,12 @@ function startTelegramReplyBackfill(params) {
   const args = [
     path.join(WORKERS_ROOT, 'telegram', 'tg_reply_backfill_ndjson.py'),
     String(workerTarget),
-    '--ids', ids,
+    '--source-id', String(sourceId),
+    '--limit', String(limit),
   ]
   if (tgSession) args.push('--session', tgSession)
 
-  console.log(`[Jobs] start tg_reply_backfill #${id} source=${sourceId} target=${target} resolve_target=${workerTarget} pending=${pending.length} session=${tgSession || 'default'}`)
+  console.log(`[Jobs] start tg_reply_backfill #${id} source=${sourceId} target=${target} resolve_target=${workerTarget} limit=${limit} session=${tgSession || 'default'}`)
   const child = spawn(WORKER_PYTHON, args, {
     cwd: WORKERS_ROOT,
     env: workerEnv(),
@@ -3477,9 +3806,9 @@ function startTelegramReplyBackfill(params) {
     source_id: sourceId,
     status: 'running',
     items_done: 0,
-    items_total: pending.length,
+    items_total: null,
     started_at: Math.floor(Date.now() / 1000),
-    params: { ...params },
+    params: Object.fromEntries(Object.entries(params).filter(([key]) => !key.startsWith('_runtime_') && key !== '_known_empty')),
     tg_reply_backfill: { resolved: 0, with_parent: 0, no_parent: 0 },
     reaction_null: 0,
     reaction_checked: 0,
@@ -3497,7 +3826,7 @@ function startTelegramReplyBackfill(params) {
       type:        job.type,
       source_id:   sourceId,
       status:      'running',
-      items_total: pending.length,
+      items_total: null,
       items_done:  0,
       params:      { ...job.params },
       started_at:  job.started_at,
@@ -3507,20 +3836,24 @@ function startTelegramReplyBackfill(params) {
   }
 
   let stderrTail = ''
+  let updatePersistenceQueue = Promise.resolve()
   const flushUpdates = () => {
     if (!job.pendingUpdates.length) return
-    const n = job.pendingUpdates.length
-    const nullReactions = job.pendingUpdates.filter(r =>
+    const rows = job.pendingUpdates.splice(0, job.pendingUpdates.length)
+    const n = rows.length
+    const nullReactions = rows.filter(r =>
       Object.prototype.hasOwnProperty.call(r, 'reactions') && r.reactions == null
     ).length
-    const t0 = Date.now()
-    try {
-      db.bulkUpdateParentExternalId(sourceId, job.pendingUpdates)
-    } catch (err) {
-      console.error('[Jobs] tg_reply_backfill UPDATE failed', err)
-    }
-    console.log(`[Jobs] tg_reply_backfill #${id} flush updates=${n} null_reactions=${nullReactions} took ${Date.now() - t0}ms`)
-    job.pendingUpdates = []
+    updatePersistenceQueue = updatePersistenceQueue.then(async () => {
+      const t0 = Date.now()
+      try {
+        await applyTelegramReplyUpdates({ source_id: sourceId, rows })
+      } catch (error) {
+        console.error('[Jobs] tg_reply_backfill persistence worker failed; falling back to main', error)
+        db.bulkUpdateParentExternalId(sourceId, rows)
+      }
+      console.log(`[Jobs] tg_reply_backfill #${id} flush updates=${n} null_reactions=${nullReactions} took ${Date.now() - t0}ms`)
+    })
   }
 
   const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
@@ -3549,6 +3882,14 @@ function startTelegramReplyBackfill(params) {
         if (job.pendingUpdates.length >= 100) flushUpdates()
         break
       }
+      case 'backfill-plan':
+        job.items_total = Number(evt.items_total || 0)
+        if (job.dbRowId) {
+          try { db.updateJob(job.dbRowId, { items_total: job.items_total }) }
+          catch (err) { console.error('[Jobs] tg_reply_backfill plan update failed', err) }
+        }
+        emit(job)
+        break
       case 'page':
         job.items_done = evt.loaded
         // Persist running progress into jobs row so JobDetail (which reads
@@ -3562,21 +3903,36 @@ function startTelegramReplyBackfill(params) {
         break
       case 'error':
         if (!job.error) job.error = evt.message
+        job._protocolError = true
+        break
+      case 'done':
+        job._protocolDone = true
         break
     }
   })
   child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk.toString()).slice(-2000) })
 
   child.on('close', code => {
+    void (async () => {
     const closeStartedMs = Date.now()
     flushUpdates()
-    job.finished_at = Math.floor(Date.now() / 1000)
-    if (code === 0) {
-      job.status = 'done'
-    } else {
-      job.status = 'error'
-      job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
+    await updatePersistenceQueue
+    if (job._cancelEscalationTimer) {
+      clearTimeout(job._cancelEscalationTimer)
+      job._cancelEscalationTimer = null
     }
+    job.finished_at = Math.floor(Date.now() / 1000)
+    const outcome = resolveTelegramProcessOutcome({
+      cancelRequested: job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled',
+      exitCode: code,
+      protocolDone: job._protocolDone === true,
+      protocolError: job._protocolError === true,
+      error: job.error || null,
+      stderrTail,
+    })
+    job.status = outcome.status
+    job.error = outcome.error
+    if (outcome.errorCode) job.error_code = job.error_code || outcome.errorCode
     if (job.status === 'done') {
       clearTelegramUnavailableAfterLiveResolve(sourceId, `tg_reply_backfill #${id}`)
     }
@@ -3611,6 +3967,16 @@ function startTelegramReplyBackfill(params) {
     }
     console.log(`[Jobs] end tg_reply_backfill #${id} status=${job.status} resolved=${job.tg_reply_backfill.resolved} with_parent=${job.tg_reply_backfill.with_parent} reactions_checked=${job.reaction_checked} reactions_null=${job.reaction_null} close_ms=${Date.now() - closeStartedMs}`)
     emit(job)
+    markJobClosed(job)
+    })().catch(error => {
+      job.status = 'error'
+      job.error = String(error?.message || error)
+      job.finished_at = Math.floor(Date.now() / 1000)
+      delete job.pendingUpdates
+      console.error(`[Jobs] tg_reply_backfill #${id} close failed`, error)
+      emit(job)
+      markJobClosed(job)
+    })
   })
 
   return id
@@ -3692,6 +4058,13 @@ function startTelegramFolderFetch(params) {
       total_items:  0,
     },
     child: null,                   // umbrella has no real child; cancel-aware
+  }
+  job.cancel = () => {
+    job._cancelRequested = true
+    const childId = job.tg_folder.child_job_id
+    console.log(`[Jobs] tg_folder_fetch #${id} cancel hook child=${childId ?? '-'}`)
+    if (childId != null) return cancelJob(childId)
+    return true
   }
   jobs.set(id, job)
   emit(job)
@@ -3794,7 +4167,11 @@ function startTelegramFolderFetch(params) {
     }
 
     // Whole batch done.
-    if (job.status === 'running') {
+    if (job._cancelRequested || job.status === 'cancelling') {
+      job.status = 'cancelled'
+      job.error = null
+      job.finished_at = Math.floor(Date.now() / 1000)
+    } else if (job.status === 'running') {
       finalizeTelegramUmbrellaStatus(job)
       job.finished_at = Math.floor(Date.now() / 1000)
     }
@@ -3907,6 +4284,13 @@ function startTelegramCatchUp(params) {
     },
     child: null,
   }
+  job.cancel = () => {
+    job._cancelRequested = true
+    const childId = job.tg_folder.child_job_id
+    console.log(`[Jobs] tg_catchup #${id} cancel hook child=${childId ?? '-'}`)
+    if (childId != null) return cancelJob(childId)
+    return true
+  }
   jobs.set(id, job)
   emit(job)
 
@@ -4005,35 +4389,35 @@ function startTelegramCatchUp(params) {
       emit(job)
     }
 
-    if (job.status === 'running') {
+    if (job._cancelRequested || job.status === 'cancelling') {
+      job.status = 'cancelled'
+      job.error = null
+      job.finished_at = Math.floor(Date.now() / 1000)
+    } else if (job.status === 'running') {
       finalizeTelegramUmbrellaStatus(job)
       job.finished_at = Math.floor(Date.now() / 1000)
     }
     job.tg_folder.current_target = null
     job.tg_folder.child_job_id   = null
 
-    const suppressAutoNoopHistory = params.auto === true
-      && job.status === 'done'
-      && Number(job.tg_folder.total_items || 0) <= 0
-    if (suppressAutoNoopHistory) {
-      job.params = { ...(job.params || {}), _history_suppressed: true }
-      console.log(`[Jobs] tg_catchup #${id} auto no-op: history row suppressed`)
-    } else {
-      try {
-        db.recordJob({
-          type:        job.type,
-          source_id:   null,
-          status:      job.status,
-          items_total: job.tg_folder.total_chats,
-          items_done:  job.tg_folder.done_chats,
-          params:      { ...job.params, _summary: job.tg_folder },
-          error:       job.error || null,
-          started_at:  job.started_at,
-          finished_at: job.finished_at,
-        })
-      } catch (err) {
-        console.error('[Jobs] tg_catchup recordJob failed', err)
-      }
+    // Automatic network work is still real user-visible work when it finds
+    // zero messages. Keep one umbrella row in Activity/History; only the 40
+    // no-op child rows stay suppressed. Hiding the umbrella made the navbar
+    // report zero while Telethon was actively walking chats.
+    try {
+      db.recordJob({
+        type:        job.type,
+        source_id:   null,
+        status:      job.status,
+        items_total: job.tg_folder.total_chats,
+        items_done:  job.tg_folder.done_chats,
+        params:      { ...job.params, _summary: job.tg_folder },
+        error:       job.error || null,
+        started_at:  job.started_at,
+        finished_at: job.finished_at,
+      })
+    } catch (err) {
+      console.error('[Jobs] tg_catchup recordJob failed', err)
     }
 
     console.log(`[Jobs] end tg_catchup #${id} status=${job.status} done=${job.tg_folder.done_chats}/${job.tg_folder.total_chats} items=${job.tg_folder.total_items}`)
@@ -4117,7 +4501,10 @@ function startTelegramPreview(params) {
   })
 
   child.on('close', code => {
-    if (job.status === 'running') {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       if (code === 0 && job.preview_summary) {
         job.status = 'done'
       } else {
@@ -4345,7 +4732,10 @@ function attachYoutubeCommentsStreams(job, child) {
 
   child.on('close', code => {
     job.child = null
-    if (job.status === 'running') {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       if (code === 0) {
         if (!job.file_path) {
           job.status = 'error'
@@ -4443,10 +4833,9 @@ function handleYoutubeCommentsEvent(job, evt) {
         count_top:     evt.count_top,
         count_replies: evt.count_replies,
       }
-      try {
-        const r = copyFileToClipboard(evt.file_path)
-        if (r.ok) job.yt_comments.copied_bytes = r.bytes
-      } catch {}
+      scheduleAutoCopy(job, evt.file_path, result => {
+        job.yt_comments.copied_bytes = result.bytes
+      })
       break
     case 'done':
       if (job.status === 'running' && job.file_path) {
@@ -4461,18 +4850,36 @@ function handleYoutubeCommentsEvent(job, evt) {
   }
 }
 
-function copyFileToClipboard(filePath) {
+async function copyFileToClipboard(filePath) {
   // Used by both fresh and cached YouTube flow.
-  // Returns { ok, bytes? | error }. Pure side-effect; caller decides UI.
+  // Resolves to { ok, bytes? | error }; file I/O stays in the read worker.
   const { clipboard } = require('electron')
   try {
-    const content = fs.readFileSync(filePath, 'utf8')
-    clipboard.writeText(content)
+    let result
+    try {
+      result = await dbRead.request('readTextFiles', [filePath], { trim: false, separator: '' })
+    } catch (workerError) {
+      console.error('[Jobs] auto-copy read worker failed; falling back to async fs', workerError)
+      const text = await fs.promises.readFile(filePath, 'utf8')
+      result = { text, parts: 1, bytes: Buffer.byteLength(text, 'utf8') }
+    }
+    if (!result?.parts) return { ok: false, error: 'File not found' }
+    clipboard.writeText(result.text)
     playClipboardSound()
-    return { ok: true, bytes: content.length }
+    return { ok: true, bytes: result.bytes }
   } catch (err) {
     return { ok: false, error: String(err) }
   }
+}
+
+function scheduleAutoCopy(job, filePath, onCopied) {
+  void copyFileToClipboard(filePath).then(result => {
+    if (!result?.ok) return
+    try { onCopied?.(result) } catch {}
+    emit(job)
+  }).catch(error => {
+    console.error('[Jobs] auto-copy failed', error)
+  })
 }
 
 // Plays macOS system "Blow.aiff" — fire-and-forget. Used after every auto-copy
@@ -4587,7 +4994,10 @@ function attachYoutubeStreams(job, child) {
     job.child = null
     // If the child finished but we already moved into a terminal state via
     // its events ('done' for subs/ai, or 'awaiting_ai'), don't override.
-    if (job.status === 'running') {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       if (code === 0) {
         // No saved file but exit 0 → could be subs_missing without follow-up
         // (handled in handleYoutubeEvent), or an unexpected silent exit.
@@ -4736,10 +5146,9 @@ function handleYoutubeEvent(job, evt) {
       job.yt = { ...(job.yt || {}), file_path: evt.file_path, kind: evt.kind, chars: evt.chars }
       // Auto-copy the transcript to clipboard the moment it's saved — this
       // matches the CLI behaviour ('paste URL → text in clipboard').
-      try {
-        const r = copyFileToClipboard(evt.file_path)
-        if (r.ok) job.yt.copied_bytes = r.bytes
-      } catch {}
+      scheduleAutoCopy(job, evt.file_path, result => {
+        job.yt.copied_bytes = result.bytes
+      })
       // Persist the video as an items-row under its channel — cross-context
       // cache hits read from items.transcript_path. Same shape that
       // yt_batch_transcribe writes per-video on save.
@@ -4802,14 +5211,46 @@ function timedYoutubeCachePath(sourceFilePath, videoId) {
   return path.join(path.dirname(source), basename.replace(/\.txt$/i, '__timestamps.txt'))
 }
 
+function findExistingTimedYoutubeTranscript(videoId) {
+  if (!videoId) return null
+  try {
+    const candidates = fs.readdirSync(YT_TRANSCRIPTS_DIR)
+      .filter(name => name.startsWith(`${videoId}__`) && name.endsWith('__timestamps.txt'))
+      .map(name => {
+        const filePath = path.join(YT_TRANSCRIPTS_DIR, name)
+        let mtimeMs = 0
+        try { mtimeMs = fs.statSync(filePath).mtimeMs } catch {}
+        return { filePath, mtimeMs }
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    return candidates[0]?.filePath || null
+  } catch {
+    return null
+  }
+}
+
+function hasPreciseYoutubeTimestamps(filePath) {
+  if (!filePath) return false
+  try {
+    const text = fs.readFileSync(filePath, 'utf8')
+    return /^\[\d{2}:\d{2}:\d{2}[.,]\d{3}\]\s+/m.test(text)
+  } catch {
+    return false
+  }
+}
+
 function createYoutubeTimedTranscript(params = {}) {
   const url = String(params.url || '').trim()
   const videoId = youtubeVideoIdFromUrl(url)
   if (!videoId) return Promise.resolve({ ok: false, error: 'Не удалось распознать YouTube URL' })
 
   const cachedPath = timedYoutubeCachePath(params.sourceFilePath, videoId)
-  if (cachedPath && fs.existsSync(cachedPath)) {
+    || findExistingTimedYoutubeTranscript(videoId)
+  if (cachedPath && fs.existsSync(cachedPath) && hasPreciseYoutubeTimestamps(cachedPath)) {
     return Promise.resolve({ ok: true, file_path: cachedPath, cached: true })
+  }
+  if (cachedPath && fs.existsSync(cachedPath)) {
+    console.log(`[Jobs] stale yt_timed_derive cache video=${videoId} reason=second_precision`)
   }
   if (timedYoutubeRequests.has(videoId)) return timedYoutubeRequests.get(videoId)
 
@@ -4821,7 +5262,10 @@ function createYoutubeTimedTranscript(params = {}) {
       '--out-dir', YT_TRANSCRIPTS_DIR,
       '--lang', lang,
       '--with-ts',
+      '--captions-only',
     ]
+    const title = String(params.title || '').trim()
+    if (title) args.push('--title', title.slice(0, 300))
     console.log(`[Jobs] start yt_timed_derive video=${videoId} lang=${lang}`)
     const child = spawn(WORKER_PYTHON, args, {
       cwd: WORKERS_ROOT,
@@ -4999,7 +5443,10 @@ function attachRutubeStreams(job, child) {
   })
   child.on('close', code => {
     job.child = null
-    if (job.status === 'running') {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       if (code === 0 && job.file_path) {
         job.status = 'done'
       } else if (code !== null) {
@@ -5126,10 +5573,9 @@ function handleRutubeEvent(job, event) {
         kind: event.kind,
         chars: event.chars,
       }
-      try {
-        const copied = copyFileToClipboard(event.file_path)
-        if (copied.ok) job.rutube.copied_bytes = copied.bytes
-      } catch {}
+      scheduleAutoCopy(job, event.file_path, result => {
+        job.rutube.copied_bytes = result.bytes
+      })
       break
     }
     case 'done':
@@ -5237,15 +5683,40 @@ function startYoutubeChannelFetch(params) {
   })
 
   child.on('close', code => {
-    if (job.status === 'running') {
+    void (async () => {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       job.status = code === 0 ? 'done' : 'error'
       if (code !== 0) job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
     }
     job.finished_at = Math.floor(Date.now() / 1000)
 
     // Persist videos → items (idempotent via UPSERT). Only on success.
+    let finalizedInWorker = false
+    if (job.source_id && job.items.length && job.status === 'done') {
+      job.phase = 'finalizing'
+      job.status = 'running'
+      emit(job)
+      try {
+        const result = await finalizeCatalogJob({
+          kind: 'youtube-channel',
+          source_id: job.source_id,
+          items: job.items,
+          status: 'done',
+          date_from: job.yt_channel?.date_min,
+          date_to: job.yt_channel?.date_max,
+        })
+        finalizedInWorker = true
+        console.log(`[CatalogFinalizer] yt source #${job.source_id} rows=${result.rows || 0}`)
+      } catch (error) {
+        console.error('[CatalogFinalizer] YouTube worker failed; falling back to main', error)
+      }
+      job.status = 'done'
+    }
     try {
-      if (job.source_id && job.items.length && job.status === 'done') {
+      if (!finalizedInWorker && job.source_id && job.items.length && job.status === 'done') {
         const rows = job.items.map(v => ({
           source_id:        job.source_id,
           external_id:      String(v.video_id),
@@ -5292,9 +5763,21 @@ function startYoutubeChannelFetch(params) {
     // we last update the list".  Only batch transcribes / TG fetches stay.
 
     delete job.items
+    job.phase = 'terminal'
     const dur = job.finished_at - job.started_at
     console.log(`[Jobs] end #${id} status=${job.status} items=${job.items_done} duration=${dur}s${job.error ? ' error=' + job.error : ''}`)
     emit(job)
+    markJobClosed(job)
+    })().catch(error => {
+      job.status = 'error'
+      job.phase = 'terminal'
+      job.error = String(error?.message || error)
+      job.finished_at = Math.floor(Date.now() / 1000)
+      delete job.items
+      console.error(`[Jobs] yt_channel_fetch #${id} close failed`, error)
+      emit(job)
+      markJobClosed(job)
+    })
   })
 
   return id
@@ -5429,8 +5912,7 @@ function _synthesiseAllCachedBatchJob(params, cachedFiles) {
   return id
 }
 
-function startYoutubeBatchTranscribe(params) {
-  const id = nextId++
+async function startYoutubeBatchTranscribe(params) {
   if (!Array.isArray(params.video_ids) || params.video_ids.length === 0) {
     throw new Error('video_ids must be a non-empty array')
   }
@@ -5442,18 +5924,25 @@ function startYoutubeBatchTranscribe(params) {
   // `params.video_ids` (audit) and the actual spawn-list as
   // `params.video_ids_run` so JobDetail still renders all selected rows
   // (cached ones get '✓ из кэша').
-  const cacheMap = db.findYoutubeTranscriptsByVideoIds(params.video_ids)
-  // Keep cache hits whose file is still on disk; stale (deleted file) entries
-  // fall back to a fresh transcribe.
-  const cachedIds = []
-  const cachedFiles = {}
-  for (const [vid, hit] of cacheMap) {
-    if (hit.file_path && fs.existsSync(hit.file_path)) {
-      cachedIds.push(vid); cachedFiles[vid] = hit.file_path
+  let cachePlan
+  try {
+    cachePlan = await dbRead.request('youtubeBatchCachePlan', params.video_ids)
+  } catch (workerError) {
+    console.error('[Jobs] YouTube batch cache worker failed; falling back to main', workerError)
+    const cacheMap = db.findYoutubeTranscriptsByVideoIds(params.video_ids)
+    const cachedFiles = {}
+    for (const [videoId, hit] of cacheMap) {
+      if (hit.file_path && fs.existsSync(hit.file_path)) cachedFiles[String(videoId)] = hit.file_path
+    }
+    const cachedIds = Object.keys(cachedFiles)
+    const cached = new Set(cachedIds)
+    cachePlan = {
+      cachedIds,
+      cachedFiles,
+      runIds: params.video_ids.map(String).filter(videoId => !cached.has(videoId)),
     }
   }
-  const cachedSet = new Set(cachedIds)
-  const runIds = params.video_ids.filter(v => !cachedSet.has(v))
+  const { cachedIds, cachedFiles, runIds } = cachePlan
 
   if (runIds.length === 0) {
     // Nothing to spawn — every selected video already has a transcript.
@@ -5465,6 +5954,8 @@ function startYoutubeBatchTranscribe(params) {
   if (cachedIds.length > 0) {
     console.log(`[Jobs] yt_batch_transcribe pre-filter: ${cachedIds.length}/${params.video_ids.length} already cached`)
   }
+
+  const id = nextId++
 
   const args = [
     YT_BATCH_SCRIPT,
@@ -5537,26 +6028,61 @@ function startYoutubeBatchTranscribe(params) {
   })
 
   child.on('close', code => {
-    if (job.status === 'running') {
+    void (async () => {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       job.status = code === 0 ? 'done' : 'error'
       if (code !== 0) job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
     }
     job.finished_at = Math.floor(Date.now() / 1000)
+
+    const terminalStatus = job.status
+    job.phase = 'finalizing'
+    job.status = terminalStatus === 'cancelled' ? 'cancelling' : 'running'
+    emit(job)
+    await waitForJobPersistence(job)
+
+    const persistParams = { ...job.params }
+    if (job.params?.is_search) {
+      persistParams.video_files = (job.yt_batch.log || [])
+        .filter(row => row.file_path)
+        .reduce((map, row) => { map[row.video_id] = row.file_path; return map }, {})
+    }
+    let finalizedInWorker = false
+    try {
+      await finalizeBatchJob({
+        job: {
+          type: 'yt_batch_transcribe',
+          source_id: params.source_id || null,
+          status: terminalStatus,
+          items_total: params.video_ids.length,
+          items_done: job.yt_batch.saved,
+          items_failed: job.yt_batch.errors,
+          cost_usd: job.yt_batch.cost_usd,
+          params: persistParams,
+          error: job.error,
+          started_at: job.started_at,
+          finished_at: job.finished_at,
+        },
+        coverage: params.source_id && job.yt_batch.saved > 0 ? {
+          source_id: params.source_id,
+          content_type: 'video', depth: 'transcribed', items_count: job.yt_batch.saved,
+        } : null,
+      })
+      finalizedInWorker = true
+    } catch (error) {
+      console.error('[Jobs] yt_batch finalizer worker failed; falling back to main', error)
+    }
+    job.status = terminalStatus
 
     try {
       // For sourceless search-batches, persist the full video metadata
       // and per-video file paths into params so JobDetail can render the
       // finalized list and yt:assembleBatchTranscript can rebuild after
       // restart without touching the items table.
-      const persistParams = { ...job.params }
-      if (job.params?.is_search) {
-        persistParams.video_files = (job.yt_batch.log || [])
-          .filter(r => r.file_path)
-          .reduce((m, r) => { m[r.video_id] = r.file_path; return m }, {})
-        // Cached pre-fills (kind='cache') already in seedLog so the loop
-        // above naturally picks them up — no separate merge needed.
-      }
-      db.recordJob({
+      if (!finalizedInWorker) db.recordJob({
         type:        'yt_batch_transcribe',
         source_id:   params.source_id || null,
         status:      job.status,
@@ -5572,7 +6098,7 @@ function startYoutubeBatchTranscribe(params) {
 
       // Coverage: each transcribed video bumps depth. We record one row
       // for the slice of videos the batch actually saved.
-      if (params.source_id && job.yt_batch.saved > 0) {
+      if (!finalizedInWorker && params.source_id && job.yt_batch.saved > 0) {
         db.recordCoverage({
           source_id:    params.source_id,
           job_id:       null,
@@ -5588,8 +6114,19 @@ function startYoutubeBatchTranscribe(params) {
     }
 
     const dur = job.finished_at - job.started_at
+    job.phase = 'terminal'
     console.log(`[Jobs] end #${id} status=${job.status} saved=${job.yt_batch.saved} skipped=${job.yt_batch.skipped} errors=${job.yt_batch.errors} cost=$${job.yt_batch.cost_usd.toFixed(4)} duration=${dur}s`)
     emit(job)
+    markJobClosed(job)
+    })().catch(error => {
+      job.status = 'error'
+      job.phase = 'terminal'
+      job.error = String(error?.message || error)
+      job.finished_at = Math.floor(Date.now() / 1000)
+      console.error(`[Jobs] yt_batch_transcribe #${id} close failed`, error)
+      emit(job)
+      markJobClosed(job)
+    })
   })
 
   return id
@@ -5625,17 +6162,19 @@ function handleBatchEvent(job, evt) {
       job.items_done = (b.saved + b.skipped + b.errors)
       // Persist transcript path on the corresponding item row
       if (job.params?.source_id) {
-        try {
-          db.markItemTranscribed({
-            source_id:       job.params.source_id,
-            external_id:     evt.video_id,
-            transcript_path: evt.file_path,
-            engine:          evt.kind === 'ai' ? (job.params.engine || 'gemini') : 'subs',
-            cost_usd:        evt.cost_usd || null,
-          })
-        } catch (err) {
-          console.error('[Jobs] markItemTranscribed failed', err)
+        const args = {
+          source_id: job.params.source_id,
+          external_id: evt.video_id,
+          transcript_path: evt.file_path,
+          engine: evt.kind === 'ai' ? (job.params.engine || 'gemini') : 'subs',
+          cost_usd: evt.cost_usd || null,
         }
+        queueJobPersistence(
+          job,
+          `yt_batch #${job.id} mark transcript`,
+          () => persistItemMutation({ method: 'markItemTranscribed', args }),
+          () => db.markItemTranscribed(args),
+        )
       }
       b.log.push({ video_id: evt.video_id, kind: evt.kind, file_path: evt.file_path })
       emit(job)
@@ -6010,14 +6549,39 @@ function startTiktokChannelFetch(params) {
   })
 
   child.on('close', code => {
-    if (job.status === 'running') {
+    void (async () => {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       job.status = code === 0 ? 'done' : 'error'
       if (code !== 0) job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
     }
     job.finished_at = Math.floor(Date.now() / 1000)
 
+    let finalizedInWorker = false
+    if (job.source_id && job.items.length && job.status === 'done') {
+      job.phase = 'finalizing'
+      job.status = 'running'
+      emit(job)
+      try {
+        const result = await finalizeCatalogJob({
+          kind: 'tiktok-channel',
+          source_id: job.source_id,
+          items: job.items,
+          status: 'done',
+          date_from: job.tk_channel?.date_min,
+          date_to: job.tk_channel?.date_max,
+        })
+        finalizedInWorker = true
+        console.log(`[CatalogFinalizer] TikTok source #${job.source_id} rows=${result.rows || 0}`)
+      } catch (error) {
+        console.error('[CatalogFinalizer] TikTok worker failed; falling back to main', error)
+      }
+      job.status = 'done'
+    }
     try {
-      if (job.source_id && job.items.length && job.status === 'done') {
+      if (!finalizedInWorker && job.source_id && job.items.length && job.status === 'done') {
         const rows = job.items.map(v => ({
           source_id:        job.source_id,
           external_id:      String(v.video_id),
@@ -6056,9 +6620,21 @@ function startTiktokChannelFetch(params) {
     }
 
     delete job.items
+    job.phase = 'terminal'
     const dur = job.finished_at - job.started_at
     console.log(`[Jobs] end #${id} status=${job.status} items=${job.items_done} duration=${dur}s${job.error ? ' error=' + job.error : ''}`)
     emit(job)
+    markJobClosed(job)
+    })().catch(error => {
+      job.status = 'error'
+      job.phase = 'terminal'
+      job.error = String(error?.message || error)
+      job.finished_at = Math.floor(Date.now() / 1000)
+      delete job.items
+      console.error(`[Jobs] tk_channel_fetch #${id} close failed`, error)
+      emit(job)
+      markJobClosed(job)
+    })
   })
 
   return id
@@ -6256,10 +6832,9 @@ function handleTiktokSingleEvent(job, evt) {
     case 'saved':
       job.file_path = evt.file_path
       job.tk = { ...(job.tk || {}), file_path: evt.file_path, kind: evt.kind, chars: evt.chars }
-      try {
-        const r = copyFileToClipboard(evt.file_path)
-        if (r.ok) job.tk.copied_bytes = r.bytes
-      } catch {}
+      scheduleAutoCopy(job, evt.file_path, result => {
+        job.tk.copied_bytes = result.bytes
+      })
       break
     case 'done':
       // status flip happens on close
@@ -6320,14 +6895,50 @@ function startTiktokBatchTranscribe(params) {
   })
 
   child.on('close', code => {
-    if (job.status === 'running') {
+    void (async () => {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       job.status = code === 0 ? 'done' : 'error'
       if (code !== 0) job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
     }
     job.finished_at = Math.floor(Date.now() / 1000)
 
+    const terminalStatus = job.status
+    job.phase = 'finalizing'
+    job.status = terminalStatus === 'cancelled' ? 'cancelling' : 'running'
+    emit(job)
+    await waitForJobPersistence(job)
+    let finalizedInWorker = false
     try {
-      db.recordJob({
+      await finalizeBatchJob({
+        job: {
+          type: 'tk_batch_transcribe',
+          source_id: params.source_id || null,
+          status: terminalStatus,
+          items_total: params.video_ids.length,
+          items_done: job.tk_batch.saved,
+          items_failed: job.tk_batch.errors,
+          cost_usd: job.tk_batch.cost_usd,
+          params: job.params,
+          error: job.error,
+          started_at: job.started_at,
+          finished_at: job.finished_at,
+        },
+        coverage: params.source_id && job.tk_batch.saved > 0 ? {
+          source_id: params.source_id,
+          content_type: 'video', depth: 'transcribed', items_count: job.tk_batch.saved,
+        } : null,
+      })
+      finalizedInWorker = true
+    } catch (error) {
+      console.error('[Jobs] tk_batch finalizer worker failed; falling back to main', error)
+    }
+    job.status = terminalStatus
+
+    try {
+      if (!finalizedInWorker) db.recordJob({
         type:        'tk_batch_transcribe',
         source_id:   params.source_id || null,
         status:      job.status,
@@ -6340,7 +6951,7 @@ function startTiktokBatchTranscribe(params) {
         started_at:  job.started_at,
         finished_at: job.finished_at,
       })
-      if (params.source_id && job.tk_batch.saved > 0) {
+      if (!finalizedInWorker && params.source_id && job.tk_batch.saved > 0) {
         db.recordCoverage({
           source_id:    params.source_id,
           job_id:       null,
@@ -6356,8 +6967,19 @@ function startTiktokBatchTranscribe(params) {
     }
 
     const dur = job.finished_at - job.started_at
+    job.phase = 'terminal'
     console.log(`[Jobs] end #${id} status=${job.status} saved=${job.tk_batch.saved} errors=${job.tk_batch.errors} cost=$${job.tk_batch.cost_usd.toFixed(4)} duration=${dur}s`)
     emit(job)
+    markJobClosed(job)
+    })().catch(error => {
+      job.status = 'error'
+      job.phase = 'terminal'
+      job.error = String(error?.message || error)
+      job.finished_at = Math.floor(Date.now() / 1000)
+      console.error(`[Jobs] tk_batch_transcribe #${id} close failed`, error)
+      emit(job)
+      markJobClosed(job)
+    })
   })
 
   return id
@@ -6383,17 +7005,19 @@ function handleTiktokBatchEvent(job, evt) {
       b.saved += 1
       job.items_done = (b.saved + b.skipped + b.errors)
       if (job.params?.source_id) {
-        try {
-          db.markItemTranscribed({
-            source_id:       job.params.source_id,
-            external_id:     evt.video_id,
-            transcript_path: evt.file_path,
-            engine:          job.params.engine || 'gemini',
-            cost_usd:        evt.cost_usd || null,
-          })
-        } catch (err) {
-          console.error('[Jobs] markItemTranscribed (tiktok) failed', err)
+        const args = {
+          source_id: job.params.source_id,
+          external_id: evt.video_id,
+          transcript_path: evt.file_path,
+          engine: job.params.engine || 'gemini',
+          cost_usd: evt.cost_usd || null,
         }
+        queueJobPersistence(
+          job,
+          `tk_batch #${job.id} mark transcript`,
+          () => persistItemMutation({ method: 'markItemTranscribed', args }),
+          () => db.markItemTranscribed(args),
+        )
       }
       b.log.push({ video_id: evt.video_id, kind: evt.kind, file_path: evt.file_path })
       emit(job)
@@ -6475,17 +7099,54 @@ function startInstagramProfileFetch(params) {
   })
 
   child.on('close', code => {
-    if (job.status === 'running') {
+    void (async () => {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       job.status = code === 0 ? 'done' : 'error'
       if (code !== 0) job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
     }
     job.finished_at = Math.floor(Date.now() / 1000)
     const dur = job.finished_at - job.started_at
 
+    const terminalStatus = job.status
+    const approxCost = terminalStatus === 'done' && job.params?.backend === 'apify' ? 0.0026 : 0
+    job.cost_usd = approxCost
+    let finalizedInWorker = false
+    if (job.source_id && job.items.length) {
+      job.phase = 'finalizing'
+      job.status = terminalStatus === 'cancelled' ? 'cancelling' : 'running'
+      emit(job)
+      try {
+        const result = await finalizeCatalogJob({
+          kind: 'instagram-profile',
+          source_id: job.source_id,
+          items: job.items,
+          status: terminalStatus,
+          job_type: job.type,
+          items_done: job.items_done,
+          type_breakdown: job.type_breakdown,
+          params: job.params,
+          error: job.error,
+          cost_usd: approxCost,
+          date_from: job.date_min,
+          date_to: job.date_max,
+          started_at: job.started_at,
+          finished_at: job.finished_at,
+        })
+        finalizedInWorker = true
+        console.log(`[CatalogFinalizer] Instagram source #${job.source_id} rows=${result.rows || 0}`)
+      } catch (error) {
+        console.error('[CatalogFinalizer] Instagram worker failed; falling back to main', error)
+      }
+      job.status = terminalStatus
+    }
+
     // Persist items into SQLite. external_id already prefixed (reel:/post:)
     // by the Python side, so reels and posts can co-exist for the same source.
     try {
-      if (job.source_id && job.items.length) {
+      if (!finalizedInWorker && job.source_id && job.items.length) {
         const rows = job.items.map(it => ({
           source_id:        job.source_id,
           external_id:      String(it.external_id),
@@ -6511,13 +7172,11 @@ function startInstagramProfileFetch(params) {
 
     // Coverage rows + jobs row.
     try {
-      if (job.source_id && job.status === 'done' && Object.keys(job.type_breakdown).length) {
+      if (!finalizedInWorker && job.source_id && job.status === 'done' && Object.keys(job.type_breakdown).length) {
         // Approximate cost — we don't have per-item cost for profile-
         // fetch, but Apify charges ~$0.0026 per actor run. So at least
         // the user sees «бесплатно» on android-api and «$0.0026» on apify
         // in JobDetail.
-        const approxCost = job.params?.backend === 'apify' ? 0.0026 : 0
-        job.cost_usd = approxCost
         const jobIdInDb = db.recordJob({
           type: job.type, source_id: job.source_id, status: job.status,
           items_total: job.items_done, items_done: job.items_done,
@@ -6542,8 +7201,20 @@ function startInstagramProfileFetch(params) {
     }
 
     delete job.items
+    job.phase = 'terminal'
     console.log(`[Jobs] end #${id} status=${job.status} items=${job.items_done} duration=${dur}s${job.error ? ' error=' + job.error : ''}`)
     emit(job)
+    markJobClosed(job)
+    })().catch(error => {
+      job.status = 'error'
+      job.phase = 'terminal'
+      job.error = String(error?.message || error)
+      job.finished_at = Math.floor(Date.now() / 1000)
+      delete job.items
+      console.error(`[Jobs] ig_profile_fetch #${id} close failed`, error)
+      emit(job)
+      markJobClosed(job)
+    })
   })
 
   return id
@@ -6678,7 +7349,11 @@ function startInstagramBatchTranscribe(params) {
   })
 
   child.on('close', code => {
-    if (job.status === 'running') {
+    void (async () => {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       const allFailed = job.yt_batch.saved === 0 && (job.yt_batch.errors > 0 || !!job.error)
       job.status = code === 0 && !allFailed ? 'done' : 'error'
       if (code !== 0) job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
@@ -6686,20 +7361,55 @@ function startInstagramBatchTranscribe(params) {
     job.finished_at = Math.floor(Date.now() / 1000)
     if (job.error_code) job.params._error_code = job.error_code
 
+    const terminalStatus = job.status
+    job.phase = 'finalizing'
+    job.status = terminalStatus === 'cancelled' ? 'cancelling' : 'running'
+    emit(job)
+    await waitForJobPersistence(job)
+    const saved = (job.yt_batch.log || []).filter(entry => entry.kind === 'ai' && entry.file_path)
+    const date = new Date((job.started_at || Math.floor(Date.now() / 1000)) * 1000).toISOString().slice(0, 10)
+    const combinedPath = saved.length ? path.join(JOBS_DIR, `${date}_ig_batch_${id}_combined.txt`) : null
+    let finalizedInWorker = false
+    try {
+      const result = await finalizeBatchJob({
+        job: {
+          type: 'ig_batch_transcribe',
+          source_id: params.source_id || null,
+          status: terminalStatus,
+          items_total: params.shortcodes.length,
+          items_done: job.yt_batch.saved,
+          items_failed: job.yt_batch.errors,
+          cost_usd: job.yt_batch.cost_usd,
+          params: job.params,
+          error: job.error,
+          started_at: job.started_at,
+          finished_at: job.finished_at,
+        },
+        coverage: params.source_id && job.yt_batch.saved > 0 ? {
+          source_id: params.source_id,
+          content_type: 'video', depth: 'transcribed', items_count: job.yt_batch.saved,
+        } : null,
+        combine_paths: saved.map(entry => entry.file_path),
+        combine_output_path: combinedPath,
+      })
+      job.file_path = result.file_path || null
+      finalizedInWorker = true
+    } catch (error) {
+      console.error('[Jobs] ig_batch finalizer worker failed; falling back to main', error)
+    }
+    job.status = terminalStatus
+
     // Combined transcript sidecar — automatic for Instagram because every
     // saved reel is a paid AI transcript (no free subs path), so a job-
     // level artefact is what the user comes back to. Writes to JOBS_DIR
     // alongside the rest of the job sidecars.
     try {
-      const saved = (job.yt_batch.log || []).filter(e => e.kind === 'ai' && e.file_path)
-      if (saved.length > 0) {
+      if (!finalizedInWorker && saved.length > 0) {
         const SEP = '\n\n' + '='.repeat(72) + '\n\n'
         const chunks = []
         for (const e of saved) {
           try { chunks.push(fs.readFileSync(e.file_path, 'utf8')) } catch {}
         }
-        const dt = new Date((job.started_at || Math.floor(Date.now() / 1000)) * 1000)
-        const date = dt.toISOString().slice(0, 10)
         const fname = `${date}_ig_batch_${id}_combined.txt`
         const fpath = path.join(JOBS_DIR, fname)
         fs.writeFileSync(fpath, chunks.join(SEP), 'utf8')
@@ -6711,7 +7421,7 @@ function startInstagramBatchTranscribe(params) {
     }
 
     try {
-      db.recordJob({
+      if (!finalizedInWorker) db.recordJob({
         type:        'ig_batch_transcribe',
         source_id:   params.source_id || null,
         status:      job.status,
@@ -6725,7 +7435,7 @@ function startInstagramBatchTranscribe(params) {
         finished_at: job.finished_at,
         file_path:   job.file_path || null,
       })
-      if (params.source_id && job.yt_batch.saved > 0) {
+      if (!finalizedInWorker && params.source_id && job.yt_batch.saved > 0) {
         db.recordCoverage({
           source_id:    params.source_id,
           job_id:       null,
@@ -6741,8 +7451,19 @@ function startInstagramBatchTranscribe(params) {
     }
 
     const dur = job.finished_at - job.started_at
+    job.phase = 'terminal'
     console.log(`[Jobs] end #${id} status=${job.status} saved=${job.yt_batch.saved} errors=${job.yt_batch.errors} cost=$${job.yt_batch.cost_usd.toFixed(4)} duration=${dur}s`)
     emit(job)
+    markJobClosed(job)
+    })().catch(error => {
+      job.status = 'error'
+      job.phase = 'terminal'
+      job.error = String(error?.message || error)
+      job.finished_at = Math.floor(Date.now() / 1000)
+      console.error(`[Jobs] ig_batch_transcribe #${id} close failed`, error)
+      emit(job)
+      markJobClosed(job)
+    })
   })
 
   return id
@@ -6806,18 +7527,20 @@ function handleInstagramBatchEvent(job, evt) {
       b.saved += 1
       job.items_done = (b.saved + b.skipped + b.errors)
       if (job.params?.source_id) {
-        try {
-          db.markItemTranscribed({
-            source_id:       job.params.source_id,
-            // DB stores items with `reel:<code>`; Python emits bare code.
-            external_id:     `reel:${evt.video_id}`,
-            transcript_path: evt.file_path,
-            engine:          job.params.engine || 'gemini',
-            cost_usd:        evt.cost_usd || null,
-          })
-        } catch (err) {
-          console.error('[Jobs] ig markItemTranscribed failed', err)
+        const args = {
+          source_id: job.params.source_id,
+          // DB stores items with `reel:<code>`; Python emits bare code.
+          external_id: `reel:${evt.video_id}`,
+          transcript_path: evt.file_path,
+          engine: job.params.engine || 'gemini',
+          cost_usd: evt.cost_usd || null,
         }
+        queueJobPersistence(
+          job,
+          `ig_batch #${job.id} mark transcript`,
+          () => persistItemMutation({ method: 'markItemTranscribed', args }),
+          () => db.markItemTranscribed(args),
+        )
       }
       b.log.push({ video_id: evt.video_id, kind: 'ai', file_path: evt.file_path })
       emit(job)
@@ -6903,15 +7626,50 @@ function _startRedditCommon(scriptPath, args, jobType, target, params) {
   })
 
   child.on('close', code => {
-    if (job.status === 'running') {
+    void (async () => {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       job.status = code === 0 ? 'done' : 'error'
       if (code !== 0) job.error = job.error || `python exited ${code}: ${stderrTail.slice(-200)}`
     }
     job.finished_at = Math.floor(Date.now() / 1000)
     const dur = job.finished_at - job.started_at
 
+    const terminalStatus = job.status
+    let finalizedInWorker = false
+    if (job.source_id && job.items.length) {
+      job.phase = 'finalizing'
+      job.status = terminalStatus === 'cancelled' ? 'cancelling' : 'running'
+      emit(job)
+      try {
+        const result = await finalizeCatalogJob({
+          kind: 'reddit',
+          source_id: job.source_id,
+          items: job.items,
+          status: terminalStatus,
+          job_type: job.type,
+          items_done: job.items_done,
+          type_breakdown: job.type_breakdown,
+          params: job.params,
+          error: job.error,
+          cost_usd: job.cost_usd || 0,
+          date_from: job.date_min,
+          date_to: job.date_max,
+          started_at: job.started_at,
+          finished_at: job.finished_at,
+        })
+        finalizedInWorker = true
+        console.log(`[CatalogFinalizer] Reddit source #${job.source_id} rows=${result.rows || 0}`)
+      } catch (error) {
+        console.error('[CatalogFinalizer] Reddit worker failed; falling back to main', error)
+      }
+      job.status = terminalStatus
+    }
+
     try {
-      if (job.source_id && job.items.length) {
+      if (!finalizedInWorker && job.source_id && job.items.length) {
         const rows = job.items.map(it => ({
           source_id:        job.source_id,
           external_id:      String(it.external_id),
@@ -6938,7 +7696,7 @@ function _startRedditCommon(scriptPath, args, jobType, target, params) {
     }
 
     try {
-      if (job.source_id && job.status === 'done' && Object.keys(job.type_breakdown).length) {
+      if (!finalizedInWorker && job.source_id && job.status === 'done' && Object.keys(job.type_breakdown).length) {
         const cost = job.cost_usd != null ? job.cost_usd : 0
         const jobIdInDb = db.recordJob({
           type: job.type, source_id: job.source_id, status: job.status,
@@ -6964,8 +7722,20 @@ function _startRedditCommon(scriptPath, args, jobType, target, params) {
     }
 
     delete job.items
+    job.phase = 'terminal'
     console.log(`[Jobs] end #${id} status=${job.status} items=${job.items_done} duration=${dur}s${job.error ? ' error=' + job.error : ''}`)
     emit(job)
+    markJobClosed(job)
+    })().catch(error => {
+      job.status = 'error'
+      job.phase = 'terminal'
+      job.error = String(error?.message || error)
+      job.finished_at = Math.floor(Date.now() / 1000)
+      delete job.items
+      console.error(`[Jobs] ${job.type} #${id} close failed`, error)
+      emit(job)
+      markJobClosed(job)
+    })
   })
 
   return id
@@ -7179,14 +7949,23 @@ async function resumeYoutubeBatch(rowId) {
     // For interrupted runs we don't have that map yet, so we trust filesystem
     // via the search_videos title list — videos saved before the interrupt
     // have their .txt under YT_TRANSCRIPTS_DIR matching <video_id>__*.txt.
-    const remaining = []
-    for (const vid of allIds) {
-      const fp = (params.video_files || {})[vid]
-      if (fp && fs.existsSync(fp)) continue
-      // Filesystem fallback: look for any .txt starting with `<vid>__`.
-      const dirEntries = fs.readdirSync(YT_TRANSCRIPTS_DIR, { withFileTypes: true })
-      const found = dirEntries.find(d => d.isFile() && d.name.startsWith(`${vid}__`) && d.name.endsWith('.txt'))
-      if (!found) remaining.push(vid)
+    let remaining
+    try {
+      remaining = await dbRead.request(
+        'youtubeResumeRemaining', allIds, params.video_files || {}, YT_TRANSCRIPTS_DIR,
+      )
+    } catch (workerError) {
+      console.error('[Jobs] YouTube resume scan worker failed; falling back to main', workerError)
+      let dirEntries = []
+      try { dirEntries = fs.readdirSync(YT_TRANSCRIPTS_DIR, { withFileTypes: true }) } catch {}
+      const cachedIds = new Set(dirEntries
+        .filter(entry => entry.isFile() && entry.name.endsWith('.txt'))
+        .map(entry => entry.name.split('__', 1)[0]))
+      remaining = allIds.filter(videoId => {
+        const explicit = (params.video_files || {})[videoId]
+        if (explicit && fs.existsSync(explicit)) return false
+        return !cachedIds.has(String(videoId))
+      })
     }
     if (!remaining.length) {
       // All done already — flip the row to done so the UI stops nagging.
@@ -7195,7 +7974,7 @@ async function resumeYoutubeBatch(rowId) {
     }
 
     // Fresh batch with reduced video_ids; preserve search context if any.
-    const id = startYoutubeBatchTranscribe({
+    const id = await startYoutubeBatchTranscribe({
       ...params,
       video_ids: remaining,
       // search_videos / search_query / is_search are forwarded as-is
@@ -7303,20 +8082,26 @@ function persistBoostyCatalog({ entity, posts, thumbnails, summary, explicit = f
   return { sourceId, counts }
 }
 
-function startBoostyThumbnailCache({ sourceId, entity, posts, notifyJob = null, fullCatalog = false }) {
-  if (!sourceId || !entity?.author_handle || !Array.isArray(posts) || !posts.length) return
-  const items = []
-  for (const post of posts) {
-    if (post?.external_id && post?.thumbnail_url) {
-      items.push({ external_id: String(post.external_id), url: post.thumbnail_url })
-    }
-    for (const video of post?.videos || []) {
-      if (video?.video_id && video?.thumbnail_url) {
-        items.push({ external_id: String(video.video_id), url: video.thumbnail_url })
+async function startBoostyThumbnailCache({
+  sourceId, entity, posts, thumbnailItems = null, manifestPath: suppliedManifestPath = null,
+  thumbnailCount = 0, notifyJob = null, fullCatalog = false,
+}) {
+  if (!sourceId || !entity?.author_handle) return
+  const items = Array.isArray(thumbnailItems) ? thumbnailItems : []
+  if (!thumbnailItems && Array.isArray(posts)) {
+    for (const post of posts) {
+      if (post?.external_id && post?.thumbnail_url) {
+        items.push({ external_id: String(post.external_id), url: post.thumbnail_url })
+      }
+      for (const video of post?.videos || []) {
+        if (video?.video_id && video?.thumbnail_url) {
+          items.push({ external_id: String(video.video_id), url: video.thumbnail_url })
+        }
       }
     }
   }
-  if (!items.length) return
+  const itemCount = items.length || Number(thumbnailCount || 0)
+  if (!itemCount) return
 
   // A refresh supersedes an older cache pass for the same author. Metadata is
   // already safely persisted and remote previews remain usable while this
@@ -7327,14 +8112,20 @@ function startBoostyThumbnailCache({ sourceId, entity, posts, notifyJob = null, 
     try { previous.child.kill('SIGTERM') } catch {}
   }
 
-  const manifestPath = path.join(
-    BOOSTY_TMP_DIR,
-    `thumbnails-${sourceId}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
+  const manifestPath = suppliedManifestPath || path.join(
+    BOOSTY_TMP_DIR, `thumbnails-${sourceId}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
   )
-  fs.writeFileSync(manifestPath, JSON.stringify({ author: entity.author_handle, items }), {
-    encoding: 'utf8',
-    mode: 0o600,
-  })
+  if (!suppliedManifestPath) {
+    try {
+      await fs.promises.writeFile(manifestPath, JSON.stringify({ author: entity.author_handle, items }), {
+        encoding: 'utf8',
+        mode: 0o600,
+      })
+    } catch (error) {
+      console.error('[Jobs] Boosty thumbnail manifest write failed', error)
+      return
+    }
+  }
   const child = spawn(WORKER_PYTHON, [
     BOOSTY_THUMBNAIL_SCRIPT,
     '--manifest', manifestPath,
@@ -7344,16 +8135,16 @@ function startBoostyThumbnailCache({ sourceId, entity, posts, notifyJob = null, 
     env: workerEnv(),
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  const state = { child, manifestPath, cached: 0, requested: items.length, summary: null, fullCatalog }
+  const state = { child, manifestPath, cached: 0, requested: itemCount, summary: null, fullCatalog }
   boostyThumbnailProcesses.set(sourceId, state)
   if (notifyJob?.boosty_channel) {
     notifyJob.boosty_channel = {
       ...notifyJob.boosty_channel,
-      thumbnail_cache: { status: 'running', cached: 0, requested: items.length },
+      thumbnail_cache: { status: 'running', cached: 0, requested: itemCount },
     }
     emit(notifyJob)
   }
-  console.log(`[Jobs] boosty thumbnail cache start source=${sourceId} rows=${items.length}`)
+  console.log(`[Jobs] boosty thumbnail cache start source=${sourceId} rows=${itemCount}`)
 
   let stderrTail = ''
   const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
@@ -7584,14 +8375,66 @@ function startBoostyChannelFetch(params = {}) {
   child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk.toString()).slice(-2000) })
   child.on('error', err => { job.error = `spawn error: ${err.message}` })
   child.on('close', code => {
+    void (async () => {
     job.child = null
-    if (job.status === 'running') {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       job.status = code === 0 && job._boostySummary ? 'done' : 'error'
       if (job.status === 'error') job.error = job.error || stderrTail.slice(-300) || `python exited ${code}`
     }
     job.finished_at = Math.floor(Date.now() / 1000)
+    const terminalStatus = job.status
+    job.phase = 'finalizing'
+    job.status = terminalStatus === 'cancelled' ? 'cancelling' : 'running'
+    emit(job)
+    let catalogResult = null
+    if (job._boostyEntity && job._boostyPosts.length) {
+      try {
+        const summary = isFullFeedRequest
+          ? (job._boostySummary || { catalog_complete: false, posts_total: job._boostyPosts.length })
+          : null
+        catalogResult = await finalizeCatalogJob({
+          kind: 'boosty-catalog',
+          entity: job._boostyEntity,
+          items: job._boostyPosts,
+          thumbnails: job._boostyThumbnails,
+          source_meta: boostySourceMeta(job._boostyEntity, summary),
+          explicit: true,
+          mark_synced: terminalStatus === 'done' && isFullFeedRequest,
+          thumbnail_manifest_path: terminalStatus === 'done'
+            ? path.join(
+                BOOSTY_TMP_DIR,
+                `thumbnails-${job.source_id || id}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`,
+              )
+            : null,
+        })
+        job.source_id = catalogResult.sourceId
+        job.boosty_channel = {
+          ...job.boosty_channel,
+          stage: terminalStatus === 'done' ? 'done' : job.boosty_channel.stage,
+          stored_posts: catalogResult.counts.posts,
+          stored_videos: catalogResult.counts.videos,
+        }
+        if (terminalStatus === 'done') {
+          void startBoostyThumbnailCache({
+            sourceId: catalogResult.sourceId,
+            entity: job._boostyEntity,
+            thumbnailItems: catalogResult.thumbnailItems,
+            manifestPath: catalogResult.thumbnailManifestPath,
+            thumbnailCount: catalogResult.thumbnailCount,
+            notifyJob: job,
+            fullCatalog: isFullFeedRequest,
+          })
+        }
+      } catch (error) {
+        console.error('[Jobs] Boosty catalog finalizer worker failed; falling back to main', error)
+      }
+    }
+    job.status = terminalStatus
     try {
-      if (job._boostyEntity && job._boostyPosts.length) {
+      if (!catalogResult && job._boostyEntity && job._boostyPosts.length) {
         const entityForThumbnails = job._boostyEntity
         const postsForThumbnails = job._boostyPosts
         const persisted = persistBoostyCatalog({
@@ -7614,7 +8457,7 @@ function startBoostyChannelFetch(params = {}) {
           stored_videos: persisted.counts.videos,
         }
         if (job.status === 'done') {
-          startBoostyThumbnailCache({
+          void startBoostyThumbnailCache({
             sourceId: persisted.sourceId,
             entity: entityForThumbnails,
             posts: postsForThumbnails,
@@ -7629,7 +8472,28 @@ function startBoostyChannelFetch(params = {}) {
         entity_title: job.entity_title,
       }
       job.params = persistedParams
-      db.recordJob({
+      let recordedInWorker = false
+      try {
+        await finalizeBatchJob({
+          job: {
+            type: job.type,
+            source_id: job.source_id || null,
+            status: job.status,
+            items_total: job.items_total,
+            items_done: job.items_done,
+            items_failed: job.status === 'error' ? 1 : 0,
+            cost_usd: 0,
+            params: persistedParams,
+            error: job.error,
+            started_at: job.started_at,
+            finished_at: job.finished_at,
+          },
+        })
+        recordedInWorker = true
+      } catch (error) {
+        console.error('[Jobs] Boosty catalog history worker failed; falling back to main', error)
+      }
+      if (!recordedInWorker) db.recordJob({
         type: job.type,
         source_id: job.source_id || null,
         status: job.status,
@@ -7653,9 +8517,23 @@ function startBoostyChannelFetch(params = {}) {
     delete job._boostyPosts
     delete job._boostyThumbnails
     delete job._boostySummary
+    job.phase = 'terminal'
     console.log(`[Jobs] end boosty_channel_fetch #${id} status=${job.status} posts=${job.items_done}${job.error ? ' error=' + job.error : ''}`)
     emit(job)
     markJobClosed(job)
+    })().catch(error => {
+      job.status = 'error'
+      job.phase = 'terminal'
+      job.error = String(error?.message || error)
+      job.finished_at = Math.floor(Date.now() / 1000)
+      delete job._boostyEntity
+      delete job._boostyPosts
+      delete job._boostyThumbnails
+      delete job._boostySummary
+      console.error(`[Jobs] boosty_channel_fetch #${id} close failed`, error)
+      emit(job)
+      markJobClosed(job)
+    })
   })
   return id
 }
@@ -7692,7 +8570,7 @@ async function previewBoostyPost(params = {}) {
     explicit: false,
     markSynced: false,
   })
-  startBoostyThumbnailCache({
+  void startBoostyThumbnailCache({
     sourceId: persisted.sourceId,
     entity,
     posts: [post],
@@ -7745,21 +8623,22 @@ function boostyCachedBatchLog(row, mode) {
     srt_path: existingFile(candidateSrt) ? candidateSrt : null,
     audio_path: row.media_path || null,
     audio_bytes: existingFileBytes(row.media_path),
+    video_path: row.video_path || null,
+    video_bytes: existingFileBytes(row.video_path),
   }
 }
 
-function synthesiseCachedBoostyBatch(params, rows, mode) {
+function synthesiseCachedBoostyBatchFromLogs(params, log, mode) {
   const id = nextId++
   const now = Math.floor(Date.now() / 1000)
-  const log = rows.map(row => boostyCachedBatchLog(row, mode))
   const job = {
     id,
     type: 'boosty_batch_transcribe',
     target: `source:${params.source_id}`,
     source_id: Number(params.source_id),
     status: 'done',
-    items_done: rows.length,
-    items_total: rows.length,
+    items_done: log.length,
+    items_total: log.length,
     started_at: now,
     finished_at: now,
     params: { ...params, mode },
@@ -7767,8 +8646,8 @@ function synthesiseCachedBoostyBatch(params, rows, mode) {
     entity_kind: 'boosty_channel',
     boosty_batch: {
       mode,
-      saved: rows.length,
-      cached: rows.length,
+      saved: log.length,
+      cached: log.length,
       errors: 0,
       current: null,
       log,
@@ -7780,8 +8659,8 @@ function synthesiseCachedBoostyBatch(params, rows, mode) {
       type: job.type,
       source_id: job.source_id,
       status: 'done',
-      items_total: rows.length,
-      items_done: rows.length,
+      items_total: log.length,
+      items_done: log.length,
       items_failed: 0,
       cost_usd: 0,
       params: { ...job.params, _boosty_batch: job.boosty_batch },
@@ -7796,62 +8675,86 @@ function synthesiseCachedBoostyBatch(params, rows, mode) {
   return id
 }
 
-function startBoostyBatchTranscribe(params = {}) {
+async function startBoostyBatchTranscribe(params = {}) {
   const sourceId = Number(params.source_id)
   const videoIds = Array.isArray(params.video_ids)
     ? [...new Set(params.video_ids.map(String).filter(Boolean))]
     : []
   if (!sourceId || !videoIds.length) throw new Error('Нужно выбрать хотя бы одно видео Boosty')
   const mode = params.mode === 'download' ? 'download' : 'transcribe'
+  const storageConfig = getBoostyStorageConfig()
+  // Full-video archiving is an explicit download-mode choice. A regular
+  // transcription never inherits it silently and stays on the fast MP3 path.
+  const saveVideo = mode === 'download' && storageConfig.save_video
   const authCookie = String(params.authCookie || '').trim()
   if (!authCookie) throw new Error('startBoostyBatchTranscribe: browser auth required')
   for (const existing of jobs.values()) {
-    if (existing.status !== 'running' || existing.type !== 'boosty_batch_transcribe') continue
+    if ((existing.status !== 'running' && existing.status !== 'cancelling')
+        || existing.type !== 'boosty_batch_transcribe') continue
     if (Number(existing.source_id) === sourceId) return existing.id
   }
-  const { source, rows } = boostyBatchSelectionRows(sourceId, videoIds)
-
-  const cachedRows = []
-  const runRows = []
-  for (const row of rows) {
-    const ready = mode === 'download'
-      ? existingFile(row.media_path)
-      : existingFile(row.transcript_path)
-    if (ready) cachedRows.push(row)
-    else runRows.push(row)
+  let plan
+  try {
+    plan = await dbRead.request('boostyBatchPlan', sourceId, videoIds, mode, saveVideo, storageConfig)
+  } catch (workerError) {
+    console.error('[Jobs] Boosty batch plan worker failed; falling back to main', workerError)
+    const fallback = boostyBatchSelectionRows(sourceId, videoIds)
+    const cachedLogs = []
+    const selection = []
+    for (const row of fallback.rows) {
+      const ready = mode === 'download'
+        ? existingFile(row.media_path) && (!saveVideo || existingFile(row.video_path))
+        : existingFile(row.transcript_path)
+      if (ready) {
+        cachedLogs.push(boostyCachedBatchLog(row, mode))
+        continue
+      }
+      let meta = {}
+      try { meta = JSON.parse(row.raw_meta_json || '{}') } catch {}
+      selection.push({
+        url: row.url,
+        video_id: String(row.external_id),
+        position: meta.position || null,
+        title: row.title || null,
+        duration_sec: row.duration_seconds || null,
+        author: fallback.source.display_name || fallback.source.handle,
+        audio_path: existingFile(row.media_path) ? row.media_path : null,
+        video_path: existingFile(row.video_path) ? row.video_path : null,
+      })
+    }
+    plan = { source: fallback.source, total: fallback.rows.length, cachedLogs, selection }
+  }
+  const { source } = plan
+  const cachedLogs = plan.cachedLogs || []
+  const selection = plan.selection || []
+  // The plan read is asynchronous. Recheck after it resolves so two rapid
+  // clicks cannot both pass the pre-read guard and spawn duplicate batches.
+  for (const existing of jobs.values()) {
+    if ((existing.status !== 'running' && existing.status !== 'cancelling')
+        || existing.type !== 'boosty_batch_transcribe') continue
+    if (Number(existing.source_id) === sourceId) return existing.id
   }
   const safeParams = {
     source_id: sourceId,
     video_ids: videoIds,
     mode,
+    save_video: saveVideo,
     entity_title: source.display_name || source.handle,
   }
-  if (!runRows.length) return synthesiseCachedBoostyBatch(safeParams, cachedRows, mode)
+  if (!selection.length) return synthesiseCachedBoostyBatchFromLogs(safeParams, cachedLogs, mode)
 
   const id = nextId++
   const selectionPath = path.join(BOOSTY_TMP_DIR, `selection-${id}-${Date.now()}.json`)
-  const selection = runRows.map(row => {
-    let meta = {}
-    try { meta = JSON.parse(row.raw_meta_json || '{}') } catch {}
-    return {
-      url: row.url,
-      video_id: String(row.external_id),
-      position: meta.position || null,
-      title: row.title || null,
-      duration_sec: row.duration_seconds || null,
-      author: source.display_name || source.handle,
-      audio_path: existingFile(row.media_path) ? row.media_path : null,
-    }
-  })
-  fs.writeFileSync(selectionPath, JSON.stringify({ items: selection }), { encoding: 'utf8', mode: 0o600 })
+  await fs.promises.writeFile(selectionPath, JSON.stringify({ items: selection }), { encoding: 'utf8', mode: 0o600 })
 
   const args = [
     BOOSTY_SCRIPT,
     '--selection-file', selectionPath,
-    '--media-dir', BOOSTY_MEDIA_DIR,
+    '--media-dir', storageConfig.audio_dir,
     '--transcript-dir', BOOSTY_TRANSCRIPTS_DIR,
     '--work-dir', BOOSTY_TMP_DIR,
   ]
+  if (saveVideo) args.push('--save-video', '--video-dir', storageConfig.video_dir)
   if (mode === 'download') args.push('--download-only')
   const env = workerEnv()
   env.SC_BOOSTY_AUTH_COOKIE = authCookie
@@ -7864,23 +8767,23 @@ function startBoostyBatchTranscribe(params = {}) {
   delete env.SC_BOOSTY_AUTH_COOKIE
   delete env.SC_BOOSTY_AUTH_EXPIRES
 
-  const seedLog = cachedRows.map(row => boostyCachedBatchLog(row, mode))
+  const seedLog = cachedLogs
   const job = {
     id,
     type: 'boosty_batch_transcribe',
     target: `source:${sourceId}`,
     source_id: sourceId,
     status: 'running',
-    items_done: cachedRows.length,
-    items_total: rows.length,
+    items_done: cachedLogs.length,
+    items_total: plan.total,
     started_at: Math.floor(Date.now() / 1000),
     params: safeParams,
     entity_title: source.display_name || source.handle,
     entity_kind: 'boosty_channel',
     boosty_batch: {
       mode,
-      saved: cachedRows.length,
-      cached: cachedRows.length,
+      saved: cachedLogs.length,
+      cached: cachedLogs.length,
       errors: 0,
       current: null,
       log: seedLog,
@@ -7890,7 +8793,7 @@ function startBoostyBatchTranscribe(params = {}) {
   }
   jobs.set(id, job)
   emit(job)
-  console.log(`[Jobs] start boosty_batch_transcribe #${id} source=${sourceId} mode=${mode} selected=${rows.length} cached=${cachedRows.length}`)
+  console.log(`[Jobs] start boosty_batch_transcribe #${id} source=${sourceId} mode=${mode} selected=${plan.total} cached=${cachedLogs.length}`)
 
   const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
   rl.on('line', line => {
@@ -7903,18 +8806,54 @@ function startBoostyBatchTranscribe(params = {}) {
   child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk.toString()).slice(-2000) })
   child.on('error', err => { job.error = `spawn error: ${err.message}` })
   child.on('close', code => {
+    void (async () => {
     job.child = null
-    try { fs.unlinkSync(selectionPath) } catch {}
+    try { await fs.promises.unlink(selectionPath) } catch {}
     delete job._boostySelectionPath
-    if (job.status === 'running') {
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+    } else if (job.status === 'running') {
       job.status = code === 0 ? 'done' : 'error'
       if (code !== 0) job.error = job.error || stderrTail.slice(-300) || `python exited ${code}`
     }
     job.finished_at = Math.floor(Date.now() / 1000)
     const persistedParams = { ...safeParams, _boosty_batch: job.boosty_batch }
     job.params = persistedParams
+    const terminalStatus = job.status
+    job.phase = 'finalizing'
+    job.status = terminalStatus === 'cancelled' ? 'cancelling' : 'running'
+    emit(job)
+    await waitForJobPersistence(job)
+    let finalizedInWorker = false
     try {
-      db.recordJob({
+      await finalizeBatchJob({
+        job: {
+          type: job.type,
+          source_id: sourceId,
+          status: terminalStatus,
+          items_total: job.items_total,
+          items_done: job.boosty_batch.saved,
+          items_failed: job.boosty_batch.errors,
+          cost_usd: job.cost_usd || 0,
+          params: persistedParams,
+          error: job.error,
+          started_at: job.started_at,
+          finished_at: job.finished_at,
+        },
+        coverage: mode === 'transcribe' && job.boosty_batch.saved > cachedLogs.length ? {
+          source_id: sourceId,
+          content_type: 'video', depth: 'transcribed',
+          items_count: job.boosty_batch.saved - cachedLogs.length,
+        } : null,
+      })
+      finalizedInWorker = true
+    } catch (error) {
+      console.error('[Jobs] Boosty batch finalizer worker failed; falling back to main', error)
+    }
+    job.status = terminalStatus
+    try {
+      if (!finalizedInWorker) db.recordJob({
         type: job.type,
         source_id: sourceId,
         status: job.status,
@@ -7927,7 +8866,7 @@ function startBoostyBatchTranscribe(params = {}) {
         started_at: job.started_at,
         finished_at: job.finished_at,
       })
-      if (mode === 'transcribe' && job.boosty_batch.saved > cachedRows.length) {
+      if (!finalizedInWorker && mode === 'transcribe' && job.boosty_batch.saved > cachedLogs.length) {
         db.recordCoverage({
           source_id: sourceId,
           job_id: null,
@@ -7935,15 +8874,25 @@ function startBoostyBatchTranscribe(params = {}) {
           date_to: null,
           content_type: 'video',
           depth: 'transcribed',
-          items_count: job.boosty_batch.saved - cachedRows.length,
+          items_count: job.boosty_batch.saved - cachedLogs.length,
         })
       }
     } catch (err) {
       console.error('[Jobs] boosty_batch_transcribe DB write failed', err)
     }
+    job.phase = 'terminal'
     console.log(`[Jobs] end boosty_batch_transcribe #${id} status=${job.status} saved=${job.boosty_batch.saved} errors=${job.boosty_batch.errors}`)
     emit(job)
     markJobClosed(job)
+    })().catch(error => {
+      job.status = 'error'
+      job.phase = 'terminal'
+      job.error = String(error?.message || error)
+      job.finished_at = Math.floor(Date.now() / 1000)
+      console.error(`[Jobs] boosty_batch_transcribe #${id} close failed`, error)
+      emit(job)
+      markJobClosed(job)
+    })
   })
   return id
 }
@@ -8006,17 +8955,24 @@ function handleBoostyBatchEvent(job, evt) {
       break
     case 'download_done':
       if (videoId && evt.audio_path) {
-        try {
-          db.markItemDownloaded({ source_id: job.source_id, external_id: videoId, media_path: evt.audio_path })
-        } catch (err) {
-          console.error('[Jobs] Boosty audio path DB write failed', err)
-        }
+        const args = { source_id: job.source_id, external_id: videoId, media_path: evt.audio_path }
+        queueJobPersistence(job, `Boosty #${job.id} audio path`,
+          () => persistItemMutation({ method: 'markItemDownloaded', args }),
+          () => db.markItemDownloaded(args))
+      }
+      if (videoId && evt.video_path) {
+        const args = { source_id: job.source_id, external_id: videoId, video_path: evt.video_path }
+        queueJobPersistence(job, `Boosty #${job.id} video path`,
+          () => persistItemMutation({ method: 'markItemVideoDownloaded', args }),
+          () => db.markItemVideoDownloaded(args))
       }
       batch.current = {
         ...(batch.current || {}),
         stage: job.params.mode === 'download' ? 'saving' : 'transcribing',
         audio_path: evt.audio_path || null,
         audio_bytes: evt.audio_bytes || null,
+        video_path: evt.video_path || null,
+        video_bytes: evt.video_bytes || null,
       }
       emit(job)
       break
@@ -8040,8 +8996,16 @@ function handleBoostyBatchEvent(job, evt) {
       batch.saved += 1
       job.items_done = batch.saved + batch.errors
       if (videoId && evt.audio_path) {
-        try { db.markItemDownloaded({ source_id: job.source_id, external_id: videoId, media_path: evt.audio_path }) }
-        catch (err) { console.error('[Jobs] Boosty audio saved DB write failed', err) }
+        const args = { source_id: job.source_id, external_id: videoId, media_path: evt.audio_path }
+        queueJobPersistence(job, `Boosty #${job.id} audio saved`,
+          () => persistItemMutation({ method: 'markItemDownloaded', args }),
+          () => db.markItemDownloaded(args))
+      }
+      if (videoId && evt.video_path) {
+        const args = { source_id: job.source_id, external_id: videoId, video_path: evt.video_path }
+        queueJobPersistence(job, `Boosty #${job.id} video saved`,
+          () => persistItemMutation({ method: 'markItemVideoDownloaded', args }),
+          () => db.markItemVideoDownloaded(args))
       }
       batch.log.push({
         video_id: videoId,
@@ -8049,6 +9013,8 @@ function handleBoostyBatchEvent(job, evt) {
         kind: evt.cached ? 'cache' : 'audio',
         audio_path: evt.audio_path,
         audio_bytes: evt.audio_bytes || batch.current?.audio_bytes || null,
+        video_path: evt.video_path || batch.current?.video_path || null,
+        video_bytes: evt.video_bytes || batch.current?.video_bytes || null,
       })
       batch.current = null
       emit(job)
@@ -8057,19 +9023,26 @@ function handleBoostyBatchEvent(job, evt) {
       batch.saved += 1
       job.items_done = batch.saved + batch.errors
       if (videoId) {
-        try {
-          if (evt.audio_path) db.markItemDownloaded({ source_id: job.source_id, external_id: videoId, media_path: evt.audio_path })
-          if (evt.file_path) {
-            db.markItemTranscribed({
-              source_id: job.source_id,
-              external_id: videoId,
-              transcript_path: evt.file_path,
-              engine: 'assemblyai',
-              cost_usd: evt.cost_usd || null,
-            })
+        if (evt.audio_path) {
+          const args = { source_id: job.source_id, external_id: videoId, media_path: evt.audio_path }
+          queueJobPersistence(job, `Boosty #${job.id} transcript audio`,
+            () => persistItemMutation({ method: 'markItemDownloaded', args }),
+            () => db.markItemDownloaded(args))
+        }
+        if (evt.video_path) {
+          const args = { source_id: job.source_id, external_id: videoId, video_path: evt.video_path }
+          queueJobPersistence(job, `Boosty #${job.id} transcript video`,
+            () => persistItemMutation({ method: 'markItemVideoDownloaded', args }),
+            () => db.markItemVideoDownloaded(args))
+        }
+        if (evt.file_path) {
+          const args = {
+            source_id: job.source_id, external_id: videoId,
+            transcript_path: evt.file_path, engine: 'assemblyai', cost_usd: evt.cost_usd || null,
           }
-        } catch (err) {
-          console.error('[Jobs] Boosty transcript DB write failed', err)
+          queueJobPersistence(job, `Boosty #${job.id} transcript`,
+            () => persistItemMutation({ method: 'markItemTranscribed', args }),
+            () => db.markItemTranscribed(args))
         }
       }
       batch.log.push({
@@ -8080,6 +9053,8 @@ function handleBoostyBatchEvent(job, evt) {
         srt_path: evt.srt_path || null,
         audio_path: evt.audio_path || null,
         audio_bytes: evt.audio_bytes || batch.current?.audio_bytes || null,
+        video_path: evt.video_path || batch.current?.video_path || null,
+        video_bytes: evt.video_bytes || batch.current?.video_bytes || null,
       })
       batch.current = null
       emit(job)
@@ -8093,14 +9068,12 @@ function handleBoostyBatchEvent(job, evt) {
         kind: 'error',
         message: evt.message,
       })
-      try {
-        if (job.params.mode === 'download') {
-          db.markItemDownloadError({ source_id: job.source_id, external_id: videoId, error: evt.message })
-        } else {
-          db.markItemTranscribeError({ source_id: job.source_id, external_id: videoId, error: evt.message })
-        }
-      } catch (err) {
-        console.error('[Jobs] Boosty item error DB write failed', err)
+      {
+        const method = job.params.mode === 'download' ? 'markItemDownloadError' : 'markItemTranscribeError'
+        const args = { source_id: job.source_id, external_id: videoId, error: evt.message }
+        queueJobPersistence(job, `Boosty #${job.id} item error`,
+          () => persistItemMutation({ method, args }),
+          () => db[method](args))
       }
       batch.current = null
       emit(job)
@@ -8135,10 +9108,11 @@ function startBoostySingle(params = {}) {
   if (!url) throw new Error('startBoostySingle: url required')
   if (!authCookie) throw new Error('startBoostySingle: browser auth required')
 
+  const storageConfig = getBoostyStorageConfig()
   const args = [
     BOOSTY_SCRIPT,
     url,
-    '--media-dir', BOOSTY_MEDIA_DIR,
+    '--media-dir', storageConfig.audio_dir,
     '--transcript-dir', BOOSTY_TRANSCRIPTS_DIR,
     '--work-dir', BOOSTY_TMP_DIR,
   ]
@@ -8361,10 +9335,9 @@ function handleBoostyEvent(job, evt) {
         chars: evt.chars || job.boosty?.chars || null,
         result_files: resultFiles,
       }
-      try {
-        const copied = copyFileToClipboard(evt.file_path)
-        if (copied.ok) job.boosty.copied_bytes = copied.bytes
-      } catch {}
+      scheduleAutoCopy(job, evt.file_path, result => {
+        job.boosty.copied_bytes = result.bytes
+      })
       emit(job)
       break
     }
@@ -8587,10 +9560,9 @@ function handleLocalEvent(job, evt) {
                       srt: evt.srt_path || null,
                     },
                     kind: evt.kind, chars: evt.chars }
-      try {
-        const r = copyFileToClipboard(evt.file_path)
-        if (r.ok) job.local.copied_bytes = r.bytes
-      } catch {}
+      scheduleAutoCopy(job, evt.file_path, result => {
+        job.local.copied_bytes = result.bytes
+      })
       break
     case 'done':
       if (job.status === 'running' && job.file_path) {
@@ -8652,6 +9624,7 @@ module.exports = {
   cancelJob,
   setAutoIndexAfterFetch,
   listJobs,
+  liveSnapshotsForSource,
   getJobDetail,
   subscribe,
   subscribeEvents,
@@ -8662,5 +9635,7 @@ module.exports = {
   RUTUBE_TRANSCRIPTS_DIR,
   BOOSTY_TRANSCRIPTS_DIR,
   BOOSTY_MEDIA_DIR,
+  BOOSTY_VIDEO_DIR,
   BOOSTY_THUMBNAILS_DIR,
+  getBoostyStorageConfig,
 }

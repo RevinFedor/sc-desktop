@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react'
+import { Virtuoso } from 'react-virtuoso'
 import { ChevronDown, ChevronUp } from 'lucide-react'
 import Checkbox from './Checkbox'
 
@@ -93,28 +94,32 @@ export default function SendersBlock({ senders }) {
             )}
           </div>
 
-          <div className="rounded-md border border-zinc-800 bg-zinc-950 divide-y divide-zinc-800 max-h-64 overflow-auto">
+          <div data-senders-list className="rounded-md border border-zinc-800 bg-zinc-950 h-64 overflow-hidden">
             {filtered.length === 0 && (
               <div className="px-4 py-3 text-zinc-600 italic">Ничего не найдено</div>
             )}
-            {filtered.map(r => {
-              const k = keyOf(r)
-              const isOn = selected.has(k)
-              return (
-                <label
-                  key={k}
-                  className="px-4 py-2 flex items-center gap-3 cursor-pointer hover:bg-zinc-900"
-                >
-                  <Checkbox
-                    checked={isOn}
-                    onChange={(next) => toggle(r, next)}
-                    size="sm"
-                  />
-                  <span className="text-zinc-300 truncate flex-1">{r.sender || '(unknown)'}</span>
-                  <span className="text-zinc-500 tabular-nums shrink-0">{r.count.toLocaleString()}</span>
-                </label>
-              )
-            })}
+            {filtered.length > 0 && (
+              <Virtuoso
+                data={filtered}
+                defaultItemHeight={40}
+                increaseViewportBy={80}
+                computeItemKey={(_index, row) => keyOf(row)}
+                itemContent={(_index, row) => {
+                  const key = keyOf(row)
+                  return (
+                    <label data-sender-row className="px-4 py-2 flex items-center gap-3 cursor-pointer hover:bg-zinc-900 border-b border-zinc-800 last:border-b-0">
+                      <Checkbox
+                        checked={selected.has(key)}
+                        onChange={(next) => toggle(row, next)}
+                        size="sm"
+                      />
+                      <span className="text-zinc-300 truncate flex-1">{row.sender || '(unknown)'}</span>
+                      <span className="text-zinc-500 tabular-nums shrink-0">{row.count.toLocaleString()}</span>
+                    </label>
+                  )
+                }}
+              />
+            )}
           </div>
         </>
       )}

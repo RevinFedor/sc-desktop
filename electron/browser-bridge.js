@@ -49,14 +49,32 @@ const {
   createTerminalNotificationRoute,
 } = require('./terminal-notification-route')
 const {
+  ensureNotificationToken,
+  matchesBearerToken,
+} = require('./local-notification-auth')
+const {
   EXTENSION_YOUTUBE_SCHEMA_VERSION,
   extensionYoutubeFromSettings,
   extensionYoutubeSchemaState,
   patchExtensionYoutubeSettings,
+  publicAppSettings,
 } = require('./app-settings')
+const {
+  MAX_ATTACHMENT_BYTES,
+  normalizeResearchAttachments,
+  materializeResearchAttachments,
+  publicAttachmentMeta,
+  researchResultForPersist,
+} = require('./research-attachments')
+const {
+  normalizeChatgptConversationUrl,
+  chatgptResearchEntryUrl,
+} = require('./chatgpt-url')
+const { withResearchAutoClose } = require('./research-tab-policy')
 
 const BODY_LIMITS = {
   default: 64 * 1024,
+  vocabularySync: 2 * 1024 * 1024,
   researchStart: 2 * 1024 * 1024,
   researchState: 5 * 1024 * 1024,
   researchArtifactJson: 30 * 1024 * 1024,
@@ -89,6 +107,7 @@ function persistResearchJob(snap) {
       result: r,
       error: snap.error, createdAt: snap.createdAt, updatedAt: snap.updatedAt, doneAt: snap.doneAt,
     })
+    invalidateResearchHistoryCache()
   } catch (e) { console.log('[BrowserBridge] persistResearchJob failed:', e.message) }
 }
 function persistAistudioJob(j) {
@@ -102,6 +121,7 @@ function persistAistudioJob(j) {
       url: j.url, responseTextLen: j.responseTextLen ?? null, linkCount: j.linkCount ?? null,
       error: j.error, createdAt: j.createdAt, updatedAt: j.updatedAt, doneAt: j.doneAt || j.updatedAt,
     })
+    invalidateResearchHistoryCache()
   } catch (e) { console.log('[BrowserBridge] persistAistudioJob failed:', e.message) }
 }
 
@@ -184,10 +204,84 @@ const RELOAD_WS_PORT = 53129  // hot-reload WebSocket (dev only)
 // Хранится час. Перезапуск sc-desktop = очистка; CS на следующем log-event
 // автоматически восстанавливает свою активную запись.
 const AISTUDIO_JOBS = new Map()
+let researchHistoryCache = null
 // Кэш реестра Perplexity-моделей. Заполняется CS через POST /pplx-models-register
 // при каждой загрузке perplexity-страницы. Источник правды — perplexity-research.js.
 let PPLX_MODELS_CACHE = null
 const AISTUDIO_TTL_MS = 60 * 60 * 1000 // 1 час
+
+function invalidateResearchHistoryCache() {
+  researchHistoryCache = null
+}
+
+function cachedResearchHistory() {
+  if (researchHistoryCache) return researchHistoryCache
+  try {
+    researchHistoryCache = db()?.listResearchJobs(100) || []
+  } catch (e) {
+    console.log('[BrowserBridge] external-jobs db history failed:', e?.message)
+    researchHistoryCache = []
+  }
+  return researchHistoryCache
+}
+
+// Navbar/popover/history need status and compact previews, not multi-megabyte
+// answers and source arrays. Keep the full object available for an explicit
+// JobDetail refresh, but never move it through the 1.5-second background path.
+function externalJobSummary(job) {
+  if (!job || typeof job !== 'object') return job
+  const fullPrompt = typeof job.fullPrompt === 'string' ? job.fullPrompt
+    : typeof job.prompt === 'string' ? job.prompt
+      : ''
+  const responseText = typeof job.responseText === 'string' ? job.responseText : ''
+  const answerText = typeof job.answerText === 'string' ? job.answerText : ''
+  const sources = Array.isArray(job.sources) ? job.sources : []
+  const summary = {
+    ...job,
+    promptHead: job.promptHead || (fullPrompt ? fullPrompt.slice(0, 140) : null),
+    promptLen: job.promptLen ?? (fullPrompt ? fullPrompt.length : null),
+    responseTextLen: job.responseTextLen ?? (responseText ? responseText.length : null),
+    responseHead: job.responseHead || (responseText ? responseText.slice(0, 600) : null),
+    answerHead: job.answerHead || (answerText ? answerText.slice(0, 600) : null),
+    linkCount: job.linkCount ?? (sources.length || null),
+  }
+  for (const key of [
+    'prompt', 'fullPrompt', 'responseText', 'answerText', 'reasoningText',
+    'sources', 'sourcesMeta', 'sourceActivity', 'result', 'resultJson',
+    'options', 'log',
+  ]) delete summary[key]
+  return summary
+}
+
+function listExternalJobsForUi({ summary = false, jobId = null } = {}) {
+  const out = []
+  const cutoff = Date.now() - AISTUDIO_TTL_MS
+  for (const [id, j] of AISTUDIO_JOBS) {
+    if ((j.updatedAt || 0) < cutoff && j.status !== 'running' && j.status !== 'pending') {
+      AISTUDIO_JOBS.delete(id)
+      continue
+    }
+    out.push({ kind: 'aistudio', ...j })
+  }
+  try {
+    for (const rj of researchState.listAllForUi()) out.push(rj)
+  } catch (e) {
+    console.log('[BrowserBridge] external-jobs research list failed:', e?.message)
+  }
+  const seen = new Set(out.map(j => j.jobId))
+  for (const historic of cachedResearchHistory()) {
+    if (!seen.has(historic.jobId)) out.push(historic)
+  }
+  const isActive = status => status === 'running' || status === 'pending' || status === 'queued'
+  out.sort((a, b) => {
+    const aa = isActive(a.status) ? 1 : 0
+    const bb = isActive(b.status) ? 1 : 0
+    if (aa !== bb) return bb - aa
+    return (b.updatedAt || 0) - (a.updatedAt || 0)
+  })
+  const selected = jobId ? out.filter(job => job.jobId === jobId) : out
+  return summary ? selected.map(externalJobSummary) : selected
+}
 
 // Очередь команд для расширения (focus tab / close tab из popover'а).
 // Bridge не имеет прямого доступа к chrome.tabs — кладём команду в queue,
@@ -324,101 +418,6 @@ function safeFileName(name, fallback = 'artifact') {
   return base || fallback
 }
 
-function normalizeResearchAttachments(raw) {
-  const arr = Array.isArray(raw) ? raw : []
-  const out = []
-  for (let i = 0; i < arr.length; i++) {
-    const it = arr[i]
-    const fp = typeof it === 'string'
-      ? it
-      : (typeof it?.path === 'string' ? it.path
-        : (typeof it?.file_path === 'string' ? it.file_path : ''))
-    if (!fp) continue
-    const abs = path.resolve(fp)
-    const st = fs.statSync(abs)
-    if (!st.isFile()) throw new Error(`attachment is not a file: ${abs}`)
-    if (st.size > 20 * 1024 * 1024) throw new Error(`attachment too large (${st.size} bytes): ${abs}`)
-    const mime = typeof it?.mime === 'string' ? it.mime : fileMime(abs)
-    if (!mime.startsWith('image/')) throw new Error(`only image attachments are supported for ChatGPT research: ${abs}`)
-    out.push({
-      index: out.length,
-      path: abs,
-      name: safeFileName(it?.name || path.basename(abs), `attachment-${i + 1}${path.extname(abs) || '.png'}`),
-      mime,
-      size: st.size,
-    })
-  }
-  return out
-}
-
-function publicAttachmentMeta(a) {
-  return { index: a.index, name: a.name, mime: a.mime, size: a.size }
-}
-
-function materializeResearchAttachments({ libRoot, id, attachments }) {
-  if (!Array.isArray(attachments) || attachments.length === 0) return []
-  const safeId = safeFileName(id, 'research')
-  const dir = path.join(libRoot, 'research-artifacts', safeId, 'input')
-  fs.mkdirSync(dir, { recursive: true })
-  return attachments.map((a, i) => {
-    const src = a.path
-    const ext = IMAGE_MIME_EXT[String(a.mime || '').toLowerCase()]
-      || path.extname(a.name || src).toLowerCase()
-      || '.png'
-    const stem = safeFileName(path.basename(a.name || `input-${i + 1}`, path.extname(a.name || '')), `input-${i + 1}`)
-    const name = `${String(i + 1).padStart(2, '0')}-${stem}${ext}`
-    const dest = path.join(dir, name)
-    fs.copyFileSync(src, dest)
-    const st = fs.statSync(dest)
-    return {
-      ...a,
-      original_path: src,
-      path: dest,
-      name,
-      size: st.size,
-      artifact_role: 'input',
-    }
-  })
-}
-
-function researchInputImageMeta(a) {
-  if (!a || !a.path) return null
-  return {
-    file_path: a.path,
-    original_path: a.original_path || null,
-    name: a.name || path.basename(a.path),
-    content_type: a.mime || fileMime(a.path),
-    bytes: a.size ?? null,
-    role: 'input',
-  }
-}
-
-function researchResultForPersist(snap) {
-  const r = snap?.result && typeof snap.result === 'object' ? snap.result : {}
-  const inputImages = Array.isArray(snap?.attachments)
-    ? snap.attachments.map(researchInputImageMeta).filter(Boolean)
-    : []
-  return inputImages.length ? { ...r, input_images: inputImages } : r
-}
-
-function appendResearchId(rawUrl, id) {
-  const u = new URL(rawUrl)
-  u.searchParams.set('sc-research', id)
-  u.hash = 'sc-research=' + encodeURIComponent(id)
-  return u.toString()
-}
-
-function normalizeChatgptConversationUrl(raw) {
-  const s = String(raw || '').trim()
-  if (!s) return ''
-  const u = new URL(s)
-  if (u.origin !== 'https://chatgpt.com') throw new Error('conversationUrl must be on https://chatgpt.com')
-  if (!/^\/c\/[\w-]+\/?$/.test(u.pathname)) throw new Error('conversationUrl must look like https://chatgpt.com/c/<conversation-id>')
-  u.hash = ''
-  u.searchParams.delete('sc-research')
-  return u.toString()
-}
-
 function saveResearchArtifact({ libRoot, id, name, contentType, base64 }) {
   if (!id) throw new Error('missing artifact id')
   if (!base64 || typeof base64 !== 'string') throw new Error('missing artifact base64')
@@ -447,10 +446,492 @@ function safeReadFile(fp, maxBytes = 4 * 1024 * 1024) {
   } catch { return null }
 }
 
+function parseTimestampedTranscript(text) {
+  const cues = []
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const match = line.match(/^\[(\d{2}):(\d{2}):(\d{2})(?:[.,](\d{1,3}))?\]\s+(.+)$/)
+    if (!match) continue
+    const fractionMs = Number(String(match[4] || '0').padEnd(3, '0'))
+    const startMs = ((Number(match[1]) * 60 + Number(match[2])) * 60 + Number(match[3])) * 1000
+      + fractionMs
+    const cueText = match[5].trim()
+    if (!cueText) continue
+    const previous = cues[cues.length - 1]
+    if (previous && previous.startMs === startMs) {
+      previous.text = `${previous.text} ${cueText}`.replace(/\s+/g, ' ').trim()
+      continue
+    }
+    cues.push({ startMs, endMs: null, text: cueText })
+  }
+  for (let i = 0; i < cues.length; i += 1) {
+    const next = cues[i + 1]
+    cues[i].endMs = next ? Math.max(cues[i].startMs + 250, next.startMs) : cues[i].startMs + 3000
+  }
+  return cues
+}
+
+const TRANSLATOR_DEFAULT_ENDPOINT = 'https://api.cognitive.microsofttranslator.com'
+const TRANSLATOR_MAX_ITEMS = 25
+const TRANSLATOR_MAX_CHARS = 5_000
+const TRANSLATOR_TIMEOUT_MS = 6_000
+const TRANSLATOR_MAX_ATTEMPTS = 2
+const TRANSLATOR_RETRYABLE_STATUSES = new Set([408, 500, 502, 503, 504])
+
+function translatorConfig(settingsAccess) {
+  const settings = settingsAccess?.readScSettings?.() || {}
+  const raw = settings.azure_translator && typeof settings.azure_translator === 'object'
+    ? settings.azure_translator
+    : {}
+  const key = String(
+    process.env.AZURE_TRANSLATOR_KEY
+      || settings.api_keys?.AZURE_TRANSLATOR_KEY
+      || '',
+  ).trim()
+  const endpoint = String(raw.endpoint || TRANSLATOR_DEFAULT_ENDPOINT)
+    .trim()
+    .replace(/\/+$/, '')
+  const region = String(raw.region || '').trim().toLowerCase()
+  return { key, endpoint: endpoint || TRANSLATOR_DEFAULT_ENDPOINT, region }
+}
+
+function cleanLanguageCode(value, { allowAuto = false } = {}) {
+  const text = String(value || '').trim()
+  if (allowAuto && (!text || text === 'auto')) return 'auto'
+  if (!/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$/i.test(text)) {
+    throw new Error(`invalid language code: ${text || 'empty'}`)
+  }
+  return text
+}
+
+function dictionaryLanguageCode(value) {
+  const code = cleanLanguageCode(value)
+  if (/^zh-(?:Hans|Hant)$/i.test(code)) return code
+  return code.split('-')[0]
+}
+
+function translatorCacheKey(operation, sourceLang, targetLang, sourceText) {
+  return crypto.createHash('sha256')
+    .update(`${operation}\u0000${sourceLang}\u0000${targetLang}\u0000${sourceText}`)
+    .digest('hex')
+}
+
+async function azureTranslatorRequest(settingsAccess, route, params, body) {
+  const config = translatorConfig(settingsAccess)
+  if (!config.key) {
+    const error = new Error('Azure Translator key is not configured')
+    error.code = 'translator_not_configured'
+    throw error
+  }
+  const url = new URL(config.endpoint + route)
+  url.searchParams.set('api-version', '3.0')
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value != null && value !== '' && value !== 'auto') url.searchParams.set(key, String(value))
+  }
+  for (let attempt = 1; attempt <= TRANSLATOR_MAX_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), TRANSLATOR_TIMEOUT_MS)
+    let failure = null
+    const headers = {
+      'Content-Type': 'application/json; charset=UTF-8',
+      'Ocp-Apim-Subscription-Key': config.key,
+      'X-ClientTraceId': crypto.randomUUID(),
+    }
+    if (config.region) headers['Ocp-Apim-Subscription-Region'] = config.region
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      })
+      const rawText = await response.text()
+      let payload = null
+      try { payload = rawText ? JSON.parse(rawText) : null } catch {}
+      if (response.ok) return payload
+
+      const detail = payload?.error?.message || payload?.message || rawText || response.statusText
+      failure = new Error(`Azure Translator HTTP ${response.status}: ${String(detail).slice(0, 500)}`)
+      failure.status = response.status
+      failure.code = payload?.error?.code || 'translator_http_error'
+      failure.retryable = TRANSLATOR_RETRYABLE_STATUSES.has(response.status)
+    } catch (error) {
+      const timeout = error?.name === 'AbortError'
+      const transportCode = String(error?.cause?.code || '').trim()
+      failure = new Error(timeout
+        ? `Azure Translator timed out after ${TRANSLATOR_TIMEOUT_MS} ms`
+        : `Azure Translator network error${transportCode ? ` (${transportCode})` : ''}`)
+      failure.code = timeout ? 'translator_timeout' : 'translator_network_error'
+      failure.retryable = true
+    } finally {
+      clearTimeout(timer)
+    }
+
+    if (attempt < TRANSLATOR_MAX_ATTEMPTS && failure?.retryable) {
+      console.log(`[Translator] retry route=${route} attempt=${attempt + 1} reason=${failure.code || failure.status || 'transient'}`)
+      await new Promise(resolve => setTimeout(resolve, 220 * attempt))
+      continue
+    }
+    throw failure || new Error('Azure Translator request failed')
+  }
+
+  throw new Error('Azure Translator request failed')
+}
+
+function sanitizeTranslationTexts(rawTexts) {
+  const texts = Array.isArray(rawTexts) ? rawTexts : [rawTexts]
+  const cleaned = texts.map(value => String(value || '').trim()).filter(Boolean)
+  if (!cleaned.length) throw new Error('at least one text is required')
+  if (cleaned.length > TRANSLATOR_MAX_ITEMS) {
+    throw new Error(`too many texts (${cleaned.length} > ${TRANSLATOR_MAX_ITEMS})`)
+  }
+  if (cleaned.some(text => text.length > 10_000)) throw new Error('one text is too long')
+  const chars = cleaned.reduce((sum, text) => sum + text.length, 0)
+  if (chars > TRANSLATOR_MAX_CHARS) {
+    throw new Error(`translation request is too large (${chars} > ${TRANSLATOR_MAX_CHARS})`)
+  }
+  return cleaned
+}
+
+async function translateTexts(settingsAccess, rawTexts, rawFrom, rawTo) {
+  const texts = sanitizeTranslationTexts(rawTexts)
+  const sourceLang = cleanLanguageCode(rawFrom, { allowAuto: true })
+  const targetLang = cleanLanguageCode(rawTo)
+  const results = new Array(texts.length)
+  const misses = []
+
+  texts.forEach((sourceText, index) => {
+    const cacheKey = translatorCacheKey('translate', sourceLang, targetLang, sourceText)
+    const cached = db()?.getTranslationCache(cacheKey)
+    if (cached?.response) {
+      results[index] = { source_text: sourceText, response: cached.response, cached: true }
+    } else {
+      misses.push({ sourceText, index, cacheKey })
+    }
+  })
+
+  if (misses.length) {
+    const payload = await azureTranslatorRequest(
+      settingsAccess,
+      '/translate',
+      { from: sourceLang, to: targetLang, textType: 'plain' },
+      misses.map(item => ({ Text: item.sourceText })),
+    )
+    if (!Array.isArray(payload) || payload.length !== misses.length) {
+      throw new Error('Azure Translator returned an unexpected translate response')
+    }
+    misses.forEach((item, i) => {
+      const response = payload[i]
+      db()?.upsertTranslationCache({
+        cacheKey: item.cacheKey,
+        operation: 'translate',
+        sourceLang,
+        targetLang,
+        sourceText: item.sourceText,
+        response,
+      })
+      results[item.index] = { source_text: item.sourceText, response, cached: false }
+    })
+  }
+
+  return {
+    source_lang: sourceLang,
+    target_lang: targetLang,
+    translations: results.map(item => ({
+      source_text: item.source_text,
+      translated_text: item.response?.translations?.[0]?.text || '',
+      detected_language: item.response?.detectedLanguage?.language || null,
+      cached: item.cached,
+    })),
+  }
+}
+
+async function dictionaryLookup(settingsAccess, rawText, rawFrom, rawTo) {
+  const sourceText = String(rawText || '').trim()
+  if (!sourceText || sourceText.length > 100) throw new Error('dictionary term must contain 1-100 characters')
+  const sourceLang = dictionaryLanguageCode(rawFrom)
+  const targetLang = dictionaryLanguageCode(rawTo)
+  const cacheKey = translatorCacheKey('dictionary', sourceLang, targetLang, sourceText)
+  const cached = db()?.getTranslationCache(cacheKey)
+  if (cached?.response) {
+    return { source_lang: sourceLang, target_lang: targetLang, dictionary: cached.response, cached: true }
+  }
+
+  try {
+    const payload = await azureTranslatorRequest(
+      settingsAccess,
+      '/dictionary/lookup',
+      { from: sourceLang, to: targetLang },
+      [{ Text: sourceText }],
+    )
+    const dictionary = Array.isArray(payload) ? payload[0] : null
+    if (dictionary?.translations?.length) {
+      db()?.upsertTranslationCache({
+        cacheKey,
+        operation: 'dictionary',
+        sourceLang,
+        targetLang,
+        sourceText,
+        response: dictionary,
+      })
+      return { source_lang: sourceLang, target_lang: targetLang, dictionary, cached: false }
+    }
+  } catch (error) {
+    // Dictionary coverage is narrower than ordinary translation. A missing
+    // language pair or non-dictionary phrase falls back to /translate; auth,
+    // quota and server failures stay visible instead of being disguised.
+    if (![400, 404].includes(Number(error?.status))) throw error
+  }
+
+  const fallback = await translateTexts(settingsAccess, [sourceText], sourceLang, targetLang)
+  return {
+    source_lang: sourceLang,
+    target_lang: targetLang,
+    dictionary: null,
+    fallback_translation: fallback.translations[0]?.translated_text || '',
+    cached: fallback.translations[0]?.cached === true,
+  }
+}
+
+const VOICE_DISCOVERY_DIR = path.join(os.homedir(), '.noted-terminal')
+const VOICE_TOKEN_FILE = path.join(VOICE_DISCOVERY_DIR, 'web-token.txt')
+const VOICE_DISCOVERY_RE = /^voice-web-server-\d+\.json$/
+
+function normalizeVocabularyTerm(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLocaleLowerCase('en-US')
+}
+
+function voiceServerCandidates() {
+  let files = []
+  try { files = fs.readdirSync(VOICE_DISCOVERY_DIR).filter((name) => VOICE_DISCOVERY_RE.test(name)) }
+  catch { return [] }
+  return files.map((name) => {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(VOICE_DISCOVERY_DIR, name), 'utf8'))
+      const port = Number(raw?.port)
+      if (!Number.isInteger(port) || port < 1 || port > 65535) return null
+      return { port, updatedAt: Number(raw?.updatedAt) || 0 }
+    } catch { return null }
+  }).filter(Boolean).sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+async function voiceVocabularyRequest(method, route, body = null) {
+  let token = ''
+  try { token = fs.readFileSync(VOICE_TOKEN_FILE, 'utf8').trim() }
+  catch {}
+  if (!token) {
+    const error = new Error('Voice Record API token is unavailable')
+    error.code = 'voice_record_offline'
+    throw error
+  }
+  const candidates = voiceServerCandidates()
+  if (!candidates.length) {
+    const error = new Error('Voice Record is not running')
+    error.code = 'voice_record_offline'
+    throw error
+  }
+  let lastError = null
+  for (const candidate of candidates) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 4_000)
+    try {
+      const response = await fetch(`http://127.0.0.1:${candidate.port}${route}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...(body == null ? {} : { 'Content-Type': 'application/json' }),
+        },
+        body: body == null ? undefined : JSON.stringify(body),
+        signal: controller.signal,
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok || payload?.ok === false) {
+        const error = new Error(payload?.error || `Voice Record HTTP ${response.status}`)
+        error.status = response.status
+        throw error
+      }
+      return payload
+    } catch (error) {
+      lastError = error
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  const error = new Error(lastError?.name === 'AbortError'
+    ? 'Voice Record API timed out'
+    : (lastError?.message || 'Voice Record API is unavailable'))
+  error.code = 'voice_record_offline'
+  throw error
+}
+
+function vocabularySyncPayload(entry) {
+  return {
+    term: String(entry?.sourceText || entry?.term || '').trim(),
+    translation: String(entry?.translation || ''),
+    translationSource: entry?.translationSource === 'manual' ? 'manual' : 'machine',
+    state: ['saved', 'known'].includes(entry?.state) ? entry.state : 'none',
+    kind: entry?.kind === 'phrase' ? 'phrase' : 'word',
+    sourceLang: String(entry?.sourceLang || 'auto').slice(0, 32),
+    targetLang: String(entry?.targetLang || 'ru').slice(0, 32),
+    contexts: Array.isArray(entry?.contexts) ? entry.contexts.slice(0, 100) : [],
+  }
+}
+
+function remoteVocabularyIndex(items) {
+  const byId = new Map()
+  const byTerm = new Map()
+  for (const item of items || []) {
+    if (item?.id) byId.set(item.id, item)
+    const key = normalizeVocabularyTerm(item?.term)
+    if (key) byTerm.set(key, item)
+  }
+  return { byId, byTerm }
+}
+
+async function syncVocabularyWithVoice(rawBody) {
+  const localEntries = Array.isArray(rawBody?.entries) ? rawBody.entries.slice(0, 5000) : []
+  const reviewOps = Array.isArray(rawBody?.reviews) ? rawBody.reviews.slice(0, 5000) : []
+  let remotePayload = await voiceVocabularyRequest('GET', '/api/vocabulary?limit=5000&includeInactive=1')
+  let remoteItems = Array.isArray(remotePayload?.items) ? remotePayload.items : []
+  let index = remoteVocabularyIndex(remoteItems)
+  const conflicts = []
+  const syncedKeys = []
+  const skippedKeys = []
+
+  for (const local of localEntries) {
+    const term = String(local?.sourceText || local?.term || '').trim()
+    const localKey = String(local?.key || '')
+    if (!term || !localKey) continue
+    let remote = (local.remoteId && index.byId.get(local.remoteId))
+      || index.byTerm.get(normalizeVocabularyTerm(term))
+      || null
+    const payload = vocabularySyncPayload(local)
+    if (!remote) {
+      if (payload.state === 'none') {
+        skippedKeys.push(localKey)
+        continue
+      }
+      const created = await voiceVocabularyRequest('POST', '/api/vocabulary', payload)
+      remote = created?.item || null
+      if (remote) {
+        index.byId.set(remote.id, remote)
+        index.byTerm.set(normalizeVocabularyTerm(remote.term), remote)
+        syncedKeys.push(localKey)
+      }
+      continue
+    }
+
+    const patch = {}
+    const remoteStateAt = Number(remote.stateUpdatedAt || remote.updatedAt || 0)
+    const localStateAt = Number(local.stateUpdatedAt || local.updatedAt || 0)
+    if (payload.state !== (remote.state || 'saved') && localStateAt >= remoteStateAt) {
+      patch.state = payload.state
+    }
+
+    const remoteTranslation = String(remote.translation || '')
+    const localTranslation = String(payload.translation || '')
+    const remoteTranslationSource = remote.translationSource === 'machine' ? 'machine' : 'manual'
+    const localTranslationSource = payload.translationSource
+    const remoteTranslationAt = Number(remote.translationUpdatedAt || remote.updatedAt || 0)
+    const localTranslationAt = Number(local.translationUpdatedAt || local.updatedAt || 0)
+    const commonTranslationAt = Number(local.remoteTranslationUpdatedAt || 0)
+    const translationDiffers = localTranslation !== remoteTranslation
+    const bothChanged = localTranslationAt > commonTranslationAt && remoteTranslationAt > commonTranslationAt
+    const manualConflict = translationDiffers
+      && bothChanged
+      && localTranslationSource === 'manual'
+      && remoteTranslationSource === 'manual'
+      && local.translationDirty === true
+    if (manualConflict) {
+      conflicts.push({
+        key: localKey,
+        field: 'translation',
+        localValue: localTranslation,
+        remoteValue: remoteTranslation,
+        remoteId: remote.id,
+        remoteUpdatedAt: remote.updatedAt,
+        remoteTranslationUpdatedAt: remoteTranslationAt,
+      })
+    } else if (translationDiffers) {
+      const localWins = local.translationDirty === true && (
+        localTranslationSource === 'manual' && remoteTranslationSource !== 'manual'
+        || localTranslationSource === remoteTranslationSource && localTranslationAt >= remoteTranslationAt
+        || !remoteTranslation
+      )
+      if (localWins) {
+        patch.translation = localTranslation
+        patch.translationSource = localTranslationSource
+      }
+    }
+
+    if (payload.kind !== (remote.kind || 'word')) patch.kind = payload.kind
+    if (payload.sourceLang && payload.sourceLang !== remote.sourceLang) patch.sourceLang = payload.sourceLang
+    if (payload.targetLang && payload.targetLang !== remote.targetLang) patch.targetLang = payload.targetLang
+    if (payload.contexts.length) patch.contexts = payload.contexts
+    if (Object.keys(patch).length) {
+      const updated = await voiceVocabularyRequest(
+        'PATCH',
+        `/api/vocabulary/${encodeURIComponent(remote.id)}`,
+        patch,
+      )
+      remote = updated?.item || remote
+      index.byId.set(remote.id, remote)
+      index.byTerm.set(normalizeVocabularyTerm(remote.term), remote)
+    }
+    if (!manualConflict) syncedKeys.push(localKey)
+  }
+
+  const acknowledgedReviews = []
+  for (const operation of reviewOps.sort((a, b) => Number(a?.reviewedAt || 0) - Number(b?.reviewedAt || 0))) {
+    const result = operation?.result === 'forgotten' ? 'forgotten' : operation?.result === 'remembered' ? 'remembered' : ''
+    const operationId = String(operation?.id || '').trim()
+    if (!result || !operationId) continue
+    const remote = (operation.remoteId && index.byId.get(operation.remoteId))
+      || index.byTerm.get(normalizeVocabularyTerm(operation.term))
+    if (!remote?.id) continue
+    const reviewed = await voiceVocabularyRequest(
+      'POST',
+      `/api/vocabulary/${encodeURIComponent(remote.id)}/review`,
+      { result, operationId, reviewedAt: Number(operation.reviewedAt) || Date.now() },
+    )
+    if (reviewed?.item) {
+      index.byId.set(reviewed.item.id, reviewed.item)
+      index.byTerm.set(normalizeVocabularyTerm(reviewed.item.term), reviewed.item)
+      acknowledgedReviews.push(operationId)
+    }
+  }
+
+  remotePayload = await voiceVocabularyRequest('GET', '/api/vocabulary?limit=5000&includeInactive=1')
+  remoteItems = Array.isArray(remotePayload?.items) ? remotePayload.items : []
+  return {
+    online: true,
+    items: remoteItems,
+    conflicts,
+    syncedKeys,
+    skippedKeys,
+    acknowledgedReviews,
+  }
+}
+
 function startServer({ jobRunner, notificationService, settingsAccess }) {
   const terminalNotificationRoute = createTerminalNotificationRoute({
     notificationService,
   })
+  let localCliToken = null
+  try { localCliToken = ensureNotificationToken().token }
+  catch (err) { console.warn(`[BrowserBridge] local CLI auth unavailable: ${err?.message || err}`) }
+
+  const defaultResearchAutoClose = () => {
+    try {
+      return publicAppSettings(settingsAccess?.readScSettings?.() || {}).main.external_research_auto_close === true
+    } catch (error) {
+      console.log(`[BrowserBridge] research auto-close settings read failed: ${error?.message || error}`)
+      return false
+    }
+  }
 
   const server = http.createServer(async (req, res) => {
     setCors(req, res)
@@ -465,6 +946,167 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
 
       if (req.method === 'GET' && url.pathname === '/healthz') {
         return sendJson(res, 200, { ok: true, version: 1 })
+      }
+
+      if (url.pathname.startsWith('/translator/')
+          || url.pathname.startsWith('/learning/')
+          || url.pathname === '/vocabulary/sync'
+          || url.pathname === '/yt-learning-cues') {
+        const origin = req.headers.origin || ''
+        if (origin && !isAllowedOrigin(origin)) {
+          return sendJson(res, 403, { ok: false, error: 'origin not allowed' })
+        }
+      }
+
+      if (req.method === 'GET' && url.pathname === '/translator/status') {
+        const config = translatorConfig(settingsAccess)
+        return sendJson(res, 200, {
+          ok: true,
+          configured: !!config.key,
+          region: config.region || null,
+          endpoint: config.endpoint,
+          provider: 'azure',
+        })
+      }
+
+      if (req.method === 'POST' && url.pathname === '/translator/translate') {
+        try {
+          const body = await readBody(req)
+          const texts = body.texts ?? body.text
+          const result = await translateTexts(settingsAccess, texts, body.from || 'auto', body.to)
+          const chars = result.translations.reduce((sum, item) => sum + item.source_text.length, 0)
+          const cacheHits = result.translations.filter(item => item.cached).length
+          console.log(`[Translator] translate items=${result.translations.length} chars=${chars} cache_hits=${cacheHits}`)
+          return sendJson(res, 200, { ok: true, ...result })
+        } catch (error) {
+          const status = error?.code === 'translator_not_configured'
+            ? 503
+            : Number(error?.status) || (/required|invalid|too many|too long|too large/i.test(error?.message || '') ? 400 : 502)
+          console.log(`[Translator] translate failed status=${status} code=${error?.code || 'unknown'} message=${error?.message || error}`)
+          return sendJson(res, status, { ok: false, code: error?.code || 'translator_error', error: error?.message || String(error) })
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/translator/dictionary') {
+        try {
+          const body = await readBody(req)
+          const result = await dictionaryLookup(settingsAccess, body.text, body.from, body.to)
+          console.log(`[Translator] dictionary chars=${String(body.text || '').length} cache_hit=${result.cached === true}`)
+          return sendJson(res, 200, { ok: true, ...result })
+        } catch (error) {
+          const status = error?.code === 'translator_not_configured'
+            ? 503
+            : Number(error?.status) || (/required|invalid|must contain/i.test(error?.message || '') ? 400 : 502)
+          console.log(`[Translator] dictionary failed status=${status} code=${error?.code || 'unknown'} message=${error?.message || error}`)
+          return sendJson(res, status, { ok: false, code: error?.code || 'translator_error', error: error?.message || String(error) })
+        }
+      }
+
+      if (url.pathname === '/learning/entry' && req.method === 'POST') {
+        try {
+          const body = await readBody(req)
+          const result = db()?.upsertLearningEntry(body)
+          if (!result?.entry) throw new Error('learning database is unavailable')
+          console.log(`[Learning] upsert kind=${result.entry.kind} state=${result.entry.state} entry=${result.entry.id} examples=${result.examples_count}`)
+          return sendJson(res, 200, { ok: true, ...result })
+        } catch (error) {
+          console.log(`[Learning] upsert failed: ${error?.message || error}`)
+          return sendJson(res, 400, { ok: false, error: error?.message || String(error) })
+        }
+      }
+
+      if (url.pathname === '/learning/entry' && req.method === 'GET') {
+        const entry = db()?.getLearningEntry({
+          kind: url.searchParams.get('kind') || 'word',
+          sourceLang: url.searchParams.get('from') || 'auto',
+          targetLang: url.searchParams.get('to') || '',
+          normalizedText: url.searchParams.get('text') || '',
+        })
+        const examples = entry ? db()?.listLearningExamples(entry.id, 30) || [] : []
+        return sendJson(res, 200, { ok: true, entry: entry || null, examples })
+      }
+
+      if (url.pathname === '/learning/entries' && req.method === 'GET') {
+        const entries = db()?.listLearningEntries(5000) || []
+        return sendJson(res, 200, { ok: true, entries })
+      }
+
+      if (url.pathname === '/vocabulary/sync' && req.method === 'POST') {
+        try {
+          const body = await readBody(req, BODY_LIMITS.vocabularySync)
+          const result = await syncVocabularyWithVoice(body)
+          console.log(`[Vocabulary] sync online entries=${result.items.length} pushed=${result.syncedKeys.length} reviews=${result.acknowledgedReviews.length} conflicts=${result.conflicts.length}`)
+          return sendJson(res, 200, { ok: true, ...result })
+        } catch (error) {
+          if (error?.code === 'voice_record_offline') {
+            console.log(`[Vocabulary] sync offline reason=${error?.message || error}`)
+            return sendJson(res, 200, {
+              ok: true,
+              online: false,
+              items: [],
+              conflicts: [],
+              syncedKeys: [],
+              skippedKeys: [],
+              acknowledgedReviews: [],
+              error: error?.message || String(error),
+            })
+          }
+          console.log(`[Vocabulary] sync failed: ${error?.message || error}`)
+          return sendJson(res, Number(error?.status) || 502, {
+            ok: false,
+            error: error?.message || String(error),
+          })
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/yt-learning-cues') {
+        try {
+          const body = await readBody(req)
+          const videoId = String(body.videoId || '').trim()
+          const targetUrl = String(body.url || '').trim()
+          if (!/^[0-9A-Za-z_-]{11}$/.test(videoId)) throw new Error('invalid YouTube video id')
+          if (!/^https?:\/\/(www\.|m\.)?youtube\.com\/watch\?v=/.test(targetUrl)) {
+            throw new Error('invalid YouTube watch URL')
+          }
+          const lang = cleanLanguageCode(body.lang || 'en')
+          const cached = jobRunner.lookupYoutubeCache(videoId)
+          const result = await jobRunner.createYoutubeTimedTranscript({
+            url: targetUrl,
+            lang,
+            title: String(body.title || '').trim().slice(0, 300),
+            sourceFilePath: cached?.file_path || null,
+          })
+          if (!result?.ok || !result.file_path) {
+            return sendJson(res, 404, { ok: false, error: result?.error || 'timestamped subtitles are unavailable' })
+          }
+          const text = safeReadFile(result.file_path, 8 * 1024 * 1024)
+          if (text == null) throw new Error('timestamped subtitle file is not readable')
+          const cues = parseTimestampedTranscript(text)
+          if (!cues.length) throw new Error('timestamped subtitle file has no cues')
+          console.log(`[Learning] timed cues video=${videoId} lang=${lang} cues=${cues.length} cached=${result.cached === true}`)
+          return sendJson(res, 200, {
+            ok: true,
+            video_id: videoId,
+            language: lang,
+            cues,
+            cached: result.cached === true,
+          })
+        } catch (error) {
+          console.log(`[Learning] timed cues failed: ${error?.message || error}`)
+          return sendJson(res, 400, { ok: false, error: error?.message || String(error) })
+        }
+      }
+
+      // Authenticated local CLI handoff. This lets `sc boosty-all` coexist
+      // with a running desktop that already owns port 53127. The cookie still
+      // exists only for this request and is never logged or persisted.
+      if (req.method === 'POST' && url.pathname === '/boosty-auth-request') {
+        if (req.headers.origin) return sendJson(res, 403, { ok: false, error: 'browser origins are not allowed' })
+        if (!localCliToken || !matchesBearerToken(req.headers.authorization, localCliToken)) {
+          return sendJson(res, 401, { ok: false, error: 'invalid local credentials' })
+        }
+        const auth = await requestBoostyAuthCookie({ timeoutMs: 20_000 })
+        return sendJson(res, 200, { ok: true, auth })
       }
 
       // One-shot cookie response from the installed extension. The cookie is
@@ -581,6 +1223,8 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           // не всё подряд, чтобы не считать mtime логов и .git'а.
           const files = [
             'manifest.json', 'background.js', 'youtube-content.js',
+            'youtube-learning-utils.js', 'learning-store.js', 'youtube-learning.js', 'youtube-main-bridge.js',
+            'study/index.html', 'study/study.js', 'study/study.css',
             'aistudio-autoscrape.js', 'aistudio-core.js', 'aistudio-mcp.js',
             'claude-autoscrape.js',
             'claude-research.js', 'perplexity-research.js', 'chatgpt-research.js',
@@ -902,7 +1546,8 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         const provider = body.provider === 'perplexity' ? 'perplexity' : 'claude'
         const prompt = typeof body.prompt === 'string' ? body.prompt : ''
         if (!prompt.trim()) return sendJson(res, 400, { error: 'empty prompt' })
-        const job = researchState.create({ provider, prompt, options: body.options || {} })
+        const options = withResearchAutoClose(body.options, defaultResearchAutoClose())
+        const job = researchState.create({ provider, prompt, options })
         console.log(`[BrowserBridge] research-create id=${job.id} provider=${provider} prompt-len=${prompt.length}`)
         return sendJson(res, 200, { id: job.id, provider, hash: 'sc-research=' + job.id })
       }
@@ -915,6 +1560,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         const body = await readBody(req, BODY_LIMITS.researchStart)
         const prompt = typeof body.prompt === 'string' ? body.prompt : ''
         if (!prompt.trim()) return sendJson(res, 400, { error: 'empty prompt' })
+        const options = withResearchAutoClose(body.options, defaultResearchAutoClose())
 
         // ── AI Studio (Gemini) provider ──────────────────────────────
         // Раньше запускался через MCP-tool aistudio_run (browser-MCP). Теперь
@@ -924,7 +1570,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         // Состояние живёт в AISTUDIO_JOBS (CS PATCH'ит через /aistudio-state),
         // jobId имеет префикс aim_ — по нему /research-status роутит в нужный store.
         if (body.provider === 'aistudio' || body.provider === 'gemini') {
-          const opts = body.options || {}
+          const opts = options
           try {
             const extResp = await sendToExtension('mcp_aistudio_start', {
               prompt,
@@ -932,10 +1578,23 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
               systemInstruction: opts.systemInstruction || body.systemInstruction,
               reuse_tab: opts.reuse_tab,
               focus: opts.focus,
+              keepTab: opts.autoClose === false,
             }, 20000)
             if (!extResp || extResp.success === false) {
               return sendJson(res, 200, { error: extResp?.error || 'aistudio start failed', provider: 'aistudio' })
             }
+            const now = Date.now()
+            const previous = AISTUDIO_JOBS.get(extResp.jobId) || { jobId: extResp.jobId, createdAt: now }
+            AISTUDIO_JOBS.set(extResp.jobId, {
+              ...previous,
+              provider: 'aistudio',
+              modelId: extResp.modelId,
+              modelTitle: extResp.modelTitle,
+              status: previous.status || 'pending',
+              stage: previous.stage || 'boot',
+              keepTab: opts.autoClose === false,
+              updatedAt: now,
+            })
             console.log(`[BrowserBridge] research-start(aistudio) id=${extResp.jobId} model=${extResp.modelId} tab=${extResp.tabId}`)
             return sendJson(res, 200, {
               id: extResp.jobId, provider: 'aistudio', tabId: extResp.tabId,
@@ -953,34 +1612,60 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         const provider = body.provider === 'perplexity' ? 'perplexity'
           : body.provider === 'chatgpt' ? 'chatgpt'
           : 'claude'
-        const attachments = normalizeResearchAttachments(body.attachments || body.files || [])
-        if (attachments.length && provider !== 'chatgpt') {
+        const rawAttachments = Array.isArray(body.attachments)
+          ? body.attachments
+          : (Array.isArray(body.files) ? body.files : [])
+        if (rawAttachments.length && provider !== 'chatgpt') {
           return sendJson(res, 400, { error: 'attachments are currently supported only for provider=chatgpt' })
+        }
+        // Browser origins never get to name arbitrary local paths. Research
+        // with files is a local CLI/main-process capability; ChatGPT's page
+        // only reads already materialized bytes for its own job id.
+        if (rawAttachments.length && req.headers.origin) {
+          return sendJson(res, 403, { error: 'local file attachments require a local origin-less request' })
+        }
+        let attachments
+        try {
+          attachments = normalizeResearchAttachments(rawAttachments)
+        } catch (error) {
+          return sendJson(res, 400, { error: String(error?.message || error) })
+        }
+        const hasDocuments = attachments.some(attachment => attachment.kind !== 'image')
+        if (hasDocuments && options.mode == null) options.mode = 'chat'
+        if (hasDocuments && options.mode !== 'chat') {
+          return sendJson(res, 400, { error: 'document attachments are currently supported only in Chat mode; Work image uploads remain supported' })
         }
         const conversationUrl = body.conversationUrl || body.continueUrl || body.url || body.options?.conversationUrl || ''
         const chatgptConversationUrl = provider === 'chatgpt' && conversationUrl
           ? normalizeChatgptConversationUrl(conversationUrl)
           : ''
-        const job = researchState.create({ provider, prompt, options: body.options || {}, attachments })
+        const job = researchState.create({ provider, prompt, options, attachments })
         if (attachments.length) {
-          const materialized = materializeResearchAttachments({
-            libRoot: jobRunner.LIB_ROOT || path.join(os.homedir(), 'Library', 'Application Support', 'sc-desktop'),
-            id: job.id,
-            attachments,
-          })
-          researchState.update(job.id, { attachments: materialized })
+          try {
+            const materialized = materializeResearchAttachments({
+              libRoot: jobRunner.LIB_ROOT || path.join(os.homedir(), 'Library', 'Application Support', 'sc-desktop'),
+              id: job.id,
+              attachments,
+            })
+            researchState.update(job.id, { attachments: materialized })
+          } catch (error) {
+            researchState.update(job.id, { status: 'error', stage: 'attachment_validation', error: String(error?.message || error) })
+            return sendJson(res, 400, { error: String(error?.message || error) })
+          }
         }
         // chatgpt: query + дубль в hash — SPA срезает query на pushState,
         // hash страхует ре-инжект CS до того как window.name установлен.
         const targetUrl = provider === 'perplexity'
           ? `https://www.perplexity.ai/?sc-research=${encodeURIComponent(job.id)}`
           : provider === 'chatgpt'
-            ? (chatgptConversationUrl
-              ? appendResearchId(chatgptConversationUrl, job.id)
-              : `https://chatgpt.com/?sc-research=${encodeURIComponent(job.id)}#sc-research=${encodeURIComponent(job.id)}`)
+            ? chatgptResearchEntryUrl({
+              id: job.id,
+              mode: options.mode,
+              conversationUrl: chatgptConversationUrl,
+            })
             : `https://claude.ai/new#sc-research=${encodeURIComponent(job.id)}`
         if (chatgptConversationUrl) researchState.update(job.id, { url: chatgptConversationUrl, title: null })
-        console.log(`[BrowserBridge] research-start id=${job.id} provider=${provider} prompt-len=${prompt.length} attachments=${attachments.length} continue=${chatgptConversationUrl ? 1 : 0}`)
+        console.log(`[BrowserBridge] research-start id=${job.id} provider=${provider} prompt-len=${prompt.length} attachments=${researchState.get(job.id)?.attachments?.length || 0}/${attachments.length} continue=${chatgptConversationUrl ? 1 : 0}`)
         try {
           const extResp = await sendToExtension('mcp_open_research_tab', { url: targetUrl }, 15000)
           const tabId = extResp?.tabId ?? extResp?.result?.tabId ?? null
@@ -1036,7 +1721,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         if (!att) return sendJson(res, 404, { error: 'attachment not found' })
         try {
           const st = fs.statSync(att.path)
-          if (!st.isFile() || st.size !== att.size || st.size > 20 * 1024 * 1024) {
+          if (!st.isFile() || st.size !== att.size || st.size > MAX_ATTACHMENT_BYTES) {
             return sendJson(res, 410, { error: 'attachment changed or too large' })
           }
           return sendJson(res, 200, {
@@ -1342,42 +2027,9 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
       // по внешним каналам. Базовый browser-MCP (list_tabs/click/…) сюда НЕ
       // входит — он не «job», а разовая команда.
       if (req.method === 'GET' && url.pathname === '/external-jobs') {
-        const out = []
-        // 1) AI Studio jobs (тот же TTL-prune что и /aistudio-jobs).
-        const cutoff = Date.now() - AISTUDIO_TTL_MS
-        for (const [id, j] of AISTUDIO_JOBS) {
-          if ((j.updatedAt || 0) < cutoff && j.status !== 'running' && j.status !== 'pending') {
-            AISTUDIO_JOBS.delete(id)
-            continue
-          }
-          out.push({ kind: 'aistudio', ...j })
-        }
-        // 2) Claude/Perplexity research jobs (live, RAM).
-        try {
-          for (const rj of researchState.listAllForUi()) out.push(rj)
-        } catch (e) {
-          console.log('[BrowserBridge] external-jobs research list failed:', e?.message)
-        }
-        // 3) История из БД (переживает рестарт). Дедуп: RAM-джоб (live, свежее)
-        //    приоритетнее БД-записи с тем же jobId.
-        try {
-          const seen = new Set(out.map(j => j.jobId))
-          for (const hj of (db()?.listResearchJobs(100) || [])) {
-            if (seen.has(hj.jobId)) continue
-            out.push(hj)
-          }
-        } catch (e) {
-          console.log('[BrowserBridge] external-jobs db history failed:', e?.message)
-        }
-        // Сортировка: активные (running/pending/queued) первыми, потом updatedAt desc.
-        const isActive = s => s === 'running' || s === 'pending' || s === 'queued'
-        out.sort((a, b) => {
-          const aa = isActive(a.status) ? 1 : 0
-          const bb = isActive(b.status) ? 1 : 0
-          if (aa !== bb) return bb - aa
-          return (b.updatedAt || 0) - (a.updatedAt || 0)
-        })
-        return sendJson(res, 200, { jobs: out })
+        const summary = url.searchParams.get('summary') === '1'
+        const jobId = url.searchParams.get('id') || null
+        return sendJson(res, 200, { jobs: listExternalJobsForUi({ summary, jobId }) })
       }
       // Детерминированный стоп research-джобы: job → error СРАЗУ (не ждём
       // tab-closed fallback — у зомби-джоб tabId может быть null), потом
@@ -1450,6 +2102,9 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         const body = await readBody(req)
         if (body.id) {
           AISTUDIO_JOBS.delete(body.id)
+          researchState.remove(body.id)
+          db()?.deleteResearchJob(body.id)
+          invalidateResearchHistoryCache()
         } else if (body.terminal) {
           // Очистить только завершённые
           for (const [id, j] of AISTUDIO_JOBS) {
@@ -1526,6 +2181,10 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           'aistudio-autoscrape.js', 'aistudio-core.js', 'aistudio-mcp.js',
           'claude-autoscrape.js', 'claude-research.js', 'perplexity-research.js',
           'chatgpt-research.js', 'research-badge.js',
+          'chatgpt-entry-url.js', 'tab-placement.js', 'pill-event-guard.js', 'research-tab-policy.js',
+          'youtube-learning-utils.js', 'learning-store.js', 'youtube-learning.js', 'youtube-main-bridge.js',
+          'study/index.html', 'study/study.js', 'study/study.css',
+          'mcp-window-model.js',
           'popup.html', 'popup.js', 'settings.js', 'mcp-handlers.js', 'mcp-content.js',
         ]
         let lastMtime = 0
@@ -1561,4 +2220,24 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
   return server
 }
 
-module.exports = { startServer, requestBoostyAuthCookie, PORT, RELOAD_WS_PORT }
+module.exports = {
+  startServer,
+  requestBoostyAuthCookie,
+  listExternalJobsForUi,
+  externalJobSummary,
+  invalidateResearchHistoryCache,
+  PORT,
+  RELOAD_WS_PORT,
+  // Kept non-public to the renderer/extension. Integration tests use the
+  // same code path without binding the fixed bridge port.
+  __test: {
+    translatorConfig,
+    azureTranslatorRequest,
+    translateTexts,
+    dictionaryLookup,
+    translatorCacheKey,
+    parseTimestampedTranscript,
+    normalizeVocabularyTerm,
+    vocabularySyncPayload,
+  },
+}

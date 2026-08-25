@@ -2,7 +2,7 @@ import React, { useRef, useState } from 'react'
 import { Settings, Activity, History, Plus } from 'lucide-react'
 import { useStore, pushScreen, toggleScreen, openSettings, toggleActivity, closeActivity } from '../lib/store'
 import { SETTINGS_SECTIONS } from '../lib/settingsSections'
-import { useJobs } from '../lib/jobs'
+import { useJobsSelector } from '../lib/jobs'
 import { useAistudioJobs } from '../lib/aistudioJobs'
 import McpRunningPopover from './McpRunningPopover'
 import RequestsRunningPopover from './RequestsRunningPopover'
@@ -15,8 +15,9 @@ export default function TitleBar({
 }) {
   const screen = useStore(s => s.screen)
   const activityOpen = useStore(s => s.activityOpen)
-  const jobs = useJobs()
-  const activeCount = jobs.filter(j => isVisibleRequestJob(j) && isActiveRequestJob(j)).length
+  const activeCount = useJobsSelector(jobs => (
+    jobs.filter(j => isVisibleRequestJob(j) && isActiveRequestJob(j)).length
+  ))
   const mcpActiveCount = useAistudioJobs(arr =>
     arr.filter(j => j.status === 'running' || j.status === 'pending').length
   )
@@ -130,6 +131,7 @@ export default function TitleBar({
           }`}
         >
           <button
+            data-requests-active-toggle
             onClick={() => {
               openOnly('requestsPopover')
               setRequestsPopoverOpen(o => !o)

@@ -162,6 +162,7 @@ const CLAUDE_AVAILABLE_MODELS = Object.freeze([
 const CHATGPT_AVAILABLE_MODELS = Object.freeze([
   { id: '5.5',       label: 'GPT-5.5 Instant', modes: ['chat'] },
   { id: '5.6-sol',   label: 'GPT-5.6 Sol',     modes: ['chat', 'work'] },
+  { id: 'o3',        label: 'o3 · до 26 августа', modes: ['chat'] },
   { id: '5.6-terra', label: 'GPT-5.6 Terra',   modes: ['work'] },
   { id: '5.6-luna',  label: 'GPT-5.6 Luna',    modes: ['work'] },
 ]);
@@ -177,7 +178,12 @@ const CHATGPT_AVAILABLE_EFFORTS = Object.freeze([
   { id: 'ultra', label: 'Ultra' },
 ]);
 
-const CHATGPT_RETIRED_MODELS = Object.freeze(new Set(['5.4', '5.3', '5.2', '4.5', 'o3']));
+const CHATGPT_RETIRED_MODELS = Object.freeze(new Set(['5.4', '5.3', '5.2', '4.5']));
+
+const CHATGPT_WORK_SPEEDS = Object.freeze([
+  { id: 'standard', label: 'Стандартный' },
+  { id: 'fast', label: 'Быстро · расход выше' },
+]);
 
 const CHATGPT_MODES = Object.freeze(['chat', 'work']);
 const CHATGPT_MODE_LABELS = Object.freeze({
@@ -196,11 +202,14 @@ function chatgptEffortsFor(mode, model) {
     return ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(id => byId[id]);
   }
   if (model === '5.5') return [byId.instant];
-  return ['medium', 'high', 'xhigh', 'pro'].map(id => byId[id]);
+  if (model === 'o3') return [byId.medium];
+  return ['instant', 'medium', 'high', 'xhigh', 'pro'].map(id => byId[id]);
 }
 
 function defaultChatgptEffort(mode, model) {
-  return mode === 'chat' && model === '5.5' ? 'instant' : 'xhigh';
+  if (mode === 'chat' && model === '5.5') return 'instant';
+  if (mode === 'chat' && model === 'o3') return 'medium';
+  return 'xhigh';
 }
 
 function normalizeChatgptPair(mode, rawModel, rawEffort) {
@@ -301,12 +310,23 @@ const YOUTUBE_TARGET_LABELS = Object.freeze({
 });
 
 const YOUTUBE_ENGINES = Object.freeze(['gemini', 'assemblyai']);
-const YOUTUBE_SETTINGS_SCHEMA_VERSION = 1;
+const YOUTUBE_SUBTITLE_POSITIONS = Object.freeze(['top', 'bottom']);
+const YOUTUBE_TRANSLATION_MODES = Object.freeze(['hover', 'always']);
+const YOUTUBE_SETTINGS_SCHEMA_VERSION = 2;
 
 const YOUTUBE_DEFAULT_SETTINGS = Object.freeze({
   auto_aistudio: false,           // legacy-поле, всегда false (split-pill решает)
   with_comments: false,
   preferred_lang: 'ru',
+  // Learning overlay is activated by YouTube's native CC button. The source
+  // track is selected in the player; Azure translates it into this language.
+  learning_enabled: true,
+  learning_target_lang: 'ru',
+  learning_auto_pause: false,
+  learning_subtitle_position: 'bottom',
+  learning_controls_mirrored: false,
+  learning_translation_mode: 'always',
+  learning_hide_native_subtitles: true,
   // Движок AI-транскрипции когда субтитров нет (awaiting_ai → resume).
   // gemini (дёшево, быстро) | assemblyai (длинные файлы 1-10ч). Прокидывается
   // в __sc_track_job → trackJob.engine → POST /yt-resume-ai. Дефолт gemini.
@@ -350,6 +370,9 @@ const YOUTUBE_DEFAULT_SETTINGS = Object.freeze({
   chatgpt_chat_effort: 'xhigh',
   chatgpt_work_model: '5.6-sol',
   chatgpt_work_effort: 'xhigh',
+  // Work имеет отдельную скорость. Fast расходует недельную квоту быстрее,
+  // поэтому безопасный default — стандартная скорость.
+  chatgpt_work_speed: 'standard',
   chatgpt_model: '5.6-sol',
   chatgpt_effort: 'xhigh',
 });
@@ -362,6 +385,22 @@ function sanitizeYoutubeSettings(raw = {}) {
   if (typeof raw.preferred_lang === 'string' && raw.preferred_lang.trim()) {
     s.preferred_lang = raw.preferred_lang.trim().slice(0, 32);
   }
+  s.learning_enabled = cb(raw.learning_enabled, s.learning_enabled);
+  if (typeof raw.learning_target_lang === 'string' && raw.learning_target_lang.trim()) {
+    s.learning_target_lang = raw.learning_target_lang.trim().slice(0, 32);
+  }
+  s.learning_auto_pause = cb(raw.learning_auto_pause, s.learning_auto_pause);
+  if (YOUTUBE_SUBTITLE_POSITIONS.includes(raw.learning_subtitle_position)) {
+    s.learning_subtitle_position = raw.learning_subtitle_position;
+  }
+  s.learning_controls_mirrored = cb(raw.learning_controls_mirrored, s.learning_controls_mirrored);
+  if (YOUTUBE_TRANSLATION_MODES.includes(raw.learning_translation_mode)) {
+    s.learning_translation_mode = raw.learning_translation_mode;
+  }
+  s.learning_hide_native_subtitles = cb(
+    raw.learning_hide_native_subtitles,
+    s.learning_hide_native_subtitles,
+  );
   if (typeof raw.engine === 'string' && YOUTUBE_ENGINES.includes(raw.engine)) {
     s.engine = raw.engine;
   }
@@ -418,6 +457,9 @@ function sanitizeYoutubeSettings(raw = {}) {
   s.chatgpt_chat_effort = chatPair.effort;
   s.chatgpt_work_model = workPair.model;
   s.chatgpt_work_effort = workPair.effort;
+  s.chatgpt_work_speed = CHATGPT_WORK_SPEEDS.some(item => item.id === raw.chatgpt_work_speed)
+    ? raw.chatgpt_work_speed
+    : 'standard';
 
   // Совместимые flat aliases: desktop и старые content-script'ы видят
   // модель/интеллект текущего режима, не теряя отдельные пары.
