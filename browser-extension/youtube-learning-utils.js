@@ -253,6 +253,22 @@
       .map(({ distance, ...cue }) => cue);
   }
 
+  function sentenceForTerm(text, term, language = 'en') {
+    const source = cleanCueText(text);
+    const normalized = normalizeTerm(term);
+    if (!source || !normalized) return source;
+    const containsTerm = sentence => segmentWords(sentence, language)
+      .some(part => part.word && part.normalized === normalized);
+    try {
+      const segmenter = new Intl.Segmenter(language || undefined, { granularity: 'sentence' });
+      const match = Array.from(segmenter.segment(source), part => part.segment.trim())
+        .find(sentence => sentence && containsTerm(sentence));
+      if (match) return match;
+    } catch {}
+    const fallback = source.split(/(?<=[.!?])\s+/).find(sentence => containsTerm(sentence));
+    return (fallback || source).trim();
+  }
+
   function inclusiveWordRange(anchorIndex, targetIndex) {
     const anchor = Math.max(0, Math.trunc(Number(anchorIndex) || 0));
     const target = Math.max(0, Math.trunc(Number(targetIndex) || 0));
@@ -263,6 +279,21 @@
     if (code === 'KeyA') return -1;
     if (code === 'KeyD') return 1;
     return 0;
+  }
+
+  function cueWindowText(cues, currentIndex, neighborCount = 0, direction = 'left') {
+    const list = Array.isArray(cues) ? cues : [];
+    const index = Math.trunc(Number(currentIndex));
+    if (!Number.isInteger(index) || index < 0 || index >= list.length) return '';
+    const count = Math.max(0, Math.min(10, Math.trunc(Number(neighborCount) || 0)));
+    const from = direction === 'right' ? index : Math.max(0, index - count);
+    const to = direction === 'right' ? Math.min(list.length - 1, index + count) : index;
+    return list.slice(from, to + 1)
+      .map(cue => cleanCueText(cue?.text || ''))
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
   function batchTexts(items, maxItems = 25, maxChars = 5_000) {
@@ -296,8 +327,10 @@
     alignedTargetRanges,
     exactTermRanges,
     examplesForTerm,
+    sentenceForTerm,
     inclusiveWordRange,
     cueNavigationDelta,
+    cueWindowText,
     batchTexts,
     timestampToMs,
   };

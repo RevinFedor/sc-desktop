@@ -111,6 +111,11 @@ test('desktop preserves the global contextual word explanation toggle', () => {
   assert.equal(sanitizeExtensionYoutube({ learning_ai_explanation: false }).learning_ai_explanation, false)
 })
 
+test('desktop keeps card autoplay off by default and persists opt-in', () => {
+  assert.equal(sanitizeExtensionYoutube({}).learning_card_autoplay, false)
+  assert.equal(sanitizeExtensionYoutube({ learning_card_autoplay: true }).learning_card_autoplay, true)
+})
+
 test('desktop accepts current Chat o3 and Instant on GPT-5.6', () => {
   const o3 = sanitizeExtensionYoutube({
     chatgpt_chat_model: 'o3',

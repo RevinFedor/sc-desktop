@@ -37,7 +37,7 @@ const VOCABULARY_SYNC_ALARM = 'sc-vocabulary-sync';
 
 const learningStore = self.__scLearningStore;
 const learningMutationActions = new Set([
-  'setState', 'saveMachineTranslation', 'editTranslation', 'queueReview', 'resolveConflict',
+  'setState', 'saveMachineTranslation', 'editTranslation', 'queueReview', 'undoReview', 'resolveConflict',
 ]);
 
 chrome.runtime.onMessage.addListener((message) => {

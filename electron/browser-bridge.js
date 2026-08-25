@@ -771,7 +771,7 @@ async function voiceVocabularyRequest(method, route, body = null, timeoutMs = 4_
 }
 
 const LEARNING_EXPLANATION_MODEL = 'gemini-3.1-flash-lite'
-const LEARNING_EXPLANATION_VERSION = 'v1'
+const LEARNING_EXPLANATION_VERSION = 'v3'
 const learningExplanationInflight = new Map()
 
 function normalizeLearningExplanationPayload(raw = {}) {
@@ -951,27 +951,43 @@ async function syncVocabularyWithVoice(rawBody) {
   }
 
   const acknowledgedReviews = []
-  for (const operation of reviewOps.sort((a, b) => Number(a?.reviewedAt || 0) - Number(b?.reviewedAt || 0))) {
-    const result = operation?.result === 'forgotten' ? 'forgotten' : operation?.result === 'remembered' ? 'remembered' : ''
+  const orderedReviewOps = [...reviewOps].sort((a, b) => Number(a?.createdAt || a?.reviewedAt || 0) - Number(b?.createdAt || b?.reviewedAt || 0))
+  for (const operation of orderedReviewOps) {
     const operationId = String(operation?.id || '').trim()
-    if (!result || !operationId) continue
     const remote = (operation.remoteId && index.byId.get(operation.remoteId))
       || index.byTerm.get(normalizeVocabularyTerm(operation.term))
-    if (!remote?.id) continue
-    const reviewed = await voiceVocabularyRequest(
-      'POST',
-      `/api/vocabulary/${encodeURIComponent(remote.id)}/review`,
-      {
-        result,
-        mode: operation.mode === 'practice' ? 'practice' : 'scheduled',
-        operationId,
-        reviewedAt: Number(operation.reviewedAt) || Date.now(),
-      },
-    )
-    if (reviewed?.item) {
-      index.byId.set(reviewed.item.id, reviewed.item)
-      index.byTerm.set(normalizeVocabularyTerm(reviewed.item.term), reviewed.item)
-      acknowledgedReviews.push(operationId)
+    if (!operationId || !remote?.id) continue
+    if (operation?.type === 'review') {
+      const result = operation?.result === 'forgotten' ? 'forgotten' : operation?.result === 'remembered' ? 'remembered' : ''
+      if (!result) continue
+      const reviewed = await voiceVocabularyRequest(
+        'POST',
+        `/api/vocabulary/${encodeURIComponent(remote.id)}/review`,
+        {
+          result,
+          mode: operation.mode === 'practice' ? 'practice' : 'scheduled',
+          operationId,
+          reviewedAt: Number(operation.reviewedAt) || Date.now(),
+        },
+      )
+      if (reviewed?.item) {
+        index.byId.set(reviewed.item.id, reviewed.item)
+        index.byTerm.set(normalizeVocabularyTerm(reviewed.item.term), reviewed.item)
+        acknowledgedReviews.push(operationId)
+      }
+    } else if (operation?.type === 'undo-review') {
+      const reviewOperationId = String(operation?.reviewOperationId || '').trim()
+      if (!reviewOperationId) continue
+      const undone = await voiceVocabularyRequest(
+        'POST',
+        `/api/vocabulary/${encodeURIComponent(remote.id)}/review/undo`,
+        { operationId: reviewOperationId },
+      )
+      if (undone?.item) {
+        index.byId.set(undone.item.id, undone.item)
+        index.byTerm.set(normalizeVocabularyTerm(undone.item.term), undone.item)
+        acknowledgedReviews.push(operationId)
+      }
     }
   }
 
@@ -1126,14 +1142,18 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         try {
           const body = await readBody(req)
           const text = String(body?.text || '').replace(/\s+/g, ' ').trim().slice(0, 5000)
+          const word = String(body?.word || '').replace(/\s+/g, ' ').trim().slice(0, 160)
+          const context = String(body?.context || '').replace(/\s+/g, ' ').trim().slice(0, 5000)
           const result = await voiceVocabularyRequest('POST', '/api/desktop/learning-selection', {
             text,
+            word,
+            context,
             sourceName: String(body?.sourceName || 'YouTube subtitles').trim().slice(0, 120),
             pageUrl: String(body?.pageUrl || '').trim().slice(0, 2000),
             videoId: String(body?.videoId || '').trim().slice(0, 32),
             cueStartMs: Number.isFinite(Number(body?.cueStartMs)) ? Math.max(0, Math.round(Number(body.cueStartMs))) : null,
           })
-          console.log(`[Learning] selection handoff armed=${result?.armed === true} chars=${text.length}`)
+          console.log(`[Learning] selection handoff armed=${result?.armed === true} chars=${text.length} word=${word ? 1 : 0} context=${context.length}`)
           return sendJson(res, 200, { ok: true, online: true, armed: result?.armed === true })
         } catch (error) {
           if (error?.code === 'voice_record_offline') {

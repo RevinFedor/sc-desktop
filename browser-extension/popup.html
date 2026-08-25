@@ -34,14 +34,13 @@
       -webkit-text-fill-color: transparent;
       margin-bottom: 14px;
     }
-    .popup-head { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
-    .popup-head h1 { margin:0; flex:1; }
+    .popup-head { display:flex; align-items:center; margin-bottom:14px; }
     .vocabulary-btn {
-      border:1px solid var(--border-color); border-radius:7px; padding:7px 10px;
-      background:var(--card-bg); color:var(--text-primary); font:600 12px inherit;
+      border:1px solid rgba(102,126,234,.46); border-radius:8px; padding:8px 11px;
+      background:rgba(102,126,234,.15); color:#c7d2fe; font-size:13px; font-weight:650;
       cursor:pointer;
     }
-    .vocabulary-btn:hover { border-color:var(--accent-color); background:rgba(102,126,234,.12); }
+    .vocabulary-btn:hover { border-color:var(--accent-color); background:rgba(102,126,234,.24); color:#eef2ff; }
 
     .content {
       background-color: var(--card-bg);
@@ -495,7 +494,6 @@
 <body>
   <div class="container">
     <div class="popup-head">
-      <h1 id="appTitle">SC Browser Parser</h1>
       <button type="button" id="openVocabulary" class="vocabulary-btn">Словарь / карточки</button>
     </div>
 

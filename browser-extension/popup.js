@@ -42,7 +42,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const messageDiv  = document.getElementById('message');
   const formatIcon  = document.getElementById('formatIcon');
   const formatText  = document.getElementById('formatText');
-  const appTitle    = document.getElementById('appTitle');
   const openVocabulary = document.getElementById('openVocabulary');
 
   openVocabulary?.addEventListener('click', () => {
@@ -766,12 +765,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (site === 'aistudio' || site === 'perplexity' || site === 'claude' || site === 'chatgpt') {
       applyExportTab(site);
     }
-    if (site === 'aistudio')        appTitle.textContent = 'Gemini Studio Exporter';
-    else if (site === 'perplexity') appTitle.textContent = 'Perplexity Exporter';
-    else if (site === 'claude')     appTitle.textContent = 'Claude Exporter';
-    else if (site === 'chatgpt')    appTitle.textContent = 'ChatGPT Exporter';
-    else if (site === 'youtube')    appTitle.textContent = 'YouTube → sc-desktop';
-    else                            appTitle.textContent = 'SC Browser Parser';
     updateFormatHint();
   }
 

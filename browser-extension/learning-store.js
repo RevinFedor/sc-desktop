@@ -367,7 +367,36 @@
       tx.objectStore(OUTBOX).put(operation);
     });
     notify({ type: 'review-queued', key: entry.key, result, mode });
-    return { entry: updated, operation };
+    return { entry: updated, operation, entryBefore: entry };
+  }
+
+  async function undoReviewDirect(payload) {
+    const current = await getEntryDirect({ key: payload?.key || payload?.entryBefore?.key });
+    const entryBefore = payload?.entryBefore;
+    const reviewOperation = payload?.operation;
+    if (!current || !entryBefore || entryBefore.key !== current.key) throw new Error('Review snapshot is unavailable');
+    const reviewOperationId = String(reviewOperation?.id || '').trim();
+    if (!reviewOperationId) throw new Error('Review operation is unavailable');
+    const timestamp = now();
+    const restored = normalizeEntry({ ...entryBefore, updatedAt: timestamp }, current);
+    const undoOperation = {
+      id: `undo:${reviewOperationId}:${timestamp}:${Math.random().toString(36).slice(2, 8)}`,
+      type: 'undo-review',
+      entryKey: current.key,
+      term: current.sourceText,
+      remoteId: current.remoteId || entryBefore.remoteId || '',
+      reviewOperationId,
+      createdAt: timestamp,
+    };
+    await transaction([ENTRIES, OUTBOX], 'readwrite', (tx) => {
+      tx.objectStore(ENTRIES).put(restored);
+      // Keep the original review operation if it has not synced yet. The
+      // server receives review → undo in order, which is correct both before
+      // and after an earlier background sync.
+      tx.objectStore(OUTBOX).put(undoOperation);
+    });
+    notify({ type: 'review-undone', key: current.key, reviewOperationId });
+    return { entry: restored, operation: undoOperation };
   }
 
   async function dueEntriesDirect(options = {}) {
@@ -541,7 +570,7 @@
     syncPromise = (async () => {
       await migrateLegacyDirect();
       const entries = (await getAllEntriesDirect()).filter((entry) => entry.dirty);
-      const reviews = (await getOutboxDirect()).filter((item) => item.type === 'review');
+      const reviews = (await getOutboxDirect()).filter((item) => item.type === 'review' || item.type === 'undo-review');
       let result;
       try {
         result = await bridgeJson('/vocabulary/sync', { method: 'POST', body: { entries, reviews } });
@@ -610,6 +639,7 @@
     saveMachineTranslation: saveMachineTranslationDirect,
     editTranslation: editTranslationDirect,
     queueReview: queueReviewDirect,
+    undoReview: undoReviewDirect,
     resolveConflict: resolveConflictDirect,
     migrateLegacy: migrateLegacyDirect,
     sync: syncDirect,
@@ -619,7 +649,7 @@
 
   const MESSAGE_METHODS = new Set([
     'getEntry', 'listEntries', 'dueEntries', 'setState', 'saveMachineTranslation',
-    'editTranslation', 'queueReview', 'resolveConflict', 'migrateLegacy', 'sync', 'stats',
+    'editTranslation', 'queueReview', 'undoReview', 'resolveConflict', 'migrateLegacy', 'sync', 'stats',
   ]);
 
   function sendStoreMessage(action, payload) {

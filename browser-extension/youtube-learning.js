@@ -39,6 +39,8 @@
     more: '<svg viewBox="0 0 24 24"><path d="M5 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4Zm7 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4Zm7 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z"/></svg>',
     play: '<svg viewBox="0 0 24 24"><path d="M7 4v16l13-8L7 4Z"/></svg>',
     book: '<svg viewBox="0 0 24 24"><path d="M4 4.5A3.5 3.5 0 0 1 7.5 1H11a3 3 0 0 1 3 3v15.2A3.8 3.8 0 0 0 11.5 18H7.2A3.2 3.2 0 0 0 4 21.2V4.5Zm16 0A3.5 3.5 0 0 0 16.5 1H15v18.2a3.8 3.8 0 0 1 2.5-1.2H20V4.5Z"/></svg>',
+    left: '<svg viewBox="0 0 24 24"><path d="m14.7 6.3-1.4-1.4L6.2 12l7.1 7.1 1.4-1.4L10 13h8v-2h-8l4.7-4.7Z"/></svg>',
+    right: '<svg viewBox="0 0 24 24"><path d="m9.3 6.3 1.4-1.4 7.1 7.1-7.1 7.1-1.4-1.4L14 13H6v-2h8L9.3 6.3Z"/></svg>',
   };
 
   const PART_OF_SPEECH_LABELS = Object.freeze({
@@ -59,6 +61,7 @@
   );
   let root = null;
   let subtitleCard = null;
+  let sourceWrap = null;
   let sourceRow = null;
   let translationRow = null;
   let statusRow = null;
@@ -99,6 +102,10 @@
   let hoverPausedCueKey = '';
   let popoverResizeObserver = null;
   let learningStateRefreshPromise = null;
+  let copyCueControl = null;
+  let copyCueButton = null;
+  let copyNeighborCount = 1;
+  let copyFeedbackTimer = null;
   const translationsByText = new Map();
   const translationAlignmentsByText = new Map();
   const pendingTranslationTexts = new Set();
@@ -149,6 +156,8 @@
         font-family: Roboto, Arial, sans-serif;
         color: #fff;
         contain: layout style;
+        user-select: none;
+        -webkit-user-select: none;
       }
       #${ROOT_ID}[data-active="0"] { display: none !important; }
       #${ROOT_ID} .sc-learning-subtitle-card {
@@ -175,6 +184,76 @@
         -webkit-box-decoration-break: clone;
         line-height: 1.32;
       }
+      #${ROOT_ID} .sc-learning-source-wrap {
+        position:relative;
+        width:fit-content;
+        max-width:100%;
+        margin:0 auto;
+      }
+      #${ROOT_ID} .sc-learning-source-wrap .sc-learning-source { margin:0; }
+      #${ROOT_ID} .sc-learning-copy-control {
+        position:absolute;
+        left:calc(100% + 6px);
+        top:50%;
+        z-index:4;
+        transform:translateY(-50%);
+        opacity:.24;
+        pointer-events:auto;
+        transition:opacity .12s;
+      }
+      #${ROOT_ID} .sc-learning-copy-control[data-visible="0"] { display:none; }
+      #${ROOT_ID} .sc-learning-source-wrap:hover .sc-learning-copy-control,
+      #${ROOT_ID} .sc-learning-copy-control:focus-within { opacity:.82; }
+      #${ROOT_ID} .sc-learning-copy-control:hover { opacity:1; }
+      #${ROOT_ID} .sc-learning-copy-launch {
+        width:32px;
+        height:32px;
+        display:grid;
+        place-items:center;
+        padding:0;
+        border:0;
+        border-radius:8px;
+        background:rgba(9,9,11,.28);
+        color:#e4e4e7;
+        cursor:pointer;
+      }
+      #${ROOT_ID} .sc-learning-copy-launch:hover,
+      #${ROOT_ID} .sc-learning-copy-control:focus-within .sc-learning-copy-launch { background:rgba(39,39,42,.96); }
+      #${ROOT_ID} .sc-learning-copy-control[data-copied="1"] .sc-learning-copy-launch { color:#86efac; background:rgba(20,83,45,.94); }
+      #${ROOT_ID} .sc-learning-copy-launch svg { width:19px; height:19px; fill:currentColor; }
+      #${ROOT_ID} .sc-learning-copy-menu {
+        position:absolute;
+        right:0;
+        bottom:calc(100% + 6px);
+        display:none;
+        align-items:center;
+        gap:3px;
+        padding:4px;
+        border:1px solid rgba(255,255,255,.14);
+        border-radius:9px;
+        background:rgba(24,24,27,.98);
+        box-shadow:0 10px 28px rgba(0,0,0,.42);
+        white-space:nowrap;
+      }
+      #${ROOT_ID} .sc-learning-copy-control:hover .sc-learning-copy-menu,
+      #${ROOT_ID} .sc-learning-copy-control:focus-within .sc-learning-copy-menu { display:flex; }
+      #${ROOT_ID} .sc-learning-copy-menu button {
+        width:27px;
+        height:27px;
+        display:grid;
+        place-items:center;
+        padding:0;
+        border:0;
+        border-radius:6px;
+        background:transparent;
+        color:#a1a1aa;
+        cursor:pointer;
+        font:700 12px Roboto,Arial,sans-serif;
+      }
+      #${ROOT_ID} .sc-learning-copy-menu button:hover { color:#fff; background:#3f3f46; }
+      #${ROOT_ID} .sc-learning-copy-menu button[data-selected="1"] { color:#e9d5ff; background:rgba(147,51,234,.34); }
+      #${ROOT_ID} .sc-learning-copy-menu button svg { width:17px; height:17px; fill:currentColor; }
+      #${ROOT_ID} .sc-learning-copy-divider { width:1px; height:18px; margin:0 2px; background:#3f3f46; }
       #${ROOT_ID} .sc-learning-source:empty,
       #${ROOT_ID} .sc-learning-translation:empty { display: none; }
       #${ROOT_ID} .sc-learning-source { font-size: clamp(20px, 2.15vw, 34px); font-weight: 500; }
@@ -188,7 +267,7 @@
         color:#fff;
         background:rgba(147,51,234,.5);
         border-radius:3px;
-        padding:0 2px;
+        padding:0;
       }
       #${ROOT_ID}[data-translation-mode="hover"] .sc-learning-translation {
         opacity: 0;
@@ -357,6 +436,8 @@
         color: #f4f4f5;
         box-shadow: 0 20px 58px rgba(0,0,0,.58);
         font-family: Roboto, Arial, sans-serif;
+        user-select:none;
+        -webkit-user-select:none;
       }
       #${WORD_POPOVER_ID} .sc-word-head { display:flex; flex:0 0 auto; align-items:flex-start; gap:8px; padding:10px 11px 9px; background:#2b2b2f; }
       #${WORD_POPOVER_ID} .sc-word-title { min-width:0; flex:1; }
@@ -370,7 +451,7 @@
       #${WORD_POPOVER_ID} .sc-word-section-title { margin-bottom:6px; color:#a1a1aa; font-size:12px; font-weight:600; letter-spacing:.02em; }
       #${WORD_POPOVER_ID} .sc-word-ai { margin:0 0 8px; padding:8px 9px; border:1px solid rgba(168,85,247,.2); border-radius:8px; background:#27272a; color:#d4d4d8; font-size:12.5px; line-height:1.38; }
       #${WORD_POPOVER_ID} .sc-word-ai[hidden] { display:none; }
-      #${WORD_POPOVER_ID} .sc-word-ai-label { margin-right:6px; color:#c4b5fd; font-size:10px; font-weight:750; letter-spacing:.04em; text-transform:uppercase; }
+      #${WORD_POPOVER_ID} .sc-word-ai-label { margin-right:6px; color:#c4b5fd; font-size:12px; font-weight:750; }
       #${WORD_POPOVER_ID} .sc-word-ai-skeleton { width:100%; height:14px; }
       #${WORD_POPOVER_ID} .sc-word-ai[data-state="error"] { border-color:rgba(255,255,255,.08); color:#71717a; }
       #${WORD_POPOVER_ID} .sc-word-meaning { display:flex; gap:7px; margin:3px 0; font-size:15px; line-height:1.3; }
@@ -382,7 +463,7 @@
       #${WORD_POPOVER_ID} .sc-word-example:first-of-type { border-top:0; }
       #${WORD_POPOVER_ID} .sc-word-example-text { font-size:15px; line-height:1.45; }
       #${WORD_POPOVER_ID} .sc-word-example-translation { margin-top:3px; color:#a1a1aa; font-size:13px; }
-      #${WORD_POPOVER_ID} mark { color:#fff; background:rgba(147,51,234,.48); border-radius:3px; padding:0 2px; }
+      #${WORD_POPOVER_ID} mark { color:#fff; background:rgba(147,51,234,.48); border-radius:3px; padding:0; }
       #${WORD_POPOVER_ID} .sc-example-actions { display:flex; opacity:.42; transition:opacity .1s; }
       #${WORD_POPOVER_ID} .sc-word-example:hover .sc-example-actions { opacity:1; }
       #${WORD_POPOVER_ID} .sc-example-menu { position:absolute; right:4px; top:42px; display:flex; gap:4px; padding:5px; border-radius:8px; background:#3f3f46; box-shadow:0 8px 22px rgba(0,0,0,.4); }
@@ -439,6 +520,81 @@
     button.setAttribute('aria-label', label);
     installSafeClick(button, handler);
     return button;
+  }
+
+  function updateCopyNeighborButtons(control) {
+    for (const button of control?.querySelectorAll?.('[data-neighbor-count]') || []) {
+      const selected = Number(button.dataset.neighborCount) === copyNeighborCount;
+      button.dataset.selected = selected ? '1' : '0';
+      button.setAttribute('aria-pressed', String(selected));
+    }
+  }
+
+  async function copyCueWindow(direction = 'current') {
+    const count = direction === 'current' ? 0 : copyNeighborCount;
+    const side = direction === 'right' ? 'right' : 'left';
+    const text = U.cueWindowText(cues, currentCueIndex, count, side);
+    if (!text) return;
+    const copied = await copyText(text);
+    if (!copied || !copyCueControl) return;
+    clearTimeout(copyFeedbackTimer);
+    copyCueControl.dataset.copied = '1';
+    copyCueButton.title = 'Скопировано';
+    copyCueButton.setAttribute('aria-label', 'Скопировано');
+    copyFeedbackTimer = setTimeout(() => {
+      if (!copyCueControl) return;
+      copyCueControl.dataset.copied = '0';
+      copyCueButton.title = 'Копировать текущую реплику';
+      copyCueButton.setAttribute('aria-label', 'Копировать текущую реплику');
+    }, 900);
+    log('cue copied', { cueIndex: currentCueIndex, neighbors: count, direction, chars: text.length });
+  }
+
+  function buildCueCopyControl() {
+    const control = document.createElement('div');
+    control.className = 'sc-learning-copy-control';
+    control.dataset.visible = '0';
+    control.dataset.copied = '0';
+    copyCueButton = document.createElement('button');
+    copyCueButton.type = 'button';
+    copyCueButton.className = 'sc-learning-copy-launch';
+    copyCueButton.innerHTML = ICONS.copy;
+    copyCueButton.title = 'Копировать текущую реплику';
+    copyCueButton.setAttribute('aria-label', 'Копировать текущую реплику');
+    installSafeClick(copyCueButton, () => { void copyCueWindow('current'); });
+
+    const menu = document.createElement('div');
+    menu.className = 'sc-learning-copy-menu';
+    menu.setAttribute('aria-label', 'Добавить соседние реплики');
+    for (const count of [1, 2, 3]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = String(count);
+      button.dataset.neighborCount = String(count);
+      button.title = `Добавить ${count} соседн${count === 1 ? 'юю реплику' : 'ие реплики'}`;
+      installSafeClick(button, () => {
+        copyNeighborCount = count;
+        updateCopyNeighborButtons(control);
+      });
+      menu.appendChild(button);
+    }
+    const divider = document.createElement('span');
+    divider.className = 'sc-learning-copy-divider';
+    menu.appendChild(divider);
+    for (const direction of ['left', 'right']) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.innerHTML = ICONS[direction];
+      button.title = direction === 'left'
+        ? 'Скопировать с предыдущими репликами'
+        : 'Скопировать со следующими репликами';
+      button.setAttribute('aria-label', button.title);
+      installSafeClick(button, () => { void copyCueWindow(direction); });
+      menu.appendChild(button);
+    }
+    control.append(copyCueButton, menu);
+    updateCopyNeighborButtons(control);
+    return control;
   }
 
   function playerAnchor() {
@@ -569,6 +725,8 @@
 
     subtitleCard = document.createElement('div');
     subtitleCard.className = 'sc-learning-subtitle-card';
+    subtitleCard.addEventListener('selectstart', event => event.preventDefault());
+    subtitleCard.addEventListener('dragstart', event => event.preventDefault());
     subtitleCard.addEventListener('pointerenter', onSubtitlePointerEnter);
     subtitleCard.addEventListener('pointerleave', onSubtitlePointerLeave);
     statusRow = document.createElement('div');
@@ -579,9 +737,13 @@
     phraseHint.dataset.visible = '0';
     translationRow = document.createElement('div');
     translationRow.className = 'sc-learning-translation';
+    sourceWrap = document.createElement('div');
+    sourceWrap.className = 'sc-learning-source-wrap';
     sourceRow = document.createElement('div');
     sourceRow.className = 'sc-learning-source';
-    subtitleCard.append(statusRow, phraseHint, sourceRow, translationRow);
+    copyCueControl = buildCueCopyControl();
+    sourceWrap.append(sourceRow, copyCueControl);
+    subtitleCard.append(statusRow, phraseHint, sourceWrap, translationRow);
 
     navRail = document.createElement('div');
     navRail.className = 'sc-learning-rail sc-learning-nav';
@@ -978,6 +1140,7 @@
     translationError = '';
     subtitleCard.style.display = '';
     sourceRow.replaceChildren();
+    if (copyCueControl) copyCueControl.dataset.visible = '0';
     translationRow.textContent = '';
     setStatus('Загружаю дорожку субтитров…', { loading: true });
     updateRootSettings();
@@ -1183,6 +1346,42 @@
     }
   }
 
+  async function publishWordSelection(word, cueIndex) {
+    const cue = cues[cueIndex];
+    if (!cue) return;
+    const context = U.sentenceForTerm(cue.text, word, sourceLanguage()) || cue.text;
+    try {
+      const result = await bridgeJson('/learning/selection', {
+        method: 'POST',
+        body: {
+          text: word,
+          word,
+          context,
+          sourceName: 'YouTube subtitles',
+          pageUrl: location.href,
+          videoId: videoMeta.videoId || extractVideoIdFromLocation(),
+          cueStartMs: cue.startMs ?? null,
+        },
+      });
+      log('word selection handoff', {
+        cueIndex,
+        word: U.normalizeTerm(word),
+        contextChars: context.length,
+        armed: result?.armed === true,
+        online: result?.online !== false,
+      });
+    } catch (error) {
+      log('word selection handoff failed', { error: error?.message || String(error) });
+    }
+  }
+
+  function clearNativeTextSelection() {
+    try {
+      const browserSelection = window.getSelection();
+      if (browserSelection?.rangeCount) browserSelection.removeAllRanges();
+    } catch {}
+  }
+
   function clearPhraseSelection({ resume = true, keepAnchor = false, notify = true } = {}) {
     const hadSelection = phraseSelectionOpen || !!phraseSelection;
     phraseSelectionOpen = false;
@@ -1191,10 +1390,7 @@
     selectionHandoffGeneration += 1;
     sourceRow?.querySelectorAll?.('.sc-learning-word[data-phrase-selected="1"]')
       .forEach((word) => delete word.dataset.phraseSelected);
-    try {
-      const browserSelection = window.getSelection();
-      if (browserSelection?.rangeCount) browserSelection.removeAllRanges();
-    } catch {}
+    clearNativeTextSelection();
     updatePhraseHint('');
     if (notify && hadSelection) {
       bridgeJson('/learning/selection', { method: 'POST', body: { text: '' } }).catch(() => {});
@@ -1213,15 +1409,24 @@
       if (index >= selection.fromWordIndex && index <= selection.toWordIndex) word.dataset.phraseSelected = '1';
       else delete word.dataset.phraseSelected;
     }
+    clearNativeTextSelection();
+    return true;
+  }
+
+  function phraseTextFromDom(selection) {
+    const words = Array.from(sourceRow?.querySelectorAll?.('.sc-learning-word[data-word-index]') || []);
+    const first = words.find((word) => Number(word.dataset.wordIndex) === selection.fromWordIndex);
+    const last = words.find((word) => Number(word.dataset.wordIndex) === selection.toWordIndex);
+    if (!first || !last) return '';
     try {
       const range = document.createRange();
       range.setStartBefore(first);
       range.setEndAfter(last);
-      const browserSelection = window.getSelection();
-      browserSelection.removeAllRanges();
-      browserSelection.addRange(range);
+      const text = range.toString();
+      range.detach?.();
+      return text;
     } catch {}
-    return true;
+    return '';
   }
 
   function selectPhraseTo(wordIndex, cueIndex) {
@@ -1229,9 +1434,9 @@
     closeWordPopover({ resume: false });
     const { fromWordIndex, toWordIndex } = U.inclusiveWordRange(phraseSelectionAnchor.wordIndex, wordIndex);
     const draft = { cueIndex, fromWordIndex, toWordIndex, text: '' };
-    if (!applyPhraseSelectionDom(draft)) return false;
-    const text = String(window.getSelection?.()?.toString?.() || '').replace(/\s+/g, ' ').trim();
+    const text = String(phraseTextFromDom(draft)).replace(/\s+/g, ' ').trim();
     if (!text) return false;
+    if (!applyPhraseSelectionDom(draft)) return false;
     draft.text = text;
     phraseSelection = draft;
     phraseSelectionOpen = true;
@@ -1264,9 +1469,11 @@
       sourceRow.textContent = '';
       translationRow.textContent = '';
       subtitleCard.style.display = 'none';
+      if (copyCueControl) copyCueControl.dataset.visible = '0';
       return;
     }
     subtitleCard.style.display = '';
+    if (copyCueControl) copyCueControl.dataset.visible = '1';
     const cue = cues[index];
     root.dataset.cueStartMs = String(cue.startMs);
     root.dataset.cueEndMs = String(cue.endMs);
@@ -1439,10 +1646,10 @@
     const safeRight = player ? Math.min(innerWidth - margin, player.right - margin) : innerWidth - margin;
     const aboveSpace = Math.max(0, a.top - gap - safeTop);
     const belowSpace = Math.max(0, safeBottom - a.bottom - gap);
-    // Bottom subtitles always open their card upward. Besides matching the
-    // reading direction, this prevents a late dictionary/example resize from
-    // growing toward the macOS Dock. Top subtitles use the mirrored rule.
-    const placeAbove = settings.learning_subtitle_position !== 'top';
+    // The word card belongs above the whole source subtitle block. Anchoring
+    // it to a word on the second line made the card overlap the first line and
+    // visually look as if it had opened beside the subtitle.
+    const placeAbove = true;
     const fullPlayerHeight = Math.max(120, safeBottom - safeTop);
     const directionalSpace = placeAbove ? aboveSpace : belowSpace;
     const availableHeight = Math.max(120, Math.min(fullPlayerHeight, directionalSpace || fullPlayerHeight));
@@ -1460,7 +1667,17 @@
   }
 
   function fixedAnchorReference(anchor) {
-    const rect = anchor.getBoundingClientRect();
+    const wordRect = anchor.getBoundingClientRect();
+    const sourceRect = sourceRow?.getBoundingClientRect();
+    const sourceTop = sourceRect?.height > 0 ? sourceRect.top : wordRect.top;
+    const rect = {
+      left: wordRect.left,
+      right: wordRect.right,
+      width: wordRect.width,
+      top: sourceTop,
+      bottom: sourceRect?.height > 0 ? sourceRect.bottom : wordRect.bottom,
+      height: sourceRect?.height > 0 ? sourceRect.height : wordRect.height,
+    };
     return {
       isConnected: true,
       getBoundingClientRect() { return rect; },
@@ -1688,9 +1905,6 @@
 
     const meanings = document.createElement('div');
     meanings.className = 'sc-word-section sc-word-meanings';
-    const meaningsTitle = document.createElement('div');
-    meaningsTitle.className = 'sc-word-section-title';
-    meaningsTitle.textContent = 'Переводы';
     const aiExplanation = document.createElement('div');
     aiExplanation.className = 'sc-word-ai';
     aiExplanation.hidden = settings.learning_ai_explanation !== true;
@@ -1701,7 +1915,7 @@
     const meaningsList = document.createElement('div');
     meaningsList.className = 'sc-word-meanings-list';
     meaningsList.append(skeletonRow(), skeletonRow());
-    meanings.append(meaningsTitle, aiExplanation, meaningsList);
+    meanings.append(aiExplanation, meaningsList);
 
     const examples = document.createElement('div');
     examples.className = 'sc-word-section sc-word-examples';
@@ -1802,7 +2016,7 @@
     refs.aiExplanation.dataset.state = error ? 'error' : 'ready';
     const label = document.createElement('span');
     label.className = 'sc-word-ai-label';
-    label.textContent = error ? 'AI' : 'В контексте';
+    label.textContent = error ? 'AI:' : `Контекст ${refs.word}:`;
     const value = document.createElement('span');
     value.textContent = text;
     refs.aiExplanation.append(label, value);
@@ -1926,17 +2140,26 @@
   async function openWordPopover(anchor, word, cueIndex) {
     closeWordPopover({ resume: false });
     wordPopoverOpen = true;
+    const video = playerVideo();
+    if (video && !video.paused) {
+      video.pause();
+      pausedForSubtitleHover = true;
+      hoverPausedCueKey = `${videoMeta.videoId}:${cues[cueIndex]?.startMs ?? cueIndex}`;
+    }
     updateHoverHoldState();
     const positionAnchor = fixedAnchorReference(anchor);
     const popover = document.createElement('div');
     popover.id = WORD_POPOVER_ID;
     popover.addEventListener('pointerdown', event => event.stopPropagation());
+    popover.addEventListener('selectstart', event => event.preventDefault());
+    popover.addEventListener('dragstart', event => event.preventDefault());
     popover.addEventListener('wheel', event => event.stopPropagation(), { passive: true });
     const refs = createWordPopoverShell(popover, positionAnchor, word, cueIndex);
     document.body.appendChild(popover);
     positionPopover(popover, positionAnchor);
     if (currentCueIndex === cueIndex) renderCue(cueIndex, true);
     ensureCueTranslation(cueIndex);
+    void publishWordSelection(word, cueIndex);
     void requestAiExplanation(refs);
     if (typeof ResizeObserver === 'function') {
       popoverResizeObserver = new ResizeObserver(() => {

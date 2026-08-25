@@ -10,12 +10,15 @@ import {
   ChevronUp,
   Clock3,
   CloudOff,
+  MoreHorizontal,
   Pencil,
   Plus,
   RefreshCw,
   Search,
   Settings,
   Sparkles,
+  Trash2,
+  Volume2,
   Wifi,
   X,
 } from 'lucide-react'
@@ -28,12 +31,15 @@ const StudyModel = window.__scStudyModel
 
 function readYoutubePreferences() {
   if (typeof chrome === 'undefined' || !chrome.storage?.sync) {
-    return Promise.resolve({ learning_ai_explanation: true })
+    return Promise.resolve({ learning_ai_explanation: true, learning_card_autoplay: false })
   }
   return new Promise((resolve) => {
-    chrome.storage.sync.get({ __yt: { learning_ai_explanation: true } }, (raw) => {
+    chrome.storage.sync.get({ __yt: { learning_ai_explanation: true, learning_card_autoplay: false } }, (raw) => {
       const settings = raw?.__yt && typeof raw.__yt === 'object' ? raw.__yt : {}
-      resolve({ learning_ai_explanation: settings.learning_ai_explanation !== false })
+      resolve({
+        learning_ai_explanation: settings.learning_ai_explanation !== false,
+        learning_card_autoplay: settings.learning_card_autoplay === true,
+      })
     })
   })
 }
@@ -50,6 +56,20 @@ function patchYoutubePreferences(patch) {
       resolve(response)
     })
   })
+}
+
+function speakLearningText(text) {
+  const value = String(text || '').trim()
+  if (!value || typeof speechSynthesis === 'undefined') return false
+  try {
+    speechSynthesis.cancel()
+    const utterance = new SpeechSynthesisUtterance(value)
+    utterance.lang = 'en-US'
+    speechSynthesis.speak(utterance)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function stateLabel(state) {
@@ -285,6 +305,9 @@ function DeckView({ entries, refresh }) {
   const [dragX, setDragX] = useState(0)
   const [dragging, setDragging] = useState(false)
   const [exiting, setExiting] = useState('')
+  const [menuOpen, setMenuOpen] = useState(false)
+  const [autoplay, setAutoplay] = useState(false)
+  const [lastAction, setLastAction] = useState(null)
   const lastKeyRef = useRef('')
   const dragRef = useRef({ pointerId: null, startX: 0, deltaX: 0 })
   const savedSignature = savedEntries.map((entry) => entry.key).sort().join('\u0000')
@@ -314,19 +337,56 @@ function DeckView({ entries, refresh }) {
     setDragX(0)
     setDragging(false)
     setExiting('')
+    setMenuOpen(false)
   }, [current?.key])
+
+  useEffect(() => {
+    let active = true
+    readYoutubePreferences().then((preferences) => {
+      if (active) setAutoplay(preferences.learning_card_autoplay === true)
+    }).catch(() => {})
+    return () => { active = false }
+  }, [])
+
+  useEffect(() => {
+    if (autoplay && current?.sourceText) speakLearningText(current.sourceText)
+  }, [autoplay, current?.key])
+
+  useEffect(() => {
+    if (!menuOpen) return undefined
+    const close = (event) => {
+      if (!event.target?.closest?.('.study-card-menu-shell')) setMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', close)
+    return () => document.removeEventListener('pointerdown', close)
+  }, [menuOpen])
 
   const review = useCallback(async (result, { animate = true } = {}) => {
     if (!current || busy) return
     setBusy(true)
+    const snapshot = {
+      queue: [...queue],
+      round,
+      roundTotal,
+      sessionStats: { ...sessionStats },
+      lastKey: lastKeyRef.current,
+      entryBefore: current,
+    }
     if (animate) {
+      setDragging(false)
+      setDragX(0)
       setExiting(result)
-      setDragX(result === 'remembered' ? Math.max(760, window.innerWidth) : -Math.max(760, window.innerWidth))
-      await new Promise((resolve) => setTimeout(resolve, 170))
+      await new Promise((resolve) => setTimeout(resolve, 150))
     }
     try {
       const mode = StudyModel.reviewMode(current)
       const reviewResult = await store.queueReview({ key: current.key, result, mode })
+      setLastAction({
+        type: 'review',
+        snapshot,
+        operation: reviewResult?.operation,
+        entryBefore: reviewResult?.entryBefore || current,
+      })
       const nextStats = StudyModel.nextSessionStats(sessionStats, current.key, result)
       const remaining = queue.slice(1).filter((key) => entriesByKey.has(key))
       lastKeyRef.current = current.key
@@ -354,7 +414,7 @@ function DeckView({ entries, refresh }) {
       setDragging(false)
       setExiting('')
     }
-  }, [busy, current, entriesByKey, queue, refresh, savedEntries, sessionStats])
+  }, [busy, current, entriesByKey, queue, refresh, round, roundTotal, savedEntries, sessionStats])
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -406,6 +466,63 @@ function DeckView({ entries, refresh }) {
     else setDragX(0)
   }
 
+  const restoreDeckSnapshot = (snapshot) => {
+    setQueue(snapshot.queue)
+    setRound(snapshot.round)
+    setRoundTotal(snapshot.roundTotal)
+    setSessionStats(snapshot.sessionStats)
+    lastKeyRef.current = snapshot.lastKey
+    setRevealed(false)
+    setDragX(0)
+    setDragging(false)
+    setExiting('')
+  }
+
+  const undoLastAction = async () => {
+    if (!lastAction || busy) return
+    setBusy(true)
+    try {
+      if (lastAction.type === 'review') {
+        await store.undoReview({
+          key: lastAction.entryBefore.key,
+          entryBefore: lastAction.entryBefore,
+          operation: lastAction.operation,
+        })
+      } else if (lastAction.type === 'delete') {
+        await store.setState({ ...lastAction.entryBefore, state: 'saved', toggle: false })
+      }
+      restoreDeckSnapshot(lastAction.snapshot)
+      setLastAction(null)
+      await refresh({ sync: false })
+      store.sync({}).catch(() => {})
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const removeCurrent = async () => {
+    if (!current || busy) return
+    const snapshot = {
+      queue: [...queue],
+      round,
+      roundTotal,
+      sessionStats: { ...sessionStats },
+      lastKey: lastKeyRef.current,
+      entryBefore: current,
+    }
+    setBusy(true)
+    setMenuOpen(false)
+    try {
+      await store.setState({ ...current, state: 'none', toggle: false })
+      setLastAction({ type: 'delete', snapshot, entryBefore: current })
+      setQueue((previous) => previous.filter((key) => key !== current.key))
+      await refresh({ sync: false })
+      store.sync({}).catch(() => {})
+    } finally {
+      setBusy(false)
+    }
+  }
+
   if (!savedEntries.length) {
     return (
       <section className="deck workspace">
@@ -417,26 +534,51 @@ function DeckView({ entries, refresh }) {
   if (!current) return <section className="deck workspace"><div className="page-loader"><RefreshCw className="spin" /></div></section>
 
   const dragProgress = Math.min(1, Math.abs(dragX) / 110)
-  const transform = `translate3d(${dragX}px,0,0) rotate(${dragX / 30}deg)`
+  const exitX = exiting === 'remembered' ? 28 : exiting === 'forgotten' ? -28 : 0
+  const transform = exiting
+    ? `translate3d(${exitX}px,0,0)`
+    : `translate3d(${dragX}px,0,0) rotate(${dragX / 90}deg)`
   const practiceHint = currentMode === 'scheduled' ? 'обновит интервал' : 'тренировочный ответ'
 
   return (
     <section className="deck workspace" aria-label="Карточки">
       <div className="deck-progress">
         <span>Круг {round}</span>
-        <strong>Карточка {currentPosition} из {roundTotal}</strong>
+        <div className="deck-progress-actions">
+          <strong>Карточка {currentPosition} из {roundTotal}</strong>
+          <button type="button" className="undo-button" onClick={undoLastAction} disabled={!lastAction || busy} title="Отменить последнее действие">
+            <ArrowLeft size={15} />Назад
+          </button>
+        </div>
       </div>
       <div className="study-card-stage">
         <div className="swipe-zone forgotten" style={{ opacity: dragX < 0 ? dragProgress : 0 }}><ArrowLeft size={22} />Не помню</div>
         <div className="swipe-zone remembered" style={{ opacity: dragX > 0 ? dragProgress : 0 }}>Помню<ArrowRight size={22} /></div>
         <div
           className={`study-card ${revealed ? 'revealed' : ''} ${dragging ? 'dragging' : ''} ${exiting ? `exiting-${exiting}` : ''}`}
-          style={{ transform, transition: dragging ? 'none' : 'transform 170ms cubic-bezier(.2,.8,.2,1)' }}
+          style={{
+            transform,
+            opacity: exiting ? 0 : 1,
+            transition: dragging && !exiting ? 'none' : 'transform 150ms ease, opacity 150ms ease',
+          }}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={(event) => finishPointer(event)}
           onPointerCancel={(event) => finishPointer(event, true)}
         >
+          <button type="button" className="study-card-tool study-card-speak" onClick={() => speakLearningText(current.sourceText)} title="Произнести слово" aria-label="Произнести слово">
+            <Volume2 size={19} />
+          </button>
+          <div className="study-card-menu-shell">
+            <button type="button" className="study-card-tool" onClick={() => setMenuOpen((value) => !value)} title="Действия со словом" aria-label="Действия со словом" aria-expanded={menuOpen}>
+              <MoreHorizontal size={20} />
+            </button>
+            {menuOpen && (
+              <div className="study-card-menu">
+                <button type="button" className="danger" onClick={removeCurrent}><Trash2 size={16} />Удалить из словаря</button>
+              </div>
+            )}
+          </div>
           <div className="study-question-slot"><h2 data-selectable-text>{current.sourceText}</h2></div>
           <div className="study-answer-slot">
             {!revealed ? (
@@ -467,6 +609,7 @@ function DeckView({ entries, refresh }) {
 
 function SettingsView() {
   const [enabled, setEnabled] = useState(true)
+  const [autoplay, setAutoplay] = useState(false)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
@@ -474,7 +617,11 @@ function SettingsView() {
   useEffect(() => {
     let active = true
     readYoutubePreferences()
-      .then((preferences) => { if (active) setEnabled(preferences.learning_ai_explanation !== false) })
+      .then((preferences) => {
+        if (!active) return
+        setEnabled(preferences.learning_ai_explanation !== false)
+        setAutoplay(preferences.learning_card_autoplay === true)
+      })
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [])
@@ -498,6 +645,25 @@ function SettingsView() {
     }
   }
 
+  const toggleAutoplay = async () => {
+    if (saving || loading) return
+    const next = !autoplay
+    setAutoplay(next)
+    setSaving(true)
+    setMessage('')
+    try {
+      const result = await patchYoutubePreferences({ learning_card_autoplay: next })
+      const canonical = result?.settings?.learning_card_autoplay
+      if (typeof canonical === 'boolean') setAutoplay(canonical)
+      setMessage(result?.online === false ? 'Сохранено локально; SC Desktop применит настройку при запуске.' : 'Сохранено')
+    } catch (error) {
+      setAutoplay(!next)
+      setMessage(error?.message || String(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <section className="workspace settings-workspace" aria-label="Настройки словаря">
       <div className="settings-card">
@@ -511,6 +677,20 @@ function SettingsView() {
           aria-checked={enabled}
           className={`settings-switch ${enabled ? 'on' : ''}`}
           onClick={toggle}
+          disabled={loading || saving}
+        ><span /></button>
+      </div>
+      <div className="settings-card">
+        <div className="settings-copy">
+          <div className="settings-title"><Volume2 size={19} /><strong>Автопроигрывание карточек</strong></div>
+          <p>Произносить английское слово или фразу сразу после появления следующей карточки.</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={autoplay}
+          className={`settings-switch ${autoplay ? 'on' : ''}`}
+          onClick={toggleAutoplay}
           disabled={loading || saving}
         ><span /></button>
       </div>

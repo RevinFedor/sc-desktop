@@ -12,6 +12,8 @@ const {
   cueNavigationDelta,
   alignedTargetRanges,
   exactTermRanges,
+  cueWindowText,
+  sentenceForTerm,
 } = require('../youtube-learning-utils')
 
 test('parses JSON3 cues and merges append events', () => {
@@ -37,6 +39,27 @@ test('physical A and D navigate cues independently of keyboard layout', () => {
   assert.equal(cueNavigationDelta('KeyA'), -1)
   assert.equal(cueNavigationDelta('KeyD'), 1)
   assert.equal(cueNavigationDelta('KeyF'), 0)
+})
+
+test('copy window adds the requested neighboring cues on one side', () => {
+  const cues = [
+    { text: 'First.' },
+    { text: 'Second.' },
+    { text: 'Third.' },
+    { text: 'Fourth.' },
+  ]
+  assert.equal(cueWindowText(cues, 2, 0, 'left'), 'Third.')
+  assert.equal(cueWindowText(cues, 2, 2, 'left'), 'First. Second. Third.')
+  assert.equal(cueWindowText(cues, 1, 2, 'right'), 'Second. Third. Fourth.')
+  assert.equal(cueWindowText(cues, 0, 3, 'left'), 'First.')
+})
+
+test('single-word handoff keeps the complete sentence containing that word', () => {
+  assert.equal(
+    sentenceForTerm('The first sentence ends. This word matters here. Another follows.', 'word', 'en'),
+    'This word matters here.',
+  )
+  assert.equal(sentenceForTerm('unfinished subtitle with word', 'word', 'en'), 'unfinished subtitle with word')
 })
 
 test('Azure alignment maps the selected English word to its Russian form', () => {

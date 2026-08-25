@@ -40,6 +40,7 @@ test('YouTube ChatGPT defaults to Chat with separate Chat and Work pairs', () =>
   assert.equal(settings.chatgpt_work_speed, 'standard');
   assert.equal(settings.chatgpt_show_in_text_field, true);
   assert.equal(settings.learning_ai_explanation, true);
+  assert.equal(settings.learning_card_autoplay, false);
   assert.equal(settings.chatgpt_model, settings.chatgpt_chat_model);
   assert.equal(settings.chatgpt_effort, settings.chatgpt_chat_effort);
 });
@@ -47,6 +48,11 @@ test('YouTube ChatGPT defaults to Chat with separate Chat and Work pairs', () =>
 test('contextual word explanation can be disabled globally', () => {
   assert.equal(sanitizeYoutubeSettings({ learning_ai_explanation: false }).learning_ai_explanation, false);
   assert.equal(sanitizeYoutubeSettings({ learning_ai_explanation: 'false' }).learning_ai_explanation, true);
+});
+
+test('card autoplay is opt-in and preserves an explicit choice', () => {
+  assert.equal(sanitizeYoutubeSettings({}).learning_card_autoplay, false);
+  assert.equal(sanitizeYoutubeSettings({ learning_card_autoplay: true }).learning_card_autoplay, true);
 });
 
 test('retired ChatGPT model and effort migrate to current Chat without changing Work defaults', () => {

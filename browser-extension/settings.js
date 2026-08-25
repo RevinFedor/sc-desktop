@@ -328,6 +328,7 @@ const YOUTUBE_DEFAULT_SETTINGS = Object.freeze({
   learning_translation_mode: 'always',
   learning_hide_native_subtitles: true,
   learning_ai_explanation: true,
+  learning_card_autoplay: false,
   // Движок AI-транскрипции когда субтитров нет (awaiting_ai → resume).
   // gemini (дёшево, быстро) | assemblyai (длинные файлы 1-10ч). Прокидывается
   // в __sc_track_job → trackJob.engine → POST /yt-resume-ai. Дефолт gemini.
@@ -405,6 +406,10 @@ function sanitizeYoutubeSettings(raw = {}) {
   s.learning_ai_explanation = cb(
     raw.learning_ai_explanation,
     s.learning_ai_explanation,
+  );
+  s.learning_card_autoplay = cb(
+    raw.learning_card_autoplay,
+    s.learning_card_autoplay,
   );
   if (typeof raw.engine === 'string' && YOUTUBE_ENGINES.includes(raw.engine)) {
     s.engine = raw.engine;
