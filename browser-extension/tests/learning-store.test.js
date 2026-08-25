@@ -32,3 +32,13 @@ test('only known and saved are active learning states', () => {
   assert.equal(normalizeEntry({ sourceText: 'saved', state: 'saved' }).state, 'saved')
   assert.equal(normalizeEntry({ sourceText: 'ignored', state: 'ignored' }).state, 'none')
 })
+
+test('legacy entries gain zeroed practice statistics without losing scheduled counts', () => {
+  const entry = normalizeEntry({ sourceText: 'repeat', rememberedCount: 2, forgottenCount: 1 })
+  assert.equal(entry.reviewCount, 3)
+  assert.equal(entry.rememberedCount, 2)
+  assert.equal(entry.forgottenCount, 1)
+  assert.equal(entry.practiceCount, 0)
+  assert.equal(entry.practiceRememberedCount, 0)
+  assert.equal(entry.practiceForgottenCount, 0)
+})

@@ -8,6 +8,10 @@ const {
   findCueIndex,
   examplesForTerm,
   batchTexts,
+  inclusiveWordRange,
+  cueNavigationDelta,
+  alignedTargetRanges,
+  exactTermRanges,
 } = require('../youtube-learning-utils')
 
 test('parses JSON3 cues and merges append events', () => {
@@ -22,6 +26,36 @@ test('parses JSON3 cues and merges append events', () => {
   assert.equal(cues[0].text, 'Hello world')
   assert.equal(cues[0].startMs, 1000)
   assert.ok(cues[0].endMs >= 2400)
+})
+
+test('shift-click phrase range works in both directions', () => {
+  assert.deepEqual(inclusiveWordRange(2, 7), { fromWordIndex: 2, toWordIndex: 7 })
+  assert.deepEqual(inclusiveWordRange(7, 2), { fromWordIndex: 2, toWordIndex: 7 })
+})
+
+test('physical A and D navigate cues independently of keyboard layout', () => {
+  assert.equal(cueNavigationDelta('KeyA'), -1)
+  assert.equal(cueNavigationDelta('KeyD'), 1)
+  assert.equal(cueNavigationDelta('KeyF'), 0)
+})
+
+test('Azure alignment maps the selected English word to its Russian form', () => {
+  const source = 'you want it if you want to'
+  const target = 'вы хотите этого, если хотите'
+  const ranges = alignedTargetRanges(
+    source,
+    target,
+    'want',
+    '0:2-0:1 4:7-3:8 9:10-10:14 12:13-17:20 15:17-22:27 19:22-22:27',
+    'en',
+  )
+  assert.deepEqual(ranges.map(range => target.slice(range.start, range.end)), ['хотите', 'хотите'])
+})
+
+test('exact Russian dictionary term is a safe fallback when Azure omits alignment', () => {
+  const target = 'Это недокументированная функция.'
+  const ranges = exactTermRanges(target, ['недокументированная', 'нелегальная'], 'ru')
+  assert.deepEqual(ranges.map(range => target.slice(range.start, range.end)), ['недокументированная'])
 })
 
 test('parses VTT and finds the active cue', () => {

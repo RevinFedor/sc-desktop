@@ -119,6 +119,47 @@ async function clearSentYoutubePendingPatch(sentPatch) {
   await storageLocalSet({ __sc_yt_pending_desktop_patch: current });
 }
 
+async function queueYoutubePendingPatch(patch) {
+  if (!patch || !Object.keys(patch).length) return;
+  const raw = await storageLocalGet({ __sc_yt_pending_desktop_patch: {} });
+  const current = raw.__sc_yt_pending_desktop_patch
+    && typeof raw.__sc_yt_pending_desktop_patch === 'object'
+    ? { ...raw.__sc_yt_pending_desktop_patch }
+    : {};
+  await storageLocalSet({ __sc_yt_pending_desktop_patch: { ...current, ...patch } });
+}
+
+async function persistYoutubeSettingsPatch(rawPatch) {
+  const allowedPatch = {};
+  for (const [key, value] of Object.entries(rawPatch || {})) {
+    if (Object.prototype.hasOwnProperty.call(YOUTUBE_DEFAULT_SETTINGS, key)) allowedPatch[key] = value;
+  }
+  const current = await loadFreshYoutubeSettings();
+  const next = sanitizeYoutubeSettings({ ...current, ...allowedPatch });
+  const patch = diffYoutubeSettings(current, next);
+  if (!Object.keys(patch).length) return { settings: next, online: true };
+  await storageSyncSet({ __yt: next });
+  await queueYoutubePendingPatch(patch);
+  try {
+    const saved = await fetchBridgeJson(YOUTUBE_SETTINGS_PATH, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ patch }),
+    });
+    if (!saved?.settings) throw new Error('desktop returned no settings');
+    const canonical = sanitizeYoutubeSettings({ ...next, ...saved.settings });
+    await storageSyncSet({ __yt: canonical });
+    await clearSentYoutubePendingPatch(patch);
+    return { settings: canonical, online: true };
+  } catch (error) {
+    scBgDbg('youtube.settings.patch_queued', {
+      keys: Object.keys(patch).sort(),
+      err: error?.message || String(error),
+    });
+    return { settings: next, online: false, error: error?.message || String(error) };
+  }
+}
+
 async function fetchBridgeJson(path, init = {}, timeoutMs = 1800) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1424,6 +1465,13 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   if (req && req.__sc_get_fresh_youtube_settings === true) {
     loadFreshYoutubeSettings()
       .then(settings => sendResponse({ ok: true, settings }))
+      .catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
+  if (req?.type === 'sc-youtube-settings-patch') {
+    persistYoutubeSettingsPatch(req.patch)
+      .then(result => sendResponse({ ok: true, ...result }))
       .catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   }

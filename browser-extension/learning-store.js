@@ -135,9 +135,17 @@
       conflict: raw?.conflict === undefined ? (existing?.conflict || null) : raw.conflict,
       dueAt: raw?.dueAt ?? existing?.dueAt ?? new Date(createdAt).toISOString(),
       lastReviewedAt: raw?.lastReviewedAt ?? existing?.lastReviewedAt ?? null,
-      reviewCount: Math.max(0, Number(raw?.reviewCount ?? existing?.reviewCount ?? 0) || 0),
+      lastPracticedAt: raw?.lastPracticedAt ?? existing?.lastPracticedAt ?? null,
+      reviewCount: Math.max(0, Number(raw?.reviewCount ?? existing?.reviewCount
+        ?? (Number(raw?.rememberedCount ?? existing?.rememberedCount ?? 0)
+          + Number(raw?.forgottenCount ?? existing?.forgottenCount ?? 0))) || 0),
       rememberedCount: Math.max(0, Number(raw?.rememberedCount ?? existing?.rememberedCount ?? 0) || 0),
       forgottenCount: Math.max(0, Number(raw?.forgottenCount ?? existing?.forgottenCount ?? 0) || 0),
+      practiceCount: Math.max(0, Number(raw?.practiceCount ?? existing?.practiceCount
+        ?? (Number(raw?.practiceRememberedCount ?? existing?.practiceRememberedCount ?? 0)
+          + Number(raw?.practiceForgottenCount ?? existing?.practiceForgottenCount ?? 0))) || 0),
+      practiceRememberedCount: Math.max(0, Number(raw?.practiceRememberedCount ?? existing?.practiceRememberedCount ?? 0) || 0),
+      practiceForgottenCount: Math.max(0, Number(raw?.practiceForgottenCount ?? existing?.practiceForgottenCount ?? 0) || 0),
     };
   }
 
@@ -318,12 +326,18 @@
     const entry = await getEntryDirect({ key: payload?.key });
     if (!entry || entry.state !== 'saved') throw new Error('Card is not in the dictionary');
     const result = payload?.result === 'forgotten' ? 'forgotten' : 'remembered';
+    const mode = payload?.mode === 'practice' ? 'practice' : 'scheduled';
     const reviewedAt = Number(payload?.reviewedAt) || now();
-    const rememberedCount = entry.rememberedCount + (result === 'remembered' ? 1 : 0);
-    const forgottenCount = entry.forgottenCount + (result === 'forgotten' ? 1 : 0);
+    const rememberedCount = Number(entry.rememberedCount || 0) + (mode === 'scheduled' && result === 'remembered' ? 1 : 0);
+    const forgottenCount = Number(entry.forgottenCount || 0) + (mode === 'scheduled' && result === 'forgotten' ? 1 : 0);
     const reviewCount = rememberedCount + forgottenCount;
+    const practiceRememberedCount = Number(entry.practiceRememberedCount || 0) + (mode === 'practice' && result === 'remembered' ? 1 : 0);
+    const practiceForgottenCount = Number(entry.practiceForgottenCount || 0) + (mode === 'practice' && result === 'forgotten' ? 1 : 0);
+    const practiceCount = practiceRememberedCount + practiceForgottenCount;
     const days = result === 'remembered' ? Math.min(30, Math.max(1, 2 ** Math.max(0, rememberedCount - 1))) : 0;
-    const dueAt = new Date(reviewedAt + (result === 'remembered' ? days * 86_400_000 : 10 * 60_000)).toISOString();
+    const dueAt = mode === 'scheduled'
+      ? new Date(reviewedAt + (result === 'remembered' ? days * 86_400_000 : 10 * 60_000)).toISOString()
+      : entry.dueAt;
     const operation = {
       id: payload?.id || `review:${entry.key}:${reviewedAt}:${Math.random().toString(36).slice(2, 10)}`,
       type: 'review',
@@ -331,6 +345,7 @@
       term: entry.sourceText,
       remoteId: entry.remoteId || '',
       result,
+      mode,
       reviewedAt,
       createdAt: now(),
     };
@@ -339,7 +354,11 @@
       rememberedCount,
       forgottenCount,
       reviewCount,
-      lastReviewedAt: reviewedAt,
+      practiceRememberedCount,
+      practiceForgottenCount,
+      practiceCount,
+      lastReviewedAt: mode === 'scheduled' ? reviewedAt : entry.lastReviewedAt,
+      lastPracticedAt: mode === 'practice' ? reviewedAt : entry.lastPracticedAt,
       dueAt,
       updatedAt: now(),
     }, entry);
@@ -347,7 +366,7 @@
       tx.objectStore(ENTRIES).put(updated);
       tx.objectStore(OUTBOX).put(operation);
     });
-    notify({ type: 'review-queued', key: entry.key, result });
+    notify({ type: 'review-queued', key: entry.key, result, mode });
     return { entry: updated, operation };
   }
 
@@ -430,9 +449,13 @@
       conflict: conflict || null,
       dueAt: remote?.dueAt,
       lastReviewedAt: remote?.lastReviewedAt,
+      lastPracticedAt: remote?.lastPracticedAt,
       reviewCount: remote?.reviewCount,
       rememberedCount: remote?.rememberedCount,
       forgottenCount: remote?.forgottenCount,
+      practiceCount: remote?.practiceCount,
+      practiceRememberedCount: remote?.practiceRememberedCount,
+      practiceForgottenCount: remote?.practiceForgottenCount,
     }, existing);
   }
 

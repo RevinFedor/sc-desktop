@@ -69,9 +69,9 @@ iPhone
 
 LaunchAgent `~/Library/LaunchAgents/tech.f9922.sc.tunnel.timeweb.plist` держит
 `autossh -R 7898:127.0.0.1:7898 root@188.225.24.118` через `KeepAlive` и
-`RunAtLoad`. Во время 24-часового DNS cutover прежний tunnel остаётся параллельно живым,
-чтобы клиенты с закэшированным A-record не теряли API. Nginx завершает TLS на canonical
-443, а 8443 временно сохраняется для старой iOS-сборки,
+`RunAtLoad`. Прежний VPN-VPS tunnel bootout; старый plist, nginx vhost и renewal-конфиг
+сохранены только в отключённых backup-каталогах, а порт `7898` на старом VPS не слушается.
+Nginx завершает TLS на canonical 443, а 8443 остаётся compatibility listener,
 отключает proxy buffering для SSE, держит длинные read/send timeouts и при
 недоступном Mac возвращает JSON 503. Сервер не надо открывать на `0.0.0.0` и
 не надо делать iPhone зависимым от одной Wi‑Fi сети.
@@ -81,7 +81,7 @@ LaunchAgent `~/Library/LaunchAgents/tech.f9922.sc.tunnel.timeweb.plist` держ
 
 1. `GET https://sc.f9922.tech/api/me` с bearer token;
 2. DNS/TLS/nginx на VPS;
-3. LaunchAgent и `~/Library/Logs/sc-tunnel.log`;
+3. LaunchAgent и `~/Library/Logs/sc-timeweb-tunnel.log`;
 4. loopback listener `127.0.0.1:7898`;
 5. только затем конкретный Instagram/YouTube job.
 

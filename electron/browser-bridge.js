@@ -600,7 +600,9 @@ async function translateTexts(settingsAccess, rawTexts, rawFrom, rawTo) {
   const misses = []
 
   texts.forEach((sourceText, index) => {
-    const cacheKey = translatorCacheKey('translate', sourceLang, targetLang, sourceText)
+    // v1 responses predate Azure word alignment. A versioned cache key makes
+    // every old line refresh exactly once instead of staying unalignable.
+    const cacheKey = translatorCacheKey('translate-alignment-v1', sourceLang, targetLang, sourceText)
     const cached = db()?.getTranslationCache(cacheKey)
     if (cached?.response) {
       results[index] = { source_text: sourceText, response: cached.response, cached: true }
@@ -613,7 +615,7 @@ async function translateTexts(settingsAccess, rawTexts, rawFrom, rawTo) {
     const payload = await azureTranslatorRequest(
       settingsAccess,
       '/translate',
-      { from: sourceLang, to: targetLang, textType: 'plain' },
+      { from: sourceLang, to: targetLang, textType: 'plain', includeAlignment: true },
       misses.map(item => ({ Text: item.sourceText })),
     )
     if (!Array.isArray(payload) || payload.length !== misses.length) {
@@ -639,6 +641,7 @@ async function translateTexts(settingsAccess, rawTexts, rawFrom, rawTo) {
     translations: results.map(item => ({
       source_text: item.source_text,
       translated_text: item.response?.translations?.[0]?.text || '',
+      alignment: item.response?.translations?.[0]?.alignment?.proj || '',
       detected_language: item.response?.detectedLanguage?.language || null,
       cached: item.cached,
     })),
@@ -718,7 +721,7 @@ function voiceServerCandidates() {
   }).filter(Boolean).sort((a, b) => b.updatedAt - a.updatedAt)
 }
 
-async function voiceVocabularyRequest(method, route, body = null) {
+async function voiceVocabularyRequest(method, route, body = null, timeoutMs = 4_000) {
   let token = ''
   try { token = fs.readFileSync(VOICE_TOKEN_FILE, 'utf8').trim() }
   catch {}
@@ -736,7 +739,7 @@ async function voiceVocabularyRequest(method, route, body = null) {
   let lastError = null
   for (const candidate of candidates) {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 4_000)
+    const timer = setTimeout(() => controller.abort(), Math.max(500, Number(timeoutMs) || 4_000))
     try {
       const response = await fetch(`http://127.0.0.1:${candidate.port}${route}`, {
         method,
@@ -765,6 +768,69 @@ async function voiceVocabularyRequest(method, route, body = null) {
     : (lastError?.message || 'Voice Record API is unavailable'))
   error.code = 'voice_record_offline'
   throw error
+}
+
+const LEARNING_EXPLANATION_MODEL = 'gemini-3.1-flash-lite'
+const LEARNING_EXPLANATION_VERSION = 'v1'
+const learningExplanationInflight = new Map()
+
+function normalizeLearningExplanationPayload(raw = {}) {
+  const word = String(raw.word || raw.sourceText || '').replace(/\s+/g, ' ').trim().slice(0, 120)
+  const context = String(raw.context || raw.cueText || '').replace(/\s+/g, ' ').trim().slice(0, 3000)
+  if (!word) throw new Error('word is required')
+  if (!context) throw new Error('subtitle context is required')
+  return {
+    word,
+    wordTranslation: String(raw.wordTranslation || '').replace(/\s+/g, ' ').trim().slice(0, 500),
+    context,
+    contextTranslation: String(raw.contextTranslation || '').replace(/\s+/g, ' ').trim().slice(0, 3000),
+    sourceLang: cleanLanguageCode(raw.sourceLang || 'en'),
+    targetLang: cleanLanguageCode(raw.targetLang || 'ru'),
+  }
+}
+
+function learningExplanationCacheKey(payload) {
+  const digest = crypto.createHash('sha256')
+    .update([
+      LEARNING_EXPLANATION_VERSION,
+      LEARNING_EXPLANATION_MODEL,
+      payload.sourceLang,
+      payload.targetLang,
+      payload.word.toLocaleLowerCase('en-US'),
+      payload.context,
+    ].join('\u0000'))
+    .digest('hex')
+  return `learning-ai:${digest}`
+}
+
+async function learningWordExplanation(raw) {
+  const payload = normalizeLearningExplanationPayload(raw)
+  const cacheKey = learningExplanationCacheKey(payload)
+  const cached = db()?.getUiPreference(cacheKey)
+  if (cached?.explanation) {
+    return { explanation: String(cached.explanation), model: cached.model || LEARNING_EXPLANATION_MODEL, cached: true }
+  }
+  if (learningExplanationInflight.has(cacheKey)) return learningExplanationInflight.get(cacheKey)
+  const request = (async () => {
+    const result = await voiceVocabularyRequest(
+      'POST',
+      '/api/desktop/learning-explain',
+      payload,
+      20_000,
+    )
+    const explanation = String(result?.explanation || '').replace(/\s+/g, ' ').trim().slice(0, 1500)
+    if (!explanation) throw new Error('Voice Record returned an empty learning explanation')
+    const value = {
+      explanation,
+      model: String(result?.model || LEARNING_EXPLANATION_MODEL),
+      createdAt: Date.now(),
+    }
+    db()?.setUiPreference(cacheKey, value)
+    return { ...value, cached: false }
+  })()
+  learningExplanationInflight.set(cacheKey, request)
+  try { return await request }
+  finally { learningExplanationInflight.delete(cacheKey) }
 }
 
 function vocabularySyncPayload(entry) {
@@ -895,7 +961,12 @@ async function syncVocabularyWithVoice(rawBody) {
     const reviewed = await voiceVocabularyRequest(
       'POST',
       `/api/vocabulary/${encodeURIComponent(remote.id)}/review`,
-      { result, operationId, reviewedAt: Number(operation.reviewedAt) || Date.now() },
+      {
+        result,
+        mode: operation.mode === 'practice' ? 'practice' : 'scheduled',
+        operationId,
+        reviewedAt: Number(operation.reviewedAt) || Date.now(),
+      },
     )
     if (reviewed?.item) {
       index.byId.set(reviewed.item.id, reviewed.item)
@@ -1029,6 +1100,49 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
       if (url.pathname === '/learning/entries' && req.method === 'GET') {
         const entries = db()?.listLearningEntries(5000) || []
         return sendJson(res, 200, { ok: true, entries })
+      }
+
+      if (url.pathname === '/learning/explain' && req.method === 'POST') {
+        try {
+          const result = await learningWordExplanation(await readBody(req))
+          console.log(`[Learning] explanation model=${result.model} cached=${result.cached === true} chars=${result.explanation.length}`)
+          return sendJson(res, 200, { ok: true, online: true, ...result })
+        } catch (error) {
+          if (error?.code === 'voice_record_offline') {
+            console.log(`[Learning] explanation offline reason=${error?.message || error}`)
+            return sendJson(res, 200, {
+              ok: true,
+              online: false,
+              explanation: '',
+              error: error?.message || String(error),
+            })
+          }
+          console.log(`[Learning] explanation failed: ${error?.message || error}`)
+          return sendJson(res, Number(error?.status) || 502, { ok: false, error: error?.message || String(error) })
+        }
+      }
+
+      if (url.pathname === '/learning/selection' && req.method === 'POST') {
+        try {
+          const body = await readBody(req)
+          const text = String(body?.text || '').replace(/\s+/g, ' ').trim().slice(0, 5000)
+          const result = await voiceVocabularyRequest('POST', '/api/desktop/learning-selection', {
+            text,
+            sourceName: String(body?.sourceName || 'YouTube subtitles').trim().slice(0, 120),
+            pageUrl: String(body?.pageUrl || '').trim().slice(0, 2000),
+            videoId: String(body?.videoId || '').trim().slice(0, 32),
+            cueStartMs: Number.isFinite(Number(body?.cueStartMs)) ? Math.max(0, Math.round(Number(body.cueStartMs))) : null,
+          })
+          console.log(`[Learning] selection handoff armed=${result?.armed === true} chars=${text.length}`)
+          return sendJson(res, 200, { ok: true, online: true, armed: result?.armed === true })
+        } catch (error) {
+          if (error?.code === 'voice_record_offline') {
+            console.log(`[Learning] selection handoff offline reason=${error?.message || error}`)
+            return sendJson(res, 200, { ok: true, online: false, armed: false, error: error?.message || String(error) })
+          }
+          console.log(`[Learning] selection handoff failed: ${error?.message || error}`)
+          return sendJson(res, Number(error?.status) || 502, { ok: false, error: error?.message || String(error) })
+        }
       }
 
       if (url.pathname === '/vocabulary/sync' && req.method === 'POST') {
@@ -2236,6 +2350,8 @@ module.exports = {
     translateTexts,
     dictionaryLookup,
     translatorCacheKey,
+    normalizeLearningExplanationPayload,
+    learningExplanationCacheKey,
     parseTimestampedTranscript,
     normalizeVocabularyTerm,
     vocabularySyncPayload,

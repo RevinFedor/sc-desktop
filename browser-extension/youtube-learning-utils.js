@@ -177,6 +177,66 @@
     }
   }
 
+  function mergeTextRanges(ranges, textLength) {
+    const limit = Math.max(0, Number(textLength) || 0);
+    const sorted = (ranges || [])
+      .map(range => ({
+        start: Math.max(0, Math.min(limit, Math.trunc(Number(range?.start) || 0))),
+        end: Math.max(0, Math.min(limit, Math.trunc(Number(range?.end) || 0))),
+      }))
+      .filter(range => range.end > range.start)
+      .sort((a, b) => a.start - b.start || a.end - b.end);
+    const merged = [];
+    for (const range of sorted) {
+      const previous = merged[merged.length - 1];
+      if (previous && range.start <= previous.end) previous.end = Math.max(previous.end, range.end);
+      else merged.push({ ...range });
+    }
+    return merged;
+  }
+
+  // Azure Translator returns inclusive UTF-16 character spans such as
+  // `0:2-0:1`. Resolve only the target spans aligned to the selected source
+  // word so the Russian example can highlight the real contextual equivalent.
+  function alignedTargetRanges(sourceText, targetText, term, projection, language) {
+    const source = String(sourceText || '');
+    const target = String(targetText || '');
+    const normalized = normalizeTerm(term);
+    if (!source || !target || !normalized || !projection) return [];
+    const sourceRanges = segmentWords(source, language)
+      .filter(part => part.word && part.normalized === normalized)
+      .map(part => ({ start: part.index, end: part.index + part.text.length }));
+    if (!sourceRanges.length) return [];
+
+    const targetRanges = [];
+    const tokenPattern = /(\d+):(\d+)-(\d+):(\d+)/g;
+    let match;
+    while ((match = tokenPattern.exec(String(projection))) !== null) {
+      const sourceStart = Number(match[1]);
+      const sourceEnd = Number(match[2]) + 1;
+      const targetStart = Number(match[3]);
+      const targetEnd = Number(match[4]) + 1;
+      if (![sourceStart, sourceEnd, targetStart, targetEnd].every(Number.isFinite)) continue;
+      const overlapsSelectedWord = sourceRanges.some(range => sourceStart < range.end && sourceEnd > range.start);
+      if (overlapsSelectedWord) targetRanges.push({ start: targetStart, end: targetEnd });
+    }
+    return mergeTextRanges(targetRanges, target.length);
+  }
+
+  // Alignment is intentionally absent for a few canned Azure translations.
+  // In that narrow case, exact dictionary alternatives are a safe fallback;
+  // no stemming or fuzzy guessing is used.
+  function exactTermRanges(text, terms, language) {
+    const source = String(text || '');
+    if (!source) return [];
+    const normalizedTerms = new Set((terms || []).map(normalizeTerm).filter(Boolean));
+    if (!normalizedTerms.size) return [];
+    const ranges = segmentWords(source, language)
+      .filter(part => part.word && normalizedTerms.has(part.normalized))
+      .map(part => ({ start: part.index, end: part.index + part.text.length }));
+    return mergeTextRanges(ranges, source.length);
+  }
+
   function examplesForTerm(cues, term, currentIndex, limit = 6, language) {
     const normalized = normalizeTerm(term);
     if (!normalized) return [];
@@ -191,6 +251,18 @@
       .slice(0, Math.max(1, limit))
       .sort((a, b) => a.cueIndex - b.cueIndex)
       .map(({ distance, ...cue }) => cue);
+  }
+
+  function inclusiveWordRange(anchorIndex, targetIndex) {
+    const anchor = Math.max(0, Math.trunc(Number(anchorIndex) || 0));
+    const target = Math.max(0, Math.trunc(Number(targetIndex) || 0));
+    return { fromWordIndex: Math.min(anchor, target), toWordIndex: Math.max(anchor, target) };
+  }
+
+  function cueNavigationDelta(code) {
+    if (code === 'KeyA') return -1;
+    if (code === 'KeyD') return 1;
+    return 0;
   }
 
   function batchTexts(items, maxItems = 25, maxChars = 5_000) {
@@ -221,7 +293,11 @@
     findCueIndex,
     normalizeTerm,
     segmentWords,
+    alignedTargetRanges,
+    exactTermRanges,
     examplesForTerm,
+    inclusiveWordRange,
+    cueNavigationDelta,
     batchTexts,
     timestampToMs,
   };

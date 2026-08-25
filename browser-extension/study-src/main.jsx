@@ -1,7 +1,9 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import {
   BookOpen,
+  ArrowLeft,
+  ArrowRight,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -12,14 +14,43 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Settings,
   Sparkles,
   Wifi,
   X,
 } from 'lucide-react'
 import '../learning-store.js'
+import '../study-model.js'
 import './study.css'
 
 const store = window.__scLearningStore
+const StudyModel = window.__scStudyModel
+
+function readYoutubePreferences() {
+  if (typeof chrome === 'undefined' || !chrome.storage?.sync) {
+    return Promise.resolve({ learning_ai_explanation: true })
+  }
+  return new Promise((resolve) => {
+    chrome.storage.sync.get({ __yt: { learning_ai_explanation: true } }, (raw) => {
+      const settings = raw?.__yt && typeof raw.__yt === 'object' ? raw.__yt : {}
+      resolve({ learning_ai_explanation: settings.learning_ai_explanation !== false })
+    })
+  })
+}
+
+function patchYoutubePreferences(patch) {
+  if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
+    return Promise.resolve({ online: false, settings: patch })
+  }
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ type: 'sc-youtube-settings-patch', patch }, (response) => {
+      const error = chrome.runtime.lastError
+      if (error) { reject(new Error(error.message)); return }
+      if (!response?.ok) { reject(new Error(response?.error || 'Не удалось сохранить настройку')); return }
+      resolve(response)
+    })
+  })
+}
 
 function stateLabel(state) {
   if (state === 'known') return 'Знаю'
@@ -127,6 +158,7 @@ function EntryRow({ entry, onState, onTranslation, onResolve }) {
   const [translation, setTranslation] = useState(entry.translation || '')
   const [expanded, setExpanded] = useState(false)
   const [busy, setBusy] = useState(false)
+  const totalAttempts = Number(entry.reviewCount || 0) + Number(entry.practiceCount || 0)
 
   useEffect(() => setTranslation(entry.translation || ''), [entry.translation])
 
@@ -164,7 +196,7 @@ function EntryRow({ entry, onState, onTranslation, onResolve }) {
             </button>
           )}
           <div className="entry-meta">
-            <span><Clock3 size={13} />{entry.reviewCount ? `${entry.reviewCount} повторений` : 'новая карточка'}</span>
+            <span><Clock3 size={13} />{totalAttempts ? `${totalAttempts} повторений` : 'новая карточка'}</span>
             {entry.state === 'saved' && <span>следующая: {formatDue(entry.dueAt)}</span>}
             {entry.dirty && <span className="pending-label">ждёт синхронизации</span>}
           </div>
@@ -240,58 +272,266 @@ function DictionaryView({ entries, refresh }) {
   )
 }
 
-function DeckView({ dueEntries, refresh }) {
+function DeckView({ entries, refresh }) {
+  const savedEntries = useMemo(() => entries.filter((entry) => entry.state === 'saved'), [entries])
+  const entriesByKey = useMemo(() => new Map(savedEntries.map((entry) => [entry.key, entry])), [savedEntries])
+  const initialRound = useMemo(() => StudyModel.buildRound(savedEntries, {}), [])
+  const [queue, setQueue] = useState(initialRound)
+  const [round, setRound] = useState(1)
+  const [roundTotal, setRoundTotal] = useState(initialRound.length)
+  const [sessionStats, setSessionStats] = useState({})
   const [revealed, setRevealed] = useState(false)
-  const current = dueEntries[0] || null
+  const [busy, setBusy] = useState(false)
+  const [dragX, setDragX] = useState(0)
+  const [dragging, setDragging] = useState(false)
+  const [exiting, setExiting] = useState('')
+  const lastKeyRef = useRef('')
+  const dragRef = useRef({ pointerId: null, startX: 0, deltaX: 0 })
+  const savedSignature = savedEntries.map((entry) => entry.key).sort().join('\u0000')
+  const current = entriesByKey.get(queue[0]) || null
+  const currentPosition = current ? Math.max(1, roundTotal - queue.length + 1) : 0
+  const currentMode = current ? StudyModel.reviewMode(current) : 'practice'
 
-  useEffect(() => setRevealed(false), [current?.key])
+  useEffect(() => {
+    const activeKeys = new Set(savedEntries.map((entry) => entry.key))
+    setQueue((previous) => {
+      const kept = previous.filter((key) => activeKeys.has(key))
+      const queued = new Set(kept)
+      const missing = savedEntries.filter((entry) => !queued.has(entry.key)).map((entry) => entry.key)
+      if (kept.length || missing.length) {
+        const next = [...kept, ...missing]
+        if (!previous.length) setRoundTotal(next.length)
+        return next
+      }
+      const next = StudyModel.buildRound(savedEntries, sessionStats, lastKeyRef.current)
+      setRoundTotal(next.length)
+      return next
+    })
+  }, [savedSignature])
 
-  const review = async (result) => {
-    if (!current) return
-    await store.queueReview({ key: current.key, result })
+  useEffect(() => {
     setRevealed(false)
-    await refresh({ sync: true })
+    setDragX(0)
+    setDragging(false)
+    setExiting('')
+  }, [current?.key])
+
+  const review = useCallback(async (result, { animate = true } = {}) => {
+    if (!current || busy) return
+    setBusy(true)
+    if (animate) {
+      setExiting(result)
+      setDragX(result === 'remembered' ? Math.max(760, window.innerWidth) : -Math.max(760, window.innerWidth))
+      await new Promise((resolve) => setTimeout(resolve, 170))
+    }
+    try {
+      const mode = StudyModel.reviewMode(current)
+      const reviewResult = await store.queueReview({ key: current.key, result, mode })
+      const nextStats = StudyModel.nextSessionStats(sessionStats, current.key, result)
+      const remaining = queue.slice(1).filter((key) => entriesByKey.has(key))
+      lastKeyRef.current = current.key
+      setSessionStats(nextStats)
+      if (remaining.length) {
+        setQueue(remaining)
+      } else {
+        const updatedEntries = savedEntries.map((entry) => entry.key === current.key
+          ? (reviewResult?.entry || entry)
+          : entry)
+        const nextRound = StudyModel.buildRound(updatedEntries, nextStats, current.key)
+        setRound((value) => value + 1)
+        setRoundTotal(nextRound.length)
+        setQueue(nextRound)
+      }
+      setRevealed(false)
+      setDragX(0)
+      setDragging(false)
+      setExiting('')
+      refresh({ sync: false }).catch(() => {})
+      store.sync({}).catch(() => {})
+    } finally {
+      setBusy(false)
+      setDragX(0)
+      setDragging(false)
+      setExiting('')
+    }
+  }, [busy, current, entriesByKey, queue, refresh, savedEntries, sessionStats])
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      const target = event.target
+      if (target?.closest?.('input, textarea, select, [contenteditable="true"]')) return
+      if (event.key === 'Enter' && !revealed && current) {
+        event.preventDefault()
+        if (!event.repeat) setRevealed(true)
+        return
+      }
+      if (busy || event.repeat || !current) return
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault()
+        review('forgotten')
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault()
+        review('remembered')
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [busy, current, revealed, review])
+
+  const onPointerDown = (event) => {
+    if (busy || event.button !== 0) return
+    if (event.target.closest('[data-selectable-text], button, a, input, textarea, select')) return
+    const selection = window.getSelection?.()
+    if (selection && !selection.isCollapsed) return
+    dragRef.current = { pointerId: event.pointerId, startX: event.clientX, deltaX: 0 }
+    try { event.currentTarget.setPointerCapture?.(event.pointerId) } catch {}
+    setDragging(true)
+    setExiting('')
   }
 
-  if (!current) {
+  const onPointerMove = (event) => {
+    if (!dragging || dragRef.current.pointerId !== event.pointerId) return
+    const delta = Math.max(-360, Math.min(360, event.clientX - dragRef.current.startX))
+    dragRef.current.deltaX = delta
+    setDragX(delta)
+  }
+
+  const finishPointer = (event, cancelled = false) => {
+    if (dragRef.current.pointerId !== event.pointerId) return
+    try { event.currentTarget.releasePointerCapture?.(event.pointerId) } catch {}
+    const result = cancelled ? null : StudyModel.swipeResult(dragRef.current.deltaX)
+    dragRef.current = { pointerId: null, startX: 0, deltaX: 0 }
+    setDragging(false)
+    if (result) review(result)
+    else setDragX(0)
+  }
+
+  if (!savedEntries.length) {
     return (
       <section className="deck workspace">
-        <div className="deck-empty"><CheckCircle2 size={58} /><h2>На сегодня всё</h2><p>Новые и назначенные карточки появятся здесь автоматически.</p></div>
+        <div className="deck-empty"><BookOpen size={58} /><h2>Добавьте карточки</h2><p>Сохраните слова из YouTube или добавьте их вручную в словаре.</p></div>
       </section>
     )
   }
 
+  if (!current) return <section className="deck workspace"><div className="page-loader"><RefreshCw className="spin" /></div></section>
+
+  const dragProgress = Math.min(1, Math.abs(dragX) / 110)
+  const transform = `translate3d(${dragX}px,0,0) rotate(${dragX / 30}deg)`
+  const practiceHint = currentMode === 'scheduled' ? 'обновит интервал' : 'тренировочный ответ'
+
   return (
     <section className="deck workspace" aria-label="Карточки">
-      <div className="deck-progress"><span>Осталось карточек</span><strong>{dueEntries.length}</strong></div>
-      <div className={`study-card ${revealed ? 'revealed' : ''}`}>
-        <div className="study-card-label">{current.kind === 'phrase' ? 'Фраза' : 'Слово'}</div>
-        <h2>{current.sourceText}</h2>
-        {!revealed ? (
-          <button type="button" className="reveal-button" onClick={() => setRevealed(true)}>Показать перевод</button>
-        ) : (
-          <>
-            <div className="study-translation">{current.translation || 'Перевод ещё не заполнен'}</div>
-            {!!current.contexts?.[0] && (
-              <div className="study-context"><span>{current.contexts[0].sourceText}</span>{current.contexts[0].translation && <small>{current.contexts[0].translation}</small>}</div>
-            )}
-          </>
-        )}
+      <div className="deck-progress">
+        <span>Круг {round}</span>
+        <strong>Карточка {currentPosition} из {roundTotal}</strong>
       </div>
-      {revealed && (
-        <div className="review-actions">
-          <button type="button" className="forgotten" onClick={() => review('forgotten')}><X size={20} /><span>Не помню<small>повторить через 10 минут</small></span></button>
-          <button type="button" className="remembered" onClick={() => review('remembered')}><Check size={20} /><span>Помню<small>увеличить интервал</small></span></button>
+      <div className="study-card-stage">
+        <div className="swipe-zone forgotten" style={{ opacity: dragX < 0 ? dragProgress : 0 }}><ArrowLeft size={22} />Не помню</div>
+        <div className="swipe-zone remembered" style={{ opacity: dragX > 0 ? dragProgress : 0 }}>Помню<ArrowRight size={22} /></div>
+        <div
+          className={`study-card ${revealed ? 'revealed' : ''} ${dragging ? 'dragging' : ''} ${exiting ? `exiting-${exiting}` : ''}`}
+          style={{ transform, transition: dragging ? 'none' : 'transform 170ms cubic-bezier(.2,.8,.2,1)' }}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={(event) => finishPointer(event)}
+          onPointerCancel={(event) => finishPointer(event, true)}
+        >
+          <div className="study-question-slot"><h2 data-selectable-text>{current.sourceText}</h2></div>
+          <div className="study-answer-slot">
+            {!revealed ? (
+              <button type="button" className="reveal-button" onClick={() => setRevealed(true)}>Показать перевод <kbd>Enter</kbd></button>
+            ) : (
+              <div className="study-translation" data-selectable-text>{current.translation || 'Перевод ещё не заполнен'}</div>
+            )}
+          </div>
+          <div className={`study-context-slot ${revealed && current.contexts?.[0] ? 'visible' : ''}`}>
+            {!!current.contexts?.[0] && (
+              <div className="study-context"><span data-selectable-text>{current.contexts[0].sourceText}</span>{current.contexts[0].translation && <small data-selectable-text>{current.contexts[0].translation}</small>}</div>
+            )}
+          </div>
         </div>
-      )}
+      </div>
+      <div className="review-actions">
+        <button type="button" className="forgotten" onClick={() => review('forgotten')} disabled={busy}>
+          <ArrowLeft size={20} /><span>Не помню<small>{practiceHint}</small></span>
+        </button>
+        <button type="button" className="remembered" onClick={() => review('remembered')} disabled={busy}>
+          <ArrowRight size={20} /><span>Помню<small>{practiceHint}</small></span>
+        </button>
+      </div>
+      <div className="deck-hint">Enter — показать перевод · ← / → — ответить · карточку можно перетащить</div>
+    </section>
+  )
+}
+
+function SettingsView() {
+  const [enabled, setEnabled] = useState(true)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [message, setMessage] = useState('')
+
+  useEffect(() => {
+    let active = true
+    readYoutubePreferences()
+      .then((preferences) => { if (active) setEnabled(preferences.learning_ai_explanation !== false) })
+      .finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [])
+
+  const toggle = async () => {
+    if (saving || loading) return
+    const next = !enabled
+    setEnabled(next)
+    setSaving(true)
+    setMessage('')
+    try {
+      const result = await patchYoutubePreferences({ learning_ai_explanation: next })
+      const canonical = result?.settings?.learning_ai_explanation
+      if (typeof canonical === 'boolean') setEnabled(canonical)
+      setMessage(result?.online === false ? 'Сохранено локально; SC Desktop применит настройку при запуске.' : 'Сохранено')
+    } catch (error) {
+      setEnabled(!next)
+      setMessage(error?.message || String(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <section className="workspace settings-workspace" aria-label="Настройки словаря">
+      <div className="settings-card">
+        <div className="settings-copy">
+          <div className="settings-title"><Sparkles size={19} /><strong>AI-пояснение слова в контексте</strong></div>
+          <p>При открытии слова в субтитрах показывать 1–2 коротких предложения о его значении именно в текущей реплике.</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          className={`settings-switch ${enabled ? 'on' : ''}`}
+          onClick={toggle}
+          disabled={loading || saving}
+        ><span /></button>
+      </div>
+      <div className="settings-card compact">
+        <div className="settings-copy">
+          <strong>Модель</strong>
+          <p>Gemini 3.1 Flash‑Lite · без инструментов агента · успешные ответы кэшируются локально на Mac.</p>
+        </div>
+      </div>
+      {message && <div className="settings-message">{message}</div>}
     </section>
   )
 }
 
 function App() {
-  const [tab, setTab] = useState(() => window.location.hash === '#cards' ? 'cards' : 'dictionary')
+  const [tab, setTab] = useState(() => {
+    if (window.location.hash === '#cards') return 'cards'
+    if (window.location.hash === '#settings') return 'settings'
+    return 'dictionary'
+  })
   const [entries, setEntries] = useState([])
-  const [dueEntries, setDueEntries] = useState([])
   const [stats, setStats] = useState(null)
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
@@ -299,17 +539,15 @@ function App() {
   const learnedPercent = stats?.total ? Math.round((stats.known / stats.total) * 100) : 0
   const chooseTab = (nextTab) => {
     setTab(nextTab)
-    window.history.replaceState(null, '', nextTab === 'cards' ? '#cards' : '#dictionary')
+    window.history.replaceState(null, '', `#${nextTab}`)
   }
 
   const readLocal = useCallback(async () => {
-    const [nextEntries, nextDue, nextStats] = await Promise.all([
+    const [nextEntries, nextStats] = await Promise.all([
       store.listEntries({}),
-      store.dueEntries({ limit: 100 }),
       store.stats({}),
     ])
     setEntries(nextEntries)
-    setDueEntries(nextDue)
     setStats(nextStats)
     setLoading(false)
   }, [])
@@ -367,12 +605,15 @@ function App() {
       </div>
       <nav className="tabs" aria-label="Разделы">
         <button type="button" className={tab === 'dictionary' ? 'active' : ''} onClick={() => chooseTab('dictionary')}><BookOpen size={18} />Словарь</button>
-        <button type="button" className={tab === 'cards' ? 'active' : ''} onClick={() => chooseTab('cards')}><Sparkles size={18} />Карточки{dueEntries.length > 0 && <strong>{dueEntries.length}</strong>}</button>
+        <button type="button" className={tab === 'cards' ? 'active' : ''} onClick={() => chooseTab('cards')}><Sparkles size={18} />Карточки{(stats?.saved || 0) > 0 && <strong>{stats.saved}</strong>}</button>
+        <button type="button" className={tab === 'settings' ? 'active' : ''} onClick={() => chooseTab('settings')}><Settings size={18} />Настройки</button>
       </nav>
       {error && <div className="error-banner">{error}<button type="button" onClick={() => setError('')}><X size={16} /></button></div>}
       {loading ? <div className="page-loader"><RefreshCw className="spin" /><span>Открываю локальную базу…</span></div> : tab === 'dictionary'
         ? <DictionaryView entries={entries} refresh={refresh} />
-        : <DeckView dueEntries={dueEntries} refresh={refresh} />}
+        : tab === 'cards'
+          ? <DeckView entries={entries} refresh={refresh} />
+          : <SettingsView />}
     </div>
   )
 }

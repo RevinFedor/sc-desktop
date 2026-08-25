@@ -18,17 +18,19 @@ const settingsAccess = {
 test('Azure request retries one transient transport failure', async () => {
   const originalFetch = global.fetch
   let calls = 0
-  global.fetch = async () => {
+  let finalUrl = ''
+  global.fetch = async (url) => {
     calls += 1
     if (calls === 1) {
       const error = new TypeError('fetch failed')
       error.cause = { code: 'ECONNRESET' }
       throw error
     }
+    finalUrl = String(url)
     return {
       ok: true,
       status: 200,
-      text: async () => JSON.stringify([{ translations: [{ text: 'Готово' }] }]),
+      text: async () => JSON.stringify([{ translations: [{ text: 'Готово', alignment: { proj: '0:4-0:5' } }] }]),
     }
   }
 
@@ -36,14 +38,34 @@ test('Azure request retries one transient transport failure', async () => {
     const payload = await __test.azureTranslatorRequest(
       settingsAccess,
       '/translate',
-      { from: 'en', to: 'ru' },
+      { from: 'en', to: 'ru', includeAlignment: true },
       [{ Text: 'Ready' }],
     )
     assert.equal(calls, 2)
     assert.equal(payload[0].translations[0].text, 'Готово')
+    assert.match(finalUrl, /includeAlignment=true/)
   } finally {
     global.fetch = originalFetch
   }
+})
+
+test('learning explanation cache identity includes word and subtitle context', () => {
+  const first = __test.normalizeLearningExplanationPayload({
+    word: ' want ',
+    context: 'I want this.',
+    contextTranslation: 'Я хочу это.',
+    sourceLang: 'en',
+    targetLang: 'ru',
+  })
+  const second = __test.normalizeLearningExplanationPayload({
+    word: 'want',
+    context: 'They want more.',
+    contextTranslation: 'Они хотят больше.',
+    sourceLang: 'en',
+    targetLang: 'ru',
+  })
+  assert.equal(first.word, 'want')
+  assert.notEqual(__test.learningExplanationCacheKey(first), __test.learningExplanationCacheKey(second))
 })
 
 test('timestamped transcript parser keeps millisecond cue boundaries', () => {

@@ -90,11 +90,17 @@
   let autoPausedCueKey = '';
   let subtitleHovered = false;
   let wordPopoverOpen = false;
+  let phraseSelectionOpen = false;
+  let phraseSelection = null;
+  let phraseSelectionAnchor = null;
+  let phraseHint = null;
+  let selectionHandoffGeneration = 0;
   let pausedForSubtitleHover = false;
   let hoverPausedCueKey = '';
   let popoverResizeObserver = null;
   let learningStateRefreshPromise = null;
   const translationsByText = new Map();
+  const translationAlignmentsByText = new Map();
   const pendingTranslationTexts = new Set();
   const snapshotRequests = new Map();
   const wordStates = new Map();
@@ -178,6 +184,12 @@
         color: #d4d4d8;
         transition: opacity .12s ease, transform .12s ease;
       }
+      #${ROOT_ID} .sc-learning-translation mark {
+        color:#fff;
+        background:rgba(147,51,234,.5);
+        border-radius:3px;
+        padding:0 2px;
+      }
       #${ROOT_ID}[data-translation-mode="hover"] .sc-learning-translation {
         opacity: 0;
         transform: translateY(4px);
@@ -215,6 +227,29 @@
       #${ROOT_ID} .sc-learning-word[data-learning-state="saved"]:focus-visible { background: rgba(147,51,234,.78); }
       #${ROOT_ID} .sc-learning-word[data-learning-state="known"]:hover,
       #${ROOT_ID} .sc-learning-word[data-learning-state="known"]:focus-visible { background: rgba(22,163,74,.72); }
+      #${ROOT_ID} .sc-learning-word[data-phrase-selected="1"] {
+        color:#fff;
+        background:rgba(37,99,235,.72);
+        box-shadow:inset 0 -2px 0 rgba(147,197,253,.98);
+      }
+      #${ROOT_ID} .sc-learning-phrase-hint {
+        display:none;
+        width:fit-content;
+        max-width:100%;
+        margin:0 auto 5px;
+        padding:5px 10px;
+        border:1px solid rgba(147,197,253,.42);
+        border-radius:999px;
+        background:rgba(9,18,38,.9);
+        color:#bfdbfe;
+        font-size:12px;
+        font-weight:600;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+      }
+      #${ROOT_ID} .sc-learning-phrase-hint[data-visible="1"] { display:block; }
+      #${ROOT_ID} .sc-learning-phrase-hint[data-state="error"] { border-color:rgba(248,113,113,.45); color:#fecaca; }
       #${ROOT_ID} .sc-learning-status {
         display: none;
         align-items: center;
@@ -313,7 +348,7 @@
         flex-direction: column;
         box-sizing: border-box;
         width: min(480px, calc(100vw - 24px));
-        max-height: min(680px, calc(100vh - 24px));
+        max-height: min(760px, calc(100vh - 24px));
         overflow: hidden;
         padding: 0;
         border: 1px solid rgba(255,255,255,.14);
@@ -323,15 +358,26 @@
         box-shadow: 0 20px 58px rgba(0,0,0,.58);
         font-family: Roboto, Arial, sans-serif;
       }
-      #${WORD_POPOVER_ID} .sc-word-head { display:flex; flex:0 0 auto; align-items:flex-start; gap:8px; padding:10px 11px 9px; background:#14538b; }
+      #${WORD_POPOVER_ID} .sc-word-head { display:flex; flex:0 0 auto; align-items:flex-start; gap:8px; padding:10px 11px 9px; background:#2b2b2f; }
       #${WORD_POPOVER_ID} .sc-word-title { min-width:0; flex:1; }
       #${WORD_POPOVER_ID} .sc-word-source { color:#e9d5ff; font-size:23px; font-weight:700; overflow-wrap:anywhere; }
       #${WORD_POPOVER_ID} .sc-word-primary { margin-top:3px; color:#fff; font-size:18px; font-weight:600; }
       #${WORD_POPOVER_ID} .sc-word-section { flex:0 0 auto; padding:9px 11px; border-top:1px solid rgba(255,255,255,.09); }
+      #${WORD_POPOVER_ID} .sc-word-meanings { flex:0 1 auto; min-height:0; max-height:min(250px,32vh); overflow-y:auto; overscroll-behavior:contain; }
+      #${WORD_POPOVER_ID} .sc-word-meanings[data-long="1"] { min-height:min(150px,22vh); }
+      #${WORD_POPOVER_ID}[data-compact="1"] .sc-word-meanings[data-long="1"] { min-height:100px; }
+      #${WORD_POPOVER_ID} .sc-word-meanings-list { min-height:0; }
       #${WORD_POPOVER_ID} .sc-word-section-title { margin-bottom:6px; color:#a1a1aa; font-size:12px; font-weight:600; letter-spacing:.02em; }
+      #${WORD_POPOVER_ID} .sc-word-ai { margin:0 0 8px; padding:8px 9px; border:1px solid rgba(168,85,247,.2); border-radius:8px; background:#27272a; color:#d4d4d8; font-size:12.5px; line-height:1.38; }
+      #${WORD_POPOVER_ID} .sc-word-ai[hidden] { display:none; }
+      #${WORD_POPOVER_ID} .sc-word-ai-label { margin-right:6px; color:#c4b5fd; font-size:10px; font-weight:750; letter-spacing:.04em; text-transform:uppercase; }
+      #${WORD_POPOVER_ID} .sc-word-ai-skeleton { width:100%; height:14px; }
+      #${WORD_POPOVER_ID} .sc-word-ai[data-state="error"] { border-color:rgba(255,255,255,.08); color:#71717a; }
       #${WORD_POPOVER_ID} .sc-word-meaning { display:flex; gap:7px; margin:3px 0; font-size:15px; line-height:1.3; }
       #${WORD_POPOVER_ID} .sc-word-pos { flex:0 0 54px; color:#71717a; font-style:italic; }
-      #${WORD_POPOVER_ID} .sc-word-examples { flex:1 1 auto; min-height:84px; max-height:min(250px,32vh); overflow-y:auto; overscroll-behavior:contain; }
+      #${WORD_POPOVER_ID} .sc-word-examples { flex:1 1 250px; min-height:150px; max-height:min(330px,40vh); overflow-y:auto; overscroll-behavior:contain; }
+      #${WORD_POPOVER_ID}[data-compact="1"] .sc-word-examples { min-height:110px; }
+      #${WORD_POPOVER_ID} { overscroll-behavior:contain; }
       #${WORD_POPOVER_ID} .sc-word-example { position:relative; display:grid; grid-template-columns:30px 1fr auto; gap:7px; align-items:start; padding:6px 0; border-top:1px solid rgba(255,255,255,.07); }
       #${WORD_POPOVER_ID} .sc-word-example:first-of-type { border-top:0; }
       #${WORD_POPOVER_ID} .sc-word-example-text { font-size:15px; line-height:1.45; }
@@ -466,7 +512,7 @@
   }
 
   function hoverHoldRequested() {
-    return subtitleHovered || wordPopoverOpen;
+    return subtitleHovered || wordPopoverOpen || phraseSelectionOpen;
   }
 
   function updateHoverHoldState() {
@@ -489,6 +535,7 @@
   function releaseHoverHold({ resume = true } = {}) {
     subtitleHovered = false;
     wordPopoverOpen = false;
+    phraseSelectionOpen = false;
     const shouldResume = resume && pausedForSubtitleHover;
     const video = playerVideo();
     pausedForSubtitleHover = false;
@@ -527,18 +574,21 @@
     statusRow = document.createElement('div');
     statusRow.className = 'sc-learning-status';
     statusRow.dataset.visible = '0';
+    phraseHint = document.createElement('div');
+    phraseHint.className = 'sc-learning-phrase-hint';
+    phraseHint.dataset.visible = '0';
     translationRow = document.createElement('div');
     translationRow.className = 'sc-learning-translation';
     sourceRow = document.createElement('div');
     sourceRow.className = 'sc-learning-source';
-    subtitleCard.append(statusRow, sourceRow, translationRow);
+    subtitleCard.append(statusRow, phraseHint, sourceRow, translationRow);
 
     navRail = document.createElement('div');
     navRail.className = 'sc-learning-rail sc-learning-nav';
     navRail.append(
-      iconButton('previous', 'Предыдущая реплика', () => seekRelativeCue(-1)),
+      iconButton('previous', 'Предыдущая реплика (A / Ф)', () => seekRelativeCue(-1)),
       iconButton('replay', 'Повторить реплику', () => seekCue(currentCueIndex)),
-      iconButton('next', 'Следующая реплика', () => seekRelativeCue(1)),
+      iconButton('next', 'Следующая реплика (D / В)', () => seekRelativeCue(1)),
     );
 
     optionRail = document.createElement('div');
@@ -650,8 +700,15 @@
     settings = sanitizeYoutubeSettings({ ...settings, ...patch });
     updateRootSettings();
     try { await chrome.storage.sync.set({ __yt: settings }); } catch {}
+    try {
+      chrome.runtime.sendMessage({ type: 'sc-youtube-settings-patch', patch }, () => {
+        const error = chrome.runtime.lastError;
+        if (error) log('settings patch queued locally', { error: error.message });
+      });
+    } catch {}
     if (previousTarget !== settings.learning_target_lang) {
       translationsByText.clear();
+      translationAlignmentsByText.clear();
       translationError = '';
       prefetchGeneration += 1;
       renderCue(currentCueIndex, true);
@@ -690,6 +747,7 @@
       updateRootSettings();
       if (previous.learning_target_lang !== fresh.learning_target_lang) {
         translationsByText.clear();
+        translationAlignmentsByText.clear();
         translationError = '';
         prefetchGeneration += 1;
         renderCue(currentCueIndex, true);
@@ -722,6 +780,7 @@
   }
 
   function deactivateOverlay() {
+    clearPhraseSelection({ resume: false });
     releaseHoverHold({ resume: true });
     overlayActive = false;
     if (root) root.dataset.active = '0';
@@ -914,6 +973,7 @@
     cues = [];
     currentCueIndex = -1;
     translationsByText.clear();
+    translationAlignmentsByText.clear();
     pendingTranslationTexts.clear();
     translationError = '';
     subtitleCard.style.display = '';
@@ -1000,7 +1060,10 @@
     texts.forEach(text => pendingTranslationTexts.add(text));
     try {
       if (sourceLanguage().toLowerCase() === settings.learning_target_lang.toLowerCase()) {
-        texts.forEach(text => translationsByText.set(text, text));
+        texts.forEach(text => {
+          translationsByText.set(text, text);
+          translationAlignmentsByText.set(text, '');
+        });
         return;
       }
       const payload = await bridgeJson('/translator/translate', {
@@ -1009,7 +1072,9 @@
       });
       if (generation !== prefetchGeneration) return;
       for (const item of payload.translations || []) {
-        if (item.source_text) translationsByText.set(item.source_text, item.translated_text || '');
+        if (!item.source_text) continue;
+        translationsByText.set(item.source_text, item.translated_text || '');
+        translationAlignmentsByText.set(item.source_text, item.alignment || '');
       }
       translationError = '';
     } catch (error) {
@@ -1083,9 +1148,113 @@
     finally { learningStateRefreshPromise = null; }
   }
 
+  function updatePhraseHint(text, state = 'ready') {
+    if (!phraseHint) return;
+    phraseHint.textContent = text || '';
+    phraseHint.dataset.visible = text ? '1' : '0';
+    phraseHint.dataset.state = state;
+  }
+
+  async function publishPhraseSelection(selection) {
+    const generation = ++selectionHandoffGeneration;
+    updatePhraseHint('Готовлю разбор…', 'loading');
+    try {
+      const result = await bridgeJson('/learning/selection', {
+        method: 'POST',
+        body: {
+          text: selection.text,
+          sourceName: 'YouTube subtitles',
+          pageUrl: location.href,
+          videoId: videoMeta.videoId || extractVideoIdFromLocation(),
+          cueStartMs: cues[selection.cueIndex]?.startMs ?? null,
+        },
+      });
+      if (generation !== selectionHandoffGeneration || !phraseSelectionOpen) return;
+      updatePhraseHint(
+        result?.online === false || result?.armed !== true
+          ? 'Voice Record недоступен · ⌥ Space откроет обычный чат'
+          : '⌥ Space — разобрать · Esc — отменить',
+        result?.online === false || result?.armed !== true ? 'error' : 'ready',
+      );
+    } catch (error) {
+      if (generation !== selectionHandoffGeneration || !phraseSelectionOpen) return;
+      updatePhraseHint('Не удалось подготовить Voice Record · Esc — отменить', 'error');
+      log('learning selection handoff failed', { error: error?.message || String(error) });
+    }
+  }
+
+  function clearPhraseSelection({ resume = true, keepAnchor = false, notify = true } = {}) {
+    const hadSelection = phraseSelectionOpen || !!phraseSelection;
+    phraseSelectionOpen = false;
+    phraseSelection = null;
+    if (!keepAnchor) phraseSelectionAnchor = null;
+    selectionHandoffGeneration += 1;
+    sourceRow?.querySelectorAll?.('.sc-learning-word[data-phrase-selected="1"]')
+      .forEach((word) => delete word.dataset.phraseSelected);
+    try {
+      const browserSelection = window.getSelection();
+      if (browserSelection?.rangeCount) browserSelection.removeAllRanges();
+    } catch {}
+    updatePhraseHint('');
+    if (notify && hadSelection) {
+      bridgeJson('/learning/selection', { method: 'POST', body: { text: '' } }).catch(() => {});
+    }
+    if (resume) resumeAfterHoverRelease();
+    else updateHoverHoldState();
+  }
+
+  function applyPhraseSelectionDom(selection) {
+    const words = Array.from(sourceRow?.querySelectorAll?.('.sc-learning-word[data-word-index]') || []);
+    const first = words.find((word) => Number(word.dataset.wordIndex) === selection.fromWordIndex);
+    const last = words.find((word) => Number(word.dataset.wordIndex) === selection.toWordIndex);
+    if (!first || !last) return false;
+    for (const word of words) {
+      const index = Number(word.dataset.wordIndex);
+      if (index >= selection.fromWordIndex && index <= selection.toWordIndex) word.dataset.phraseSelected = '1';
+      else delete word.dataset.phraseSelected;
+    }
+    try {
+      const range = document.createRange();
+      range.setStartBefore(first);
+      range.setEndAfter(last);
+      const browserSelection = window.getSelection();
+      browserSelection.removeAllRanges();
+      browserSelection.addRange(range);
+    } catch {}
+    return true;
+  }
+
+  function selectPhraseTo(wordIndex, cueIndex) {
+    if (!phraseSelectionAnchor || phraseSelectionAnchor.cueIndex !== cueIndex) return false;
+    closeWordPopover({ resume: false });
+    const { fromWordIndex, toWordIndex } = U.inclusiveWordRange(phraseSelectionAnchor.wordIndex, wordIndex);
+    const draft = { cueIndex, fromWordIndex, toWordIndex, text: '' };
+    if (!applyPhraseSelectionDom(draft)) return false;
+    const text = String(window.getSelection?.()?.toString?.() || '').replace(/\s+/g, ' ').trim();
+    if (!text) return false;
+    draft.text = text;
+    phraseSelection = draft;
+    phraseSelectionOpen = true;
+    wordPopoverOpen = false;
+    const video = playerVideo();
+    if (video && !video.paused) {
+      video.pause();
+      pausedForSubtitleHover = true;
+      hoverPausedCueKey = `${videoMeta.videoId}:${cues[cueIndex]?.startMs ?? cueIndex}`;
+    }
+    updateHoverHoldState();
+    publishPhraseSelection(draft);
+    log('phrase selected', { cueIndex, fromWordIndex, toWordIndex, chars: text.length });
+    return true;
+  }
+
   function renderCue(index, force = false) {
     ensureRoot();
     if (!force && index === currentCueIndex) return;
+    const preservedPhrase = phraseSelectionOpen && phraseSelection?.cueIndex === index
+      ? { ...phraseSelection }
+      : null;
+    if (phraseSelectionOpen && !preservedPhrase) clearPhraseSelection({ resume: false });
     currentCueIndex = index;
     root.dataset.cueIndex = String(index);
     sourceRow.replaceChildren();
@@ -1102,6 +1271,7 @@
     root.dataset.cueStartMs = String(cue.startMs);
     root.dataset.cueEndMs = String(cue.endMs);
     const parts = U.segmentWords(cue.text, sourceLanguage());
+    let wordIndex = 0;
     for (const part of parts) {
       if (!part.word) {
         sourceRow.appendChild(document.createTextNode(part.text));
@@ -1112,6 +1282,9 @@
       word.textContent = part.text;
       word.tabIndex = 0;
       word.dataset.normalized = part.normalized;
+      word.dataset.wordIndex = String(wordIndex);
+      const currentWordIndex = wordIndex;
+      wordIndex += 1;
       const learningState = wordStates.get(part.normalized)?.state || '';
       if (learningState) {
         word.dataset.learningState = learningState;
@@ -1120,23 +1293,36 @@
       word.addEventListener('click', event => {
         event.preventDefault();
         event.stopPropagation();
+        if (event.shiftKey && selectPhraseTo(currentWordIndex, index)) return;
+        clearPhraseSelection({ resume: false });
+        phraseSelectionAnchor = { cueIndex: index, wordIndex: currentWordIndex };
         openWordPopover(word, part.text, index);
       });
       word.addEventListener('keydown', event => {
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
+          clearPhraseSelection({ resume: false });
+          phraseSelectionAnchor = { cueIndex: index, wordIndex: currentWordIndex };
           openWordPopover(word, part.text, index);
         }
       });
       sourceRow.appendChild(word);
     }
+    if (preservedPhrase) applyPhraseSelectionDom(preservedPhrase);
     let translated = translationsByText.get(cue.text);
     if (settings.learning_translation_mode === 'always' && !translated) {
       ensureCueTranslation(index);
       translated = translationsByText.get(cue.text);
     }
-    translationRow.textContent = translated
-      || (pendingTranslationTexts.has(cue.text) ? 'Перевожу…' : (translationError ? 'Перевод временно недоступен' : ''));
+    if (translated) {
+      const refs = document.getElementById(WORD_POPOVER_ID)?.__scWordRefs;
+      if (refs?.cueIndex === index) highlightTargetTerm(translationRow, cue.text, translated, refs);
+      else translationRow.textContent = translated;
+    } else {
+      translationRow.textContent = pendingTranslationTexts.has(cue.text)
+        ? 'Перевожу…'
+        : (translationError ? 'Перевод временно недоступен' : '');
+    }
   }
 
   function renderCurrentVideoCue(video, force = false) {
@@ -1194,6 +1380,8 @@
 
   function seekRelativeCue(delta) {
     if (!cues.length) return;
+    closeWordPopover({ resume: false });
+    clearPhraseSelection({ resume: false });
     const base = currentCueIndex >= 0 ? currentCueIndex : 0;
     seekCue(Math.max(0, Math.min(cues.length - 1, base + delta)));
   }
@@ -1243,7 +1431,7 @@
     const a = anchor.getBoundingClientRect();
     const player = playerAnchor()?.getBoundingClientRect();
     const playerTopInset = player
-      ? Math.min(150, Math.max(96, Math.round(player.height * 0.18)))
+      ? Math.min(112, Math.max(72, Math.round(player.height * 0.12)))
       : 0;
     const safeTop = player ? Math.max(margin, player.top + playerTopInset) : margin;
     const safeBottom = player ? Math.min(innerHeight - margin, player.bottom - margin) : innerHeight - margin;
@@ -1254,11 +1442,12 @@
     // Bottom subtitles always open their card upward. Besides matching the
     // reading direction, this prevents a late dictionary/example resize from
     // growing toward the macOS Dock. Top subtitles use the mirrored rule.
-    const placeAbove = settings.learning_position !== 'top';
+    const placeAbove = settings.learning_subtitle_position !== 'top';
     const fullPlayerHeight = Math.max(120, safeBottom - safeTop);
     const directionalSpace = placeAbove ? aboveSpace : belowSpace;
     const availableHeight = Math.max(120, Math.min(fullPlayerHeight, directionalSpace || fullPlayerHeight));
     popover.style.maxHeight = `${Math.floor(availableHeight)}px`;
+    popover.dataset.compact = availableHeight < 470 ? '1' : '0';
 
     const p = popover.getBoundingClientRect();
     let left = a.left + a.width / 2 - p.width / 2;
@@ -1281,8 +1470,11 @@
   function closeWordPopover({ resume = true } = {}) {
     popoverResizeObserver?.disconnect();
     popoverResizeObserver = null;
-    document.getElementById(WORD_POPOVER_ID)?.remove();
+    const popover = document.getElementById(WORD_POPOVER_ID);
+    const highlightedCueIndex = popover?.__scWordRefs?.cueIndex;
+    popover?.remove();
     wordPopoverOpen = false;
+    if (highlightedCueIndex === currentCueIndex && currentCueIndex >= 0) renderCue(currentCueIndex, true);
     if (resume) resumeAfterHoverRelease();
     else updateHoverHoldState();
   }
@@ -1377,6 +1569,35 @@
     }
   }
 
+  function renderRanges(container, text, ranges) {
+    container.replaceChildren();
+    let cursor = 0;
+    for (const range of ranges || []) {
+      if (range.start > cursor) container.appendChild(document.createTextNode(text.slice(cursor, range.start)));
+      const mark = document.createElement('mark');
+      mark.textContent = text.slice(range.start, range.end);
+      container.appendChild(mark);
+      cursor = range.end;
+    }
+    if (cursor < text.length) container.appendChild(document.createTextNode(text.slice(cursor)));
+  }
+
+  function highlightTargetTerm(container, sourceText, translatedText, refs) {
+    const alignment = translationAlignmentsByText.get(sourceText) || '';
+    let ranges = U.alignedTargetRanges(
+      sourceText,
+      translatedText,
+      refs?.word || '',
+      alignment,
+      sourceLanguage(),
+    );
+    if (!ranges.length && refs?.targetTerms?.length) {
+      ranges = U.exactTermRanges(translatedText, refs.targetTerms, settings.learning_target_lang);
+    }
+    if (ranges.length) renderRanges(container, translatedText, ranges);
+    else container.textContent = translatedText;
+  }
+
   function openStudyPage() {
     try { chrome.runtime.sendMessage({ type: 'sc-open-study' }); } catch {}
   }
@@ -1466,11 +1687,21 @@
     );
 
     const meanings = document.createElement('div');
-    meanings.className = 'sc-word-section';
+    meanings.className = 'sc-word-section sc-word-meanings';
     const meaningsTitle = document.createElement('div');
     meaningsTitle.className = 'sc-word-section-title';
     meaningsTitle.textContent = 'Переводы';
-    meanings.append(meaningsTitle, skeletonRow(), skeletonRow());
+    const aiExplanation = document.createElement('div');
+    aiExplanation.className = 'sc-word-ai';
+    aiExplanation.hidden = settings.learning_ai_explanation !== true;
+    aiExplanation.dataset.state = settings.learning_ai_explanation === true ? 'loading' : 'disabled';
+    const aiSkeleton = document.createElement('span');
+    aiSkeleton.className = 'sc-word-skeleton sc-word-ai-skeleton';
+    aiExplanation.appendChild(aiSkeleton);
+    const meaningsList = document.createElement('div');
+    meaningsList.className = 'sc-word-meanings-list';
+    meaningsList.append(skeletonRow(), skeletonRow());
+    meanings.append(meaningsTitle, aiExplanation, meaningsList);
 
     const examples = document.createElement('div');
     examples.className = 'sc-word-section sc-word-examples';
@@ -1503,10 +1734,13 @@
       source,
       target,
       meanings,
+      meaningsList,
+      aiExplanation,
       examples,
       footer,
       stateButtons,
       primary: '',
+      targetTerms: [],
       entry: null,
       busy: false,
     };
@@ -1525,30 +1759,78 @@
     refs.target.dataset.loading = '0';
     refs.target.removeAttribute('aria-label');
     refs.target.textContent = refs.primary || 'Перевод не найден';
-    const title = document.createElement('div');
-    title.className = 'sc-word-section-title';
-    title.textContent = 'Переводы';
-    refs.meanings.replaceChildren(title);
     const alternatives = payload?.dictionary?.translations || [];
+    refs.targetTerms = [refs.primary, ...alternatives.map(item => item.displayTarget || item.normalizedTarget || '')]
+      .filter(Boolean);
+    refs.meaningsList.replaceChildren();
     if (!alternatives.length) {
       const value = document.createElement('div');
       value.className = 'sc-word-meaning';
       value.textContent = refs.primary || 'Дополнительных значений нет.';
-      refs.meanings.appendChild(value);
+      refs.meaningsList.appendChild(value);
     }
-    for (const item of alternatives.slice(0, 7)) {
+    const groupedMeanings = new Map();
+    for (const item of alternatives.slice(0, 20)) {
+      const key = String(item.posTag || 'OTHER').toUpperCase();
+      if (!groupedMeanings.has(key)) groupedMeanings.set(key, []);
+      const value = item.displayTarget || item.normalizedTarget || '';
+      if (value && !groupedMeanings.get(key).includes(value)) groupedMeanings.get(key).push(value);
+    }
+    for (const [posTag, values] of groupedMeanings) {
+      if (!values.length) continue;
       const row = document.createElement('div');
       row.className = 'sc-word-meaning';
       const pos = document.createElement('span');
       pos.className = 'sc-word-pos';
-      pos.textContent = partOfSpeechLabel(item.posTag);
-      if (item.posTag) pos.title = item.posTag;
+      pos.textContent = `${partOfSpeechLabel(posTag)}:`;
+      pos.title = posTag;
       const value = document.createElement('span');
-      value.textContent = item.displayTarget || item.normalizedTarget || '';
+      value.textContent = values.join(', ');
       row.append(pos, value);
-      refs.meanings.appendChild(row);
+      refs.meaningsList.appendChild(row);
     }
+    const meaningTextLength = Array.from(groupedMeanings.values()).flat().join(', ').length;
+    refs.meanings.dataset.long = alternatives.length > 5 || meaningTextLength > 82 ? '1' : '0';
+    renderExamples(refs);
+    if (currentCueIndex === refs.cueIndex) renderCue(currentCueIndex, true);
     positionPopover(refs.popover, refs.anchor);
+  }
+
+  function renderAiExplanation(refs, text, { error = false } = {}) {
+    if (!refs?.aiExplanation?.isConnected) return;
+    refs.aiExplanation.replaceChildren();
+    refs.aiExplanation.dataset.state = error ? 'error' : 'ready';
+    const label = document.createElement('span');
+    label.className = 'sc-word-ai-label';
+    label.textContent = error ? 'AI' : 'В контексте';
+    const value = document.createElement('span');
+    value.textContent = text;
+    refs.aiExplanation.append(label, value);
+    positionPopover(refs.popover, refs.anchor);
+  }
+
+  async function requestAiExplanation(refs) {
+    if (!settings.learning_ai_explanation || !refs?.cue) return;
+    try {
+      const payload = await bridgeJson('/learning/explain', {
+        method: 'POST',
+        body: {
+          word: refs.word,
+          wordTranslation: refs.primary || '',
+          context: refs.cue.text,
+          contextTranslation: translationsByText.get(refs.cue.text) || '',
+          sourceLang: sourceLanguage(),
+          targetLang: settings.learning_target_lang,
+        },
+      });
+      if (!refs.popover.isConnected) return;
+      if (!payload?.explanation) throw new Error(payload?.error || 'AI-пояснение недоступно');
+      renderAiExplanation(refs, payload.explanation);
+    } catch (error) {
+      if (!refs.popover.isConnected) return;
+      log('word AI explanation failed', { error: error?.message || String(error) });
+      renderAiExplanation(refs, 'Пояснение сейчас недоступно.', { error: true });
+    }
   }
 
   function renderExamples(refs) {
@@ -1577,7 +1859,7 @@
       const translatedNode = document.createElement('div');
       translatedNode.className = 'sc-word-example-translation';
       if (translated) {
-        translatedNode.textContent = translated;
+        highlightTargetTerm(translatedNode, example.text, translated, refs);
       } else if (translationError) {
         translatedNode.classList.add('sc-word-error');
         translatedNode.textContent = 'Перевод временно недоступен';
@@ -1649,9 +1931,13 @@
     const popover = document.createElement('div');
     popover.id = WORD_POPOVER_ID;
     popover.addEventListener('pointerdown', event => event.stopPropagation());
+    popover.addEventListener('wheel', event => event.stopPropagation(), { passive: true });
     const refs = createWordPopoverShell(popover, positionAnchor, word, cueIndex);
     document.body.appendChild(popover);
     positionPopover(popover, positionAnchor);
+    if (currentCueIndex === cueIndex) renderCue(cueIndex, true);
+    ensureCueTranslation(cueIndex);
+    void requestAiExplanation(refs);
     if (typeof ResizeObserver === 'function') {
       popoverResizeObserver = new ResizeObserver(() => {
         requestAnimationFrame(() => positionPopover(popover, positionAnchor));
@@ -1695,13 +1981,10 @@
       refs.target.dataset.loading = '0';
       refs.target.classList.add('sc-word-error');
       refs.target.textContent = 'Перевод недоступен';
-      const title = document.createElement('div');
-      title.className = 'sc-word-section-title';
-      title.textContent = 'Переводы';
       const message = document.createElement('div');
       message.className = 'sc-word-error';
       message.textContent = error?.message || String(error);
-      refs.meanings.replaceChildren(title, message);
+      refs.meaningsList.replaceChildren(message);
       positionPopover(popover, positionAnchor);
     }
   }
@@ -1721,6 +2004,7 @@
     selectedTrack = null;
     videoMeta = { videoId: '', title: '' };
     translationsByText.clear();
+    translationAlignmentsByText.clear();
     pendingTranslationTexts.clear();
     translationError = '';
     autoPausedCueKey = '';
@@ -1764,16 +2048,30 @@
       setControlsHovered(false);
     });
     document.addEventListener('keydown', event => {
-      if (event.key !== 'Escape') return;
-      if (document.getElementById(WORD_POPOVER_ID)) closeWordPopover();
-      else if (settingsPanel && !settingsPanel.hidden) {
-        settingsPanel.hidden = true;
-        root.dataset.controlsVisible = controlHovered ? '1' : '0';
+      const editable = event.target?.closest?.('input, textarea, select, [contenteditable="true"]');
+      const cueDelta = U.cueNavigationDelta(event.code);
+      if (cueDelta && overlayActive && cues.length && !editable
+          && !event.metaKey && !event.ctrlKey && !event.altKey && !event.repeat) {
+        event.preventDefault();
+        event.stopPropagation();
+        seekRelativeCue(cueDelta);
+        return;
+      }
+      if (event.key === 'Escape') {
+        if (document.getElementById(WORD_POPOVER_ID)) closeWordPopover();
+        else if (phraseSelectionOpen) clearPhraseSelection();
+        else if (settingsPanel && !settingsPanel.hidden) {
+          settingsPanel.hidden = true;
+          root.dataset.controlsVisible = controlHovered ? '1' : '0';
+        }
       }
     }, true);
     document.addEventListener('pointerdown', event => {
       const popover = document.getElementById(WORD_POPOVER_ID);
       if (popover && !popover.contains(event.target) && !event.target.closest?.('.sc-learning-word')) closeWordPopover();
+      if (phraseSelectionOpen && !event.target.closest?.('.sc-learning-word') && !phraseHint?.contains?.(event.target)) {
+        clearPhraseSelection();
+      }
       if (settingsPanel && !settingsPanel.hidden && !settingsPanel.contains(event.target) && !settingsButton?.contains(event.target)) {
         settingsPanel.hidden = true;
       }
@@ -1787,6 +2085,7 @@
       updateRootSettings();
       if (previousTarget !== settings.learning_target_lang) {
         translationsByText.clear();
+        translationAlignmentsByText.clear();
         prefetchGeneration += 1;
         refreshLearningWordStates().catch(() => {});
         if (settings.learning_translation_mode === 'always') startTranslationPrefetch();
