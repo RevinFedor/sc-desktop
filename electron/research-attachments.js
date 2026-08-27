@@ -71,8 +71,8 @@ function fileMime(filePath) {
 }
 
 function safeFileName(name, fallback = 'attachment') {
-  const base = path.basename(String(name || fallback))
-    .replace(/[^\w.\-]+/g, '_')
+  const base = path.basename(String(name || fallback)).normalize('NFC')
+    .replace(/[^\p{L}\p{N}\p{M}.\-]+/gu, '_')
     .replace(/^_+|_+$/g, '')
   return base || fallback
 }

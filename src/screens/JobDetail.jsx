@@ -15,6 +15,7 @@ const MODE_LABELS = {
   date_range: 'Диапазон дат',
   between:    'Между двумя URL',
   single:     'Одно сообщение',
+  id_list:    'Выбранные сообщения',
 }
 
 // Reconstruct content-type labels from the per-flag params we pass to
@@ -176,6 +177,10 @@ export default function JobDetail({ payload }) {
   const isTgFolderRefresh = job.type === 'tg_folder_refresh'
   const isTgReplyBackfill = job.type === 'tg_reply_backfill'
   const isTgIndex        = job.type === 'tg_index'
+  const isTgLive         = job.type === 'tg_live_search'
+                        || job.type === 'tg_live_context'
+                        || job.type === 'tg_live_range'
+  const isTgSave         = job.type === 'tg_fetch' && job.params?.mode === 'id_list'
   const isLocal          = job.type === 'local_transcribe'
   const isBoostySingle   = job.type === 'boosty_transcribe'
   const isBoostyChannel  = job.type === 'boosty_channel_fetch'
@@ -197,6 +202,10 @@ export default function JobDetail({ payload }) {
                          : isTgFolderRefresh ? 'Telegram · обновление папок'
                          : isTgReplyBackfill ? 'Telegram · reply backfill'
                          : isTgIndex        ? 'Семантический индекс'
+                         : isTgSave         ? 'Telegram · сохранение найденного'
+                         : job.type === 'tg_live_search' ? 'Telegram · поиск'
+                         : job.type === 'tg_live_context' ? 'Telegram · контекст'
+                         : job.type === 'tg_live_range' ? 'Telegram · диапазон'
                          : isBoostyChannel  ? 'Boosty · каталог'
                          : isBoostyBatch    ? 'Boosty · пакетная обработка'
                          : isBoostySingle   ? 'Boosty · видео'
@@ -212,6 +221,7 @@ export default function JobDetail({ payload }) {
   const isTelegramFetch = job.type === 'tg_fetch'
   const canShowAutoRag = isTelegramFetch
     && job.params?.mode !== 'single'
+    && job.params?.mode !== 'id_list'
     && job.params?.mode !== 'media_only'
   const autoRagEnabled = job.params?._auto_index_after_fetch === true
   const autoRagStarted = job.params?._auto_index_after_fetch_started || null
@@ -368,11 +378,12 @@ export default function JobDetail({ payload }) {
           {isTgFolderRefresh && <TelegramFolderRefreshBody job={job} />}
           {isTgIndex        && <TelegramIndexBody job={job} />}
           {isTgReplyBackfill && <TelegramReplyBackfillBody job={job} />}
+          {isTgLive          && <TelegramLiveBody job={job} />}
           {isBoostySingle  && <BoostyBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
           {isBoostyChannel && <BoostyChannelBody job={job} />}
           {isBoostyBatch   && <BoostyBatchBody job={job} />}
           {isLocal          && <LocalBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
-          {!isYoutube && !isRutube && !isTiktok && !isInstagram && !isTgPreview && !isTgFolderFetch && !isTgFolderRefresh && !isTgIndex && !isTgReplyBackfill && !isBoosty && !isLocal && <TelegramBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
+          {!isYoutube && !isRutube && !isTiktok && !isInstagram && !isTgPreview && !isTgFolderFetch && !isTgFolderRefresh && !isTgIndex && !isTgReplyBackfill && !isTgLive && !isBoosty && !isLocal && <TelegramBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
 
           {window.api && (
             <div className="mt-12 pt-6 border-t border-zinc-900">
@@ -474,6 +485,32 @@ function TelegramPreviewBody({ job }) {
         } />
         <KV k="Запущено"  v={job.started_at  ? formatTs(job.started_at)  : '—'} />
         <KV k="Закончено" v={job.finished_at ? formatTs(job.finished_at) : '—'} />
+        {job.error && <KV k="Ошибка" v={<span className="text-red-400">{job.error}</span>} />}
+      </Section>
+    </>
+  )
+}
+
+function TelegramLiveBody({ job }) {
+  const live = job.tg_live || {}
+  const operation = {
+    search: 'Поиск по серверу Telegram',
+    context: 'Контекст сообщения',
+    range: 'Диапазон сообщений',
+  }[live.operation] || live.operation || 'Live-запрос'
+  const queryCount = Array.isArray(job.params?.searches) ? job.params.searches.length : null
+  return (
+    <>
+      <EntityCard platform="telegram" target={job.target} title={job.entity_title} kind={job.entity_kind} />
+      <Section title="Live-запрос">
+        <KV k="Операция" v={operation} />
+        <KV k="Этап" v={live.stage || job.status || '—'} />
+        {queryCount != null && <KV k="Поисковых формулировок" v={queryCount} />}
+        <KV k="Найдено" v={(live.unique_hits || 0).toLocaleString('ru-RU')} />
+        {live.truncated && <KV k="Результат" v="ограничен заданным лимитом" />}
+        <KV k="Медиа" v="не скачивались" />
+        <KV k="Хранение" v={live.result_available ? 'временно, до перезапуска приложения' : 'результат не сохранялся'} />
+        {live.duration_ms != null && <KV k="Время" v={`${(live.duration_ms / 1000).toFixed(2)}s`} />}
         {job.error && <KV k="Ошибка" v={<span className="text-red-400">{job.error}</span>} />}
       </Section>
     </>

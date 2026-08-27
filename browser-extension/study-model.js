@@ -5,6 +5,8 @@
 })(typeof window !== 'undefined' ? window : globalThis, function () {
   'use strict';
 
+  const SWIPE_THRESHOLD = 56;
+
   function timestamp(value, fallback = 0) {
     const parsed = typeof value === 'number' ? value : Date.parse(value);
     return Number.isFinite(parsed) ? parsed : fallback;
@@ -67,11 +69,11 @@
     return round.map((entry) => entry.key);
   }
 
-  function swipeResult(deltaX, threshold = 96) {
+  function swipeResult(deltaX, threshold = SWIPE_THRESHOLD) {
     const distance = Number(deltaX) || 0;
-    const limit = Math.max(24, Number(threshold) || 96);
-    if (distance <= -limit) return 'forgotten';
-    if (distance >= limit) return 'remembered';
+    const limit = Math.max(24, Number(threshold) || SWIPE_THRESHOLD);
+    if (distance <= -limit) return 'remembered';
+    if (distance >= limit) return 'forgotten';
     return null;
   }
 
@@ -88,5 +90,5 @@
     };
   }
 
-  return { isDue, reviewMode, buildRound, swipeResult, nextSessionStats, errorWeight };
+  return { SWIPE_THRESHOLD, isDue, reviewMode, buildRound, swipeResult, nextSessionStats, errorWeight };
 });

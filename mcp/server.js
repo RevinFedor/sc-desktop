@@ -48,10 +48,12 @@ const {
   scrapeTwitterSearch,
   scrapeTwitterThread,
 } = require(path.join(projectRoot, 'mcp', 'twitter-browser.js'))
+const { createTelegramLiveClient } = require('./telegram-live-client')
 
 let _jobRunner = null
 let _indexJob = null
 let _youtubeSubtitlesClient = null
+let _telegramLiveClient = null
 function jobRunner() {
   if (!_jobRunner) {
     _jobRunner = require(path.join(projectRoot, 'electron', 'job-runner.js'))
@@ -70,6 +72,10 @@ function youtubeSubtitlesClient() {
     _youtubeSubtitlesClient = createYoutubeSubtitlesClient()
   }
   return _youtubeSubtitlesClient
+}
+function telegramLiveClient() {
+  if (!_telegramLiveClient) _telegramLiveClient = createTelegramLiveClient()
+  return _telegramLiveClient
 }
 
 // ===== GT EDITOR INTEGRATION =====
@@ -473,6 +479,153 @@ const TOOLS = [
     },
   },
   {
+    name: 'telegram_live_search',
+    description:
+      'Search one Telegram chat directly on Telegram servers without fetching ' +
+      'or indexing the whole chat. Returns matching message text/metadata and ' +
+      'a pagination offset. This is lexical Telegram search, not semantic RAG. ' +
+      'The request runs as a visible, cancellable SC Desktop job; no media bytes ' +
+      'or messages are saved locally. Use telegram_live_context on selected hits.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat: { oneOf: [{ type: 'string' }, { type: 'integer' }], description: 'Source id, title, handle, internal id, or t.me URL.' },
+        query: { type: 'string', minLength: 1, maxLength: 4000 },
+        session: { type: 'string', description: 'Telegram session name or account alias.' },
+        profile: { type: 'string', description: 'Alias for session.' },
+        limit: { type: 'integer', default: 20, minimum: 1, maximum: 100 },
+        offset_id: { type: 'integer', default: 0, minimum: 0, description: 'Pagination cursor returned as next_offset_id.' },
+        date_from: { type: 'string', description: 'Optional lower date bound (ISO, YYYY-MM-DD, or DD.MM.YYYY).' },
+        date_to: { type: 'string', description: 'Optional inclusive upper date bound.' },
+        sender: { oneOf: [{ type: 'string' }, { type: 'integer' }], description: 'Optional sender handle/id.' },
+        topic_id: { type: 'integer', minimum: 1, description: 'Optional forum top_msg_id.' },
+        media_filter: {
+          type: 'string',
+          enum: ['all', 'photos', 'videos', 'photo_video', 'documents', 'voice', 'audio', 'music', 'links', 'polls', 'gifs'],
+          default: 'all',
+        },
+        caption_chars: { type: 'integer', default: 1200, minimum: 100, maximum: 8000 },
+        wait_ms: { type: 'integer', default: 15000, minimum: 0, maximum: 30000 },
+      },
+      required: ['chat', 'query'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'telegram_live_search_batch',
+    description:
+      'Run a bounded batch of lexical Telegram server searches across one or ' +
+      'more chats, without downloading the chats. Intended for an AI agent\'s ' +
+      'wide-search wave: provide several literal/synonym queries, then inspect ' +
+      'deduplicated candidates and expand only strong hits with ' +
+      'telegram_live_context. SC Desktop limits Telegram concurrency (default 3), ' +
+      'shows one umbrella job in Requests, and provides Cancel.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chats: {
+          type: 'array', minItems: 1, maxItems: 12,
+          items: { oneOf: [{ type: 'string' }, { type: 'integer' }] },
+        },
+        queries: { type: 'array', minItems: 1, maxItems: 60, items: { type: 'string', minLength: 1, maxLength: 4000 } },
+        session: { type: 'string', description: 'Telegram session name or account alias.' },
+        profile: { type: 'string', description: 'Alias for session.' },
+        limit_per_query: { type: 'integer', default: 20, minimum: 1, maximum: 100 },
+        max_candidates: { type: 'integer', default: 250, minimum: 1, maximum: 500 },
+        concurrency: { type: 'integer', default: 3, minimum: 1, maximum: 5 },
+        date_from: { type: 'string' },
+        date_to: { type: 'string' },
+        sender: { oneOf: [{ type: 'string' }, { type: 'integer' }] },
+        topic_id: { type: 'integer', minimum: 1 },
+        media_filter: {
+          type: 'string',
+          enum: ['all', 'photos', 'videos', 'photo_video', 'documents', 'voice', 'audio', 'music', 'links', 'polls', 'gifs'],
+          default: 'all',
+        },
+        caption_chars: { type: 'integer', default: 1200, minimum: 100, maximum: 8000 },
+        wait_ms: { type: 'integer', default: 20000, minimum: 0, maximum: 30000 },
+      },
+      required: ['chats', 'queries'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'telegram_live_context',
+    description:
+      'Read live context around one Telegram message without saving it: the ' +
+      'reply ancestor chain, reply descendants, and chronological messages ' +
+      'before/after are fetched together and deduplicated. Accepts a t.me URL ' +
+      'or chat + message_id. Use this for every live hit you cite or analyse; ' +
+      'reply links alone miss ordinary follow-up messages.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Full t.me message URL.' },
+        chat: { oneOf: [{ type: 'string' }, { type: 'integer' }] },
+        message_id: { type: 'integer', minimum: 1 },
+        session: { type: 'string' },
+        profile: { type: 'string' },
+        before: { type: 'integer', default: 15, minimum: 0, maximum: 100 },
+        after: { type: 'integer', default: 15, minimum: 0, maximum: 100 },
+        max_depth: { type: 'integer', default: 20, minimum: 0, maximum: 50 },
+        max_replies: { type: 'integer', default: 100, minimum: 0, maximum: 500 },
+        caption_chars: { type: 'integer', default: 8000, minimum: 100, maximum: 8000 },
+        wait_ms: { type: 'integer', default: 20000, minimum: 0, maximum: 30000 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'telegram_live_range',
+    description:
+      'Read an inclusive Telegram message-id range without saving the chat or ' +
+      'downloading media. Pass two t.me URLs from the same chat, or chat + ' +
+      'from_id + to_id. Missing/deleted ids are reported explicitly. This is ' +
+      'the deterministic tool for requests like “read messages 5299 through 5318”.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from_url: { type: 'string' },
+        to_url: { type: 'string' },
+        chat: { oneOf: [{ type: 'string' }, { type: 'integer' }] },
+        from_id: { type: 'integer', minimum: 1 },
+        to_id: { type: 'integer', minimum: 1 },
+        session: { type: 'string' },
+        profile: { type: 'string' },
+        max_messages: { type: 'integer', default: 1000, minimum: 1, maximum: 5000 },
+        caption_chars: { type: 'integer', default: 8000, minimum: 100, maximum: 8000 },
+        wait_ms: { type: 'integer', default: 20000, minimum: 0, maximum: 30000 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'telegram_live_save',
+    description:
+      'Explicitly materialise selected live Telegram message ids into the SC ' +
+      'Desktop library. Live search/context/range are ephemeral by default; ' +
+      'call this only when the user asks to save chosen messages. Starts one ' +
+      'visible cancellable tg_fetch job and never fetches surrounding history.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat: { oneOf: [{ type: 'string' }, { type: 'integer' }] },
+        message_ids: { type: 'array', minItems: 1, maxItems: 5000, items: { type: 'integer', minimum: 1 } },
+        session: { type: 'string' },
+        profile: { type: 'string' },
+        process_voice: { type: 'boolean', default: false },
+        process_photo: { type: 'boolean', default: false },
+        process_docs: { type: 'boolean', default: false },
+        process_polls: { type: 'boolean', default: true },
+        transcribe_engine: { type: 'string', enum: ['assemblyai', 'gemini'] },
+        transcribe_lang: { type: 'string', default: 'ru' },
+        wait_ms: { type: 'integer', default: 0, minimum: 0, maximum: 30000 },
+      },
+      required: ['chat', 'message_ids'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'telegram_preview_fetch',
     description:
       'Start a Telegram pre-analysis job for a target/range. It walks the same ' +
@@ -652,7 +805,9 @@ const TOOLS = [
     description:
       'Get one job snapshot/detail by in-memory id or DB id. For index status ' +
       'by source, pass source_id/chat. Use after telegram_fetch, ' +
-      'telegram_preview_fetch, telegram_comments_catchup, or telegram_index.',
+      'telegram_preview_fetch, telegram_comments_catchup, telegram_index, or ' +
+      'a telegram_live_* tool. desktop:<id> jobs are read from the running app ' +
+      'and include the ephemeral live result while the app remains open.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -667,7 +822,8 @@ const TOOLS = [
     name: 'telegram_cancel_job',
     description:
       'Cancel a running Telegram fetch/preview/comments/index job by in-memory ' +
-      'id or DB id. Returns false when no live job in this MCP process matches.',
+      'id or DB id. For desktop:<id> returned by telegram_live_* this routes ' +
+      'to the running SC Desktop app, so the same cancellation is reflected in Requests.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1584,6 +1740,42 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       })
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
+    if (name === 'telegram_live_search') {
+      const request = await buildTelegramLiveSearchRequest(args)
+      const out = await telegramLiveClient().start(request, args.wait_ms ?? 15000)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'telegram_live_search_batch') {
+      const request = await buildTelegramLiveSearchRequest(args, { batch: true })
+      const out = await telegramLiveClient().start(request, args.wait_ms ?? 20000)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'telegram_live_context') {
+      const request = await buildTelegramLiveContextRequest(args)
+      const out = await telegramLiveClient().start(request, args.wait_ms ?? 20000)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'telegram_live_range') {
+      const request = await buildTelegramLiveRangeRequest(args)
+      const out = await telegramLiveClient().start(request, args.wait_ms ?? 20000)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'telegram_live_save') {
+      const resolved = liveChatTarget(args.chat)
+      const session = await liveSessionForArgs(args, [resolved])
+      const out = await telegramLiveClient().save({
+        chat: resolved.target,
+        message_ids: args.message_ids,
+        session,
+        process_voice: args.process_voice === true,
+        process_photo: args.process_photo === true,
+        process_docs: args.process_docs === true,
+        process_polls: args.process_polls !== false,
+        transcribe_engine: args.transcribe_engine,
+        transcribe_lang: args.transcribe_lang,
+      }, args.wait_ms || 0)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
     if (name === 'telegram_preview_fetch') {
       const params = await buildTelegramJobParams(args, { preview: true })
       const id = jobRunner().startTelegramPreview(params)
@@ -1617,12 +1809,18 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
     if (name === 'telegram_job_status') {
-      const out = telegramJobStatus(args)
+      const out = typeof args.job_id === 'string' && args.job_id.startsWith('desktop:')
+        ? await telegramLiveClient().status(args.job_id, 0)
+        : telegramJobStatus(args)
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
     if (name === 'telegram_cancel_job') {
       const { job_id } = args
       if (job_id == null || job_id === '') throw new Error('job_id is required')
+      if (typeof job_id === 'string' && job_id.startsWith('desktop:')) {
+        const out = await telegramLiveClient().cancel(job_id)
+        return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+      }
       const ok = jobRunner().cancelJob(job_id)
       return { content: [{ type: 'text', text: JSON.stringify({ ok, job_id }, null, 2) }] }
     }
@@ -2232,6 +2430,102 @@ function targetFromArgs(args) {
   if (args.target != null && String(args.target).trim()) return String(args.target).trim()
   const source = resolveSourceOrThrow(args)
   return source.handle || source.external_id || String(source.id)
+}
+
+function liveChatTarget(value) {
+  try {
+    const source = resolveSourceOrThrow({ chat: value })
+    return {
+      target: source.external_id || source.handle || String(value),
+      source,
+    }
+  } catch {
+    return { target: String(value), source: null }
+  }
+}
+
+async function liveSessionForArgs(args = {}, resolvedChats = []) {
+  const explicit = await resolveTelegramSessionName(args)
+  if (explicit) return explicit
+  const sessions = [...new Set(
+    resolvedChats
+      .map(entry => entry?.source?.tg_session)
+      .filter(Boolean),
+  )]
+  if (sessions.length > 1) {
+    throw new Error(`Selected Telegram chats use different sessions (${sessions.join(', ')}). Pass session/profile explicitly.`)
+  }
+  return sessions[0] || null
+}
+
+async function buildTelegramLiveSearchRequest(args = {}, { batch = false } = {}) {
+  const chatValues = batch ? args.chats : [args.chat]
+  const queryValues = batch ? args.queries : [args.query]
+  if (!Array.isArray(chatValues) || !chatValues.length) throw new Error('chat/chats is required')
+  if (!Array.isArray(queryValues) || !queryValues.length) throw new Error('query/queries is required')
+  const chats = chatValues.map(liveChatTarget)
+  const session = await liveSessionForArgs(args, chats)
+  const searches = []
+  for (const chat of chats) {
+    for (const query of queryValues) {
+      searches.push({
+        chat: chat.target,
+        query: String(query || ''),
+        limit: batch ? args.limit_per_query : args.limit,
+        offset_id: batch ? 0 : args.offset_id,
+        date_from: args.date_from,
+        date_to: args.date_to,
+        sender: args.sender == null ? null : String(args.sender),
+        topic_id: args.topic_id,
+        media_filter: args.media_filter,
+      })
+    }
+  }
+  return {
+    operation: 'search',
+    session,
+    searches,
+    concurrency: batch ? args.concurrency : 1,
+    max_candidates: batch ? args.max_candidates : (args.limit || 20),
+    caption_chars: args.caption_chars,
+  }
+}
+
+async function buildTelegramLiveContextRequest(args = {}) {
+  if (!args.url && (args.chat == null || args.message_id == null)) {
+    throw new Error('url or chat + message_id is required')
+  }
+  const resolved = args.chat == null ? null : liveChatTarget(args.chat)
+  return {
+    operation: 'context',
+    session: await liveSessionForArgs(args, resolved ? [resolved] : []),
+    chat: resolved?.target || null,
+    url: args.url || null,
+    message_id: args.message_id || null,
+    before: args.before,
+    after: args.after,
+    max_depth: args.max_depth,
+    max_replies: args.max_replies,
+    caption_chars: args.caption_chars,
+  }
+}
+
+async function buildTelegramLiveRangeRequest(args = {}) {
+  if (!(args.from_url && args.to_url) && (args.chat == null || args.from_id == null || args.to_id == null)) {
+    throw new Error('from_url + to_url or chat + from_id + to_id is required')
+  }
+  const resolved = args.chat == null ? null : liveChatTarget(args.chat)
+  return {
+    operation: 'range',
+    session: await liveSessionForArgs(args, resolved ? [resolved] : []),
+    chat: resolved?.target || null,
+    from_url: args.from_url || null,
+    to_url: args.to_url || null,
+    from_id: args.from_id || null,
+    to_id: args.to_id || null,
+    max_messages: args.max_messages,
+    caption_chars: args.caption_chars,
+  }
 }
 
 async function resolveTelegramSessionName(args = {}) {

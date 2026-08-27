@@ -91,3 +91,16 @@ test('persists documents separately from image inputs', (t) => {
   assert.equal(result.input_files[0].line_start, 1)
   assert.equal(result.input_files[0].line_end, 1)
 })
+
+test('preserves meaningful Unicode attachment names', (t) => {
+  const root = tempDir(t)
+  const source = path.join(root, 'архитектура-окон-и-вкладок.md')
+  fs.writeFileSync(source, '# test\n')
+  const [attachment] = materializeResearchAttachments({
+    libRoot: root,
+    id: 'unicode-name',
+    attachments: normalizeResearchAttachments([source]),
+  })
+
+  assert.match(attachment.name, /архитектура-окон-и-вкладок\.md$/u)
+})

@@ -134,6 +134,7 @@
         "settings.js",
         "pill-event-guard.js",
         "youtube-content.js",
+        "english-lexeme.js",
         "learning-store.js",
         "youtube-learning-utils.js",
         "youtube-learning.js"

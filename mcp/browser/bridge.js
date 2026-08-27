@@ -105,10 +105,19 @@ extServer.on('connection', (socket) => {
   socket.on('close', () => {
     console.log('[Bridge] Extension disconnected');
     extensionWs = null;
-    // Reject all pending using each client's original id.
+    // Команда могла уже выполнить side effect (например, tabs.create), а
+    // disconnect случился до ACK. Это ambiguous delivery, не доказанный
+    // отказ операции. Вызывающий обязан reconcile по стабильному id/URL.
     for (const [, { mcpSocket, originalId }] of pendingCommands) {
       if (mcpSocket.readyState === WebSocket.OPEN) {
-        mcpSocket.send(JSON.stringify({ commandId: originalId, success: false, error: 'Extension disconnected' }));
+        mcpSocket.send(JSON.stringify({
+          commandId: originalId,
+          success: false,
+          error: 'Extension disconnected before command result; delivery state unknown',
+          code: 'extension_disconnected_delivery_unknown',
+          deliveryUnknown: true,
+          retryable: true,
+        }));
       }
     }
     pendingCommands.clear();

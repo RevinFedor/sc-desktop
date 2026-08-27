@@ -302,6 +302,9 @@ function labelFor(type, job) {
   if (type === 'tg_fetch' && job?.params?.mode === 'media_only') {
     return 'Telegram · перевод медиа'
   }
+  if (type === 'tg_fetch' && job?.params?.mode === 'id_list') {
+    return 'Telegram · сохранение найденного'
+  }
   if (type === 'tg_catchup' && job?.params?.auto === true) {
     return 'Telegram · автообновление'
   }
@@ -311,6 +314,9 @@ function labelFor(type, job) {
     tg_folder_fetch:      'Telegram · папка',
     tg_folder_refresh:    'Telegram · обновление папок',
     tg_catchup:           'Telegram · до конца',
+    tg_live_search:       'Telegram · поиск',
+    tg_live_context:      'Telegram · контекст',
+    tg_live_range:        'Telegram · диапазон',
     sync_source:          'Синхронизация',
     transcribe:           'Транскрипция',
     download_item:        'Загрузка',

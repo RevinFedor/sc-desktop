@@ -29,6 +29,14 @@ const {
 const { resolveTelegramProcessOutcome } = require('./telegram-lifecycle')
 const { boundedTail } = require('./job-snapshot-policy')
 const {
+  normalizeTelegramLiveRequest,
+  telegramLiveJobType,
+  telegramLiveTarget,
+  createTelegramLiveState,
+  applyTelegramLiveEvent,
+  publicTelegramLiveState,
+} = require('./telegram-live')
+const {
   TELEGRAM_SOURCE_UNAVAILABLE,
   telegramStableTarget,
 } = require('./telegram-source-state')
@@ -503,7 +511,7 @@ function telegramCoveragePlannerAllowed(params = {}) {
 function isSourceWideTelegramCoverageParams(params = {}) {
   if (!params || typeof params !== 'object') return true
   if (params._range_plan_parent) return false
-  if (params.mode === 'single' || params.mode === 'media_only') return false
+  if (params.mode === 'single' || params.mode === 'id_list' || params.mode === 'media_only') return false
   if (Array.isArray(params._comments_only_post_ids) && params._comments_only_post_ids.length > 0) return false
   if (params._comments_only_source_id) return false
   if (Array.isArray(params._media_only_msg_ids) && params._media_only_msg_ids.length > 0) return false
@@ -546,6 +554,10 @@ function coverageIntervalForPlannerRow(row, request) {
 }
 
 function telegramCoverageTypesForParams(params = {}, typeBreakdown = {}) {
+  // Saving hand-picked live hits proves nothing about corpus coverage. The
+  // rows themselves are durable, but no date/type coverage interval should
+  // be created from an arbitrary sparse id list.
+  if (params.mode === 'id_list') return []
   const types = new Set(Object.keys(typeBreakdown || {}).filter(Boolean))
   if (isSourceWideTelegramCoverageParams(params)) {
     const mode = params.mode || 'last_n'
@@ -846,7 +858,7 @@ if (process.env.SC_DESKTOP_MCP !== '1') {
         'yt_batch_transcribe', 'tk_batch_transcribe', 'ig_batch_transcribe',
         'tg_index', 'tg_fetch', 'tg_preview',
         'tg_folder_fetch', 'tg_folder_refresh', 'tg_reply_backfill',
-        'tg_catchup',
+        'tg_catchup', 'tg_live_search', 'tg_live_context', 'tg_live_range',
         'yt_transcribe', 'yt_comments', 'yt_batch_comments',
         'rutube_transcribe',
         'yt_channel_fetch', 'tk_transcribe', 'tk_channel_fetch',
@@ -979,6 +991,12 @@ function snapshot(j, { includeLiveItems = false } = {}) {
                   : null,
     tg_live_items: includeLiveItems ? publicTelegramLiveItems(j) : null,
     tg_current_item: publicTelegramLiveItem(j.tg_current_item, j),
+    // Read-only Telegram server request started by MCP. The potentially large
+    // message result stays in process memory and is returned only through the
+    // explicit bridge status endpoint; renderer snapshots carry this compact
+    // progress summary so background polling never recreates the old traffic
+    // amplification bug.
+    tg_live: publicTelegramLiveState(j.tg_live),
   }
 }
 
@@ -1123,6 +1141,24 @@ function listJobs(historyRows = null) {
   } catch (err) {
     console.error('[Jobs] historic tg_single query failed', err)
   }
+  // Read-only Telegram live requests persist only a compact summary. Message
+  // bodies are deliberately RAM-only, but the user still sees the completed
+  // request in Activity history after restart.
+  let historicTgLive = []
+  try {
+    const rows = workerHistory
+      ? (workerHistory.telegramLive || [])
+      : db.getDb().prepare(
+          `SELECT * FROM jobs
+            WHERE type IN ('tg_live_search', 'tg_live_context', 'tg_live_range')
+            ORDER BY started_at DESC LIMIT 150`
+        ).all()
+    historicTgLive = rows
+      .filter(row => !live.some(job => job.db_id === row.id))
+      .map(rowToHistoricSnapshot)
+  } catch (err) {
+    console.error('[Jobs] historic Telegram live query failed', err)
+  }
   // Search-batch (yt_batch_transcribe with source_id IS NULL → params.is_search).
   // Channel-batches keep their source_id and reach Activity through the
   // source-list fan-out; sourceless ones would otherwise never appear in
@@ -1191,7 +1227,7 @@ function listJobs(historyRows = null) {
   } catch (err) {
     console.error('[Jobs] historic yt_batch_comments query failed', err)
   }
-  return [...live, ...historic, ...historicLocal, ...historicRutube, ...historicBoosty, ...historicTgSingle, ...historicYtBatch, ...historicIgBatch, ...historicYtComments, ...historicYtBatchComments]
+  return [...live, ...historic, ...historicLocal, ...historicRutube, ...historicBoosty, ...historicTgSingle, ...historicTgLive, ...historicYtBatch, ...historicIgBatch, ...historicYtComments, ...historicYtBatchComments]
     .sort((a, b) => (b.started_at || 0) - (a.started_at || 0))
 }
 
@@ -1885,6 +1921,9 @@ function startTelegramFetch(params) {
   if (params.date_to) args.push('--date-to', params.date_to)
   if (params.url)   args.push('--url', params.url)
   if (params.sinceMessageId) args.push('--since-msgid', String(params.sinceMessageId))
+  if (Array.isArray(params.message_ids) && params.message_ids.length > 0) {
+    args.push('--message-ids', params.message_ids.join(','))
+  }
   // Single-message voice transcription (mode='single' only). Renderer
   // (TelegramSingleMessageForm) sets engine/lang from its selectors;
   // tg_fetch_json silently ignores both unless the message has voice/audio
@@ -2757,7 +2796,7 @@ function handleEvent(job, evt) {
             external_id:  String(evt.id || ''),
             avatar_url:   evt.avatar_path || null,
             meta: { kind: evt.kind, username: evt.username },
-            mark_synced: true,
+            mark_synced: job.params?.mode !== 'id_list',
             is_explicit: !fromFolder,
             tg_session: job.tg_session || null,
           })
@@ -3247,6 +3286,19 @@ function rowToHistoricSnapshot(row) {
       synced:        0,
       removed:       0,
     }
+  } else if (type === 'tg_live_search' || type === 'tg_live_context' || type === 'tg_live_range') {
+    base.entity_kind = 'telegram_live'
+    base.tg_live = params?._tg_live || {
+      operation: type.replace('tg_live_', ''),
+      stage: row.status === 'done' ? 'done' : row.status,
+      steps_done: row.items_done || 0,
+      steps_total: row.items_total || null,
+      hits: row.items_done || 0,
+      unique_hits: row.items_done || 0,
+      result_available: false,
+      truncated: false,
+      duration_ms: null,
+    }
   }
   return base
 }
@@ -3302,6 +3354,7 @@ function cancelJob(id, { identity = null, type = null } = {}) {
   // process or an in-flight SQLite commit.
   const deferTerminalUntilClose = new Set([
     'tg_fetch', 'tg_reply_backfill', 'tg_folder_refresh',
+    'tg_live_search', 'tg_live_context', 'tg_live_range',
     'yt_channel_fetch', 'yt_batch_transcribe',
     'tk_channel_fetch', 'tk_batch_transcribe',
     'ig_profile_fetch', 'ig_batch_transcribe',
@@ -4431,6 +4484,168 @@ function startTelegramCatchUp(params) {
   })
 
   return id
+}
+
+const TG_LIVE_SCRIPT = path.join(WORKERS_ROOT, 'telegram', 'tg_live_ndjson.py')
+const TG_LIVE_RESULT_TTL_MS = 30 * 60 * 1000
+const TG_LIVE_RESULT_MAX_BYTES = 32 * 1024 * 1024
+const TG_LIVE_RESULT_MAX_JOBS = 50
+
+function pruneTelegramLiveResults({ keepId = null } = {}) {
+  const now = Date.now()
+  const candidates = [...jobs.values()]
+    .filter(job => job._tgLiveResult)
+    .sort((a, b) => Number(b.finished_at || b.started_at || 0) - Number(a.finished_at || a.started_at || 0))
+  let kept = 0
+  let bytes = 0
+  for (const job of candidates) {
+    const ageMs = Math.max(0, now - Number(job.finished_at || job.started_at || 0) * 1000)
+    const resultBytes = Number(job._tgLiveResultBytes || 0)
+    const mustKeep = Number(job.id) === Number(keepId)
+    const overBudget = kept >= TG_LIVE_RESULT_MAX_JOBS || bytes + resultBytes > TG_LIVE_RESULT_MAX_BYTES
+    if (!mustKeep && (ageMs > TG_LIVE_RESULT_TTL_MS || overBudget)) {
+      delete job._tgLiveResult
+      delete job._tgLiveResultBytes
+      if (job.tg_live) job.tg_live.result_available = false
+      continue
+    }
+    kept += 1
+    bytes += resultBytes
+  }
+}
+
+/**
+ * Start a read-only Telegram server request on behalf of MCP. The MCP process
+ * calls the loopback bridge, so this is the main-process job Map the renderer
+ * already watches — no invisible second job-runner exists for this flow.
+ *
+ * Message bodies stay in `_tgLiveResult` and are never put in snapshots or the
+ * jobs table. The explicit `/telegram-live/status` route is the only reader.
+ */
+function startTelegramLive(rawRequest = {}) {
+  pruneTelegramLiveResults()
+  const request = normalizeTelegramLiveRequest(rawRequest)
+  const id = nextId++
+  const type = telegramLiveJobType(request.operation)
+  const target = telegramLiveTarget(request)
+  const tgSession = telegramSessionForFetchParams({ session: request.session }) || 'session2'
+  request.session = tgSession
+  const args = [TG_LIVE_SCRIPT, '--session', tgSession]
+  console.log(`[Jobs] start ${type} #${id} target=${target} session=${tgSession}${request.operation === 'search' ? ` searches=${request.searches.length}` : ''}`)
+
+  const child = spawn(WORKER_PYTHON, args, {
+    cwd: WORKERS_ROOT,
+    env: workerEnv(),
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  const job = {
+    id,
+    type,
+    target,
+    status: 'running',
+    items_done: 0,
+    items_total: request.operation === 'search' ? request.searches.length : null,
+    started_at: Math.floor(Date.now() / 1000),
+    params: request,
+    source_id: null,
+    tg_session: tgSession,
+    tg_live: createTelegramLiveState(request),
+    child,
+  }
+  jobs.set(id, job)
+  emit(job)
+
+  let stderrTail = ''
+  const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
+  rl.on('line', line => {
+    if (!line.trim()) return
+    let event
+    try { event = JSON.parse(line) } catch {
+      console.warn(`[Jobs] ${type} #${id} ignored non-JSON worker line`)
+      return
+    }
+    emitEvent(job, event)
+    const shouldEmit = applyTelegramLiveEvent(job, event)
+    if (event.type === 'result' && job._tgLiveResult) {
+      job._tgLiveResultBytes = Buffer.byteLength(line, 'utf8')
+    }
+    if (shouldEmit) emit(job)
+  })
+  child.stderr.on('data', chunk => {
+    stderrTail = (stderrTail + chunk.toString()).slice(-4000)
+  })
+  child.on('error', error => {
+    job.error = `spawn error: ${error.message}`
+  })
+  try {
+    child.stdin.end(JSON.stringify(request))
+  } catch (error) {
+    job.error = `request write failed: ${error.message}`
+    try { child.kill('SIGTERM') } catch {}
+  }
+
+  child.on('close', code => {
+    job.child = null
+    if (job._cancelEscalationTimer) clearTimeout(job._cancelEscalationTimer)
+    if (job._cancelRequested || job.status === 'cancelling' || job.status === 'cancelled') {
+      job.status = 'cancelled'
+      job.error = null
+      if (job.tg_live) job.tg_live.stage = 'cancelled'
+    } else if (job.status === 'running') {
+      if (code === 0 && job._tgLiveResult) {
+        job.status = 'done'
+      } else {
+        job.status = 'error'
+        job.error = job.error || stderrTail.slice(-500) || `python exited ${code} without a result`
+        if (job.tg_live) job.tg_live.stage = 'error'
+      }
+    }
+    job.finished_at = Math.floor(Date.now() / 1000)
+    if (job.tg_live) {
+      job.tg_live.result_available = job.status === 'done' && !!job._tgLiveResult
+      if (job.tg_live.duration_ms == null) {
+        job.tg_live.duration_ms = Math.max(0, (job.finished_at - job.started_at) * 1000)
+      }
+    }
+    try {
+      job.dbRowId = db.recordJob({
+        type: job.type,
+        source_id: null,
+        status: job.status,
+        items_total: job.tg_live?.unique_hits || job.items_total || 0,
+        items_done: job.tg_live?.unique_hits || job.items_done || 0,
+        items_failed: job.status === 'error' ? 1 : 0,
+        cost_usd: 0,
+        params: {
+          ...job.params,
+          _tg_live: publicTelegramLiveState(job.tg_live),
+          entity_title: job.entity_title || null,
+          target: job.target,
+        },
+        error: job.error,
+        started_at: job.started_at,
+        finished_at: job.finished_at,
+      })
+    } catch (error) {
+      console.error(`[Jobs] ${type} #${id} recordJob failed`, error)
+    }
+    console.log(`[Jobs] end ${type} #${id} status=${job.status} hits=${job.tg_live?.unique_hits || 0}${job.error ? ` error=${job.error}` : ''}`)
+    job.phase = 'terminal'
+    emit(job)
+    pruneTelegramLiveResults({ keepId: job.id })
+    markJobClosed(job)
+  })
+  return id
+}
+
+function getTelegramLiveResult(id) {
+  const raw = typeof id === 'string' && id.startsWith('desktop:') ? id.slice(8) : id
+  const numeric = Number(raw)
+  if (!Number.isFinite(numeric)) return null
+  pruneTelegramLiveResults({ keepId: numeric })
+  const job = jobs.get(numeric)
+  if (!job || !String(job.type || '').startsWith('tg_live_')) return null
+  return job._tgLiveResult || null
 }
 
 /**
@@ -8685,7 +8900,7 @@ async function startBoostyBatchTranscribe(params = {}) {
   const storageConfig = getBoostyStorageConfig()
   // Full-video archiving is an explicit download-mode choice. A regular
   // transcription never inherits it silently and stays on the fast MP3 path.
-  const saveVideo = mode === 'download' && storageConfig.save_video
+  const saveVideo = mode === 'download' && (params.save_video === true || storageConfig.save_video)
   const authCookie = String(params.authCookie || '').trim()
   if (!authCookie) throw new Error('startBoostyBatchTranscribe: browser auth required')
   for (const existing of jobs.values()) {
@@ -9578,6 +9793,8 @@ function handleLocalEvent(job, evt) {
 }
 
 module.exports = {
+  startTelegramLive,
+  getTelegramLiveResult,
   startTelegramFetch,
   startTelegramCommentsCatchUp,
   startTelegramPreview,

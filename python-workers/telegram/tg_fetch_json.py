@@ -892,6 +892,7 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
               include_comments=False, comments_limit=0,
               comments_only_post_ids=None,
               media_only_msg_ids=None,
+              message_ids=None,
               topic_ids=None,
               date_to_str=None):
     t0 = time.time()
@@ -1240,6 +1241,76 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
               "duration_sec":         round(time.time() - t0, 2)})
         await client.disconnect()
         return 0
+    elif mode == "id_list":
+        # Explicit persistence hand-off from telegram_live_* MCP tools. Fetch
+        # exactly the selected Telegram message ids, emit the same item
+        # protocol as an ordinary chat fetch, and let Electron's existing
+        # finalizer UPSERT them into library.db. No surrounding history is
+        # materialised and media AI remains opt-in through the usual flags.
+        if not message_ids:
+            emit({"type": "error", "message": "id_list requires --message-ids"})
+            await client.disconnect()
+            return 2
+        saved = 0
+        ids = list(dict.fromkeys(int(value) for value in message_ids if int(value) > 0))
+        for start in range(0, len(ids), 100):
+            chunk = ids[start:start + 100]
+            try:
+                rows = await client.get_messages(entity, ids=chunk)
+            except Exception as ex:
+                emit({"type": "error", "message": f"get_messages failed: {ex}"})
+                await client.disconnect()
+                return 2
+            for msg in rows or []:
+                if msg is None:
+                    continue
+                topic_id, topic_title = _topic_for(msg)
+                msg_type = classify(msg)
+                reply_to = _reply_to_for(msg)
+                body_text = (msg.text or "")[:8000]
+                if msg_type == "poll":
+                    body_text = render_poll(msg)[:8000] if process_polls else ""
+                duration = 0
+                if msg.media and hasattr(msg.media, "document") and msg.media.document:
+                    for attr in msg.media.document.attributes:
+                        if hasattr(attr, "duration"):
+                            duration = attr.duration
+                            break
+                emit({
+                    "type": "item",
+                    "data": {
+                        "id": msg.id,
+                        "date": msg.date.isoformat() if msg.date else None,
+                        "type": msg_type,
+                        "text": body_text,
+                        "sender": await sender_label(msg),
+                        "has_media": bool(msg.media),
+                        "duration": duration,
+                        "topic_id": topic_id,
+                        "topic_title": topic_title,
+                        "parent_external_id": str(reply_to) if reply_to else None,
+                        "reactions": reactions_for(msg),
+                    },
+                })
+                if process_voice or process_photo or process_docs:
+                    await process_media(
+                        msg, msg_type,
+                        transcribe_engine=transcribe_engine,
+                        process_voice=process_voice,
+                        process_photo=process_photo,
+                        process_docs=process_docs,
+                    )
+                saved += 1
+            emit({"type": "page", "loaded": min(start + len(chunk), len(ids)), "limit": len(ids)})
+        if saved == 0:
+            emit({"type": "warning", "code": "empty_result", "message": "Выбранные сообщения недоступны или были удалены."})
+        emit({
+            "type": "done",
+            "items_total": saved,
+            "duration_sec": round(time.time() - t0, 2),
+        })
+        await client.disconnect()
+        return 0
     elif mode == "media_only":
         # On-demand re-processing of a fixed set of ALREADY-SAVED messages.
         # The desktop user ticked specific voice/photo/doc rows in ChatView
@@ -1551,7 +1622,7 @@ def main():
                         help="@username, chat_id, or URL (omit when --resolve-title)")
     parser.add_argument("--mode", required=False,
                         choices=["last_n", "all", "from_date", "single", "sync_new",
-                                 "media_only"])
+                                 "id_list", "media_only"])
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--date", default=None)
     parser.add_argument("--date-to", default=None,
@@ -1632,6 +1703,9 @@ def main():
                              "to (re)process media for on demand (mode=media_only). "
                              "Fetches exactly these by id and runs process_media() "
                              "on each — no iter_messages walk.")
+    parser.add_argument("--message-ids", default=None,
+                        help="Comma-separated Telegram message ids for mode=id_list. "
+                             "Fetches and saves exactly these messages.")
     parser.add_argument("--session", default=None,
                         help="Session name to use (overrides settings.json). "
                              "Electron passes the snapshot taken at job spawn so "
@@ -1728,6 +1802,13 @@ def main():
                 emit({"type": "error",
                       "message": f"Bad --media-only-msg-ids: {ex}"})
                 sys.exit(2)
+        selected_message_ids = None
+        if args.message_ids:
+            try:
+                selected_message_ids = [int(x.strip()) for x in args.message_ids.split(",") if x.strip()]
+            except Exception as ex:
+                emit({"type": "error", "message": f"Bad --message-ids: {ex}"})
+                sys.exit(2)
         topic_ids_arg = None
         if args.topic_ids:
             try:
@@ -1749,6 +1830,7 @@ def main():
                              comments_limit=args.comments_limit,
                              comments_only_post_ids=post_ids,
                              media_only_msg_ids=media_msg_ids,
+                             message_ids=selected_message_ids,
                              topic_ids=topic_ids_arg,
                              date_to_str=args.date_to))
         sys.exit(rc)

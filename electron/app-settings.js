@@ -21,7 +21,9 @@ const CHATGPT_CHAT_O3_EFFORTS = new Set(['medium'])
 const CHATGPT_WORK_56_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
 const CHATGPT_WORK_SPEEDS = new Set(['standard', 'fast'])
 const YOUTUBE_SUBTITLE_POSITIONS = new Set(['top', 'bottom'])
-const YOUTUBE_TRANSLATION_MODES = new Set(['hover', 'always'])
+const YOUTUBE_SUBTITLE_LANGUAGE_ORDERS = new Set(['source_first', 'target_first'])
+const YOUTUBE_TRANSLATION_MODES = new Set(['never', 'hover', 'always'])
+const YOUTUBE_TRANSLATION_ORDERS = new Set(['natural', 'source'])
 const EXTENSION_YOUTUBE_SCHEMA_VERSION = 2
 
 const EXTENSION_YOUTUBE_DEFAULTS = Object.freeze({
@@ -32,8 +34,15 @@ const EXTENSION_YOUTUBE_DEFAULTS = Object.freeze({
   learning_target_lang: 'ru',
   learning_auto_pause: false,
   learning_subtitle_position: 'bottom',
+  learning_subtitle_language_order: 'source_first',
+  learning_subtitle_offset_x: 0,
+  learning_subtitle_offset_y: 0,
+  learning_subtitle_width_px: 1600,
+  learning_subtitle_source_font_px: 34,
+  learning_subtitle_target_font_px: 25,
   learning_controls_mirrored: false,
   learning_translation_mode: 'always',
+  learning_translation_order: 'natural',
   learning_hide_native_subtitles: true,
   learning_ai_explanation: true,
   learning_card_autoplay: false,
@@ -74,6 +83,11 @@ function enumValue(value, allowed, fallback) {
 
 function booleanValue(value, fallback) {
   return typeof value === 'boolean' ? value : fallback
+}
+
+function clampedNumberValue(value, fallback, min, max) {
+  const number = Number(value)
+  return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback
 }
 
 function storagePathValue(value) {
@@ -148,11 +162,26 @@ function sanitizeExtensionYoutube(raw = {}) {
       YOUTUBE_SUBTITLE_POSITIONS,
       'bottom',
     ),
+    learning_subtitle_language_order: enumValue(
+      input.learning_subtitle_language_order,
+      YOUTUBE_SUBTITLE_LANGUAGE_ORDERS,
+      'source_first',
+    ),
+    learning_subtitle_offset_x: clampedNumberValue(input.learning_subtitle_offset_x, 0, -1, 1),
+    learning_subtitle_offset_y: clampedNumberValue(input.learning_subtitle_offset_y, 0, -1, 1),
+    learning_subtitle_width_px: Math.round(clampedNumberValue(input.learning_subtitle_width_px, 1600, 320, 2400)),
+    learning_subtitle_source_font_px: Math.round(clampedNumberValue(input.learning_subtitle_source_font_px, 34, 16, 64)),
+    learning_subtitle_target_font_px: Math.round(clampedNumberValue(input.learning_subtitle_target_font_px, 25, 14, 52)),
     learning_controls_mirrored: booleanValue(input.learning_controls_mirrored, false),
     learning_translation_mode: enumValue(
       input.learning_translation_mode,
       YOUTUBE_TRANSLATION_MODES,
       'always',
+    ),
+    learning_translation_order: enumValue(
+      input.learning_translation_order,
+      YOUTUBE_TRANSLATION_ORDERS,
+      'natural',
     ),
     learning_hide_native_subtitles: booleanValue(input.learning_hide_native_subtitles, true),
     learning_ai_explanation: booleanValue(input.learning_ai_explanation, true),
@@ -214,7 +243,7 @@ const FORWARD_ENUM_KEYS = new Set([
   'chatgpt_mode', 'chatgpt_model', 'chatgpt_effort',
   'chatgpt_chat_model', 'chatgpt_chat_effort',
   'chatgpt_work_model', 'chatgpt_work_effort', 'chatgpt_work_speed',
-  'learning_subtitle_position', 'learning_translation_mode',
+  'learning_subtitle_position', 'learning_subtitle_language_order', 'learning_translation_mode', 'learning_translation_order',
 ])
 
 const FORWARD_ENUM_VALUES = Object.freeze({
@@ -232,7 +261,9 @@ const FORWARD_ENUM_VALUES = Object.freeze({
   chatgpt_work_effort: CHATGPT_EFFORTS,
   chatgpt_work_speed: CHATGPT_WORK_SPEEDS,
   learning_subtitle_position: YOUTUBE_SUBTITLE_POSITIONS,
+  learning_subtitle_language_order: YOUTUBE_SUBTITLE_LANGUAGE_ORDERS,
   learning_translation_mode: YOUTUBE_TRANSLATION_MODES,
+  learning_translation_order: YOUTUBE_TRANSLATION_ORDERS,
 })
 
 function isFutureEnumValue(key, value) {

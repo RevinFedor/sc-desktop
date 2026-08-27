@@ -9,6 +9,8 @@ const DEFAULTS = {
   learning_target_lang: 'ru',
   learning_auto_pause: false,
   learning_subtitle_position: 'bottom',
+  learning_subtitle_language_order: 'source_first',
+  learning_subtitle_width_px: 1600,
   learning_controls_mirrored: false,
   learning_translation_mode: 'always',
   learning_hide_native_subtitles: true,
@@ -96,20 +98,40 @@ export default function YouTubeSettings() {
               ]} />
             </div>
           </ControlRow>
-          <ControlRow label="Показывать перевод" hint="При наведении сохраняет видео чистым; «Всегда» показывает обе строки постоянно.">
+          <ControlRow label="Показывать перевод" hint="«При наведении» заранее готовит вторую строку без сдвига субтитров; «Никогда» оставляет только основной язык.">
             <div className="w-56">
               <Select compact hideHint value={settings.learning_translation_mode} onChange={v => state.patch({ learning_translation_mode: v })} options={[
                 { id: 'always', label: 'Всегда' },
                 { id: 'hover', label: 'При наведении' },
+                { id: 'never', label: 'Никогда' },
               ]} />
             </div>
           </ControlRow>
-          <ControlRow label="Позиция субтитров">
+          <ControlRow label="Порядок строк" hint="Положение всей плашки меняется перетаскиванием прямо на видео.">
             <div className="w-56">
-              <Select compact hideHint value={settings.learning_subtitle_position} onChange={v => state.patch({ learning_subtitle_position: v })} options={[
-                { id: 'bottom', label: 'Снизу' },
-                { id: 'top', label: 'Сверху' },
+              <Select compact hideHint value={settings.learning_subtitle_language_order} onChange={v => state.patch({ learning_subtitle_language_order: v })} options={[
+                { id: 'source_first', label: 'English → Русский' },
+                { id: 'target_first', label: 'Русский → English' },
               ]} />
+            </div>
+          </ControlRow>
+          <ControlRow label="Ширина субтитров" hint="Хранится в пикселях и автоматически уменьшается, если плеер стал уже.">
+            <div className="w-56 flex items-center gap-3">
+              <input
+                className="min-w-0 flex-1 accent-purple-500"
+                type="range"
+                min="320"
+                max="2400"
+                step="20"
+                value={settings.learning_subtitle_width_px}
+                onChange={event => setLocal('learning_subtitle_width_px', Number(event.target.value))}
+                onPointerUp={event => state.patch({ learning_subtitle_width_px: Number(event.currentTarget.value) })}
+                onKeyUp={event => state.patch({ learning_subtitle_width_px: Number(event.currentTarget.value) })}
+                onBlur={event => state.patch({ learning_subtitle_width_px: Number(event.currentTarget.value) })}
+              />
+              <span className="w-16 text-right text-sm tabular-nums text-zinc-400">
+                {Math.round(settings.learning_subtitle_width_px)} px
+              </span>
             </div>
           </ControlRow>
           <ControlRow label="Автопауза" hint="Останавливать видео в конце каждой реплики.">

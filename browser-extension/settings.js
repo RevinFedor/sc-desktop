@@ -311,7 +311,9 @@ const YOUTUBE_TARGET_LABELS = Object.freeze({
 
 const YOUTUBE_ENGINES = Object.freeze(['gemini', 'assemblyai']);
 const YOUTUBE_SUBTITLE_POSITIONS = Object.freeze(['top', 'bottom']);
-const YOUTUBE_TRANSLATION_MODES = Object.freeze(['hover', 'always']);
+const YOUTUBE_SUBTITLE_LANGUAGE_ORDERS = Object.freeze(['source_first', 'target_first']);
+const YOUTUBE_TRANSLATION_MODES = Object.freeze(['never', 'hover', 'always']);
+const YOUTUBE_TRANSLATION_ORDERS = Object.freeze(['natural', 'source']);
 const YOUTUBE_SETTINGS_SCHEMA_VERSION = 2;
 
 const YOUTUBE_DEFAULT_SETTINGS = Object.freeze({
@@ -324,8 +326,15 @@ const YOUTUBE_DEFAULT_SETTINGS = Object.freeze({
   learning_target_lang: 'ru',
   learning_auto_pause: false,
   learning_subtitle_position: 'bottom',
+  learning_subtitle_language_order: 'source_first',
+  learning_subtitle_offset_x: 0,
+  learning_subtitle_offset_y: 0,
+  learning_subtitle_width_px: 1600,
+  learning_subtitle_source_font_px: 34,
+  learning_subtitle_target_font_px: 25,
   learning_controls_mirrored: false,
   learning_translation_mode: 'always',
+  learning_translation_order: 'natural',
   learning_hide_native_subtitles: true,
   learning_ai_explanation: true,
   learning_card_autoplay: false,
@@ -395,9 +404,25 @@ function sanitizeYoutubeSettings(raw = {}) {
   if (YOUTUBE_SUBTITLE_POSITIONS.includes(raw.learning_subtitle_position)) {
     s.learning_subtitle_position = raw.learning_subtitle_position;
   }
+  if (YOUTUBE_SUBTITLE_LANGUAGE_ORDERS.includes(raw.learning_subtitle_language_order)) {
+    s.learning_subtitle_language_order = raw.learning_subtitle_language_order;
+  }
+  const subtitleOffsetX = Number(raw.learning_subtitle_offset_x);
+  const subtitleOffsetY = Number(raw.learning_subtitle_offset_y);
+  const subtitleWidth = Number(raw.learning_subtitle_width_px);
+  const subtitleSourceFont = Number(raw.learning_subtitle_source_font_px);
+  const subtitleTargetFont = Number(raw.learning_subtitle_target_font_px);
+  if (Number.isFinite(subtitleOffsetX)) s.learning_subtitle_offset_x = Math.max(-1, Math.min(1, subtitleOffsetX));
+  if (Number.isFinite(subtitleOffsetY)) s.learning_subtitle_offset_y = Math.max(-1, Math.min(1, subtitleOffsetY));
+  if (Number.isFinite(subtitleWidth)) s.learning_subtitle_width_px = Math.max(320, Math.min(2400, Math.round(subtitleWidth)));
+  if (Number.isFinite(subtitleSourceFont)) s.learning_subtitle_source_font_px = Math.max(16, Math.min(64, Math.round(subtitleSourceFont)));
+  if (Number.isFinite(subtitleTargetFont)) s.learning_subtitle_target_font_px = Math.max(14, Math.min(52, Math.round(subtitleTargetFont)));
   s.learning_controls_mirrored = cb(raw.learning_controls_mirrored, s.learning_controls_mirrored);
   if (YOUTUBE_TRANSLATION_MODES.includes(raw.learning_translation_mode)) {
     s.learning_translation_mode = raw.learning_translation_mode;
+  }
+  if (YOUTUBE_TRANSLATION_ORDERS.includes(raw.learning_translation_order)) {
+    s.learning_translation_order = raw.learning_translation_order;
   }
   s.learning_hide_native_subtitles = cb(
     raw.learning_hide_native_subtitles,
@@ -484,4 +509,23 @@ function diffYoutubeSettings(before, after) {
     if (!before || before[key] !== value) patch[key] = value;
   }
   return patch;
+}
+
+function reconcileYoutubeSettingsPatch(localSettings, sentPatch, remoteSettings) {
+  const local = sanitizeYoutubeSettings(localSettings || {});
+  const remote = sanitizeYoutubeSettings({ ...local, ...(remoteSettings || {}) });
+  const confirmedPatch = {};
+  const pendingPatch = {};
+  for (const key of Object.keys(sentPatch || {})) {
+    if (Object.is(remote[key], local[key])) confirmedPatch[key] = local[key];
+    else {
+      pendingPatch[key] = local[key];
+      remote[key] = local[key];
+    }
+  }
+  return {
+    settings: sanitizeYoutubeSettings(remote),
+    confirmedPatch,
+    pendingPatch,
+  };
 }

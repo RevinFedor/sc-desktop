@@ -126,16 +126,25 @@ function connectBridge() {
     ws.on('close', () => {
       bridgeWs = null;
       try { ws.removeAllListeners(); ws.terminate(); } catch {} // free socket fully
+      // Bridge мог умереть уже ПОСЛЕ успешного initial probe. Разрешаем
+      // новый race-safe auto-spawn; иначе долгоживущий index.js навсегда
+      // остаётся без bridge с bridgeSpawnAttempted=true.
+      bridgeSpawnAttempted = false;
+      ensureBridgeRunning();
       scheduleReconnect();
     });
 
     ws.on('error', () => {
       bridgeWs = null;
       try { ws.removeAllListeners(); ws.terminate(); } catch {}
+      bridgeSpawnAttempted = false;
+      ensureBridgeRunning();
       scheduleReconnect();
     });
 
   } catch (e) {
+    bridgeSpawnAttempted = false;
+    ensureBridgeRunning();
     scheduleReconnect();
   }
 }

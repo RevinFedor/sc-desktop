@@ -145,6 +145,7 @@ function publicSnapshot(job) {
     provider: job.provider,
     status: job.status,
     stage: job.stage,
+    tabId: job.tabId,
     url: job.url,
     title: job.title,
     error: job.error,

@@ -2,6 +2,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 
 const {
+  SWIPE_THRESHOLD,
   buildRound,
   isDue,
   nextSessionStats,
@@ -45,8 +46,10 @@ test('forgotten cards gain priority in the next endless round', () => {
   assert.equal(buildRound(entries, stats, '', now)[0], 'hard')
 })
 
-test('horizontal swipe maps left to forgotten and right to remembered', () => {
-  assert.equal(swipeResult(-120), 'forgotten')
-  assert.equal(swipeResult(120), 'remembered')
-  assert.equal(swipeResult(30), null)
+test('horizontal swipe maps left to remembered and right to forgotten', () => {
+  assert.equal(SWIPE_THRESHOLD, 56)
+  assert.equal(swipeResult(-56), 'remembered')
+  assert.equal(swipeResult(56), 'forgotten')
+  assert.equal(swipeResult(-55), null)
+  assert.equal(swipeResult(55), null)
 })

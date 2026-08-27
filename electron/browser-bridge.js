@@ -71,14 +71,17 @@ const {
   chatgptResearchEntryUrl,
 } = require('./chatgpt-url')
 const { withResearchAutoClose } = require('./research-tab-policy')
+const { reconcileResearchTabOpen, researchIdFromUrl } = require('./research-tab-open')
 
 const BODY_LIMITS = {
   default: 64 * 1024,
   vocabularySync: 2 * 1024 * 1024,
+  vocabularyPractice: 256 * 1024,
   researchStart: 2 * 1024 * 1024,
   researchState: 5 * 1024 * 1024,
   researchArtifactJson: 30 * 1024 * 1024,
   researchArtifactFile: 25 * 1024 * 1024,
+  telegramLive: 256 * 1024,
 }
 
 // История research persist'ится в library.db (research_jobs). Терминальные
@@ -164,7 +167,13 @@ function ensureMcpBridge() {
         if (!pending) return
         mcpPending.delete(msg.commandId)
         clearTimeout(pending.timer)
-        if (msg.success === false) pending.reject(new Error(msg.error || 'extension error'))
+        if (msg.success === false) {
+          const error = new Error(msg.error || 'extension error')
+          error.code = msg.code || null
+          error.deliveryUnknown = msg.deliveryUnknown === true
+          error.retryable = msg.retryable === true
+          pending.reject(error)
+        }
         else pending.resolve(msg)
       } catch (e) {
         console.error('[BrowserBridge] mcp ws parse error:', e.message)
@@ -333,6 +342,7 @@ function isAllowedOrigin(origin) {
 // be exposed to every unrelated installed extension.
 const SC_BROWSER_EXTENSION_ID = 'phnlfhkblebijojjnnlbcbklijgcijgf'
 const SC_BROWSER_EXTENSION_ORIGIN = `chrome-extension://${SC_BROWSER_EXTENSION_ID}`
+const LEARNING_MEDIA_ACCESS_TOKEN = crypto.randomBytes(24).toString('base64url')
 function isExtensionOrigin(origin) {
   return origin === SC_BROWSER_EXTENSION_ORIGIN
 }
@@ -340,13 +350,15 @@ function isExtensionOrigin(origin) {
 function isExtensionSettingsRequest(req) {
   const origin = req.headers.origin || ''
   if (isExtensionOrigin(origin)) return true
-  // Yandex's MV3 service worker omits Origin on loopback fetches. Sec-Fetch-*
-  // headers cannot be set by a web page, and the explicit extension id keeps
-  // ordinary origin-less requests out of the settings route.
-  return !origin &&
-    req.headers['x-sc-extension-id'] === SC_BROWSER_EXTENSION_ID &&
-    req.headers['sec-fetch-site'] === 'none' &&
-    req.headers['sec-fetch-mode'] === 'cors'
+  // Yandex omits Origin on some loopback fetches from extension pages/service
+  // workers. A public web page cannot attach this custom header without a CORS
+  // preflight, and unknown origins never receive our allow-origin response.
+  return !origin && req.headers['x-sc-extension-id'] === SC_BROWSER_EXTENSION_ID
+}
+
+function isLearningMediaRequest(req, url, { tokenAllowed = false } = {}) {
+  if (isExtensionSettingsRequest(req)) return true
+  return tokenAllowed && String(url.searchParams.get('token') || '') === LEARNING_MEDIA_ACCESS_TOKEN
 }
 
 function setCors(req, res) {
@@ -374,6 +386,44 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body))
 }
 
+function telegramDesktopJobId(value) {
+  const raw = typeof value === 'string' && value.startsWith('desktop:')
+    ? value.slice('desktop:'.length)
+    : value
+  const id = Number(raw)
+  return Number.isFinite(id) && id > 0 ? id : null
+}
+
+function telegramJobIsTerminal(job) {
+  return !!job && ['done', 'error', 'cancelled', 'interrupted'].includes(job.status)
+}
+
+async function waitForTelegramDesktopJob(jobRunner, id, waitMs) {
+  const boundedWait = Math.max(0, Math.min(30000, Number(waitMs || 0) || 0))
+  let current = jobRunner.getJobDetail(id)
+  if (!current || boundedWait <= 0 || telegramJobIsTerminal(current)) return current
+  await new Promise(resolve => {
+    let settled = false
+    let off = null
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { off?.() } catch {}
+      resolve()
+    }
+    const timer = setTimeout(finish, boundedWait)
+    off = jobRunner.subscribe(snapshot => {
+      if (Number(snapshot?.id) !== Number(id)) return
+      current = snapshot
+      if (telegramJobIsTerminal(snapshot)) finish()
+    })
+    current = jobRunner.getJobDetail(id) || current
+    if (telegramJobIsTerminal(current)) finish()
+  })
+  return jobRunner.getJobDetail(id) || current
+}
+
 async function readBody(req, maxBytes = BODY_LIMITS.default) {
   return new Promise((resolve, reject) => {
     let data = ''
@@ -391,6 +441,147 @@ async function readBody(req, maxBytes = BODY_LIMITS.default) {
     req.on('end',  () => { try { resolve(data ? JSON.parse(data) : {}) } catch (e) { reject(e) } })
     req.on('error', reject)
   })
+}
+
+const LEARNING_MEDIA_MIME = Object.freeze({
+  '.mp4': 'video/mp4',
+  '.m4v': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.webm': 'video/webm',
+  '.mkv': 'video/x-matroska',
+})
+
+function existingAllowedFile(filePath, roots) {
+  if (!filePath || typeof filePath !== 'string') return null
+  const absolute = path.resolve(filePath)
+  const allowed = (roots || []).some(rawRoot => {
+    if (!rawRoot) return false
+    const root = path.resolve(rawRoot)
+    const relative = path.relative(root, absolute)
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+  })
+  if (!allowed) return null
+  try {
+    const stat = fs.statSync(absolute)
+    return stat.isFile() && stat.size > 0 ? { path: absolute, stat } : null
+  } catch {
+    return null
+  }
+}
+
+function srtPathForTranscript(transcriptPath) {
+  const value = String(transcriptPath || '').trim()
+  return value ? value.replace(/\.txt$/i, '.srt') : ''
+}
+
+function learningMediaRows(jobRunner) {
+  const database = db()
+  if (!database) return []
+  const storage = jobRunner.getBoostyStorageConfig()
+  const sources = database.listSources('boosty') || []
+  const rows = []
+  for (const source of sources) {
+    for (const item of database.listBoostyVideos(source.id) || []) {
+      const video = existingAllowedFile(item.video_path, [jobRunner.LIB_ROOT, storage.video_dir])
+      const subtitles = existingAllowedFile(srtPathForTranscript(item.transcript_path), [jobRunner.LIB_ROOT])
+      const audio = existingAllowedFile(item.media_path, [jobRunner.LIB_ROOT, storage.audio_dir])
+      rows.push({ source, item, video, subtitles, audio })
+    }
+  }
+  return rows.sort((left, right) => Number(right.item.published_at || 0) - Number(left.item.published_at || 0))
+}
+
+function publicLearningMedia(row, accessToken = '') {
+  if (!row) return null
+  const { source, item, video, subtitles, audio } = row
+  return {
+    id: item.id,
+    sourceId: item.source_id,
+    externalId: String(item.external_id || ''),
+    title: item.title || 'Видео Boosty',
+    author: source.display_name || source.handle || 'Boosty',
+    sourceUrl: item.url || '',
+    durationSeconds: Number(item.duration_seconds || 0),
+    publishedAt: Number(item.published_at || 0),
+    videoReady: !!video,
+    videoBytes: Number(video?.stat?.size || 0),
+    subtitlesReady: !!subtitles,
+    audioReady: !!audio,
+    downloadStatus: item.download_status || 'none',
+    transcribeStatus: item.transcribe_status || 'none',
+    videoUrl: video ? `/learning/media/${item.id}/video?token=${encodeURIComponent(accessToken)}` : '',
+    subtitlesUrl: subtitles ? `/learning/media/${item.id}/subtitles?token=${encodeURIComponent(accessToken)}` : '',
+  }
+}
+
+function parseSrtTimestamp(value) {
+  const parts = String(value || '').trim().replace(',', '.').split(':').map(Number)
+  if (parts.length !== 3 || parts.some(part => !Number.isFinite(part))) return null
+  return Math.round(((parts[0] * 60 + parts[1]) * 60 + parts[2]) * 1000)
+}
+
+function parseSrtCues(text) {
+  const lines = String(text || '').replace(/\r/g, '').split('\n')
+  const cues = []
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!lines[index].includes('-->')) continue
+    const [left, rightRaw] = lines[index].split(/\s+-->\s+/)
+    const startMs = parseSrtTimestamp(left)
+    const endMs = parseSrtTimestamp(String(rightRaw || '').split(/\s+/)[0])
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue
+    const body = []
+    for (index += 1; index < lines.length && lines[index].trim(); index += 1) body.push(lines[index].trim())
+    const cueText = body.join(' ').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()
+    if (cueText) cues.push({ startMs, endMs, text: cueText })
+  }
+  return cues
+}
+
+function parseByteRange(value, size) {
+  if (!value) return null
+  const match = String(value).match(/^bytes=(\d*)-(\d*)$/i)
+  if (!match) return { invalid: true }
+  let start = match[1] === '' ? null : Number(match[1])
+  let end = match[2] === '' ? null : Number(match[2])
+  if (start == null) {
+    const suffix = Number(end)
+    if (!Number.isFinite(suffix) || suffix <= 0) return { invalid: true }
+    start = Math.max(0, size - suffix)
+    end = size - 1
+  } else {
+    if (!Number.isFinite(start) || start < 0 || start >= size) return { invalid: true }
+    if (end == null || !Number.isFinite(end)) end = size - 1
+    end = Math.min(size - 1, end)
+  }
+  if (end < start) return { invalid: true }
+  return { start, end }
+}
+
+function streamLearningVideo(req, res, file) {
+  const size = file.stat.size
+  const range = parseByteRange(req.headers.range, size)
+  const contentType = LEARNING_MEDIA_MIME[path.extname(file.path).toLowerCase()] || 'application/octet-stream'
+  res.setHeader('Accept-Ranges', 'bytes')
+  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('Content-Type', contentType)
+  if (range?.invalid) {
+    res.writeHead(416, { 'Content-Range': `bytes */${size}` })
+    res.end()
+    return
+  }
+  if (range) {
+    const length = range.end - range.start + 1
+    res.writeHead(206, {
+      'Content-Range': `bytes ${range.start}-${range.end}/${size}`,
+      'Content-Length': length,
+    })
+    if (req.method === 'HEAD') { res.end(); return }
+    fs.createReadStream(file.path, { start: range.start, end: range.end }).pipe(res)
+    return
+  }
+  res.writeHead(200, { 'Content-Length': size })
+  if (req.method === 'HEAD') { res.end(); return }
+  fs.createReadStream(file.path).pipe(res)
 }
 
 const IMAGE_EXT_MIME = {
@@ -473,6 +664,7 @@ function parseTimestampedTranscript(text) {
 const TRANSLATOR_DEFAULT_ENDPOINT = 'https://api.cognitive.microsofttranslator.com'
 const TRANSLATOR_MAX_ITEMS = 25
 const TRANSLATOR_MAX_CHARS = 5_000
+const TRANSLATOR_MAX_DICTIONARY_EXAMPLE_PAIRS = 10
 const TRANSLATOR_TIMEOUT_MS = 6_000
 const TRANSLATOR_MAX_ATTEMPTS = 2
 const TRANSLATOR_RETRYABLE_STATUSES = new Set([408, 500, 502, 503, 504])
@@ -695,6 +887,57 @@ async function dictionaryLookup(settingsAccess, rawText, rawFrom, rawTo) {
   }
 }
 
+function sanitizeDictionaryExamplePairs(rawPairs) {
+  const pairs = (Array.isArray(rawPairs) ? rawPairs : [])
+    .map((raw) => ({
+      text: String(raw?.text || raw?.sourceText || '').trim(),
+      translation: String(raw?.translation || raw?.targetText || '').trim(),
+    }))
+    .filter((pair) => pair.text && pair.translation)
+  if (!pairs.length) throw new Error('at least one dictionary example pair is required')
+  if (pairs.length > TRANSLATOR_MAX_DICTIONARY_EXAMPLE_PAIRS) {
+    throw new Error(`too many dictionary example pairs (${pairs.length} > ${TRANSLATOR_MAX_DICTIONARY_EXAMPLE_PAIRS})`)
+  }
+  if (pairs.some((pair) => pair.text.length > 100 || pair.translation.length > 100)) {
+    throw new Error('dictionary example terms must contain 1-100 characters')
+  }
+  return Array.from(new Map(
+    pairs.map((pair) => [`${pair.text.toLocaleLowerCase('en-US')}\u0000${pair.translation.toLocaleLowerCase('en-US')}`, pair]),
+  ).values())
+}
+
+async function dictionaryExamples(settingsAccess, rawPairs, rawFrom, rawTo, options = {}) {
+  const pairs = sanitizeDictionaryExamplePairs(rawPairs)
+  const sourceLang = dictionaryLanguageCode(rawFrom)
+  const targetLang = dictionaryLanguageCode(rawTo)
+  const sourceText = JSON.stringify(pairs)
+  const cacheKey = translatorCacheKey('dictionary-examples-v1', sourceLang, targetLang, sourceText)
+  const cache = options.cache === false ? null : db()
+  const cached = cache?.getTranslationCache(cacheKey)
+  if (cached?.response) {
+    return { source_lang: sourceLang, target_lang: targetLang, examples: cached.response, cached: true }
+  }
+
+  const payload = await azureTranslatorRequest(
+    settingsAccess,
+    '/dictionary/examples',
+    { from: sourceLang, to: targetLang },
+    pairs.map((pair) => ({ Text: pair.text, Translation: pair.translation })),
+  )
+  if (!Array.isArray(payload) || payload.length !== pairs.length) {
+    throw new Error('Azure Translator returned an unexpected dictionary examples response')
+  }
+  cache?.upsertTranslationCache({
+    cacheKey,
+    operation: 'dictionary',
+    sourceLang,
+    targetLang,
+    sourceText,
+    response: payload,
+  })
+  return { source_lang: sourceLang, target_lang: targetLang, examples: payload, cached: false }
+}
+
 const VOICE_DISCOVERY_DIR = path.join(os.homedir(), '.noted-terminal')
 const VOICE_TOKEN_FILE = path.join(VOICE_DISCOVERY_DIR, 'web-token.txt')
 const VOICE_DISCOVERY_RE = /^voice-web-server-\d+\.json$/
@@ -705,6 +948,21 @@ function normalizeVocabularyTerm(value) {
     .replace(/\s+/g, ' ')
     .trim()
     .toLocaleLowerCase('en-US')
+}
+
+function normalizeVocabularyPartOfSpeech(value) {
+  const normalized = String(value || 'unknown').trim().toLocaleLowerCase('en-US')
+  return normalized || 'unknown'
+}
+
+function vocabularyIdentityKey(item) {
+  const kind = item?.kind === 'phrase' ? 'phrase' : 'word'
+  const sourceLang = String(item?.sourceLang || 'auto').trim().toLocaleLowerCase('en-US')
+  const targetLang = String(item?.targetLang || 'ru').trim().toLocaleLowerCase('en-US')
+  const lemma = normalizeVocabularyTerm(item?.lemma || item?.sourceText || item?.term)
+  return kind === 'phrase'
+    ? `${kind}|${sourceLang}|${targetLang}|${lemma}`
+    : `${kind}|${sourceLang}|${targetLang}|${lemma}`
 }
 
 function voiceServerCandidates() {
@@ -770,15 +1028,32 @@ async function voiceVocabularyRequest(method, route, body = null, timeoutMs = 4_
   throw error
 }
 
-const LEARNING_EXPLANATION_MODEL = 'gemini-3.1-flash-lite'
-const LEARNING_EXPLANATION_VERSION = 'v3'
+const LEARNING_EXPLANATION_MODEL = 'gemini-3.7-flash'
+const LEARNING_EXPLANATION_VERSION = 'v13'
 const learningExplanationInflight = new Map()
+const LEARNING_LITERAL_MODEL = 'gemini-3.1-flash-lite'
+const LEARNING_LITERAL_VERSION = 'v4'
+const learningLiteralInflight = new Map()
+const LEARNING_EXPRESSION_MODEL = 'gemini-3.1-flash-lite'
+const LEARNING_EXPRESSION_VERSION = 'v1'
+const learningExpressionInflight = new Map()
+const LEARNING_EXPRESSION_TYPES = new Set(['phrasal_verb', 'function_phrase', 'idiom'])
 
 function normalizeLearningExplanationPayload(raw = {}) {
   const word = String(raw.word || raw.sourceText || '').replace(/\s+/g, ' ').trim().slice(0, 120)
   const context = String(raw.context || raw.cueText || '').replace(/\s+/g, ' ').trim().slice(0, 3000)
   if (!word) throw new Error('word is required')
   if (!context) throw new Error('subtitle context is required')
+  const knownMeanings = Array.from(new Set((Array.isArray(raw.knownMeanings) ? raw.knownMeanings : [])
+    .map((value) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 300))
+    .filter(Boolean))).slice(0, 12)
+  const dictionaryTranslations = (Array.isArray(raw.dictionaryTranslations) ? raw.dictionaryTranslations : [])
+    .map((item) => ({
+      value: String(item?.value || item?.translation || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+      partOfSpeech: normalizeVocabularyPartOfSpeech(item?.partOfSpeech || item?.pos),
+    }))
+    .filter((item) => item.value)
+    .slice(0, 20)
   return {
     word,
     wordTranslation: String(raw.wordTranslation || '').replace(/\s+/g, ' ').trim().slice(0, 500),
@@ -786,6 +1061,8 @@ function normalizeLearningExplanationPayload(raw = {}) {
     contextTranslation: String(raw.contextTranslation || '').replace(/\s+/g, ' ').trim().slice(0, 3000),
     sourceLang: cleanLanguageCode(raw.sourceLang || 'en'),
     targetLang: cleanLanguageCode(raw.targetLang || 'ru'),
+    knownMeanings,
+    dictionaryTranslations,
   }
 }
 
@@ -798,9 +1075,37 @@ function learningExplanationCacheKey(payload) {
       payload.targetLang,
       payload.word.toLocaleLowerCase('en-US'),
       payload.context,
+      JSON.stringify(payload.knownMeanings),
+      JSON.stringify(payload.dictionaryTranslations),
     ].join('\u0000'))
     .digest('hex')
   return `learning-ai:${digest}`
+}
+
+function normalizeLearningExplanationResult(result) {
+  return {
+    explanation: String(result?.explanation || '').replace(/\s+/g, ' ').trim().slice(0, 1500),
+    model: String(result?.model || LEARNING_EXPLANATION_MODEL),
+    lemma: String(result?.lemma || '').trim().slice(0, 120),
+    partOfSpeech: normalizeVocabularyPartOfSpeech(result?.partOfSpeech),
+    analysisConfidence: String(result?.analysisConfidence || 'low').trim().slice(0, 16),
+    currentMeanings: Array.from(new Set((Array.isArray(result?.currentMeanings) ? result.currentMeanings : [])
+      .map((value) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 300))
+      .filter(Boolean))).slice(0, 3),
+    matchedMeaning: String(result?.matchedMeaning || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+    expressionText: String(result?.expressionText || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase('en-US').slice(0, 160),
+    meaningGroups: (Array.isArray(result?.meaningGroups) ? result.meaningGroups : []).slice(0, 20).map((group) => ({
+      values: Array.from(new Set((Array.isArray(group?.values) ? group.values : [])
+        .map((value) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 160))
+        .filter(Boolean))),
+      partOfSpeech: normalizeVocabularyPartOfSpeech(group?.partOfSpeech || group?.pos),
+      example: String(group?.example || '').replace(/\s+/g, ' ').trim().slice(0, 1000),
+      exampleTranslation: String(group?.exampleTranslation || '').replace(/\s+/g, ' ').trim().slice(0, 1000),
+    })).filter((group) => group.values.length),
+    invalidValues: Array.from(new Set((Array.isArray(result?.invalidValues) ? result.invalidValues : [])
+      .map((value) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 160))
+      .filter(Boolean))).slice(0, 20),
+  }
 }
 
 async function learningWordExplanation(raw) {
@@ -808,7 +1113,19 @@ async function learningWordExplanation(raw) {
   const cacheKey = learningExplanationCacheKey(payload)
   const cached = db()?.getUiPreference(cacheKey)
   if (cached?.explanation) {
-    return { explanation: String(cached.explanation), model: cached.model || LEARNING_EXPLANATION_MODEL, cached: true }
+    return {
+      explanation: String(cached.explanation),
+      model: cached.model || LEARNING_EXPLANATION_MODEL,
+      lemma: String(cached.lemma || ''),
+      partOfSpeech: normalizeVocabularyPartOfSpeech(cached.partOfSpeech),
+      analysisConfidence: String(cached.analysisConfidence || 'low'),
+      currentMeanings: Array.isArray(cached.currentMeanings) ? cached.currentMeanings : [],
+      matchedMeaning: String(cached.matchedMeaning || ''),
+      expressionText: String(cached.expressionText || ''),
+      meaningGroups: Array.isArray(cached.meaningGroups) ? cached.meaningGroups : [],
+      invalidValues: Array.isArray(cached.invalidValues) ? cached.invalidValues : [],
+      cached: true,
+    }
   }
   if (learningExplanationInflight.has(cacheKey)) return learningExplanationInflight.get(cacheKey)
   const request = (async () => {
@@ -818,11 +1135,10 @@ async function learningWordExplanation(raw) {
       payload,
       20_000,
     )
-    const explanation = String(result?.explanation || '').replace(/\s+/g, ' ').trim().slice(0, 1500)
-    if (!explanation) throw new Error('Voice Record returned an empty learning explanation')
+    const normalized = normalizeLearningExplanationResult(result)
+    if (!normalized.explanation) throw new Error('Voice Record returned an empty learning explanation')
     const value = {
-      explanation,
-      model: String(result?.model || LEARNING_EXPLANATION_MODEL),
+      ...normalized,
       createdAt: Date.now(),
     }
     db()?.setUiPreference(cacheKey, value)
@@ -833,6 +1149,216 @@ async function learningWordExplanation(raw) {
   finally { learningExplanationInflight.delete(cacheKey) }
 }
 
+function normalizeLearningExpressionPayload(raw = {}) {
+  const selectedText = String(raw.selectedText || raw.text || '').replace(/\s+/g, ' ').trim().slice(0, 500)
+  const context = String(raw.context || selectedText).replace(/\s+/g, ' ').trim().slice(0, 3000)
+  if (!selectedText || !selectedText.includes(' ')) throw new Error('multi-word expression is required')
+  return {
+    selectedText,
+    context,
+    contextTranslation: String(raw.contextTranslation || '').replace(/\s+/g, ' ').trim().slice(0, 3000),
+    sourceLang: cleanLanguageCode(raw.sourceLang || 'en'),
+    targetLang: cleanLanguageCode(raw.targetLang || 'ru'),
+  }
+}
+
+function learningExpressionCacheKey(payload) {
+  const digest = crypto.createHash('sha256')
+    .update([
+      LEARNING_EXPRESSION_VERSION,
+      LEARNING_EXPRESSION_MODEL,
+      payload.sourceLang,
+      payload.targetLang,
+      payload.selectedText.toLocaleLowerCase('en-US'),
+      payload.context,
+    ].join('\u0000'))
+    .digest('hex')
+  return `learning-expression:${digest}`
+}
+
+function normalizeLearningExpressionResult(raw = {}) {
+  const expressionType = LEARNING_EXPRESSION_TYPES.has(String(raw.expressionType || ''))
+    ? String(raw.expressionType)
+    : ''
+  return {
+    eligible: !!expressionType,
+    expressionType,
+    canonicalText: String(raw.canonicalText || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase('en-US').slice(0, 500),
+    translation: String(raw.translation || '').replace(/\s+/g, ' ').trim().slice(0, 1000),
+    confidence: ['high', 'medium', 'low'].includes(String(raw.confidence || '')) ? String(raw.confidence) : 'low',
+    model: String(raw.model || LEARNING_EXPRESSION_MODEL),
+  }
+}
+
+async function learningExpressionClassification(raw) {
+  const payload = normalizeLearningExpressionPayload(raw)
+  const cacheKey = learningExpressionCacheKey(payload)
+  const cached = db()?.getUiPreference(cacheKey)
+  if (cached?.canonicalText) return { ...normalizeLearningExpressionResult(cached), cached: true }
+  if (learningExpressionInflight.has(cacheKey)) return learningExpressionInflight.get(cacheKey)
+  const request = (async () => {
+    const remote = await voiceVocabularyRequest('POST', '/api/desktop/learning-expression', payload, 20_000)
+    const value = { ...normalizeLearningExpressionResult(remote), createdAt: Date.now() }
+    db()?.setUiPreference(cacheKey, value)
+    return { ...value, cached: false }
+  })()
+  learningExpressionInflight.set(cacheKey, request)
+  try { return await request }
+  finally { learningExpressionInflight.delete(cacheKey) }
+}
+
+function normalizeLearningLiteralPayload(raw = {}) {
+  const sourceText = String(raw.sourceText || raw.text || '').replace(/\s+/g, ' ').trim().slice(0, 3000)
+  const naturalTranslation = String(raw.naturalTranslation || raw.translation || '').replace(/\s+/g, ' ').trim().slice(0, 3000)
+  if (!sourceText) throw new Error('subtitle source text is required')
+  if (!naturalTranslation) throw new Error('natural subtitle translation is required')
+  return {
+    sourceText,
+    naturalTranslation,
+    sourceLang: cleanLanguageCode(raw.sourceLang || raw.from || 'en'),
+    targetLang: cleanLanguageCode(raw.targetLang || raw.to || 'ru'),
+  }
+}
+
+function learningLiteralCacheKey(payload) {
+  const digest = crypto.createHash('sha256')
+    .update([
+      LEARNING_LITERAL_VERSION,
+      LEARNING_LITERAL_MODEL,
+      payload.sourceLang,
+      payload.targetLang,
+      payload.sourceText,
+      payload.naturalTranslation,
+    ].join('\u0000'))
+    .digest('hex')
+  return `learning-literal:${digest}`
+}
+
+function snapLiteralAlignmentToWords(text, targetStart, targetEnd) {
+  const words = Array.from(String(text || '').matchAll(/[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*/gu), match => ({
+    start: match.index,
+    end: match.index + match[0].length,
+  })).filter(word => word.start < targetEnd && word.end > targetStart)
+  if (!words.length) return null
+  let first = words[0]
+  const last = words[words.length - 1]
+  // A model can accidentally tag the last letter of the previous word plus
+  // the beginning of the intended one (for example `а под` in
+  // `Афина подходит`). Drop that partial left edge and keep the complete
+  // following word; a single partial word is expanded instead of discarded.
+  if (targetStart > first.start && words.length > 1) first = words[1]
+  if (!first || first.start > last.end) return null
+  return { targetStart: first.start, targetEnd: last.end }
+}
+
+function normalizeLiteralAlignments(rawAlignments, literalText) {
+  const text = String(literalText || '')
+  const result = []
+  const seen = new Set()
+  for (const raw of Array.isArray(rawAlignments) ? rawAlignments : []) {
+    const sourceWordIndex = Number(raw?.sourceWordIndex)
+    let targetStart = Number(raw?.targetStart)
+    let targetEnd = Number(raw?.targetEnd)
+    if (!Number.isInteger(sourceWordIndex) || sourceWordIndex < 0 || sourceWordIndex > 300) continue
+    if (!Number.isInteger(targetStart) || !Number.isInteger(targetEnd)
+        || targetStart < 0 || targetEnd <= targetStart || targetEnd > text.length) continue
+    const snapped = snapLiteralAlignmentToWords(text, targetStart, targetEnd)
+    if (!snapped) continue
+    targetStart = snapped.targetStart
+    targetEnd = snapped.targetEnd
+    const key = `${sourceWordIndex}:${targetStart}:${targetEnd}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push({ sourceWordIndex, targetStart, targetEnd })
+    if (result.length >= 300) break
+  }
+  return result
+}
+
+async function learningLiteralTranslation(raw) {
+  const payload = normalizeLearningLiteralPayload(raw)
+  const cacheKey = learningLiteralCacheKey(payload)
+  const cached = db()?.getUiPreference(cacheKey)
+  if (cached?.literalText) {
+    return {
+      literalText: String(cached.literalText),
+      alignments: normalizeLiteralAlignments(cached.alignments, cached.literalText),
+      model: cached.model || LEARNING_LITERAL_MODEL,
+      cached: true,
+    }
+  }
+  if (learningLiteralInflight.has(cacheKey)) return learningLiteralInflight.get(cacheKey)
+  const request = (async () => {
+    const result = await voiceVocabularyRequest(
+      'POST',
+      '/api/desktop/learning-literal',
+      payload,
+      20_000,
+    )
+    const literalText = String(result?.literalText || '').replace(/\s+/g, ' ').trim().slice(0, 4000)
+    if (!literalText) throw new Error('Voice Record returned an empty literal subtitle')
+    const value = {
+      literalText,
+      alignments: normalizeLiteralAlignments(result?.alignments, literalText),
+      model: String(result?.model || LEARNING_LITERAL_MODEL),
+      createdAt: Date.now(),
+    }
+    db()?.setUiPreference(cacheKey, value)
+    return { ...value, cached: false }
+  })()
+  learningLiteralInflight.set(cacheKey, request)
+  try { return await request }
+  finally { learningLiteralInflight.delete(cacheKey) }
+}
+
+function normalizeVocabularyPracticeRequest(raw = {}) {
+  const action = raw.action === 'start' ? 'start' : 'turn'
+  const vocabulary = []
+  const seen = new Set()
+  for (const item of Array.isArray(raw.vocabulary) ? raw.vocabulary : []) {
+    const id = String(item?.id || item?.key || '').trim().slice(0, 220)
+    const term = String(item?.term || item?.sourceText || '').normalize('NFKC').replace(/\s+/g, ' ').trim().slice(0, 160)
+    if (!id || !term || seen.has(id)) continue
+    seen.add(id)
+    vocabulary.push({
+      id,
+      term,
+      translation: String(item?.translation || '').replace(/\s+/g, ' ').trim().slice(0, 300),
+      partOfSpeech: normalizeVocabularyPartOfSpeech(item?.partOfSpeech),
+    })
+    if (vocabulary.length >= 16) break
+  }
+  if (!vocabulary.length) throw new Error('practice vocabulary is empty')
+  const history = (Array.isArray(raw.history) ? raw.history : []).slice(-16).map((message) => ({
+    role: message?.role === 'user' ? 'user' : 'assistant',
+    english: String(message?.english || message?.content || '').replace(/\s+/g, ' ').trim().slice(0, 2000),
+    russian: String(message?.russian || '').replace(/\s+/g, ' ').trim().slice(0, 2000),
+  })).filter((message) => message.english)
+  const answer = String(raw.answer || '').replace(/\s+/g, ' ').trim().slice(0, 3000)
+  if (action === 'turn' && !answer) throw new Error('English answer is required')
+  return { action, vocabulary, history, answer }
+}
+
+async function vocabularyPracticeTurn(raw) {
+  const payload = normalizeVocabularyPracticeRequest(raw)
+  const result = await voiceVocabularyRequest(
+    'POST',
+    '/api/desktop/vocabulary-practice',
+    payload,
+    45_000,
+  )
+  return {
+    online: true,
+    feedbackRussian: String(result?.feedbackRussian || '').slice(0, 1200),
+    correctedEnglish: String(result?.correctedEnglish || '').slice(0, 2000),
+    assistantEnglish: String(result?.assistantEnglish || '').slice(0, 2000),
+    assistantRussian: String(result?.assistantRussian || '').slice(0, 2000),
+    usedVocabularyIds: Array.isArray(result?.usedVocabularyIds) ? result.usedVocabularyIds.slice(0, 8) : [],
+    model: String(result?.model || 'gemini-3.1-flash-lite'),
+    usage: result?.usage || null,
+  }
+}
+
 function vocabularySyncPayload(entry) {
   return {
     term: String(entry?.sourceText || entry?.term || '').trim(),
@@ -840,21 +1366,31 @@ function vocabularySyncPayload(entry) {
     translationSource: entry?.translationSource === 'manual' ? 'manual' : 'machine',
     state: ['saved', 'known'].includes(entry?.state) ? entry.state : 'none',
     kind: entry?.kind === 'phrase' ? 'phrase' : 'word',
+    expressionType: LEARNING_EXPRESSION_TYPES.has(String(entry?.expressionType || '')) ? String(entry.expressionType) : '',
     sourceLang: String(entry?.sourceLang || 'auto').slice(0, 32),
     targetLang: String(entry?.targetLang || 'ru').slice(0, 32),
+    lemma: String(entry?.lemma || entry?.sourceText || entry?.term || '').trim(),
+    partOfSpeech: normalizeVocabularyPartOfSpeech(entry?.partOfSpeech),
+    partsOfSpeech: Array.isArray(entry?.partsOfSpeech) ? entry.partsOfSpeech.slice(0, 20) : [],
+    analysisConfidence: String(entry?.analysisConfidence || 'low').trim().slice(0, 16),
+    observedForms: Array.isArray(entry?.observedForms) ? entry.observedForms.slice(0, 100) : [],
     contexts: Array.isArray(entry?.contexts) ? entry.contexts.slice(0, 100) : [],
+    ...(entry?.replaceContexts === true ? { replaceContexts: true } : {}),
   }
 }
 
 function remoteVocabularyIndex(items) {
   const byId = new Map()
   const byTerm = new Map()
+  const byIdentity = new Map()
   for (const item of items || []) {
     if (item?.id) byId.set(item.id, item)
     const key = normalizeVocabularyTerm(item?.term)
     if (key) byTerm.set(key, item)
+    const identity = vocabularyIdentityKey(item)
+    if (identity) byIdentity.set(identity, item)
   }
-  return { byId, byTerm }
+  return { byId, byTerm, byIdentity }
 }
 
 async function syncVocabularyWithVoice(rawBody) {
@@ -872,6 +1408,7 @@ async function syncVocabularyWithVoice(rawBody) {
     const localKey = String(local?.key || '')
     if (!term || !localKey) continue
     let remote = (local.remoteId && index.byId.get(local.remoteId))
+      || index.byIdentity.get(vocabularyIdentityKey(local))
       || index.byTerm.get(normalizeVocabularyTerm(term))
       || null
     const payload = vocabularySyncPayload(local)
@@ -885,6 +1422,7 @@ async function syncVocabularyWithVoice(rawBody) {
       if (remote) {
         index.byId.set(remote.id, remote)
         index.byTerm.set(normalizeVocabularyTerm(remote.term), remote)
+        index.byIdentity.set(vocabularyIdentityKey(remote), remote)
         syncedKeys.push(localKey)
       }
       continue
@@ -934,9 +1472,18 @@ async function syncVocabularyWithVoice(rawBody) {
     }
 
     if (payload.kind !== (remote.kind || 'word')) patch.kind = payload.kind
+    if (payload.expressionType !== (remote.expressionType || '')) patch.expressionType = payload.expressionType
     if (payload.sourceLang && payload.sourceLang !== remote.sourceLang) patch.sourceLang = payload.sourceLang
     if (payload.targetLang && payload.targetLang !== remote.targetLang) patch.targetLang = payload.targetLang
-    if (payload.contexts.length) patch.contexts = payload.contexts
+    if (payload.lemma && payload.lemma !== remote.lemma) patch.lemma = payload.lemma
+    if (payload.partOfSpeech !== (remote.partOfSpeech || 'unknown')) patch.partOfSpeech = payload.partOfSpeech
+    if (JSON.stringify(payload.partsOfSpeech) !== JSON.stringify(remote.partsOfSpeech || [])) patch.partsOfSpeech = payload.partsOfSpeech
+    if (payload.analysisConfidence !== (remote.analysisConfidence || 'low')) patch.analysisConfidence = payload.analysisConfidence
+    if (payload.observedForms.length) patch.observedForms = payload.observedForms
+    if (payload.contexts.length || payload.replaceContexts === true) {
+      patch.contexts = payload.contexts
+      if (payload.replaceContexts === true) patch.replaceContexts = true
+    }
     if (Object.keys(patch).length) {
       const updated = await voiceVocabularyRequest(
         'PATCH',
@@ -946,6 +1493,7 @@ async function syncVocabularyWithVoice(rawBody) {
       remote = updated?.item || remote
       index.byId.set(remote.id, remote)
       index.byTerm.set(normalizeVocabularyTerm(remote.term), remote)
+      index.byIdentity.set(vocabularyIdentityKey(remote), remote)
     }
     if (!manualConflict) syncedKeys.push(localKey)
   }
@@ -955,6 +1503,7 @@ async function syncVocabularyWithVoice(rawBody) {
   for (const operation of orderedReviewOps) {
     const operationId = String(operation?.id || '').trim()
     const remote = (operation.remoteId && index.byId.get(operation.remoteId))
+      || index.byIdentity.get(vocabularyIdentityKey(operation))
       || index.byTerm.get(normalizeVocabularyTerm(operation.term))
     if (!operationId || !remote?.id) continue
     if (operation?.type === 'review') {
@@ -973,6 +1522,7 @@ async function syncVocabularyWithVoice(rawBody) {
       if (reviewed?.item) {
         index.byId.set(reviewed.item.id, reviewed.item)
         index.byTerm.set(normalizeVocabularyTerm(reviewed.item.term), reviewed.item)
+        index.byIdentity.set(vocabularyIdentityKey(reviewed.item), reviewed.item)
         acknowledgedReviews.push(operationId)
       }
     } else if (operation?.type === 'undo-review') {
@@ -986,6 +1536,7 @@ async function syncVocabularyWithVoice(rawBody) {
       if (undone?.item) {
         index.byId.set(undone.item.id, undone.item)
         index.byTerm.set(normalizeVocabularyTerm(undone.item.term), undone.item)
+        index.byIdentity.set(vocabularyIdentityKey(undone.item), undone.item)
         acknowledgedReviews.push(operationId)
       }
     }
@@ -1035,6 +1586,95 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         return sendJson(res, 200, { ok: true, version: 1 })
       }
 
+      // MCP-first Telegram live retrieval. Browser pages are explicitly
+      // rejected: these routes can access the user's signed-in Telegram
+      // account and are only for origin-less local processes (our MCP server).
+      // All operations are created in the app's real job-runner, so Activity
+      // receives updates and its Cancel button terminates the Python worker.
+      if (url.pathname.startsWith('/telegram-live/')) {
+        if (req.headers.origin) {
+          return sendJson(res, 403, { ok: false, error: 'browser origins are not allowed' })
+        }
+        if (req.method === 'POST' && url.pathname === '/telegram-live/start') {
+          const body = await readBody(req, BODY_LIMITS.telegramLive)
+          try {
+            const desktopId = jobRunner.startTelegramLive(body)
+            return sendJson(res, 200, {
+              ok: true,
+              job_id: `desktop:${desktopId}`,
+              desktop_job_id: desktopId,
+              job: jobRunner.getJobDetail(desktopId),
+            })
+          } catch (error) {
+            return sendJson(res, 400, { ok: false, error: String(error?.message || error) })
+          }
+        }
+        if (req.method === 'GET' && url.pathname === '/telegram-live/status') {
+          const desktopId = telegramDesktopJobId(url.searchParams.get('id'))
+          if (!desktopId) return sendJson(res, 400, { ok: false, error: 'invalid job id' })
+          const job = await waitForTelegramDesktopJob(
+            jobRunner,
+            desktopId,
+            url.searchParams.get('wait'),
+          )
+          if (!job) return sendJson(res, 404, { ok: false, error: 'job not found' })
+          return sendJson(res, 200, {
+            ok: true,
+            job_id: `desktop:${desktopId}`,
+            desktop_job_id: desktopId,
+            job,
+            result: jobRunner.getTelegramLiveResult(desktopId),
+          })
+        }
+        if (req.method === 'POST' && url.pathname === '/telegram-live/cancel') {
+          const body = await readBody(req, BODY_LIMITS.telegramLive)
+          const desktopId = telegramDesktopJobId(body.job_id ?? body.id)
+          if (!desktopId) return sendJson(res, 400, { ok: false, error: 'invalid job id' })
+          const cancelled = jobRunner.cancelJob(desktopId, { identity: 'live' })
+          return sendJson(res, 200, {
+            ok: cancelled === true,
+            job_id: `desktop:${desktopId}`,
+            desktop_job_id: desktopId,
+            job: jobRunner.getJobDetail(desktopId),
+          })
+        }
+        if (req.method === 'POST' && url.pathname === '/telegram-live/save') {
+          const body = await readBody(req, BODY_LIMITS.telegramLive)
+          const chat = String(body.chat || '').trim()
+          const messageIds = Array.isArray(body.message_ids)
+            ? [...new Set(body.message_ids.map(Number).filter(id => Number.isSafeInteger(id) && id > 0))]
+            : []
+          if (!chat || !messageIds.length) {
+            return sendJson(res, 400, { ok: false, error: 'chat and message_ids are required' })
+          }
+          if (messageIds.length > 5000) {
+            return sendJson(res, 400, { ok: false, error: 'too many message_ids (max 5000)' })
+          }
+          try {
+            const desktopId = jobRunner.startTelegramFetch({
+              target: chat,
+              mode: 'id_list',
+              message_ids: messageIds,
+              _tg_session_override: body.session || null,
+              process_voice: body.process_voice === true,
+              process_photo: body.process_photo === true,
+              process_docs: body.process_docs === true,
+              process_polls: body.process_polls !== false,
+              transcribe_engine: body.transcribe_engine || undefined,
+              transcribe_lang: body.transcribe_lang || undefined,
+            })
+            return sendJson(res, 200, {
+              ok: true,
+              job_id: `desktop:${desktopId}`,
+              desktop_job_id: desktopId,
+              job: jobRunner.getJobDetail(desktopId),
+            })
+          } catch (error) {
+            return sendJson(res, 400, { ok: false, error: String(error?.message || error) })
+          }
+        }
+      }
+
       if (url.pathname.startsWith('/translator/')
           || url.pathname.startsWith('/learning/')
           || url.pathname === '/vocabulary/sync'
@@ -1043,6 +1683,85 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         if (origin && !isAllowedOrigin(origin)) {
           return sendJson(res, 403, { ok: false, error: 'origin not allowed' })
         }
+      }
+
+      if (url.pathname === '/learning/media/library' && req.method === 'GET') {
+        if (!isLearningMediaRequest(req, url)) {
+          return sendJson(res, 403, { ok: false, error: 'extension origin required' })
+        }
+        const items = learningMediaRows(jobRunner).map(row => publicLearningMedia(row, LEARNING_MEDIA_ACCESS_TOKEN))
+        return sendJson(res, 200, { ok: true, items })
+      }
+
+      const mediaSubtitlesMatch = url.pathname.match(/^\/learning\/media\/(\d+)\/subtitles$/)
+      if (mediaSubtitlesMatch && req.method === 'GET') {
+        if (!isLearningMediaRequest(req, url, { tokenAllowed: true })) {
+          return sendJson(res, 403, { ok: false, error: 'extension origin required' })
+        }
+        const media = learningMediaRows(jobRunner).find(row => Number(row.item.id) === Number(mediaSubtitlesMatch[1]))
+        if (!media?.subtitles) return sendJson(res, 404, { ok: false, error: 'timed subtitles are unavailable' })
+        const cues = parseSrtCues(fs.readFileSync(media.subtitles.path, 'utf8'))
+        if (!cues.length) return sendJson(res, 422, { ok: false, error: 'timed subtitles are empty' })
+        return sendJson(res, 200, {
+          ok: true,
+          item: publicLearningMedia(media, LEARNING_MEDIA_ACCESS_TOKEN),
+          languageCode: 'en',
+          cues,
+        })
+      }
+
+      const mediaVideoMatch = url.pathname.match(/^\/learning\/media\/(\d+)\/video$/)
+      if (mediaVideoMatch && (req.method === 'GET' || req.method === 'HEAD')) {
+        if (!isLearningMediaRequest(req, url, { tokenAllowed: true })) {
+          return sendJson(res, 403, { ok: false, error: 'extension origin required' })
+        }
+        const media = learningMediaRows(jobRunner).find(row => Number(row.item.id) === Number(mediaVideoMatch[1]))
+        if (!media?.video) return sendJson(res, 404, { ok: false, error: 'video is unavailable' })
+        return streamLearningVideo(req, res, media.video)
+      }
+
+      const mediaDownloadMatch = url.pathname.match(/^\/learning\/media\/(\d+)\/download$/)
+      if (mediaDownloadMatch && req.method === 'POST') {
+        if (!isLearningMediaRequest(req, url)) {
+          return sendJson(res, 403, { ok: false, error: 'extension origin required' })
+        }
+        const media = learningMediaRows(jobRunner).find(row => Number(row.item.id) === Number(mediaDownloadMatch[1]))
+        if (!media) return sendJson(res, 404, { ok: false, error: 'Boosty video is unavailable' })
+        if (media.video) return sendJson(res, 200, { ok: true, ready: true, item: publicLearningMedia(media, LEARNING_MEDIA_ACCESS_TOKEN) })
+        try {
+          const auth = await requestBoostyAuthCookie()
+          const jobId = await jobRunner.startBoostyBatchTranscribe({
+            source_id: media.item.source_id,
+            video_ids: [String(media.item.external_id)],
+            mode: 'download',
+            save_video: true,
+            authCookie: auth.value,
+            authExpiration: auth.expirationDate,
+          })
+          console.log(`[LearningMedia] download item=${media.item.id} job=${jobId}`)
+          return sendJson(res, 200, { ok: true, ready: false, jobId })
+        } catch (error) {
+          console.log(`[LearningMedia] download failed item=${media.item.id} error=${error?.message || error}`)
+          return sendJson(res, 502, { ok: false, error: error?.message || String(error) })
+        }
+      }
+
+      if (url.pathname === '/learning/media/download-status' && req.method === 'GET') {
+        if (!isLearningMediaRequest(req, url)) {
+          return sendJson(res, 403, { ok: false, error: 'extension origin required' })
+        }
+        const jobId = Number(url.searchParams.get('id'))
+        const job = (jobRunner.listJobs() || []).find(item => Number(item.id) === jobId) || null
+        if (!job) return sendJson(res, 404, { ok: false, error: 'download job was not found' })
+        return sendJson(res, 200, {
+          ok: true,
+          job: {
+            id: job.id,
+            status: job.status,
+            error: job.error || null,
+            progress: job.boosty_batch?.current || null,
+          },
+        })
       }
 
       if (req.method === 'GET' && url.pathname === '/translator/status') {
@@ -1085,6 +1804,22 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
             ? 503
             : Number(error?.status) || (/required|invalid|must contain/i.test(error?.message || '') ? 400 : 502)
           console.log(`[Translator] dictionary failed status=${status} code=${error?.code || 'unknown'} message=${error?.message || error}`)
+          return sendJson(res, status, { ok: false, code: error?.code || 'translator_error', error: error?.message || String(error) })
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/translator/examples') {
+        try {
+          const body = await readBody(req)
+          const result = await dictionaryExamples(settingsAccess, body.pairs, body.from, body.to)
+          const count = result.examples.reduce((sum, item) => sum + (Array.isArray(item?.examples) ? item.examples.length : 0), 0)
+          console.log(`[Translator] dictionary examples pairs=${result.examples.length} examples=${count} cache_hit=${result.cached === true}`)
+          return sendJson(res, 200, { ok: true, ...result })
+        } catch (error) {
+          const status = error?.code === 'translator_not_configured'
+            ? 503
+            : Number(error?.status) || (/required|invalid|too many|must contain/i.test(error?.message || '') ? 400 : 502)
+          console.log(`[Translator] dictionary examples failed status=${status} code=${error?.code || 'unknown'} message=${error?.message || error}`)
           return sendJson(res, status, { ok: false, code: error?.code || 'translator_error', error: error?.message || String(error) })
         }
       }
@@ -1134,6 +1869,59 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
             })
           }
           console.log(`[Learning] explanation failed: ${error?.message || error}`)
+          return sendJson(res, Number(error?.status) || 502, { ok: false, error: error?.message || String(error) })
+        }
+      }
+
+      if (url.pathname === '/learning/expression' && req.method === 'POST') {
+        try {
+          const result = await learningExpressionClassification(await readBody(req))
+          console.log(`[Learning] expression type=${result.expressionType || 'none'} cached=${result.cached === true}`)
+          return sendJson(res, 200, { ok: true, online: true, ...result })
+        } catch (error) {
+          if (error?.code === 'voice_record_offline') {
+            console.log(`[Learning] expression offline reason=${error?.message || error}`)
+            return sendJson(res, 200, {
+              ok: true,
+              online: false,
+              eligible: false,
+              expressionType: '',
+              error: error?.message || String(error),
+            })
+          }
+          console.log(`[Learning] expression failed: ${error?.message || error}`)
+          return sendJson(res, Number(error?.status) || 502, { ok: false, error: error?.message || String(error) })
+        }
+      }
+
+      if (url.pathname === '/learning/practice' && req.method === 'POST') {
+        try {
+          const body = await readBody(req, BODY_LIMITS.vocabularyPractice)
+          const result = await vocabularyPracticeTurn(body)
+          console.log(`[Learning] practice action=${body?.action === 'start' ? 'start' : 'turn'} vocabulary=${Array.isArray(body?.vocabulary) ? body.vocabulary.length : 0} history=${Array.isArray(body?.history) ? body.history.length : 0}`)
+          return sendJson(res, 200, { ok: true, ...result })
+        } catch (error) {
+          if (error?.code === 'voice_record_offline') {
+            console.log(`[Learning] practice offline reason=${error?.message || error}`)
+            return sendJson(res, 200, { ok: true, online: false, error: error?.message || String(error) })
+          }
+          console.log(`[Learning] practice failed: ${error?.message || error}`)
+          return sendJson(res, Number(error?.status) || 400, { ok: false, error: error?.message || String(error) })
+        }
+      }
+
+      if (url.pathname === '/learning/literal' && req.method === 'POST') {
+        try {
+          const body = await readBody(req)
+          const result = await learningLiteralTranslation(body)
+          console.log(`[Learning] literal source_chars=${String(body?.sourceText || body?.text || '').length} alignments=${result.alignments.length} cache_hit=${result.cached === true}`)
+          return sendJson(res, 200, { ok: true, online: true, ...result })
+        } catch (error) {
+          if (error?.code === 'voice_record_offline') {
+            console.log(`[Learning] literal offline reason=${error?.message || error}`)
+            return sendJson(res, 200, { ok: true, online: false, error: error?.message || String(error) })
+          }
+          console.log(`[Learning] literal failed: ${error?.message || error}`)
           return sendJson(res, Number(error?.status) || 502, { ok: false, error: error?.message || String(error) })
         }
       }
@@ -1357,7 +2145,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           // не всё подряд, чтобы не считать mtime логов и .git'а.
           const files = [
             'manifest.json', 'background.js', 'youtube-content.js',
-            'youtube-learning-utils.js', 'learning-store.js', 'youtube-learning.js', 'youtube-main-bridge.js',
+            'english-lexeme.js', 'youtube-learning-utils.js', 'learning-store.js', 'youtube-learning.js', 'youtube-main-bridge.js',
             'study/index.html', 'study/study.js', 'study/study.css',
             'aistudio-autoscrape.js', 'aistudio-core.js', 'aistudio-mcp.js',
             'claude-autoscrape.js',
@@ -1800,21 +2588,33 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
             : `https://claude.ai/new#sc-research=${encodeURIComponent(job.id)}`
         if (chatgptConversationUrl) researchState.update(job.id, { url: chatgptConversationUrl, title: null })
         console.log(`[BrowserBridge] research-start id=${job.id} provider=${provider} prompt-len=${prompt.length} attachments=${researchState.get(job.id)?.attachments?.length || 0}/${attachments.length} continue=${chatgptConversationUrl ? 1 : 0}`)
-        try {
-          const extResp = await sendToExtension('mcp_open_research_tab', { url: targetUrl }, 15000)
-          const tabId = extResp?.tabId ?? extResp?.result?.tabId ?? null
-          // tabId в job СРАЗУ, не дожидаясь CS stage=configuring. Если CS не
-          // стартует вовсе (LNA, расширение умерло) — job остаётся queued, и
-          // только эта привязка позволяет tab-closed fallback'у его прибить.
-          if (tabId != null) researchState.update(job.id, { tabId })
-          console.log(`[BrowserBridge] research-start id=${job.id} tab opened tabId=${tabId}`)
-          return sendJson(res, 200, { id: job.id, provider, tabId, url: targetUrl, status: job.status })
-        } catch (e) {
-          console.log(`[BrowserBridge] research-start id=${job.id} OPEN_TAB_FAILED ${e.message} — job создан но вкладку придётся открыть вручную`)
-          // Job создан, но не открыли. Возвращаем 200 с meta — юзер может
-          // сам открыть в браузере URL и CS заработает.
-          return sendJson(res, 200, { id: job.id, provider, tabId: null, url: targetUrl, status: job.status, openError: e.message })
+        const open = await reconcileResearchTabOpen({
+          openTab: () => sendToExtension('mcp_open_research_tab', { url: targetUrl }, 15000),
+          findTab: () => sendToExtension('mcp_find_research_tab', { url: targetUrl }, 10000),
+          getSnapshot: () => researchState.get(job.id),
+          delay: () => new Promise(resolve => setTimeout(resolve, 350)),
+        })
+        // tabId в job СРАЗУ после обычного ACK или reconcile. Без него ручное
+        // закрытие не сможет перевести зависший job через tab-closed fallback.
+        if (open.tabId != null) researchState.update(job.id, { tabId: open.tabId })
+        const liveJob = researchState.get(job.id) || job
+        if (open.openState === 'failed') {
+          console.log(`[BrowserBridge] research-start id=${job.id} OPEN_TAB_FAILED ${open.openError}`)
+        } else if (open.openState !== 'opened') {
+          console.log(`[BrowserBridge] research-start id=${job.id} OPEN_ACK_RECONCILED state=${open.openState} tabId=${open.tabId ?? '-'} warning=${open.openWarning || '-'}`)
+        } else {
+          console.log(`[BrowserBridge] research-start id=${job.id} tab opened tabId=${open.tabId}`)
         }
+        return sendJson(res, 200, {
+          id: job.id,
+          provider,
+          tabId: open.tabId,
+          url: targetUrl,
+          status: liveJob.status,
+          openState: open.openState,
+          ...(open.openWarning ? { openWarning: open.openWarning } : {}),
+          ...(open.openError ? { openError: open.openError } : {}),
+        })
       }
 
       // Content-script читает свой job-payload. Включает prompt — без
@@ -1922,12 +2722,24 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
       // в bridge console log (persistent в production.log).
       if (req.method === 'POST' && url.pathname === '/research-log') {
         const body = await readBody(req)
-        const logId = body.id || '-'
+        const logId = body.id && body.id !== '-'
+          ? body.id
+          : (researchIdFromUrl(body.url || body.data?.url) || '-')
         const tag = String(body.tag || 'unknown').slice(0, 80)
         const tabId = body.tabId != null ? body.tabId : '-'
         const pageUrl = String(body.url || '').slice(0, 160)
         const payload = body.data ? JSON.stringify(body.data).slice(0, 400) : ''
         console.log(`[BrowserBridge] research-log id=${String(logId).slice(0,12)} tabId=${tabId} tag=${tag} url=${pageUrl} ${payload}`)
+        // `cs.boot` может прийти раньше ACK команды open-tab. URL уже несёт
+        // стабильный sc-research id, поэтому это независимое доказательство
+        // совершившегося side effect и источник настоящего tabId.
+        if (logId !== '-' && typeof body.tabId === 'number') {
+          const current = researchState.get(logId)
+          if (current && current.tabId !== body.tabId) {
+            researchState.update(logId, { tabId: body.tabId })
+            console.log(`[BrowserBridge] research id=${logId} tab reconciled from ${tag} tabId=${body.tabId}`)
+          }
+        }
         // Tab-closed fallback: SW шлёт sw.tab.onRemoved для research-вкладок.
         // Закрыл вкладку руками → job не должен висеть «running 30 минут»
         // (реальный кейс — зомби-queued при не стартовавшем CS). Auto-close
@@ -2315,8 +3127,8 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           'aistudio-autoscrape.js', 'aistudio-core.js', 'aistudio-mcp.js',
           'claude-autoscrape.js', 'claude-research.js', 'perplexity-research.js',
           'chatgpt-research.js', 'research-badge.js',
-          'chatgpt-entry-url.js', 'tab-placement.js', 'pill-event-guard.js', 'research-tab-policy.js',
-          'youtube-learning-utils.js', 'learning-store.js', 'youtube-learning.js', 'youtube-main-bridge.js',
+          'chatgpt-entry-url.js', 'tab-placement.js', 'pill-event-guard.js', 'research-tab-policy.js', 'research-tab-registry.js',
+          'english-lexeme.js', 'youtube-learning-utils.js', 'learning-store.js', 'youtube-learning.js', 'youtube-main-bridge.js',
           'study/index.html', 'study/study.js', 'study/study.css',
           'mcp-window-model.js',
           'popup.html', 'popup.js', 'settings.js', 'mcp-handlers.js', 'mcp-content.js',
@@ -2369,10 +3181,22 @@ module.exports = {
     azureTranslatorRequest,
     translateTexts,
     dictionaryLookup,
+    dictionaryExamples,
+    sanitizeDictionaryExamplePairs,
     translatorCacheKey,
     normalizeLearningExplanationPayload,
     learningExplanationCacheKey,
+    normalizeLearningExplanationResult,
+    normalizeLearningExpressionPayload,
+    learningExpressionCacheKey,
+    normalizeLearningExpressionResult,
+    normalizeLearningLiteralPayload,
+    learningLiteralCacheKey,
+    normalizeLiteralAlignments,
+    normalizeVocabularyPracticeRequest,
     parseTimestampedTranscript,
+    parseSrtCues,
+    parseByteRange,
     normalizeVocabularyTerm,
     vocabularySyncPayload,
   },

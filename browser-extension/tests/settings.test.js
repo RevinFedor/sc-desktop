@@ -10,6 +10,7 @@ vm.runInContext(`${source}\n;globalThis.__settingsExports = {
   sanitizeYoutubeSettings,
   YOUTUBE_DEFAULT_SETTINGS,
   diffYoutubeSettings,
+  reconcileYoutubeSettingsPatch,
   chatgptModelsForMode,
   chatgptEffortsFor,
   safeYoutubeChatgptDocumentName,
@@ -22,6 +23,7 @@ const {
   sanitizeYoutubeSettings,
   YOUTUBE_DEFAULT_SETTINGS,
   diffYoutubeSettings,
+  reconcileYoutubeSettingsPatch,
   chatgptModelsForMode,
   chatgptEffortsFor,
   safeYoutubeChatgptDocumentName,
@@ -41,6 +43,13 @@ test('YouTube ChatGPT defaults to Chat with separate Chat and Work pairs', () =>
   assert.equal(settings.chatgpt_show_in_text_field, true);
   assert.equal(settings.learning_ai_explanation, true);
   assert.equal(settings.learning_card_autoplay, false);
+  assert.equal(settings.learning_translation_order, 'natural');
+  assert.equal(settings.learning_subtitle_language_order, 'source_first');
+  assert.equal(settings.learning_subtitle_offset_x, 0);
+  assert.equal(settings.learning_subtitle_offset_y, 0);
+  assert.equal(settings.learning_subtitle_width_px, 1600);
+  assert.equal(settings.learning_subtitle_source_font_px, 34);
+  assert.equal(settings.learning_subtitle_target_font_px, 25);
   assert.equal(settings.chatgpt_model, settings.chatgpt_chat_model);
   assert.equal(settings.chatgpt_effort, settings.chatgpt_chat_effort);
 });
@@ -50,9 +59,49 @@ test('contextual word explanation can be disabled globally', () => {
   assert.equal(sanitizeYoutubeSettings({ learning_ai_explanation: 'false' }).learning_ai_explanation, true);
 });
 
+test('translation order defaults to natural Russian and accepts source order', () => {
+  assert.equal(sanitizeYoutubeSettings({}).learning_translation_mode, 'always');
+  assert.equal(sanitizeYoutubeSettings({ learning_translation_mode: 'hover' }).learning_translation_mode, 'hover');
+  assert.equal(sanitizeYoutubeSettings({ learning_translation_mode: 'never' }).learning_translation_mode, 'never');
+  assert.equal(sanitizeYoutubeSettings({ learning_translation_mode: 'unknown' }).learning_translation_mode, 'always');
+  assert.equal(sanitizeYoutubeSettings({}).learning_translation_order, 'natural');
+  assert.equal(sanitizeYoutubeSettings({ learning_translation_order: 'source' }).learning_translation_order, 'source');
+  assert.equal(sanitizeYoutubeSettings({ learning_translation_order: 'unknown' }).learning_translation_order, 'natural');
+  assert.equal(sanitizeYoutubeSettings({}).learning_subtitle_language_order, 'source_first');
+  assert.equal(sanitizeYoutubeSettings({ learning_subtitle_language_order: 'target_first' }).learning_subtitle_language_order, 'target_first');
+  assert.equal(sanitizeYoutubeSettings({ learning_subtitle_language_order: 'unknown' }).learning_subtitle_language_order, 'source_first');
+});
+
+test('a newer translation mode stays local until an older desktop confirms it', () => {
+  const pending = reconcileYoutubeSettingsPatch(
+    sanitizeYoutubeSettings({ learning_translation_mode: 'never' }),
+    { learning_translation_mode: 'never' },
+    { learning_translation_mode: 'always' },
+  );
+  assert.equal(pending.settings.learning_translation_mode, 'never');
+  assert.deepEqual({ ...pending.confirmedPatch }, {});
+  assert.deepEqual({ ...pending.pendingPatch }, { learning_translation_mode: 'never' });
+
+  const confirmed = reconcileYoutubeSettingsPatch(
+    pending.settings,
+    pending.pendingPatch,
+    { learning_translation_mode: 'never' },
+  );
+  assert.equal(confirmed.settings.learning_translation_mode, 'never');
+  assert.deepEqual({ ...confirmed.confirmedPatch }, { learning_translation_mode: 'never' });
+  assert.deepEqual({ ...confirmed.pendingPatch }, {});
+});
+
 test('card autoplay is opt-in and preserves an explicit choice', () => {
   assert.equal(sanitizeYoutubeSettings({}).learning_card_autoplay, false);
   assert.equal(sanitizeYoutubeSettings({ learning_card_autoplay: true }).learning_card_autoplay, true);
+  assert.equal(sanitizeYoutubeSettings({ learning_subtitle_offset_x: 4 }).learning_subtitle_offset_x, 1);
+  assert.equal(sanitizeYoutubeSettings({ learning_subtitle_offset_y: -4 }).learning_subtitle_offset_y, -1);
+  assert.equal(sanitizeYoutubeSettings({ learning_subtitle_width_px: 9999 }).learning_subtitle_width_px, 2400);
+  assert.equal(sanitizeYoutubeSettings({ learning_subtitle_source_font_px: 999 }).learning_subtitle_source_font_px, 64);
+  assert.equal(sanitizeYoutubeSettings({ learning_subtitle_source_font_px: 1 }).learning_subtitle_source_font_px, 16);
+  assert.equal(sanitizeYoutubeSettings({ learning_subtitle_target_font_px: 999 }).learning_subtitle_target_font_px, 52);
+  assert.equal(sanitizeYoutubeSettings({ learning_subtitle_target_font_px: 1 }).learning_subtitle_target_font_px, 14);
 });
 
 test('retired ChatGPT model and effort migrate to current Chat without changing Work defaults', () => {

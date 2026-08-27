@@ -111,9 +111,32 @@ test('desktop preserves the global contextual word explanation toggle', () => {
   assert.equal(sanitizeExtensionYoutube({ learning_ai_explanation: false }).learning_ai_explanation, false)
 })
 
+test('desktop persists the selected translation word order', () => {
+  assert.equal(sanitizeExtensionYoutube({}).learning_translation_mode, 'always')
+  assert.equal(sanitizeExtensionYoutube({ learning_translation_mode: 'hover' }).learning_translation_mode, 'hover')
+  assert.equal(sanitizeExtensionYoutube({ learning_translation_mode: 'never' }).learning_translation_mode, 'never')
+  assert.equal(sanitizeExtensionYoutube({ learning_translation_mode: 'unknown' }).learning_translation_mode, 'always')
+  assert.equal(sanitizeExtensionYoutube({}).learning_translation_order, 'natural')
+  assert.equal(sanitizeExtensionYoutube({ learning_translation_order: 'source' }).learning_translation_order, 'source')
+  assert.equal(sanitizeExtensionYoutube({ learning_translation_order: 'unknown' }).learning_translation_order, 'natural')
+  assert.equal(sanitizeExtensionYoutube({}).learning_subtitle_language_order, 'source_first')
+  assert.equal(sanitizeExtensionYoutube({ learning_subtitle_language_order: 'target_first' }).learning_subtitle_language_order, 'target_first')
+  assert.equal(sanitizeExtensionYoutube({ learning_subtitle_language_order: 'unknown' }).learning_subtitle_language_order, 'source_first')
+})
+
 test('desktop keeps card autoplay off by default and persists opt-in', () => {
   assert.equal(sanitizeExtensionYoutube({}).learning_card_autoplay, false)
   assert.equal(sanitizeExtensionYoutube({ learning_card_autoplay: true }).learning_card_autoplay, true)
+  assert.equal(sanitizeExtensionYoutube({ learning_subtitle_offset_x: 4 }).learning_subtitle_offset_x, 1)
+  assert.equal(sanitizeExtensionYoutube({ learning_subtitle_offset_y: -4 }).learning_subtitle_offset_y, -1)
+  assert.equal(sanitizeExtensionYoutube({}).learning_subtitle_width_px, 1600)
+  assert.equal(sanitizeExtensionYoutube({ learning_subtitle_width_px: 9999 }).learning_subtitle_width_px, 2400)
+  assert.equal(sanitizeExtensionYoutube({}).learning_subtitle_source_font_px, 34)
+  assert.equal(sanitizeExtensionYoutube({}).learning_subtitle_target_font_px, 25)
+  assert.equal(sanitizeExtensionYoutube({ learning_subtitle_source_font_px: 999 }).learning_subtitle_source_font_px, 64)
+  assert.equal(sanitizeExtensionYoutube({ learning_subtitle_source_font_px: 1 }).learning_subtitle_source_font_px, 16)
+  assert.equal(sanitizeExtensionYoutube({ learning_subtitle_target_font_px: 999 }).learning_subtitle_target_font_px, 52)
+  assert.equal(sanitizeExtensionYoutube({ learning_subtitle_target_font_px: 1 }).learning_subtitle_target_font_px, 14)
 })
 
 test('desktop accepts current Chat o3 and Instant on GPT-5.6', () => {

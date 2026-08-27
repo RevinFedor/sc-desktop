@@ -24,6 +24,7 @@ test('translation cache stores provider payload without changing its shape', () 
   const cached = db.getTranslationCache('abc')
   assert.deepEqual(cached.response, response)
   assert.equal(cached.provider, 'azure')
+
 })
 
 test('one vocabulary entry keeps examples from multiple video cues', () => {

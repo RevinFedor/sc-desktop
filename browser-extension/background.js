@@ -11,10 +11,12 @@
 
 // MCP-Bridge подключается в SW через importScripts (MV3 разрешает).
 // mcp-handlers.js сам вызывает connectMcpBridge() в конце файла.
-try { importScripts('learning-store.js'); }
+try { importScripts('english-lexeme.js', 'learning-store.js'); }
 catch (e) { console.warn('[SC-BG] learning-store load failed:', e); }
 try { importScripts('mcp-window-model.js'); }
 catch (e) { console.warn('[SC-BG] mcp-window-model load failed:', e); }
+try { importScripts('research-tab-registry.js'); }
+catch (e) { console.warn('[SC-BG] research-tab-registry load failed:', e); }
 try { importScripts('mcp-handlers.js'); }
 catch (e) { console.warn('[SC-BG] mcp-handlers load failed:', e); }
 try { importScripts('tab-placement.js'); }
@@ -147,9 +149,10 @@ async function persistYoutubeSettingsPatch(rawPatch) {
       body: JSON.stringify({ patch }),
     });
     if (!saved?.settings) throw new Error('desktop returned no settings');
-    const canonical = sanitizeYoutubeSettings({ ...next, ...saved.settings });
+    const reconciliation = reconcileYoutubeSettingsPatch(next, patch, saved.settings);
+    const canonical = reconciliation.settings;
     await storageSyncSet({ __yt: canonical });
-    await clearSentYoutubePendingPatch(patch);
+    await clearSentYoutubePendingPatch(reconciliation.confirmedPatch);
     return { settings: canonical, online: true };
   } catch (error) {
     scBgDbg('youtube.settings.patch_queued', {
@@ -193,6 +196,7 @@ function normalizeChatgptMode(mode) {
 // initialized=false означает, что реальные старые настройки пока есть только
 // в chrome.storage; сначала загружаем их в desktop, затем читаем canonical.
 let youtubeSettingsRefreshPromise = null;
+let youtubeSettingsPatchQueue = Promise.resolve();
 async function loadFreshYoutubeSettings() {
   if (youtubeSettingsRefreshPromise) return youtubeSettingsRefreshPromise;
   youtubeSettingsRefreshPromise = loadFreshYoutubeSettingsOnce();
@@ -211,6 +215,7 @@ async function loadFreshYoutubeSettingsOnce() {
     ? pendingRaw.__sc_yt_pending_desktop_patch
     : {};
   const local = sanitizeYoutubeSettings({ ...(localRaw.__yt || {}), ...pending });
+  let confirmedPending = pending;
   try {
     const remote = await fetchBridgeJson(YOUTUBE_SETTINGS_PATH);
     const schemaVersion = Number(remote?.schemaVersion);
@@ -246,13 +251,19 @@ async function loadFreshYoutubeSettingsOnce() {
         if (saved?.ok !== true || !saved.settings || typeof saved.settings !== 'object') {
           throw new Error('desktop returned no settings after YouTube patch');
         }
-        merged = sanitizeYoutubeSettings({ ...local, ...remote.settings, ...saved.settings });
+        const reconciliation = reconcileYoutubeSettingsPatch(
+          local,
+          pending,
+          { ...remote.settings, ...saved.settings },
+        );
+        merged = reconciliation.settings;
+        confirmedPending = reconciliation.confirmedPatch;
       } else {
         merged = sanitizeYoutubeSettings({ ...local, ...remote.settings });
       }
     }
     await storageSyncSet({ __yt: merged });
-    await clearSentYoutubePendingPatch(pending);
+    await clearSentYoutubePendingPatch(confirmedPending);
     return merged;
   } catch (error) {
     scBgDbg('youtube.settings.fallback_local', { err: error?.message || String(error) });
@@ -1023,6 +1034,9 @@ chrome.debugger.onDetach.addListener(async (source, reason) => {
 // автоматически произошёл; снимаем из set чтобы re-attach был возможен
 // если юзер откроет новую aistudio в этой же tabId (редкий случай).
 chrome.tabs.onRemoved.addListener((tabId) => {
+  if (typeof scForgetResearchTabByTabId === 'function') {
+    scForgetResearchTabByTabId(chrome, tabId).catch(() => {});
+  }
   if (SC_DEBUGGER_ATTACHED.has(tabId)) {
     SC_DEBUGGER_ATTACHED.delete(tabId);
     scBgDbg('debugger.tab_removed', { tabId });
@@ -1352,6 +1366,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   postLifecycleLog('sw.tab.onUpdated', tabId, patch);
 });
 chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
+  if (typeof scReplaceResearchTabId === 'function') {
+    scReplaceResearchTabId(chrome, removedTabId, addedTabId).catch(() => {});
+  }
   if (!RESEARCH_TABS.has(removedTabId)) return;
   postLifecycleLog('sw.tab.onReplaced', removedTabId, { addedTabId });
   // Перенесём tracking на новый id.
@@ -1470,7 +1487,11 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   }
 
   if (req?.type === 'sc-youtube-settings-patch') {
-    persistYoutubeSettingsPatch(req.patch)
+    const queued = youtubeSettingsPatchQueue
+      .catch(() => {})
+      .then(() => persistYoutubeSettingsPatch(req.patch));
+    youtubeSettingsPatchQueue = queued;
+    queued
       .then(result => sendResponse({ ok: true, ...result }))
       .catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;

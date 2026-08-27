@@ -344,6 +344,11 @@ function activityHistoryRows() {
     rutube: db.listSourcelessJobs({ type: 'rutube_transcribe', limit: 150 }),
     boosty: db.listSourcelessJobs({ type: 'boosty_transcribe', limit: 150 }),
     telegramSingle: db.listSourcelessJobs({ type: 'tg_fetch', limit: 150 }),
+    telegramLive: handle.prepare(
+      `SELECT * FROM jobs
+        WHERE type IN ('tg_live_search', 'tg_live_context', 'tg_live_range')
+        ORDER BY started_at DESC LIMIT 150`
+    ).all(),
     youtubeBatch: db.listSourcelessJobs({ type: 'yt_batch_transcribe', limit: 150 }),
     instagramBatch: db.listSourcelessJobs({ type: 'ig_batch_transcribe', limit: 150 }),
     youtubeComments: handle.prepare(

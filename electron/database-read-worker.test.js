@@ -54,6 +54,7 @@ test('large aggregate read runs off the parent event loop', async () => {
     'instagramBatch',
     'local',
     'rutube',
+    'telegramLive',
     'telegramSingle',
     'youtube',
     'youtubeBatch',

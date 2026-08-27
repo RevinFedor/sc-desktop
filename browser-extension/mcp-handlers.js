@@ -132,6 +132,21 @@ async function handleMcpCommand(command) {
     return { success: true, windowId: command.windowId };
   }
 
+  if (action === 'mcp_find_research_tab') {
+    const target = String(command.url || '');
+    if (!target) return { success: false, error: 'url required' };
+    if (typeof scFindResearchTab !== 'function') {
+      return { success: false, error: 'research tab registry unavailable' };
+    }
+    const existing = await scFindResearchTab(chrome, target);
+    return {
+      success: true,
+      tabId: existing?.id ?? null,
+      url: existing?.url || target,
+      found: !!existing,
+    };
+  }
+
   // Resolve target tab
   let targetTabId = tabId;
   if (!targetTabId) {
@@ -209,10 +224,24 @@ async function handleMcpCommand(command) {
     // Раньше был focus-pulse 600мс (открыть active:true, подождать, вернуть
     // фокус на prevActive) — юзер видел флэш. Заменили на autoDiscardable,
     // юзер вообще ничего не видит.
-    const tab = await chrome.tabs.create({
-      url: command.url,
-      active: false,
-    });
+    const target = String(command.url || '');
+    if (!target) return { success: false, error: 'url required' };
+    const researchId = typeof scResearchIdFromUrl === 'function' ? scResearchIdFromUrl(target) : null;
+    let tab = typeof scFindResearchTab === 'function'
+      ? await scFindResearchTab(chrome, target)
+      : null;
+    const reused = !!tab;
+    if (!tab) {
+      tab = await chrome.tabs.create({
+        url: target,
+        active: false,
+      });
+    }
+    // Durable identity ДО debugger/load awaits. Если SW reload'нется после
+    // tabs.create, повтор команды найдёт тот же tab и не создаст дубль.
+    if (researchId && typeof scRememberResearchTab === 'function') {
+      await scRememberResearchTab(chrome, researchId, tab);
+    }
     // Set autoDiscardable=false ASAP — до load complete, чтобы Yandex
     // ни секунды не считал её never-active кандидатом на discard.
     try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (e) {
@@ -252,16 +281,18 @@ async function handleMcpCommand(command) {
     } catch {}
     // Ждём load — без этого следующие операции на tabId упадут
     // "No response from any frame".
-    await new Promise(resolve => {
-      function l(id, info) {
-        if (id === tab.id && info.status === 'complete') {
-          chrome.tabs.onUpdated.removeListener(l);
-          resolve();
+    if (tab.status !== 'complete') {
+      await new Promise(resolve => {
+        function l(id, info) {
+          if (id === tab.id && info.status === 'complete') {
+            chrome.tabs.onUpdated.removeListener(l);
+            resolve();
+          }
         }
-      }
-      chrome.tabs.onUpdated.addListener(l);
-      setTimeout(() => { chrome.tabs.onUpdated.removeListener(l); resolve(); }, 15000);
-    });
+        chrome.tabs.onUpdated.addListener(l);
+        setTimeout(() => { chrome.tabs.onUpdated.removeListener(l); resolve(); }, 15000);
+      });
+    }
     // Visually distinguish MCP-tab: extension's icon as favicon (sites cannot
     // be put into a specific Yandex tab group programmatically, see research).
     try { await markTabAsMcpVisually(tab.id); } catch {}
@@ -271,7 +302,7 @@ async function handleMcpCommand(command) {
     // LNA, расширение протухло) не даёт sw.tab.onRemoved при ручном закрытии,
     // и bridge не может перевести вечно-queued job в error (tab-closed fallback).
     try { RESEARCH_TABS.add(tab.id); } catch {}
-    return { success: true, tabId: tab.id, url: tab.url };
+    return { success: true, tabId: tab.id, url: tab.url || target, researchId, reused };
   }
 
   // ── AI Studio job-runner ──────────────────────────────────────────
