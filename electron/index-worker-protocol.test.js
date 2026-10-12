@@ -28,6 +28,17 @@ test('normalizes source identity and full-index limits', () => {
   assert.throws(() => normalizeStartRequest({ sourceId: null }), /sourceId required/)
 })
 
+test('optional local item selection is bounded, deduplicated and never coerces invalid IDs', () => {
+  assert.deepEqual(normalizeStartRequest({ sourceId: 48, itemIds: [3, '1', 3, 2] }), {
+    sourceId: 48, limit: null, origin: 'unknown', itemIds: [1, 2, 3],
+  })
+  assert.deepEqual(normalizeStartRequest({ sourceId: 48, itemIds: [] }).itemIds, [])
+  for (const itemIds of [[null], [true], [-1], [0], [1.5], ['not-an-id'], '1,2']) {
+    assert.throws(() => normalizeStartRequest({ sourceId: 48, itemIds }), /itemIds/)
+  }
+  assert.throws(() => normalizeStartRequest({ sourceId: 48, itemIds: Array(5001).fill(1) }), /at most 5000/)
+})
+
 test('worker messages preserve cumulative and monotonic progress', () => {
   let state = createStartingState({ id: 7, sourceId: 48 })
   state = applyWorkerMessage(state, {
@@ -62,6 +73,38 @@ test('live and database ids both address the same job', () => {
   assert.equal(matchesJobId(state, 'index-3'), true)
   assert.equal(matchesJobId(state, '400'), true)
   assert.equal(matchesJobId(state, 'db-400'), false)
+})
+
+test('fragment progress exposes its unit and selection instead of claiming message counts', () => {
+  let state = createStartingState({ id: 8, sourceId: 48 })
+  state = applyWorkerMessage(state, {
+    type: 'started', dbRowId: 902, itemsTotal: 6, initialIndexed: 2,
+    unit: 'fragments', messagesSelected: 3, indexVersion: 'fixture-v1',
+  })
+  state = applyWorkerMessage(state, { type: 'progress', itemsDone: 4, itemsTotal: 6 })
+  assert.equal(snapshot(state).items_done, 6)
+  assert.equal(snapshot(state).items_total, 8)
+  assert.equal(snapshot(state).unit, 'fragments')
+  assert.equal(snapshot(state).messages_selected, 3)
+  assert.deepEqual(runningStatus(state), {
+    state: 'running', done: 6, total: 8, jobId: 'index-8', dbId: 902,
+    unit: 'fragments', messages_selected: 3, index_version: 'fixture-v1',
+    fragments_total: 0, fragments_embedded: 0,
+  })
+})
+
+test('message completion does not count staged fragments as published messages', () => {
+  let state = createStartingState({ id: 9, sourceId: 48 })
+  state = applyWorkerMessage(state, {
+    type: 'started', itemsTotal: 2, initialIndexed: 1,
+    unit: 'messages', messagesSelected: 3, fragmentsTotal: 12,
+  })
+  state = applyWorkerMessage(state, { type: 'progress', itemsDone: 0, itemsTotal: 2, fragmentsEmbedded: 4 })
+  assert.equal(snapshot(state).unit, 'messages')
+  assert.equal(snapshot(state).items_done, 1)
+  assert.equal(snapshot(state).items_total, 3)
+  assert.equal(snapshot(state).fragments_embedded, 4)
+  assert.equal(snapshot(state).fragments_total, 12)
 })
 
 test('context text keeps five prior lines before the target and clamps captions', () => {

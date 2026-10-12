@@ -78,6 +78,11 @@ contextBridge.exposeInMainWorld('api', {
   ytChannelLookup:        (payload) => ipcRenderer.invoke('yt:channelLookup', payload),
   ytChannelFetch:         (params)  => ipcRenderer.invoke('yt:channelFetch', params),
   ytBatchTranscribe:      (params)  => ipcRenderer.invoke('yt:batchTranscribe', params),
+  ytIndex:                (params)  => ipcRenderer.invoke('yt:index', params),
+  ytIndexStatus:          (id)      => ipcRenderer.invoke('yt:indexStatus', id),
+  ytIndexCancel:          (id)      => ipcRenderer.invoke('yt:indexCancel', id),
+  ytSemanticSearch:       (params)  => ipcRenderer.invoke('yt:semanticSearch', params),
+  ytSemanticContext:      (params)  => ipcRenderer.invoke('yt:semanticContext', params),
   ytItemsState:           (payload) => ipcRenderer.invoke('yt:itemsState', payload),
   ytItemsStateGlobal:     (payload) => ipcRenderer.invoke('yt:itemsStateGlobal', payload),
   ytItemsCommentsState:   (payload) => ipcRenderer.invoke('yt:itemsCommentsState', payload),
@@ -127,6 +132,13 @@ contextBridge.exposeInMainWorld('api', {
   researchStart:     (payload) => ipcRenderer.invoke('research:start', payload),
   researchStatus:    (payload) => ipcRenderer.invoke('research:status', payload),
   researchPplxModels: ()       => ipcRenderer.invoke('research:pplxModels'),
+  researchOpenReady: () => ipcRenderer.invoke('research:open-job-ready'),
+  researchOpenAck: payload => ipcRenderer.invoke('research:open-job-ack', payload),
+  onResearchOpenRequest: fn => {
+    const handler = (_event, payload) => fn(payload)
+    ipcRenderer.on('research:open-job-request', handler)
+    return () => ipcRenderer.removeListener('research:open-job-request', handler)
+  },
   // Стоп джобы (job→error + закрыть вкладку) и tab-команды (focus/close/open-url)
   // для попапа «Запущенные MCP» / страницы джобы — тоже через main (CORS).
   researchStop:      (payload) => ipcRenderer.invoke('research:stop', payload),

@@ -72,3 +72,21 @@ test('tab replacement keeps the research identity attached to the new tab id', a
   await scReplaceResearchTabId(chromeApi, 21, 22);
   assert.equal(chromeApi.state[RESEARCH_TAB_REGISTRY_KEY]['replace-me'].tabId, 22);
 });
+
+test('ten concurrent registrations survive URL rewrites and one tab closing independently', async () => {
+  const chromeApi = fakeChrome();
+  const tabs = Array.from({ length: 10 }, (_, i) => ({
+    id: 100 + i, windowId: 7, url: `https://chatgpt.com/?sc-research=parallel-${i}`,
+  }));
+  tabs.forEach(tab => chromeApi.tabsMap.set(tab.id, tab));
+  await Promise.all(tabs.map((tab, i) => scRememberResearchTab(chromeApi, `parallel-${i}`, tab)));
+  assert.equal(Object.keys(chromeApi.state[RESEARCH_TAB_REGISTRY_KEY]).length, 10);
+  tabs.forEach((tab, i) => chromeApi.tabsMap.set(tab.id, { ...tab, url: `https://chatgpt.com/c/conversation-${i}` }));
+  const restored = await Promise.all(tabs.map(tab => scFindResearchTab(chromeApi, tab.url)));
+  assert.deepEqual(restored.map(tab => tab.id), tabs.map(tab => tab.id));
+  await scForgetResearchTabByTabId(chromeApi, 104);
+  chromeApi.tabsMap.delete(104);
+  assert.equal(await scFindResearchTab(chromeApi, tabs[4].url), null);
+  assert.equal(Object.keys(chromeApi.state[RESEARCH_TAB_REGISTRY_KEY]).length, 9);
+  assert.equal((await scFindResearchTab(chromeApi, tabs[9].url)).id, 109);
+});

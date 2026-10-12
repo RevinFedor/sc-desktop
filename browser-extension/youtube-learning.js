@@ -15,19 +15,29 @@
   }
   const learningStore = window.__scLearningStore || null;
   const Lexeme = window.__scEnglishLexeme || null;
+  const vocabularySaves = window.__scCreateVocabularySaveObserver?.(payload => bridgeJson('/learning/catalogue', { method: 'POST', body: payload }));
 
   const BRIDGE = 'http://127.0.0.1:53127';
   const ROOT_ID = 'sc-yt-learning-root';
   const WORD_POPOVER_ID = 'sc-yt-word-popover';
+  const QUICK_WORD_POPOVER_ID = 'sc-yt-quick-word-popover';
   const MAIN_BRIDGE_ID = 'sc-yt-learning-main-bridge';
   const HIDE_NATIVE_CLASS = 'sc-yt-learning-hide-native';
   const REPLACE_LEGACY_CLASS = 'sc-yt-learning-replace-legacy';
   const WORD_DOUBLE_CLICK_MS = 460;
+  // Avoid flicker while crossing words without making the tooltip feel delayed.
+  const QUICK_WORD_HOVER_DELAY_MS = 70;
   const SUBTITLE_SAFE_SIDE_INSET = 68;
   const LITERAL_REQUEST_CONCURRENCY = 4;
+  // Warm at 10 ready cues, then keep a rolling target of 16 ahead.
+  const YOUTUBE_TRANSLATION_INITIAL_AHEAD = 10;
+  const YOUTUBE_TRANSLATION_PREFETCH_AHEAD = 16;
+  const YOUTUBE_TRANSLATION_PREFETCH_BEHIND = 2;
   const EXTERNAL_LITERAL_PREFETCH_AHEAD = 16;
   const EXTERNAL_LITERAL_INITIAL_AHEAD = 10;
-  const YOUTUBE_PLAYER_PAGE = () => location.pathname.startsWith('/watch') || location.pathname.startsWith('/shorts/');
+  const YOUTUBE_PLAYER_PAGE = () => location.pathname.startsWith('/watch')
+    || location.pathname.startsWith('/live/')
+    || location.pathname.startsWith('/shorts/');
   const PLAYER_PAGE = () => Boolean(externalMedia?.anchor?.isConnected && externalMedia?.video?.isConnected)
     || YOUTUBE_PLAYER_PAGE();
 
@@ -38,6 +48,8 @@
     swap: '<svg viewBox="0 0 24 24"><path d="m7 7 3-3-3-3v2H3v2h4v2Zm10 10-3 3 3 3v-2h4v-2h-4v-2ZM5 8h14a2 2 0 0 1 2 2v2h-2v-2H5v2l-3-3 3-3v2Zm14 8H5a2 2 0 0 1-2-2v-2h2v2h14v-2l3 3-3 3v-2Z"/></svg>',
     pause: '<svg viewBox="0 0 24 24"><path d="M6 4h4v16H6V4Zm8 0h4v16h-4V4Z"/></svg>',
     settings: '<svg viewBox="0 0 24 24"><path d="m19.4 13 .1-1-.1-1 2-1.6-2-3.4-2.5 1a8 8 0 0 0-1.7-1L15 3.3h-4L10.6 6a8 8 0 0 0-1.7 1L6.4 6 4.4 9.4l2 1.6-.1 1 .1 1-2 1.6 2 3.4 2.5-1a8 8 0 0 0 1.7 1l.4 2.7h4l.4-2.7a8 8 0 0 0 1.7-1l2.5 1 2-3.4-2-1.6ZM13 16a4 4 0 1 1 0-8 4 4 0 0 1 0 8Z"/></svg>',
+    buffer: '<svg viewBox="0 0 24 24"><path d="M4 4h16v4H4V4Zm0 6h16v4H4v-4Zm0 6h10v4H4v-4Zm12 0h4v4h-4v-4Z"/></svg>',
+    translation: '<svg viewBox="0 0 24 24"><path d="M3 5h18v14H3V5Zm2 2v10h14V7H5Zm2 2h10v2H7V9Zm0 4h7v2H7v-2Z"/></svg>',
     close: '<svg viewBox="0 0 24 24"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12l5.6 5.6-1.4 1.4-5.6-5.6L6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>',
     speaker: '<svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2-3.74v7.48A4.5 4.5 0 0 0 16.5 12Zm-2-8.5v2.06a7 7 0 0 1 0 12.88v2.06a9 9 0 0 0 0-17Z"/></svg>',
     copy: '<svg viewBox="0 0 24 24"><path d="M8 7V3h13v13h-4v5H3V7h5Zm2 0h7v7h2V5h-9v2Zm5 2H5v10h10V9Z"/></svg>',
@@ -80,6 +92,7 @@
   let root = null;
   let subtitleCard = null;
   let sourceWrap = null;
+  let subtitleLines = null;
   let sourceRow = null;
   let translationRow = null;
   let statusRow = null;
@@ -108,20 +121,31 @@
   let literalGeneration = 0;
   let prefetchGeneration = 0;
   let prefetchRunning = false;
+  let prefetchRerunRequested = false;
+  let naturalRequestsActive = 0;
+  let naturalLastLatencyMs = 0;
+  let literalLastLatencyMs = 0;
+  let literalLastQueueWaitMs = 0;
+  let bufferDiagnosticsFrame = null;
+  let lastBufferDiagnosticsSignature = '';
+  const bufferDiagnosticsPanels = [];
   let settingsRefreshBusy = false;
   let settingsPersistQueue = Promise.resolve();
   let lastTickAt = 0;
   let lastVideoTimeMs = null;
   let autoPausedCueKey = '';
   let subtitleHovered = false;
+  let fullTranslationMetaDown = false;
   let wordPopoverOpen = false;
   let phraseSelectionOpen = false;
+  let russianSelection = null, russianClickTimer = null, lastRussianClick = null, hoveredRussianWord = null;
   let phraseSelection = null;
   let phraseSelectionAnchor = null;
   let phraseSelectionFocus = null;
   let lastWordClick = null;
   let hoveredPhraseWord = null;
   let phraseHint = null;
+  let phraseHintResizeObserver = null;
   let phraseAnalysis = null;
   let phraseAnalysisGeneration = 0;
   let selectionHandoffGeneration = 0;
@@ -140,7 +164,6 @@
   let subtitleLastPlacement = null;
   let subtitleCardResizeObserver = null;
   let subtitleLayoutFrame = null;
-  let subtitleWidthClampTimer = null;
   let subtitleCueLayoutSignature = '';
   let subtitleMeasureContext = null;
   let viewportScrollFrame = null;
@@ -151,20 +174,31 @@
   const literalTranslationPromises = new Map();
   const pendingLiteralTexts = new Set();
   const failedLiteralTexts = new Set();
+  const literalErrorsByText = new Map();
   const literalRequestQueue = [];
   let literalRequestsActive = 0;
   const snapshotRequests = new Map();
   const wordStates = new Map();
+  const wordStateOperations = new Map();
+  const wordPopoverHistory = [];
+  let pendingWordClickTimer = null;
   const wordFormStates = new Map();
+  const quickWordTranslations = new Map();
+  const quickTranslationPending = new Set();
+  let quickWordHoverTimer = null;
+  let quickWordHideTimer = null;
+  let quickWordHoverAnchor = null;
+  let quickWordPointer = null;
+  let quickWordHoverToken = 0;
   let expressionEntries = [];
   let currentExpressionMatches = [];
   let lastLearningStateSignature = '';
 
-  function debugSink() {
-    let sink = document.getElementById('sc-yt-learning-debug');
+  function debugSink(id = 'sc-yt-learning-debug') {
+    let sink = document.getElementById(id);
     if (sink) return sink;
     sink = document.createElement('pre');
-    sink.id = 'sc-yt-learning-debug';
+    sink.id = id;
     sink.style.cssText = 'position:fixed;left:-99999px;top:0;width:0;height:0;visibility:hidden;pointer-events:none;';
     (document.body || document.documentElement).appendChild(sink);
     return sink;
@@ -179,7 +213,15 @@
     } catch {}
   }
 
+  function logLearningAction(message, data) {
+    log(message, data);
+    const sink = debugSink('sc-yt-learning-actions');
+    const entry = `${new Date().toISOString()} ${message} ${JSON.stringify(data || {})}`;
+    sink.textContent = `${sink.textContent || ''}\n${entry}`.trim().split('\n').slice(-120).join('\n');
+  }
+
   function pumpLiteralRequestQueue() {
+    reprioritizeLiteralRequestQueue(currentCueIndex);
     while (literalRequestsActive < LITERAL_REQUEST_CONCURRENCY && literalRequestQueue.length) {
       const item = literalRequestQueue.shift();
       if (item.generation !== literalGeneration) {
@@ -187,19 +229,48 @@
         continue;
       }
       literalRequestsActive += 1;
+      item.startedAt = performance.now();
+      literalLastQueueWaitMs = Math.max(0, item.startedAt - item.queuedAt);
+      scheduleBufferDiagnosticsUpdate();
       Promise.resolve()
         .then(item.run)
         .then(item.resolve, item.reject)
         .finally(() => {
           literalRequestsActive = Math.max(0, literalRequestsActive - 1);
+          scheduleBufferDiagnosticsUpdate();
           pumpLiteralRequestQueue();
         });
     }
+    scheduleBufferDiagnosticsUpdate();
   }
 
-  function queueLiteralRequest(run, generation) {
+  function literalRequestPriority(index, centerIndex = currentCueIndex) {
+    if (!Number.isInteger(index)) return Number.MAX_SAFE_INTEGER;
+    if (!Number.isInteger(centerIndex) || centerIndex < 0) return index;
+    if (index >= centerIndex) return index - centerIndex;
+    return YOUTUBE_TRANSLATION_PREFETCH_AHEAD + 1 + (centerIndex - index);
+  }
+
+  function reprioritizeLiteralRequestQueue(centerIndex = currentCueIndex) {
+    for (const item of literalRequestQueue) item.priority = literalRequestPriority(item.index, centerIndex);
+    literalRequestQueue.sort((left, right) => left.priority - right.priority || left.queuedAt - right.queuedAt);
+  }
+
+  function queueLiteralRequest(run, generation, metadata = {}) {
     return new Promise((resolve, reject) => {
-      literalRequestQueue.push({ run, generation, resolve, reject });
+      const queuedAt = performance.now();
+      literalRequestQueue.push({
+        run,
+        generation,
+        resolve,
+        reject,
+        index: Number.isInteger(metadata.index) ? metadata.index : -1,
+        key: String(metadata.key || ''),
+        queuedAt,
+        startedAt: 0,
+        priority: literalRequestPriority(metadata.index),
+      });
+      scheduleBufferDiagnosticsUpdate();
       pumpLiteralRequestQueue();
     });
   }
@@ -209,8 +280,12 @@
     literalTranslationsByText.clear();
     pendingLiteralTexts.clear();
     failedLiteralTexts.clear();
+    literalErrorsByText.clear();
     literalTranslationPromises.clear();
     for (const item of literalRequestQueue.splice(0)) item.resolve(false);
+    literalLastLatencyMs = 0;
+    literalLastQueueWaitMs = 0;
+    scheduleBufferDiagnosticsUpdate();
   }
 
   function injectCss() {
@@ -250,7 +325,10 @@
         max-width: calc(100% - 136px);
         box-sizing: border-box;
         text-align: center;
-        pointer-events: auto;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        pointer-events: none;
         filter: drop-shadow(0 2px 3px rgba(0,0,0,.75));
       }
       #${ROOT_ID}[data-position="bottom"] .sc-learning-subtitle-card { bottom: 10%; }
@@ -265,12 +343,17 @@
         padding: 5px 12px;
         border-radius: 6px;
         background: rgba(8, 8, 10, .82);
+        pointer-events: auto;
         box-decoration-break: clone;
         -webkit-box-decoration-break: clone;
         line-height: 1.32;
         white-space: nowrap;
         transition: background-color 120ms ease, box-shadow 120ms ease;
       }
+      #${ROOT_ID} .sc-learning-translation { width:max-content; max-width:none; margin:0; flex-shrink:0; white-space:nowrap; overflow-wrap:normal; }
+      #${ROOT_ID} [data-saving="1"], #${WORD_POPOVER_ID} [data-saving="1"] { animation: sc-word-saving 1.4s ease-in-out infinite; }
+      @keyframes sc-word-saving { 0%, 100% { background-color: rgba(139,92,246,.14); } 50% { background-color: rgba(139,92,246,.52); } }
+      @media (prefers-reduced-motion: reduce) { #${ROOT_ID} [data-saving="1"], #${WORD_POPOVER_ID} [data-saving="1"] { animation: none; background: rgba(139,92,246,.35); } }
       #${ROOT_ID}[data-hover-hold="scheduled"] .sc-learning-subtitle-card:hover .sc-learning-source,
       #${ROOT_ID}[data-hover-hold="scheduled"] .sc-learning-subtitle-card:hover .sc-learning-translation {
         background: rgba(18, 11, 26, .83);
@@ -284,6 +367,18 @@
         width:fit-content;
         max-width:100%;
         margin:0 auto;
+      }
+      #${ROOT_ID} .sc-learning-lines {
+        display:flex;
+        flex-direction:column;
+        align-items:center;
+        width:fit-content;
+        max-width:100%;
+        margin:0 auto;
+        pointer-events:auto;
+      }
+      #${ROOT_ID}[data-translation-mode="never"][data-full-translation-reveal="0"] .sc-learning-lines {
+        pointer-events:none;
       }
       #${ROOT_ID} .sc-learning-source-wrap .sc-learning-source { margin:0; }
       #${ROOT_ID} .sc-learning-copy-control {
@@ -385,6 +480,7 @@
       #${ROOT_ID} .sc-learning-copy-divider { width:1px; height:18px; margin:0 2px; background:#3f3f46; }
       #${ROOT_ID} .sc-learning-source:empty,
       #${ROOT_ID} .sc-learning-translation:empty { display: none; }
+      #${ROOT_ID} .sc-learning-translation[hidden] { display:none; }
       #${ROOT_ID} .sc-learning-source { font-size: var(--sc-learning-source-font-size, 34px); font-weight: 500; }
       #${ROOT_ID} .sc-learning-translation {
         position: relative;
@@ -415,34 +511,21 @@
       }
       #${ROOT_ID} .sc-learning-translation mark {
         color:#fff;
-        background:rgba(147,51,234,.5);
+        background:rgba(111,72,151,.85);
         border-radius:3px;
         padding:0;
       }
-      #${ROOT_ID} .sc-learning-translation mark[data-learning-state="saved"] {
-        background:rgba(147,51,234,.56);
-        box-shadow:inset 0 -2px 0 rgba(216,180,254,.95);
+      #${ROOT_ID}[data-translation-mode="never"] .sc-learning-translation {
+        visibility:hidden;
+        opacity:0;
+        transform:none;
+        pointer-events:none;
       }
-      #${ROOT_ID} .sc-learning-translation mark[data-learning-state="known"] {
-        background:rgba(22,163,74,.5);
-        box-shadow:inset 0 -2px 0 rgba(134,239,172,.95);
+      #${ROOT_ID}[data-translation-mode="never"][data-full-translation-reveal="1"] .sc-learning-translation {
+        visibility:visible;
+        opacity:1;
+        pointer-events:auto;
       }
-      #${ROOT_ID} .sc-learning-translation mark[data-active="1"] {
-        color:#fff;
-        outline:1px solid rgba(216,180,254,.72);
-        outline-offset:1px;
-      }
-      #${ROOT_ID}[data-translation-mode="hover"] .sc-learning-translation {
-        opacity: 0;
-        transform: none;
-        pointer-events: none;
-      }
-      #${ROOT_ID}[data-translation-mode="hover"] .sc-learning-subtitle-card:hover .sc-learning-translation,
-      #${ROOT_ID}[data-translation-mode="hover"] .sc-learning-subtitle-card:focus-within .sc-learning-translation {
-        opacity: 1;
-        transform: none;
-      }
-      #${ROOT_ID}[data-translation-mode="never"] .sc-learning-translation { display:none !important; }
       #${ROOT_ID} .sc-learning-word {
         display: inline;
         padding: 0 1px;
@@ -456,26 +539,33 @@
         background: rgba(147,51,234,.28);
         outline: none;
       }
-      #${ROOT_ID} .sc-learning-word[data-active="1"] {
+      #${ROOT_ID} .sc-learning-word[data-active="1"],
+      #${ROOT_ID} .sc-learning-translation :is(mark,.sc-learning-ru-word)[data-active="1"] {
         color:#fff;
-        background:rgba(147,51,234,.72);
-        outline:1px solid rgba(216,180,254,.82);
+        background:rgba(111,72,151,.85);
+        outline:1px solid rgba(199,176,222,.75);
         outline-offset:1px;
       }
-      #${ROOT_ID} .sc-learning-word[data-learning-state="saved"] {
+      #${ROOT_ID} .sc-learning-word[data-learning-state="saved"],
+      #${ROOT_ID} .sc-learning-translation :is(mark,.sc-learning-ru-word)[data-learning-state="saved"] {
         color: #fff;
-        background: rgba(147,51,234,.56);
-        box-shadow: inset 0 -2px 0 rgba(216,180,254,.95);
+        background: rgba(91,59,122,.78);
+        box-shadow: inset 0 -2px 0 rgba(187,161,214,.78);
       }
-      #${ROOT_ID} .sc-learning-word[data-learning-state="known"] {
+      #${ROOT_ID} .sc-learning-word[data-learning-state="known"],
+      #${ROOT_ID} .sc-learning-translation :is(mark,.sc-learning-ru-word)[data-learning-state="known"] {
         color: #fff;
         background: rgba(22,163,74,.5);
         box-shadow: inset 0 -2px 0 rgba(134,239,172,.95);
       }
-      #${ROOT_ID} .sc-learning-word[data-learning-state="saved"]:hover,
-      #${ROOT_ID} .sc-learning-word[data-learning-state="saved"]:focus-visible { background: rgba(147,51,234,.78); }
-      #${ROOT_ID} .sc-learning-word[data-learning-state="known"]:hover,
-      #${ROOT_ID} .sc-learning-word[data-learning-state="known"]:focus-visible { background: rgba(22,163,74,.72); }
+      #${ROOT_ID} .sc-learning-word[data-learning-state="saved"]:hover:not([data-phrase-selected="1"]):not([data-phrase-preview="1"]),
+      #${ROOT_ID} .sc-learning-word[data-learning-state="saved"]:focus-visible:not([data-phrase-selected="1"]):not([data-phrase-preview="1"]),
+      #${ROOT_ID} .sc-learning-word[data-learning-state="saved"][data-active="1"]:not([data-phrase-selected="1"]):not([data-phrase-preview="1"]),
+      #${ROOT_ID} .sc-learning-translation :is(mark,.sc-learning-ru-word)[data-learning-state="saved"][data-active="1"] { background: rgba(111,72,151,.85); }
+      #${ROOT_ID} .sc-learning-word[data-learning-state="known"]:hover:not([data-phrase-selected="1"]):not([data-phrase-preview="1"]),
+      #${ROOT_ID} .sc-learning-word[data-learning-state="known"]:focus-visible:not([data-phrase-selected="1"]):not([data-phrase-preview="1"]),
+      #${ROOT_ID} .sc-learning-word[data-learning-state="known"][data-active="1"]:not([data-phrase-selected="1"]):not([data-phrase-preview="1"]),
+      #${ROOT_ID} .sc-learning-translation :is(mark,.sc-learning-ru-word)[data-learning-state="known"][data-active="1"] { background: rgba(22,163,74,.72); }
       #${ROOT_ID} .sc-learning-word[data-expression-state="saved"],
       #${ROOT_ID} .sc-learning-word[data-expression-state="known"] {
         text-decoration-line:underline;
@@ -484,6 +574,11 @@
         text-decoration-color:#60a5fa;
       }
       #${ROOT_ID} .sc-learning-word[data-expression-state="known"] { text-decoration-color:#4ade80; }
+      #${ROOT_ID} .sc-learning-ru-word { cursor:pointer; border-radius:4px; padding:0 1px; }
+      #${ROOT_ID} .sc-learning-ru-word:hover { background:#ffffff15; }
+      #${ROOT_ID} .sc-learning-ru-word:focus-visible { outline:1px solid #c4b5fd; }
+      #${ROOT_ID} .sc-learning-translation .sc-learning-ru-word[data-ru-selected],
+      #${ROOT_ID} .sc-learning-source .sc-learning-word[data-ru-match] { background:#224caa !important; color:#fff !important; box-shadow:inset 0 -2px #93c5fd !important; opacity:1 !important; }
       #${ROOT_ID} .sc-learning-word[data-phrase-selected="1"] {
         color:#fff;
         background:rgba(37,99,235,.72);
@@ -496,6 +591,7 @@
       }
       #${ROOT_ID} .sc-learning-phrase-hint {
         display:none;
+        pointer-events:auto;
         position:absolute;
         left:50%;
         bottom:calc(100% + 6px);
@@ -522,6 +618,7 @@
         padding:9px 10px;
         border-radius:11px;
         background:rgba(17,24,39,.97);
+        text-align:left;
         white-space:normal;
         overflow:visible;
         text-overflow:clip;
@@ -529,11 +626,17 @@
       #${ROOT_ID} .sc-learning-phrase-hint[data-expanded="1"]::after { display:none; }
       #${ROOT_ID} .sc-expression-summary { display:flex; align-items:center; gap:8px; min-width:0; }
       #${ROOT_ID} .sc-expression-summary strong { color:#fff; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-      #${ROOT_ID} .sc-expression-summary span { margin-left:auto; color:#d8b4fe; font-weight:500; }
+      #${ROOT_ID} .sc-expression-summary .sc-expression-translation { margin-left:auto; color:#d8b4fe; font-weight:500; }
+      #${ROOT_ID} .sc-expression-translation button { display:inline; appearance:none; margin:0; padding:0; border:0; border-bottom:1px dotted currentColor; background:none; color:inherit; font:inherit; text-align:left; cursor:pointer; }
       #${ROOT_ID} .sc-expression-types { display:flex; flex-wrap:wrap; gap:5px; margin-top:7px; }
-      #${ROOT_ID} .sc-expression-types button,
+      #${ROOT_ID} .sc-expression-type,
       #${ROOT_ID} .sc-expression-actions button { padding:5px 8px; border:1px solid #3f3f46; border-radius:7px; background:#27272a; color:#d4d4d8; font:600 11px Roboto,Arial,sans-serif; cursor:pointer; }
-      #${ROOT_ID} .sc-expression-types button[data-active="1"] { border-color:#60a5fa; color:#dbeafe; background:rgba(37,99,235,.3); }
+      #${ROOT_ID} .sc-expression-type { border-color:#444; color:#a1a1aa; background:#27272a; cursor:default; }
+      #${ROOT_ID} .sc-expression-composition { margin-top:7px; color:#a1a1aa; font-size:13px; line-height:1.45; white-space:normal; overflow-wrap:anywhere; text-align:left; }
+      #${ROOT_ID} .sc-expression-composition .sc-expression-part { display:inline-block; margin-right:9px; }
+      #${ROOT_ID} .sc-expression-composition strong { color:#e4e4e7; font-weight:600; }
+      #${ROOT_ID} .sc-expression-composition p { margin:3px 0 0; color:#c4b5fd; }
+      #${ROOT_ID} .sc-expression-types:has(+ .sc-expression-composition) .sc-expression-type { padding:2px 6px; font-size:11px; }
       #${ROOT_ID} .sc-expression-actions { display:flex; align-items:center; gap:6px; margin-top:7px; }
       #${ROOT_ID} .sc-expression-actions button[data-primary="1"] { border-color:#9333ea; color:#f3e8ff; background:rgba(126,34,206,.35); }
       #${ROOT_ID} .sc-expression-actions small { margin-left:auto; color:#64748b; font-weight:500; }
@@ -555,6 +658,7 @@
       #${ROOT_ID} .sc-learning-phrase-hint[data-cancellable="1"]:focus-visible::after { opacity:1; }
       #${ROOT_ID} .sc-learning-status {
         display: none;
+        pointer-events: auto;
         align-items: center;
         gap: 8px;
         width: fit-content;
@@ -597,6 +701,67 @@
         opacity: 1;
         visibility: visible;
       }
+      #${ROOT_ID} .sc-learning-buffer-control {
+        position:relative;
+        width:34px;
+        height:34px;
+      }
+      #${ROOT_ID} .sc-learning-buffer-control::after {
+        content:'';
+        position:absolute;
+        top:-3px;
+        right:-3px;
+        width:7px;
+        height:7px;
+        border:1px solid rgba(9,9,11,.9);
+        border-radius:999px;
+        background:#71717a;
+        box-shadow:0 0 0 2px rgba(9,9,11,.28);
+        pointer-events:none;
+      }
+      #${ROOT_ID} .sc-learning-buffer-control[data-buffer-state="ready"]::after { background:#4ade80; }
+      #${ROOT_ID} .sc-learning-buffer-control[data-buffer-state="warming"]::after { background:#c084fc; }
+      #${ROOT_ID} .sc-learning-buffer-control[data-buffer-state="empty"]::after { background:#f59e0b; }
+      #${ROOT_ID} .sc-learning-buffer-control[data-buffer-state="error"]::after { background:#f87171; }
+      #${ROOT_ID} .sc-learning-buffer-diagnostics {
+        position:absolute;
+        top:50%;
+        z-index:12;
+        width:248px;
+        box-sizing:border-box;
+        padding:10px 11px;
+        border:1px solid rgba(255,255,255,.14);
+        border-radius:11px;
+        background:rgba(18,18,20,.97);
+        box-shadow:0 16px 42px rgba(0,0,0,.5);
+        color:#d4d4d8;
+        opacity:0;
+        visibility:hidden;
+        transform:translateY(-50%);
+        transition:opacity .1s ease;
+        pointer-events:none;
+        font:500 11px/1.35 Roboto,Arial,sans-serif;
+      }
+      #${ROOT_ID} .sc-learning-buffer-control:hover .sc-learning-buffer-diagnostics,
+      #${ROOT_ID} .sc-learning-buffer-control:focus-within .sc-learning-buffer-diagnostics {
+        opacity:1;
+        visibility:visible;
+      }
+      #${ROOT_ID}[data-mirrored="0"] .sc-learning-nav .sc-learning-buffer-diagnostics { left:calc(100% + 7px); }
+      #${ROOT_ID}[data-mirrored="1"] .sc-learning-nav .sc-learning-buffer-diagnostics { right:calc(100% + 7px); }
+      #${ROOT_ID} .sc-learning-buffer-head { display:flex; align-items:center; gap:7px; margin-bottom:8px; }
+      #${ROOT_ID} .sc-learning-buffer-head i { width:7px; height:7px; flex:0 0 7px; border-radius:999px; background:#71717a; }
+      #${ROOT_ID} .sc-learning-buffer-diagnostics[data-state="ready"] .sc-learning-buffer-head i { background:#4ade80; }
+      #${ROOT_ID} .sc-learning-buffer-diagnostics[data-state="warming"] .sc-learning-buffer-head i { background:#c084fc; }
+      #${ROOT_ID} .sc-learning-buffer-diagnostics[data-state="empty"] .sc-learning-buffer-head i { background:#f59e0b; }
+      #${ROOT_ID} .sc-learning-buffer-diagnostics[data-state="error"] .sc-learning-buffer-head i { background:#f87171; }
+      #${ROOT_ID} .sc-learning-buffer-head strong { color:#f4f4f5; font-size:12px; }
+      #${ROOT_ID} .sc-learning-buffer-head span { margin-left:auto; color:#c4b5fd; font-variant-numeric:tabular-nums; }
+      #${ROOT_ID} .sc-learning-buffer-grid { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; }
+      #${ROOT_ID} .sc-learning-buffer-grid dt { color:#71717a; }
+      #${ROOT_ID} .sc-learning-buffer-grid dd { margin:0; color:#d4d4d8; text-align:right; font-variant-numeric:tabular-nums; }
+      #${ROOT_ID} .sc-learning-buffer-error { display:none; margin-top:7px; padding-top:7px; border-top:1px solid rgba(255,255,255,.08); color:#fca5a5; overflow-wrap:anywhere; }
+      #${ROOT_ID} .sc-learning-buffer-error[data-visible="1"] { display:block; }
       #${ROOT_ID}[data-mirrored="0"] .sc-learning-nav { left: 12px; }
       #${ROOT_ID}[data-mirrored="0"] .sc-learning-options { right: 12px; }
       #${ROOT_ID}[data-mirrored="1"] .sc-learning-nav { right: 12px; }
@@ -651,7 +816,7 @@
       #${ROOT_ID} .sc-learning-settings {
         position: absolute;
         top: 50%;
-        width: 300px;
+        width: 340px;
         padding: 14px;
         border: 1px solid rgba(255,255,255,.16);
         border-radius: 12px;
@@ -665,16 +830,52 @@
       #${ROOT_ID} .sc-learning-settings[hidden] { display: none; }
       #${ROOT_ID} .sc-learning-settings-head { display:flex; align-items:center; gap:8px; margin-bottom:10px; font-size:15px; font-weight:600; }
       #${ROOT_ID} .sc-learning-settings-head button { margin-left:auto; }
-      #${ROOT_ID} .sc-learning-setting-row { display:grid; grid-template-columns: 1fr 130px; gap:10px; align-items:center; min-height:38px; font-size:13px; }
+      #${ROOT_ID} .sc-learning-setting-row { display:grid; grid-template-columns: minmax(0,1fr) 180px; gap:10px; align-items:center; min-height:38px; font-size:13px; }
       #${ROOT_ID} .sc-learning-setting-row select,
       #${ROOT_ID} .sc-learning-setting-row input[type="text"] {
         width:100%; min-width:0; height:30px; border:1px solid #3f3f46; border-radius:7px;
         background:#27272a; color:#f4f4f5; padding:0 8px; font:inherit;
       }
-      #${ROOT_ID} .sc-learning-setting-row input[type="checkbox"] { justify-self:end; width:18px; height:18px; accent-color:#9333ea; }
+      #${ROOT_ID} .sc-learning-switch-row { grid-template-columns:minmax(0,1fr) max-content; }
+      #${ROOT_ID} .sc-learning-switch { display:inline-flex; justify-content:flex-end; align-items:center; gap:8px; min-height:30px; padding:0; border:0; background:transparent; color:#d4d4d8; font:inherit; cursor:pointer; }
+      #${ROOT_ID} .sc-learning-switch:focus-visible { outline:2px solid #a78bfa; outline-offset:3px; border-radius:5px; }
+      #${ROOT_ID} .sc-learning-switch-labels { display:inline-grid; text-align:right; font-size:12px; }
+      #${ROOT_ID} .sc-learning-switch-labels > span { grid-area:1 / 1; white-space:nowrap; }
+      #${ROOT_ID} .sc-learning-switch[aria-checked="true"] [data-switch-caption="off"],
+      #${ROOT_ID} .sc-learning-switch[aria-checked="false"] [data-switch-caption="on"] { visibility:hidden; }
+      #${ROOT_ID} .sc-learning-switch-track { position:relative; display:block; flex:none; width:36px; height:20px; border-radius:999px; background:#3f3f46; transition:background .12s; }
+      #${ROOT_ID} .sc-learning-switch-track::after { content:''; position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:50%; background:#fff; transition:transform .12s; }
+      #${ROOT_ID} .sc-learning-switch[aria-checked="true"] .sc-learning-switch-track { background:#9333ea; }
+      #${ROOT_ID} .sc-learning-switch[aria-checked="true"] .sc-learning-switch-track::after { transform:translateX(16px); }
       #${ROOT_ID} .sc-learning-setting-range { display:grid; grid-template-columns:1fr 48px; gap:7px; align-items:center; min-width:0; }
       #${ROOT_ID} .sc-learning-setting-range input[type="range"] { width:100%; min-width:0; accent-color:#9333ea; cursor:ew-resize; }
-      #${ROOT_ID} .sc-learning-setting-range output { color:#a1a1aa; text-align:right; font-variant-numeric:tabular-nums; }
+      #${ROOT_ID} .sc-learning-range-step { width:24px; height:26px; padding:0; border:1px solid #3f3f46; border-radius:6px; background:#27272a; color:#d4d4d8; font:600 17px/1 Roboto,Arial,sans-serif; cursor:pointer; }
+      #${ROOT_ID} .sc-learning-range-step:disabled { opacity:.35; cursor:default; }
+      #${ROOT_ID} .sc-learning-setting-range output { color:#a1a1aa; text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+      #${ROOT_ID} .sc-learning-width-setting { grid-template-columns:max-content minmax(0,1fr); }
+      #${ROOT_ID} .sc-learning-width-setting .sc-learning-setting-range { grid-template-columns:minmax(45px,1fr) max-content; }
+      #${QUICK_WORD_POPOVER_ID} {
+        position:fixed;
+        z-index:2147483002;
+        width:max-content;
+        min-width:0;
+        max-width:min(270px,calc(100vw - 20px));
+        box-sizing:border-box;
+        padding:8px 10px;
+        border:1px solid rgba(255,255,255,.14);
+        border-radius:10px;
+        background:rgba(24,24,27,.97);
+        box-shadow:0 12px 34px rgba(0,0,0,.48);
+        color:#e4e4e7;
+        pointer-events:none;
+        font:600 13px/1.3 Roboto,Arial,sans-serif;
+        user-select:none;
+        -webkit-user-select:none;
+      }
+      #${QUICK_WORD_POPOVER_ID} .sc-quick-word-row { display:block; min-height:18px; white-space:normal; text-align:center; }
+      #${QUICK_WORD_POPOVER_ID} .sc-quick-word-row + .sc-quick-word-row { margin-top:2px; }
+      #${QUICK_WORD_POPOVER_ID} .sc-quick-word-row span { color:#f4f4f5; overflow-wrap:anywhere; }
+      #${QUICK_WORD_POPOVER_ID}[data-loading="1"] .sc-quick-word-row span { color:#a1a1aa; font-weight:500; }
       #${WORD_POPOVER_ID} {
         position: fixed;
         z-index: 2147483000;
@@ -723,6 +924,8 @@
       #${WORD_POPOVER_ID} .sc-word-title { min-width:0; flex:1; }
       #${WORD_POPOVER_ID} .sc-word-source { color:#e9d5ff; font-size:23px; font-weight:700; overflow-wrap:anywhere; }
       #${WORD_POPOVER_ID} .sc-word-primary { margin-top:3px; color:#fff; font-size:18px; font-weight:600; }
+      #${WORD_POPOVER_ID} .sc-word-primary .sc-word-support-meaning { color:#85858f; }
+      #${WORD_POPOVER_ID} .sc-word-primary .sc-word-meaning-divider { color:#62626c; padding:0 5px; }
       #${WORD_POPOVER_ID} .sc-word-section { flex:0 0 auto; padding:9px 11px; border-top:1px solid rgba(255,255,255,.09); }
       #${WORD_POPOVER_ID} .sc-word-meanings { flex:0 1 auto; min-height:0; max-height:min(250px,32vh); overflow-y:auto; overscroll-behavior:contain; }
       #${WORD_POPOVER_ID} .sc-word-meanings[data-long="1"] { min-height:min(150px,22vh); }
@@ -735,16 +938,30 @@
       #${WORD_POPOVER_ID} .sc-word-ai-skeleton { width:100%; height:14px; }
       #${WORD_POPOVER_ID} .sc-word-ai[data-state="error"] { border-color:rgba(255,255,255,.08); color:#71717a; }
       #${WORD_POPOVER_ID} .sc-word-meaning { display:flex; gap:7px; margin:3px 0; font-size:15px; line-height:1.3; }
-      #${WORD_POPOVER_ID} .sc-word-pos { flex:0 0 auto; color:#71717a; font-size:12px; font-style:italic; }
+      #${WORD_POPOVER_ID} .sc-word-meaning-trigger { color:inherit; font:inherit; text-align:left; border:0; border-bottom:1px dotted currentColor; background:none; padding:0; cursor:pointer; }
+      #${WORD_POPOVER_ID} .sc-word-english-choices:not([hidden]) { display:flex; flex-direction:column; gap:7px; padding:12px 14px; border-bottom:1px solid #39343f; font-size:14px; }
+      #${WORD_POPOVER_ID} .sc-word-choices-title { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+      #${WORD_POPOVER_ID} .sc-word-english-choice { text-align:left; color:#c4b5fd; background:#292431; padding:7px 9px; border:0; border-radius:6px; font:inherit; }
+      #${WORD_POPOVER_ID} button.sc-word-english-choice { cursor:pointer; }
       #${WORD_POPOVER_ID} .sc-word-examples { flex:1 1 250px; min-height:150px; max-height:min(330px,40vh); overflow-y:auto; overscroll-behavior:contain; }
       #${WORD_POPOVER_ID}[data-compact="1"] .sc-word-examples { min-height:110px; }
       #${WORD_POPOVER_ID} { overscroll-behavior:contain; }
-      #${WORD_POPOVER_ID} .sc-word-example { position:relative; display:grid; grid-template-columns:30px 1fr auto; gap:7px; align-items:start; padding:6px 0; border-top:1px solid rgba(255,255,255,.07); }
+      #${WORD_POPOVER_ID} .sc-word-example { position:relative; display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:7px; align-items:center; padding:6px 0; border-top:1px solid rgba(255,255,255,.07); }
       #${WORD_POPOVER_ID} .sc-word-example:first-of-type { border-top:0; }
+      #${WORD_POPOVER_ID} .sc-word-example-toggle { appearance:none; display:block; min-width:0; width:100%; border:0; padding:0; background:transparent; color:inherit; text-align:left; cursor:pointer; }
+      #${WORD_POPOVER_ID} .sc-word-example-toggle:focus-visible { outline:1px solid #a855f7; outline-offset:3px; border-radius:4px; }
       #${WORD_POPOVER_ID} .sc-word-example-text { font-size:15px; line-height:1.45; }
+      #${WORD_POPOVER_ID} .sc-word-example-source { display:flex; align-items:center; gap:8px; }
+      #${WORD_POPOVER_ID} .sc-word-example-source .sc-word-example-text { flex:1; min-width:0; }
+      #${WORD_POPOVER_ID} .sc-word-chevron { flex:0 0 14px; color:#a78bfa; font-size:22px; line-height:1; }
+      #${WORD_POPOVER_ID} .sc-word-example-token { display:inline; padding:0; border:0; border-radius:3px; background:none; color:inherit; font:inherit; cursor:pointer; }
+      #${WORD_POPOVER_ID} .sc-word-example-token:hover { background:rgba(139,92,246,.3); }
+      #${WORD_POPOVER_ID} .sc-word-example-token[data-focus="1"], #${WORD_POPOVER_ID} .sc-word-example-token[data-learning-state="saved"] { background:#5b2890; color:#fff; }
+      #${WORD_POPOVER_ID} .sc-word-example-token[data-phrase-selected="1"] { background:#224caa; color:white; box-shadow:inset 0 -2px #93c5fd; }
       #${WORD_POPOVER_ID} .sc-word-example-translation { margin-top:3px; color:#a1a1aa; font-size:13px; }
       #${WORD_POPOVER_ID} .sc-word-example-meaning { margin-bottom:3px; color:#d8b4fe; font-size:12px; font-weight:650; }
-      #${WORD_POPOVER_ID} .sc-word-example-sense { width:25px; height:25px; display:grid; place-items:center; margin-top:1px; border-radius:7px; background:rgba(147,51,234,.2); color:#d8b4fe; font-size:11px; font-weight:800; }
+      #${WORD_POPOVER_ID} .sc-word-example.support .sc-word-example-meaning { color:#8b8b95; }
+      #${WORD_POPOVER_ID} .sc-word-example-play { align-self:center; opacity:.82; }
       #${WORD_POPOVER_ID} .sc-word-video-examples { margin-top:5px; border-top:1px solid rgba(255,255,255,.07); }
       #${WORD_POPOVER_ID} .sc-word-video-examples summary { padding:7px 0 2px; color:#71717a; cursor:pointer; font-size:12px; font-weight:600; list-style:none; }
       #${WORD_POPOVER_ID} .sc-word-video-examples summary::-webkit-details-marker { display:none; }
@@ -761,12 +978,17 @@
       #${WORD_POPOVER_ID} .sc-word-footer button { display:inline-flex; align-items:center; gap:5px; min-width:88px; justify-content:center; border:1px solid #3f3f46; border-radius:8px; padding:6px 8px; background:#27272a; color:#e4e4e7; cursor:pointer; font-size:13px; }
       #${WORD_POPOVER_ID} .sc-word-footer button:hover { background:#3f3f46; }
       #${WORD_POPOVER_ID} .sc-word-footer button[data-active="1"] { border-color:#a855f7; color:#e9d5ff; background:rgba(147,51,234,.2); }
+      #${WORD_POPOVER_ID} .sc-word-footer button[data-loading="1"] { cursor:wait; }
+      #${WORD_POPOVER_ID} .sc-word-footer button[data-loading="1"] svg { display:none; }
+      #${WORD_POPOVER_ID} .sc-word-footer button[data-loading="1"]::before { content:''; width:14px; height:14px; box-sizing:border-box; border:2px solid rgba(233,213,255,.35); border-top-color:#e9d5ff; border-radius:50%; animation:sc-learning-spin .8s linear infinite; }
+      #${WORD_POPOVER_ID} .sc-word-footer button[data-error="1"] { border-color:rgba(248,113,113,.65); color:#fecaca; }
       #${WORD_POPOVER_ID} .sc-word-footer .sc-word-context-button { min-width:116px; }
       #${WORD_POPOVER_ID} .sc-word-footer .sc-word-context-button[data-active="1"] { border-color:#3f3f46; color:#a1a1aa; background:#27272a; }
       #${WORD_POPOVER_ID} .sc-word-footer svg { width:18px; height:18px; fill:currentColor; }
       #${WORD_POPOVER_ID} .sc-learning-icon-button { width:30px; height:30px; border-radius:7px; }
       #${WORD_POPOVER_ID} .sc-learning-icon-button svg { width:18px; height:18px; }
       #${WORD_POPOVER_ID} .sc-word-loading { padding:18px 14px; color:#a1a1aa; text-align:center; }
+      #${WORD_POPOVER_ID} .sc-word-action-error:not([hidden]) { padding:10px 14px; color:#fda4af; font:400 13px/1.45 Roboto,Arial,sans-serif; white-space:normal; overflow-wrap:anywhere; border-bottom:1px solid #ffffff18; }
       #${WORD_POPOVER_ID} .sc-word-error { color:#fca5a5; }
       #${WORD_POPOVER_ID} .sc-word-primary[data-loading="1"] { width:150px; height:20px; margin-top:5px; }
       #${WORD_POPOVER_ID} .sc-word-skeleton {
@@ -776,8 +998,7 @@
         background-size:220% 100%;
         animation:sc-word-skeleton 1.15s ease-in-out infinite;
       }
-      #${WORD_POPOVER_ID} .sc-word-skeleton-row { display:grid; grid-template-columns:30px 1fr; gap:7px; align-items:center; padding:7px 0; }
-      #${WORD_POPOVER_ID} .sc-word-skeleton-row span:first-child { width:24px; height:24px; border-radius:999px; }
+      #${WORD_POPOVER_ID} .sc-word-skeleton-row { display:block; padding:7px 0; }
       #${WORD_POPOVER_ID} .sc-word-skeleton-lines { display:grid; gap:6px; }
       #${WORD_POPOVER_ID} .sc-word-skeleton-lines span { height:13px; }
       #${WORD_POPOVER_ID} .sc-word-skeleton-lines span:last-child { width:62%; }
@@ -989,20 +1210,29 @@
     scheduleSubtitleLayout();
   }
 
+  function updateRangeStepButtons(input) {
+    for (const button of input?.__scStepButtons || []) {
+      button.disabled = Number(button.dataset.direction) < 0
+        ? Number(input.value) <= Number(input.min) : Number(input.value) >= Number(input.max);
+    }
+  }
+
   function updateSubtitleWidthControl(layout) {
     const input = settingsPanel?.querySelector?.('[data-setting="learning_subtitle_width_px"]');
     const output = settingsPanel?.querySelector?.('[data-setting-output="learning_subtitle_width_px"]');
     if (!input) return;
-    const max = Math.max(1, Math.floor(layout?.maxWidth || 2400));
+    const max = Math.max(1, Math.min(2400, Math.floor(layout?.maxWidth || 2400)));
     const min = Math.min(320, max);
     const value = Math.max(min, Math.min(max, Math.round(layout?.width || settings.learning_subtitle_width_px || 1600)));
     input.min = String(min);
     input.max = String(max);
     input.value = String(value);
-    if (output) output.textContent = `${value}px`;
+    updateRangeStepButtons(input);
+    const requestedWidth = Math.round(Number(settings.learning_subtitle_width_px) || 1600);
+    if (output) output.textContent = layout?.clamped ? `${value}px (макс. ${requestedWidth}px)` : `${value}px`;
   }
 
-  function applySubtitleWidth({ persistClamp = true } = {}) {
+  function applySubtitleWidth() {
     if (!root?.isConnected || !subtitleCard?.isConnected) return null;
     const rootRect = root.getBoundingClientRect();
     if (rootRect.width <= 0) return null;
@@ -1018,25 +1248,16 @@
     updateSubtitleWidthControl({ ...layout, width });
     const reservedWidth = Number.parseFloat(translationRow?.style.minWidth || '');
     if (Number.isFinite(reservedWidth) && reservedWidth > width) translationRow.style.minWidth = `${width}px`;
-    const persistedWidth = Math.max(320, width);
-    if (layout.clamped && persistedWidth < requestedWidth) {
-      settings = sanitizeYoutubeSettings({ ...settings, learning_subtitle_width_px: persistedWidth });
-      updateSubtitleWidthControl({ ...layout, width: persistedWidth });
-      if (persistClamp) {
-        clearTimeout(subtitleWidthClampTimer);
-        subtitleWidthClampTimer = setTimeout(() => {
-          subtitleWidthClampTimer = null;
-          void persistSettingsPatch({ learning_subtitle_width_px: persistedWidth });
-        }, 320);
-      }
-    }
+    // Resize limits the visible width only. A new preference is persisted by
+    // the slider's change event, never by player/viewport geometry changes.
     return layout;
   }
 
   function applySubtitleTypography() {
     if (!root) return;
     root.style.setProperty('--sc-learning-source-font-size', `${settings.learning_subtitle_source_font_px}px`);
-    root.style.setProperty('--sc-learning-target-font-size', `${settings.learning_subtitle_target_font_px}px`);
+    const targetPx = Math.round(settings.learning_subtitle_source_font_px * settings.learning_subtitle_target_font_percent) / 100;
+    root.style.setProperty('--sc-learning-target-font-size', `${targetPx}px`);
   }
 
   function measureSourceSubtitleText(text) {
@@ -1062,7 +1283,7 @@
     const signature = `${contentWidth}:${fontSize}:${sourceCues.length}:${sourceCues[0]?.startMs || 0}:${sourceCues.at(-1)?.endMs || 0}`;
     if (!force && signature === subtitleCueLayoutSignature) return false;
     subtitleCueLayoutSignature = signature;
-    const nextCues = U.splitTimedCuesToFit(sourceCues, {
+    const nextCues = U.layoutTimedCuesToFit(sourceCues, {
       maxWidth: contentWidth,
       measureText: measureSourceSubtitleText,
       language: sourceLanguage(),
@@ -1076,7 +1297,7 @@
     currentCueIndex = -1;
     const video = playerVideo();
     renderCurrentVideoCue(video, true);
-    if (settings.learning_translation_mode !== 'never') startTranslationPrefetch();
+    startTranslationPrefetch();
     return true;
   }
 
@@ -1087,6 +1308,7 @@
       applySubtitleWidth();
       reflowCuesForSubtitleLayout();
       applySubtitlePlacement();
+      positionPhraseHint();
     });
   }
 
@@ -1225,8 +1447,29 @@
     return button;
   }
 
+  function updateFullSubtitleReveal() {
+    if (!root) return false;
+    const reveal = U.fullSubtitleRevealActive({
+      translationMode: settings.learning_translation_mode,
+      metaKeyDown: fullTranslationMetaDown,
+    });
+    root.dataset.fullTranslationReveal = reveal ? '1' : '0';
+    if (translationRow) {
+      if (settings.learning_translation_mode === 'never' && !reveal) {
+        translationRow.setAttribute('aria-hidden', 'true');
+      } else {
+        translationRow.removeAttribute('aria-hidden');
+      }
+    }
+    if (reveal && currentCueIndex >= 0 && cues[currentCueIndex]) {
+      ensureCueTranslation(currentCueIndex);
+      renderTranslationForCue(currentCueIndex);
+    }
+    return reveal;
+  }
+
   function hoverHoldRequested() {
-    return subtitleHovered || wordPopoverOpen || phraseSelectionOpen;
+    return subtitleHovered || wordPopoverOpen || phraseSelectionOpen || !!russianSelection;
   }
 
   function updateHoverHoldState() {
@@ -1259,11 +1502,14 @@
     // Keep this synchronous: play() must run inside the real click/keyboard
     // activation that dismissed the card, not on a later animation frame.
     subtitleHovered = !!subtitleCard?.isConnected && subtitleCard.matches(':hover');
+    updateFullSubtitleReveal();
     resumeAfterHoverRelease();
   }
 
   function releaseHoverHold({ resume = true } = {}) {
+    clearRussianSelection({ resume: false });
     subtitleHovered = false;
+    updateFullSubtitleReveal();
     wordPopoverOpen = false;
     phraseSelectionOpen = false;
     const shouldResume = resume && pausedForSubtitleHover;
@@ -1277,7 +1523,8 @@
   function onSubtitlePointerEnter() {
     subtitleHovered = true;
     updateHoverHoldState();
-    if (currentCueIndex >= 0 && settings.learning_translation_mode !== 'never') {
+    updateFullSubtitleReveal();
+    if (currentCueIndex >= 0) {
       ensureCueTranslation(currentCueIndex);
       renderTranslationForCue(currentCueIndex);
     }
@@ -1285,7 +1532,145 @@
 
   function onSubtitlePointerLeave() {
     subtitleHovered = false;
+    updateFullSubtitleReveal();
     resumeAfterHoverRelease();
+  }
+
+  function translationPrefetchAhead() {
+    return externalMedia?.literalPrefetchAhead ?? YOUTUBE_TRANSLATION_PREFETCH_AHEAD;
+  }
+
+  function translationInitialAhead() {
+    return externalMedia?.literalInitialAhead ?? YOUTUBE_TRANSLATION_INITIAL_AHEAD;
+  }
+
+  function currentTranslationBufferSnapshot() {
+    return U.translationBufferSnapshot({
+      cues,
+      currentIndex: currentCueIndex,
+      ahead: translationPrefetchAhead(),
+      translationMode: settings.learning_translation_mode,
+      translationOrder: settings.learning_translation_order,
+      literalNeeded: literalTranslationNeeded(),
+      naturalReady: new Set(translationsByText.keys()),
+      literalReady: new Set(literalTranslationsByText.keys()),
+      naturalPending: pendingTranslationTexts,
+      literalPending: pendingLiteralTexts,
+    });
+  }
+
+  function bufferDurationLabel(value) {
+    const duration = Math.max(0, Number(value) || 0);
+    if (!duration) return '—';
+    return duration < 1_000 ? `${Math.round(duration)} мс` : `${(duration / 1_000).toFixed(1)} с`;
+  }
+
+  function buildBufferDiagnosticsPanel() {
+    const panel = document.createElement('div');
+    panel.className = 'sc-learning-buffer-diagnostics';
+    panel.dataset.state = 'empty';
+    panel.innerHTML = [
+      '<div class="sc-learning-buffer-head"><i></i><strong data-buffer-title>Буфер перевода</strong><span data-buffer-ahead>+0</span></div>',
+      '<dl class="sc-learning-buffer-grid">',
+      '<dt>Реплика</dt><dd data-buffer-cue>—</dd>',
+      '<dt>Готово впереди</dt><dd data-buffer-ready>0 / 0</dd>',
+      '<dt>Natural / literal</dt><dd data-buffer-layers>0 / 0</dd>',
+      '<dt>Сейчас</dt><dd data-buffer-active>Azure 0 · Gemini 0</dd>',
+      '<dt>В очереди</dt><dd data-buffer-queued>0</dd>',
+      '<dt>Последний ответ</dt><dd data-buffer-latency>—</dd>',
+      '</dl>',
+      '<div class="sc-learning-buffer-error" data-buffer-error></div>',
+    ].join('');
+    bufferDiagnosticsPanels.push(panel);
+    return panel;
+  }
+
+  function buildBufferDiagnosticsControl() {
+    const control = document.createElement('div');
+    control.className = 'sc-learning-buffer-control';
+    control.dataset.bufferState = 'empty';
+    control.append(
+      iconButton('buffer', 'Дословный буфер', () => {}),
+      buildBufferDiagnosticsPanel(),
+    );
+    return control;
+  }
+
+  function scheduleBufferDiagnosticsUpdate() {
+    if (bufferDiagnosticsFrame != null || !root?.isConnected) return;
+    bufferDiagnosticsFrame = requestAnimationFrame(() => {
+      bufferDiagnosticsFrame = null;
+      updateBufferDiagnostics();
+    });
+  }
+
+  function updateBufferDiagnostics() {
+    if (!root?.isConnected) return;
+    const snapshot = currentTranslationBufferSnapshot();
+    const currentText = String(cues[currentCueIndex]?.text || '').trim();
+    const currentError = snapshot.stage === 'azure'
+      ? translationError
+      : snapshot.stage === 'gemini' ? (literalErrorsByText.get(currentText) || '') : '';
+    const warmTarget = Math.min(snapshot.targetAhead, translationInitialAhead());
+    const state = currentError ? 'error'
+      : !snapshot.currentReady ? 'empty'
+        : snapshot.readyAhead < warmTarget ? 'warming' : 'ready';
+    const title = snapshot.stage === 'captions' ? 'Дорожка субтитров'
+        : snapshot.stage === 'azure' ? 'Готовлю Azure'
+          : snapshot.stage === 'gemini' ? 'Готовлю дословно'
+            : snapshot.literal ? 'Дословный буфер' : 'Буфер перевода';
+    const cueLabel = currentCueIndex >= 0 && cues.length
+      ? `${currentCueIndex + 1} / ${cues.length}`
+      : `0 / ${cues.length}`;
+    const latencyParts = [];
+    if (naturalLastLatencyMs) latencyParts.push(`Azure ${bufferDurationLabel(naturalLastLatencyMs)}`);
+    if (literalLastLatencyMs) latencyParts.push(`Gemini ${bufferDurationLabel(literalLastLatencyMs)}`);
+    if (literalLastQueueWaitMs >= 50) latencyParts.push(`ожидание ${bufferDurationLabel(literalLastQueueWaitMs)}`);
+    const signature = [
+      currentCueIndex,
+      state,
+      snapshot.stage,
+      snapshot.readyAhead,
+      snapshot.targetAhead,
+      naturalRequestsActive,
+      literalRequestsActive,
+      literalRequestQueue.length,
+      currentError,
+    ].join('|');
+    if (signature !== lastBufferDiagnosticsSignature) {
+      lastBufferDiagnosticsSignature = signature;
+      log('translation buffer state', {
+        cueIndex: currentCueIndex,
+        cues: cues.length,
+        state,
+        stage: snapshot.stage,
+        readyAhead: snapshot.readyAhead,
+        targetAhead: snapshot.targetAhead,
+        naturalReady: snapshot.naturalReadyInWindow,
+        literalReady: snapshot.literalReadyInWindow,
+        naturalActive: naturalRequestsActive,
+        literalActive: literalRequestsActive,
+        literalQueued: literalRequestQueue.length,
+        error: currentError || '',
+      });
+    }
+    for (const panel of bufferDiagnosticsPanels) {
+      if (!panel.isConnected) continue;
+      panel.dataset.state = state;
+      const control = panel.closest('.sc-learning-buffer-control');
+      if (control) control.dataset.bufferState = state;
+      panel.querySelector('[data-buffer-title]').textContent = title;
+      panel.querySelector('[data-buffer-ahead]').textContent = snapshot.currentReady ? `+${snapshot.readyAhead}` : '+0';
+      panel.querySelector('[data-buffer-cue]').textContent = cueLabel;
+      panel.querySelector('[data-buffer-ready]').textContent = `${snapshot.readyAhead} / ${snapshot.targetAhead}`;
+      panel.querySelector('[data-buffer-layers]').textContent = `${snapshot.naturalReadyInWindow} / ${snapshot.literalReadyInWindow}`;
+      panel.querySelector('[data-buffer-active]').textContent = `Azure ${naturalRequestsActive} · Gemini ${literalRequestsActive}`;
+      panel.querySelector('[data-buffer-queued]').textContent = String(literalRequestQueue.length);
+      panel.querySelector('[data-buffer-latency]').textContent = latencyParts.join(' · ') || '—';
+      const error = panel.querySelector('[data-buffer-error]');
+      error.dataset.visible = currentError ? '1' : '0';
+      error.textContent = currentError || '';
+    }
   }
 
   function ensureRoot() {
@@ -1296,7 +1681,9 @@
     root.dataset.active = '0';
     root.dataset.controlsVisible = '0';
     root.dataset.hoverHold = 'off';
+    root.dataset.fullTranslationReveal = '0';
     root.dataset.dragging = '0';
+    bufferDiagnosticsPanels.length = 0;
 
     subtitleCard = document.createElement('div');
     subtitleCard.className = 'sc-learning-subtitle-card';
@@ -1314,14 +1701,15 @@
     phraseHint.setAttribute('role', 'button');
     phraseHint.tabIndex = -1;
     phraseHint.addEventListener('click', event => {
-      if (!phraseSelectionOpen) return;
+      if (!phraseSelectionOpen || phraseHint.dataset.cancellable !== '1') return;
       if (event.target.closest?.('button, a')) return;
       event.preventDefault();
       event.stopPropagation();
       clearPhraseSelection();
     });
     phraseHint.addEventListener('keydown', event => {
-      if (!phraseSelectionOpen || (event.key !== 'Enter' && event.key !== ' ')) return;
+      if (!phraseSelectionOpen || phraseHint.dataset.cancellable !== '1'
+          || event.target !== phraseHint || (event.key !== 'Enter' && event.key !== ' ')) return;
       event.preventDefault();
       event.stopPropagation();
       clearPhraseSelection();
@@ -1337,7 +1725,25 @@
     });
     copyCueControl = buildCueCopyControl();
     sourceWrap.append(sourceRow, copyCueControl);
-    subtitleCard.append(statusRow, phraseHint, sourceWrap, translationRow);
+    subtitleLines = document.createElement('div');
+    subtitleLines.className = 'sc-learning-lines';
+    // Only the space owned by the two visible lines is a hover bridge. The
+    // wide transparent card and the reserved hidden translation stay inert.
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'dblclick']) {
+      subtitleLines.addEventListener(type, event => {
+        if (event.target !== subtitleLines) return;
+        event.preventDefault();
+        event.stopPropagation();
+      });
+    }
+    subtitleLines.append(sourceWrap, translationRow);
+    subtitleCard.append(statusRow, phraseHint, subtitleLines);
+    phraseHintResizeObserver?.disconnect();
+    if (typeof ResizeObserver !== 'undefined') {
+      phraseHintResizeObserver = new ResizeObserver(() => { if (phraseHint?.dataset.visible === '1') requestAnimationFrame(positionPhraseHint); });
+      phraseHintResizeObserver.observe(phraseHint);
+      phraseHintResizeObserver.observe(subtitleCard);
+    }
 
     navRail = document.createElement('div');
     navRail.className = 'sc-learning-rail sc-learning-nav';
@@ -1345,6 +1751,7 @@
       iconButton('previous', 'Предыдущая реплика (A / Ф)', () => seekRelativeCue(-1)),
       iconButton('replay', 'Повторить реплику', () => seekCue(currentCueIndex)),
       iconButton('next', 'Следующая реплика (D / В)', () => seekRelativeCue(1)),
+      buildBufferDiagnosticsControl(),
     );
 
     optionRail = document.createElement('div');
@@ -1359,7 +1766,12 @@
       settingsPanel.hidden = !settingsPanel.hidden;
       root.dataset.controlsVisible = settingsPanel.hidden ? (controlHovered ? '1' : '0') : '1';
     });
-    optionRail.append(swapButton, autoPauseButton, settingsButton);
+    const translationModeButton = iconButton('translation', 'Переключить показ перевода', () => {
+      void persistSettingsPatch({
+        learning_translation_mode: U.nextTranslationMode(settings.learning_translation_mode),
+      });
+    });
+    optionRail.append(swapButton, autoPauseButton, settingsButton, translationModeButton);
 
     subtitleDragHandle = buildSubtitleDragHandle();
     settingsPanel = buildSettingsPanel();
@@ -1374,6 +1786,7 @@
     }
     updateRootSettings();
     updateGeometry();
+    updateBufferDiagnostics();
     return root;
   }
 
@@ -1414,25 +1827,50 @@
       row.append(text, select);
       panel.appendChild(row);
     };
-    const addCheck = (label, key) => {
+    const addSwitch = (label, key, onValue = true, offValue = false, captions = null) => {
       const row = document.createElement('label');
-      row.className = 'sc-learning-setting-row';
+      row.className = 'sc-learning-setting-row sc-learning-switch-row';
       const text = document.createElement('span');
       text.textContent = label;
-      const input = document.createElement('input');
-      input.type = 'checkbox';
-      input.dataset.setting = key;
-      input.addEventListener('change', () => persistSettingsPatch({ [key]: input.checked }));
-      row.append(text, input);
+      const control = document.createElement('button');
+      control.type = 'button';
+      control.className = 'sc-learning-switch';
+      control.dataset.setting = key;
+      control.dataset.settingOn = JSON.stringify(onValue);
+      control.setAttribute('role', 'switch');
+      control.setAttribute('aria-label', label);
+      if (captions) {
+        const labels = document.createElement('span');
+        labels.className = 'sc-learning-switch-labels';
+        labels.setAttribute('aria-hidden', 'true');
+        for (const [state, caption] of [['off', captions[0]], ['on', captions[1]]]) {
+          const value = document.createElement('span');
+          value.dataset.switchCaption = state;
+          value.textContent = caption;
+          labels.appendChild(value);
+        }
+        control.appendChild(labels);
+      }
+      const track = document.createElement('span');
+      track.className = 'sc-learning-switch-track';
+      track.setAttribute('aria-hidden', 'true');
+      control.appendChild(track);
+      control.addEventListener('click', () => persistSettingsPatch({ [key]: settings[key] === onValue ? offValue : onValue }));
+      control.addEventListener('keydown', event => {
+        if (event.key === ' ' || event.key === 'Enter') event.stopPropagation();
+      });
+      row.append(text, control);
       panel.appendChild(row);
     };
     const addRange = (label, key, options = {}) => {
       const row = document.createElement('label');
       row.className = 'sc-learning-setting-row';
+      if (key === 'learning_subtitle_width_px') row.classList.add('sc-learning-width-setting');
       const text = document.createElement('span');
       text.textContent = label;
       const control = document.createElement('span');
       control.className = 'sc-learning-setting-range';
+      control.style.gridTemplateColumns = '24px minmax(0,1fr) auto 24px';
       const input = document.createElement('input');
       input.type = 'range';
       input.min = String(options.min ?? 320);
@@ -1441,18 +1879,36 @@
       input.dataset.setting = key;
       const output = document.createElement('output');
       output.dataset.settingOutput = key;
+      output.dataset.settingUnit = options.unit || 'px';
       input.addEventListener('input', () => {
-        const value = Math.round(Number(input.value));
-        settings = sanitizeYoutubeSettings({ ...settings, [key]: value });
-        output.textContent = `${value}px`;
+        const value = Number(input.value);
+        settings = applyYoutubeSettingsPatch(settings, { [key]: value });
+        output.textContent = `${value}${output.dataset.settingUnit}`;
+        updateRangeStepButtons(input);
         if (key === 'learning_subtitle_width_px') scheduleSubtitleLayout();
         else {
           applySubtitleTypography();
           scheduleSubtitleLayout();
         }
       });
-      input.addEventListener('change', () => persistSettingsPatch({ [key]: Math.round(Number(input.value)) }));
-      control.append(input, output);
+      input.addEventListener('change', () => persistSettingsPatch({ [key]: Number(input.value) }));
+      const stepButton = direction => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'sc-learning-range-step';
+        button.textContent = direction < 0 ? '−' : '+';
+        button.setAttribute('aria-label', `${direction < 0 ? 'Уменьшить' : 'Увеличить'} ${label}`);
+        button.dataset.settingStep = key;
+        button.dataset.direction = String(direction);
+        button.addEventListener('click', event => {
+          event.preventDefault(); event.stopPropagation();
+          const value = Math.max(Number(input.min), Math.min(Number(input.max), Math.round((Number(input.value) + direction) * 100) / 100));
+          void persistSettingsPatch({ [key]: value });
+        });
+        return button;
+      };
+      input.__scStepButtons = [stepButton(-1), stepButton(1)];
+      control.append(input.__scStepButtons[0], input, output, input.__scStepButtons[1]);
       row.append(text, control);
       panel.appendChild(row);
     };
@@ -1462,15 +1918,16 @@
     source.innerHTML = '<span>Дорожка YouTube</span><span data-source-track style="text-align:right;color:#a1a1aa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>';
     panel.appendChild(source);
     addSelect('Перевод', 'learning_target_lang', languageOptions);
-    addSelect('Порядок строк', 'learning_subtitle_language_order', [['source_first', 'English → Русский'], ['target_first', 'Русский → English']]);
-    addRange('Ширина', 'learning_subtitle_width_px', { min: 320, max: 2400, step: 20 });
+    addSwitch('Порядок строк', 'learning_subtitle_language_order', 'target_first', 'source_first', ['English → Русский', 'Русский → English']);
+    addRange('Ширина', 'learning_subtitle_width_px', { min: 320, max: 2400, step: 1 });
     addRange('English · шрифт', 'learning_subtitle_source_font_px', { min: 16, max: 64, step: 1 });
-    addRange('Русский · шрифт', 'learning_subtitle_target_font_px', { min: 14, max: 52, step: 1 });
-    addSelect('Показывать перевод', 'learning_translation_mode', [['always', 'Всегда'], ['hover', 'При наведении'], ['never', 'Никогда']]);
-    addSelect('Порядок перевода', 'learning_translation_order', [['natural', 'Естественный'], ['source', 'Как в английском']]);
-    addCheck('Автопауза', 'learning_auto_pause');
-    addCheck('Поменять стороны', 'learning_controls_mirrored');
-    addCheck('Скрывать родные CC', 'learning_hide_native_subtitles');
+    addRange('Русский · шрифт', 'learning_subtitle_target_font_percent', { min: 20, max: 325, step: 0.01, unit: '%' });
+    addSwitch('Показывать перевод', 'learning_translation_mode', 'always', 'never');
+    addSwitch('Порядок перевода', 'learning_translation_order', 'source', 'natural', ['Естественный', 'Как в английском']);
+    addSwitch('Перевод слова при наведении', 'learning_hover_word_translation');
+    addSwitch('Автопауза', 'learning_auto_pause');
+    addSwitch('Поменять стороны', 'learning_controls_mirrored');
+    addSwitch('Скрывать родные CC', 'learning_hide_native_subtitles');
     return panel;
   }
 
@@ -1480,32 +1937,38 @@
     root.dataset.languageOrder = settings.learning_subtitle_language_order;
     root.dataset.mirrored = settings.learning_controls_mirrored ? '1' : '0';
     root.dataset.translationMode = settings.learning_translation_mode;
+    updateFullSubtitleReveal();
     autoPauseButton?.setAttribute('data-active', settings.learning_auto_pause ? '1' : '0');
     settingsButton?.setAttribute('data-active', settingsPanel && !settingsPanel.hidden ? '1' : '0');
     for (const input of settingsPanel?.querySelectorAll('[data-setting]') || []) {
       const key = input.dataset.setting;
-      if (input.type === 'checkbox') input.checked = !!settings[key];
+      if (input.getAttribute('role') === 'switch') input.setAttribute('aria-checked', String(settings[key] === JSON.parse(input.dataset.settingOn)));
+      else if (input.type === 'checkbox') input.checked = !!settings[key];
       else input.value = settings[key];
+      if (input.type === 'range') updateRangeStepButtons(input);
       const output = settingsPanel.querySelector(`[data-setting-output="${key}"]`);
-      if (output) output.textContent = `${settings[key]}px`;
+      if (output) output.textContent = `${settings[key]}${output.dataset.settingUnit || 'px'}`;
     }
     const source = settingsPanel?.querySelector('[data-source-track]');
     if (source) source.textContent = selectedTrack?.label || selectedTrack?.languageCode || 'Авто';
-    if (subtitleCard && statusRow && phraseHint && sourceWrap && translationRow) {
-      subtitleCard.append(statusRow, phraseHint);
-      if (settings.learning_subtitle_language_order === 'target_first') subtitleCard.append(translationRow, sourceWrap);
-      else subtitleCard.append(sourceWrap, translationRow);
+    if (subtitleCard && subtitleLines && statusRow && phraseHint && sourceWrap && translationRow) {
+      subtitleCard.append(statusRow, phraseHint, subtitleLines);
+      if (settings.learning_subtitle_language_order === 'target_first') subtitleLines.append(translationRow, sourceWrap);
+      else subtitleLines.append(sourceWrap, translationRow);
     }
     applyNativeCaptionVisibility();
+    if (!settings.learning_hover_word_translation) hideQuickWordPopover();
+    else if (currentCueIndex >= 0 && cues[currentCueIndex]) void prefetchQuickWordTranslations(cues[currentCueIndex]);
     applySubtitleTypography();
     scheduleSubtitleLayout();
+    scheduleBufferDiagnosticsUpdate();
   }
 
   async function persistSettingsPatch(patch) {
     const previousTarget = settings.learning_target_lang;
     const previousTranslationOrder = settings.learning_translation_order;
     const previousTranslationMode = settings.learning_translation_mode;
-    settings = sanitizeYoutubeSettings({ ...settings, ...patch });
+    settings = applyYoutubeSettingsPatch(settings, patch);
     const settingsSnapshot = { ...settings };
     const patchSnapshot = { ...patch };
     updateRootSettings();
@@ -1531,18 +1994,21 @@
       translationError = '';
       literalTranslationError = '';
       prefetchGeneration += 1;
+      prefetchRerunRequested = false;
+      naturalLastLatencyMs = 0;
       renderCue(currentCueIndex, true);
-      if (settings.learning_translation_mode !== 'never') startTranslationPrefetch();
+      startTranslationPrefetch();
     } else if (previousTranslationOrder !== settings.learning_translation_order) {
       renderTranslationForCue(currentCueIndex);
-      if (settings.learning_translation_mode !== 'never' && settings.learning_translation_order === 'source') {
+      if (settings.learning_translation_order === 'source') {
         prefetchLiteralWindow(currentCueIndex);
       }
     }
     if (previousTranslationMode !== settings.learning_translation_mode) {
       prefetchGeneration += 1;
+      prefetchRerunRequested = false;
       renderTranslationForCue(currentCueIndex);
-      if (settings.learning_translation_mode !== 'never') startTranslationPrefetch();
+      startTranslationPrefetch();
     }
   }
 
@@ -1582,18 +2048,21 @@
         translationError = '';
         literalTranslationError = '';
         prefetchGeneration += 1;
+        prefetchRerunRequested = false;
+        naturalLastLatencyMs = 0;
         renderCue(currentCueIndex, true);
       }
       if (previous.learning_translation_order !== fresh.learning_translation_order) {
         renderTranslationForCue(currentCueIndex);
-        if (fresh.learning_translation_mode !== 'never' && fresh.learning_translation_order === 'source') {
+        if (fresh.learning_translation_order === 'source') {
           prefetchLiteralWindow(currentCueIndex);
         }
       }
       if (previous.learning_translation_mode !== fresh.learning_translation_mode) {
         prefetchGeneration += 1;
+        prefetchRerunRequested = false;
         renderTranslationForCue(currentCueIndex);
-        if (fresh.learning_translation_mode !== 'never') startTranslationPrefetch();
+        startTranslationPrefetch();
       }
       if (previous.learning_enabled !== fresh.learning_enabled) syncOverlay({ force: true });
     } catch (error) {
@@ -1619,6 +2088,7 @@
   }
 
   function deactivateOverlay() {
+    hideQuickWordPopover();
     const cleanup = U.overlayDeactivationPlan({
       overlayActive,
       subtitleHovered,
@@ -1634,7 +2104,7 @@
     if (root) root.dataset.active = '0';
     document.documentElement.classList.remove(HIDE_NATIVE_CLASS);
     document.documentElement.classList.remove(REPLACE_LEGACY_CLASS);
-    if (cleanup.closePopover) closeWordPopover();
+    if (cleanup.closePopover || pendingWordClickTimer != null) closeWordPopover();
   }
 
   function applyNativeCaptionVisibility() {
@@ -1735,8 +2205,7 @@
   }
 
   function prepareCaptionCues(rawCues, track) {
-    const prepared = U.finalizeCues(rawCues || []);
-    return track?.kind === 'asr' ? U.pairAdjacentAsrCues(prepared) : prepared;
+    return U.finalizeCues(rawCues || []);
   }
 
   async function fetchCaptionCues(track) {
@@ -1799,21 +2268,40 @@
   }
 
   async function bridgeJson(path, options = {}) {
+    // The catalogue can legitimately take several provider stages. Its server
+    // deadline is ten minutes; reads and disconnected transports must not hang.
+    const timeoutMs = ['save', 'prepare', 'translation-edit'].includes(options.body?.action) ? 610_000 : 125_000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
     const response = await fetch(BRIDGE + path, {
       method: options.method || 'GET',
       headers: options.body ? { 'Content-Type': 'application/json' } : undefined,
       body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal,
     });
     let payload = null;
     try { payload = await response.json(); } catch {}
     if (!response.ok || payload?.ok === false) {
-      throw new Error(payload?.error || `SC Desktop HTTP ${response.status}`);
+      const error = new Error(payload?.error || `SC Desktop HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
     }
+    if (!payload || typeof payload !== 'object') throw new Error('SC Desktop вернул пустой ответ. Повторите запрос.');
     return payload;
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error('Не удалось дождаться ответа SC Desktop. Результат операции пока не подтверждён; состояние словаря будет проверено при восстановлении связи.');
+      if (error instanceof TypeError) throw new Error('Нет связи с SC Desktop. Проверьте, что приложение запущено; результат операции пока не подтверждён.');
+      throw error;
+    } finally { clearTimeout(timer); }
   }
 
   async function loadTrack(track, snapshot) {
     const generation = ++loadGeneration;
+    prefetchGeneration += 1;
+    prefetchRerunRequested = false;
+    naturalLastLatencyMs = 0;
+    lastBufferDiagnosticsSignature = '';
     selectedTrack = track;
     videoMeta = {
       videoId: snapshot?.videoId || extractVideoIdFromLocation(),
@@ -1829,6 +2317,7 @@
     resetLiteralTranslationState();
     translationError = '';
     literalTranslationError = '';
+    scheduleBufferDiagnosticsUpdate();
     subtitleCard.style.display = '';
     sourceRow.replaceChildren();
     if (copyCueControl) copyCueControl.dataset.visible = '0';
@@ -1845,7 +2334,8 @@
       activeVideo = playerVideo();
       renderCurrentVideoCue(activeVideo, true);
       log('captions loaded', { videoId: videoMeta.videoId, lang: track.languageCode, cues: cues.length });
-      if (settings.learning_translation_mode !== 'never') startTranslationPrefetch();
+      startTranslationPrefetch();
+      scheduleBufferDiagnosticsUpdate();
     } catch (error) {
       if (generation !== loadGeneration) return;
       // A YouTube main-world fetch can time out during SPA navigation or tab
@@ -1854,12 +2344,15 @@
       lastTrackIdentity = '';
       setStatus(`Не удалось прочитать субтитры: ${error?.message || error}`);
       log('captions failed', { error: error?.message || String(error) });
+      scheduleBufferDiagnosticsUpdate();
     }
   }
 
   function resetTimedMediaState() {
+    hideQuickWordPopover();
     loadGeneration += 1;
     prefetchGeneration += 1;
+    prefetchRerunRequested = false;
     sourceCues = [];
     cues = [];
     subtitleCueLayoutSignature = '';
@@ -1872,10 +2365,13 @@
     resetLiteralTranslationState();
     translationError = '';
     literalTranslationError = '';
+    naturalLastLatencyMs = 0;
+    lastBufferDiagnosticsSignature = '';
     autoPausedCueKey = '';
     lastVideoTimeMs = null;
     closeWordPopover({ resume: false });
     clearPhraseSelection({ resume: false });
+    scheduleBufferDiagnosticsUpdate();
   }
 
   function seedExternalTranslations(rawTranslations) {
@@ -1923,13 +2419,12 @@
     applyNativeCaptionVisibility();
     activeVideo = video;
     renderCurrentVideoCue(video, true);
-    if (settings.learning_translation_mode !== 'never') startTranslationPrefetch();
+    startTranslationPrefetch();
     const nextCueIndex = cues.findIndex(cue => cue.startMs >= video.currentTime * 1_000);
     const literalCenterIndex = currentCueIndex >= 0
       ? currentCueIndex
       : nextCueIndex >= 0 ? nextCueIndex : Math.max(0, cues.length - 1);
-    if (settings.learning_translation_mode !== 'never'
-        && settings.learning_translation_order === 'source' && literalCenterIndex >= 0) {
+    if (settings.learning_translation_order === 'source' && literalTranslationNeeded() && literalCenterIndex >= 0) {
       const progress = typeof payload.onLiteralProgress === 'function' ? payload.onLiteralProgress : null;
       const buffered = await prefetchLiteralRange(
         literalCenterIndex,
@@ -1944,7 +2439,7 @@
       });
     }
     if (externalMedia) externalMedia.initializingLiteral = false;
-    if (settings.learning_translation_mode !== 'never' && settings.learning_translation_order === 'source') {
+    if (settings.learning_translation_order === 'source' && literalTranslationNeeded()) {
       void prefetchLiteralWindow(literalCenterIndex);
     }
     renderTranslationForCue(currentCueIndex);
@@ -2025,6 +2520,10 @@
     return /^[a-z]{2,3}/i.test(raw) ? raw : 'en';
   }
 
+  function literalTranslationNeeded() {
+    return sourceLanguage().toLocaleLowerCase('en-US') !== String(settings.learning_target_lang || '').toLocaleLowerCase('en-US');
+  }
+
   function currentMediaUrl() {
     if (externalMedia?.sourceUrl) return externalMedia.sourceUrl;
     return videoMeta.videoId ? `https://www.youtube.com/watch?v=${videoMeta.videoId}` : location.href;
@@ -2037,6 +2536,9 @@
   async function requestTranslations(batch, generation) {
     const texts = batch.map(item => item.text);
     texts.forEach(text => pendingTranslationTexts.add(text));
+    const startedAt = performance.now();
+    naturalRequestsActive += 1;
+    scheduleBufferDiagnosticsUpdate();
     try {
       if (sourceLanguage().toLowerCase() === settings.learning_target_lang.toLowerCase()) {
         texts.forEach(text => {
@@ -2059,42 +2561,52 @@
     } catch (error) {
       if (generation === prefetchGeneration) translationError = error?.message || String(error);
     } finally {
+      if (generation === prefetchGeneration) naturalLastLatencyMs = Math.max(0, performance.now() - startedAt);
+      naturalRequestsActive = Math.max(0, naturalRequestsActive - 1);
       texts.forEach(text => pendingTranslationTexts.delete(text));
       if (generation === prefetchGeneration && currentCueIndex >= 0) {
         renderTranslationForCue(currentCueIndex);
         prefetchLiteralWindow(currentCueIndex);
         refreshOpenPopoverExamples();
       }
+      scheduleBufferDiagnosticsUpdate();
     }
   }
 
   async function startTranslationPrefetch() {
-    if (!cues.length || settings.learning_translation_mode === 'never') return;
-    const generation = ++prefetchGeneration;
+    if (!cues.length) return;
+    prefetchRerunRequested = true;
+    scheduleBufferDiagnosticsUpdate();
     if (prefetchRunning) return;
     prefetchRunning = true;
+    const generation = prefetchGeneration;
     try {
-      const current = Math.max(0, currentCueIndex);
-      const start = Math.max(0, current - 8);
-      const end = Math.min(cues.length, current + 9);
-      const order = cues.slice(start, end)
-        .map((cue, offset) => ({ cue, index: start + offset, distance: Math.abs(start + offset - current) }))
-        .sort((a, b) => a.distance - b.distance || a.index - b.index);
-      const unique = [];
-      const seen = new Set();
-      for (const { cue, index } of order) {
-        if (translationsByText.has(cue.text) || seen.has(cue.text)) continue;
-        seen.add(cue.text);
-        unique.push({ text: cue.text, cueIndex: index });
-      }
-      for (const batch of U.batchTexts(unique, 25, 5_000)) {
-        if (generation !== prefetchGeneration) return;
-        await requestTranslations(batch, generation);
+      while (generation === prefetchGeneration && prefetchRerunRequested) {
+        prefetchRerunRequested = false;
+        const current = Math.max(0, currentCueIndex);
+        const order = U.cuePrefetchItems(
+          cues,
+          current,
+          translationPrefetchAhead(),
+          YOUTUBE_TRANSLATION_PREFETCH_BEHIND,
+        );
+        const unique = order
+          .filter(({ cue }) => !translationsByText.has(cue.text) && !pendingTranslationTexts.has(cue.text))
+          .map(({ cue, index }) => ({ text: cue.text, cueIndex: index }));
+        for (const batch of U.batchTexts(unique, 25, 5_000)) {
+          if (generation !== prefetchGeneration) return;
+          await requestTranslations(batch, generation);
+        }
+        if (generation === prefetchGeneration && settings.learning_translation_order === 'source') {
+          prefetchLiteralWindow(Math.max(0, currentCueIndex));
+        }
       }
     } finally {
       prefetchRunning = false;
-      if (generation !== prefetchGeneration && cues.length && settings.learning_translation_mode !== 'never') {
-        startTranslationPrefetch();
+      scheduleBufferDiagnosticsUpdate();
+      if (cues.length && (generation !== prefetchGeneration || prefetchRerunRequested)) {
+        prefetchRerunRequested = true;
+        void startTranslationPrefetch();
       }
     }
   }
@@ -2117,12 +2629,14 @@
     pendingLiteralTexts.add(cue.text);
     let request = null;
     request = queueLiteralRequest(async () => {
+      const startedAt = performance.now();
       try {
         if (generation !== literalGeneration) return false;
-        const payload = await bridgeJson('/learning/literal', {
+        const payload = await bridgeJson('/learning/catalogue', {
           method: 'POST',
           body: {
             sourceText: cue.text,
+            action: 'literal',
             naturalTranslation,
             sourceLang: sourceLanguage(),
             targetLang: settings.learning_target_lang,
@@ -2131,6 +2645,7 @@
         if (payload?.online === false) {
           if (generation !== literalGeneration) return false;
           literalTranslationError = payload.error || 'Voice Record недоступен';
+          literalErrorsByText.set(cue.text, literalTranslationError);
           failedLiteralTexts.add(cue.text);
           return false;
         }
@@ -2153,15 +2668,20 @@
             && item.targetStart >= 0 && item.targetEnd > item.targetStart && item.targetEnd <= literalText.length);
         literalTranslationsByText.set(cue.text, { literalText, alignments });
         literalTranslationError = '';
+        literalErrorsByText.delete(cue.text);
         return true;
       } catch (error) {
         if (generation !== literalGeneration) return false;
         literalTranslationError = error?.message || String(error);
+        literalErrorsByText.set(cue.text, literalTranslationError);
         failedLiteralTexts.add(cue.text);
         log('literal subtitle failed', { error: literalTranslationError });
         return false;
+      } finally {
+        if (generation === literalGeneration) literalLastLatencyMs = Math.max(0, performance.now() - startedAt);
+        scheduleBufferDiagnosticsUpdate();
       }
-    }, generation);
+    }, generation, { index, key: cue.text });
     literalTranslationPromises.set(cue.text, request);
     try {
       return await request;
@@ -2174,12 +2694,13 @@
       if (generation === literalGeneration && document.getElementById(WORD_POPOVER_ID)) {
         refreshOpenPopoverExamples();
       }
+      scheduleBufferDiagnosticsUpdate();
     }
   }
 
   async function prefetchLiteralRange(centerIndex, ahead, { onProgress } = {}) {
-    if (settings.learning_translation_mode === 'never'
-        || settings.learning_translation_order !== 'source'
+    if (settings.learning_translation_order !== 'source'
+        || !literalTranslationNeeded()
         || !Number.isInteger(centerIndex) || centerIndex < 0) {
       return { ready: 0, done: 0, total: 0 };
     }
@@ -2200,7 +2721,9 @@
 
   function prefetchLiteralWindow(centerIndex = currentCueIndex) {
     if (externalMedia?.initializingLiteral) return Promise.resolve({ ready: 0, done: 0, total: 0 });
-    const ahead = externalMedia?.literalPrefetchAhead ?? 2;
+    const ahead = translationPrefetchAhead();
+    reprioritizeLiteralRequestQueue(centerIndex);
+    scheduleBufferDiagnosticsUpdate();
     return prefetchLiteralRange(centerIndex, ahead);
   }
 
@@ -2262,7 +2785,7 @@
 
   function updateWordLearningTitle(word) {
     const labels = [];
-    if (word.__scLearningState?.state === 'known') labels.push('Отмечено: знаю');
+    if (word.__scLearningState?.state === 'known') labels.push('Исключено из обучения');
     else if (word.__scLearningState?.state === 'saved') labels.push('Добавлено в словарь');
     if (word.__scExpressionMatch?.entry) {
       labels.push(`${EXPRESSION_TYPE_LABELS[word.__scExpressionMatch.entry.expressionType]}: ${word.__scExpressionMatch.entry.sourceText}`);
@@ -2319,6 +2842,18 @@
     finally { learningStateRefreshPromise = null; }
   }
 
+  function positionPhraseHint() {
+    if (phraseHint?.dataset.visible !== '1' || !subtitleCard?.isConnected) return;
+    U.fitFloatingElement(phraseHint, subtitleCard, { margin: 12, gap: 6 });
+    const box = phraseHint.getBoundingClientRect();
+    const blocked = [navRail, optionRail].some(rail => {
+      if (!rail?.isConnected || getComputedStyle(rail).visibility === 'hidden') return false;
+      const rect = rail.getBoundingClientRect();
+      return rect.width > 0 && rect.left < box.right && rect.right > box.left && rect.top < box.bottom && rect.bottom > box.top;
+    });
+    if (blocked) U.fitFloatingElement(phraseHint, subtitleCard, { margin: 12, gap: 6, preferBelow: true });
+  }
+
   function updatePhraseHint(text, state = 'ready') {
     if (!phraseHint) return;
     delete phraseHint.dataset.expanded;
@@ -2326,7 +2861,9 @@
     phraseHint.dataset.visible = text ? '1' : '0';
     phraseHint.dataset.state = state;
     phraseHint.dataset.cancellable = text && phraseSelectionOpen ? '1' : '0';
+    phraseHint.setAttribute('role', 'button');
     phraseHint.tabIndex = text && phraseSelectionOpen ? 0 : -1;
+    positionPhraseHint();
   }
 
   function expressionContextForSelection(selection) {
@@ -2353,7 +2890,9 @@
     phraseHint.replaceChildren();
     phraseHint.dataset.visible = '1';
     phraseHint.dataset.expanded = '1';
-    phraseHint.dataset.cancellable = '1';
+    phraseHint.dataset.cancellable = '0';
+    phraseHint.setAttribute('role', 'group');
+    phraseHint.tabIndex = -1;
     phraseHint.dataset.state = analysis.error ? 'error' : analysis.loading ? 'loading' : 'ready';
     const summary = document.createElement('div');
     summary.className = 'sc-expression-summary';
@@ -2362,72 +2901,88 @@
       ? 'Определяю тип выражения…'
       : (analysis.canonicalText || analysis.selection?.text || 'Выражение');
     const translation = document.createElement('span');
+    translation.className = 'sc-expression-translation';
     translation.textContent = analysis.loading
       ? ''
-      : analysis.translation || (analysis.error ? 'AI недоступен — выберите тип вручную' : 'Обычная фраза');
+      : analysis.translation || (analysis.error ? analysis.error : 'Перевод недоступен');
+    if (!analysis.loading && !analysis.error && analysis.translation) {
+      translation.replaceChildren();
+      for (const [index, meaning] of analysis.translation.split(/\s*[/;]\s*/u).filter(Boolean).entries()) {
+        if (index) translation.appendChild(document.createTextNode(' / '));
+        const button = document.createElement('button'); button.type = 'button'; button.textContent = meaning;
+        installSafeClick(button, () => void showExpressionEnglishChoices(analysis, meaning, button));
+        translation.appendChild(button);
+      }
+    }
     summary.append(title, translation);
     phraseHint.appendChild(summary);
-    if (analysis.loading) return;
+    if (analysis.loading) { positionPhraseHint(); return; }
 
+    const composition = window.__scPhraseComposition?.normalize(analysis.composition, analysis.selection?.text);
     const types = document.createElement('div');
     types.className = 'sc-expression-types';
-    for (const [type, label] of Object.entries(EXPRESSION_TYPE_LABELS)) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = label;
-      button.dataset.active = analysis.expressionType === type ? '1' : '0';
-      installSafeClick(button, () => {
-        phraseAnalysis = { ...phraseAnalysis, expressionType: type, eligible: true, error: '' };
-        renderExpressionInspector();
-      });
-      types.appendChild(button);
+    {
+      const badge = document.createElement('span');
+      badge.className = 'sc-expression-type';
+      const meaningLabel = window.__scPhraseComposition?.meaningLabel(analysis) || window.__scPhraseComposition?.meaningLabel(composition);
+      badge.textContent = (EXPRESSION_TYPE_LABELS[analysis.expressionType] || 'Обычная фраза') + (meaningLabel ? ' (' + meaningLabel + ')' : '');
+      types.appendChild(badge);
     }
     phraseHint.appendChild(types);
+
+    if (composition && settings.learning_ai_explanation) {
+      const details = document.createElement('div');
+      details.className = 'sc-expression-composition';
+      const parts = document.createElement('div');
+      for (const [index, part] of composition.parts.entries()) {
+        const pair = document.createElement('span');
+        pair.className = 'sc-expression-part';
+        const english = document.createElement('strong');
+        english.textContent = part.en;
+        pair.append(english, document.createTextNode(` — ${part.ru}${index + 1 < composition.parts.length ? ' ·' : ''}`));
+        parts.appendChild(pair);
+      }
+      const explanation = document.createElement('p');
+      explanation.textContent = composition.explanation;
+      details.append(parts, explanation);
+      phraseHint.appendChild(details);
+    }
 
     const actions = document.createElement('div');
     actions.className = 'sc-expression-actions';
     const save = document.createElement('button');
     save.type = 'button';
-    save.dataset.primary = '1';
-    save.textContent = analysis.entry?.state === 'known'
-      ? 'Знаю'
+    save.dataset.primary = analysis.entry?.state === 'saved' ? '1' : '0';
+    save.textContent = analysis.saving ? 'Сохраняю…' : analysis.error ? 'Повторить' : analysis.entry?.state === 'known'
+      ? 'Не учить'
       : analysis.entry?.state === 'saved' ? 'В словаре' : 'В словарь';
-    save.disabled = !analysis.expressionType || analysis.saving;
+    save.disabled = analysis.saving === true;
+    if (analysis.error) save.title = analysis.error;
     installSafeClick(save, () => { void saveSelectedExpression(); });
     const close = document.createElement('button');
     close.type = 'button';
     close.textContent = 'Закрыть';
     installSafeClick(close, () => clearPhraseSelection());
-    const hotkey = document.createElement('small');
-    hotkey.textContent = '⌥ Space — подробный разбор';
-    actions.append(save, close, hotkey);
+    const copy = iconButton('copy', 'Копировать', () => copyText(analysis.selection?.text || analysis.canonicalText));
+    actions.append(save, close, copy);
     phraseHint.appendChild(actions);
+    positionPhraseHint();
   }
 
   async function saveSelectedExpression() {
     const analysis = phraseAnalysis;
     const selection = analysis?.selection;
-    if (!analysis?.expressionType || !selection || analysis.saving || !learningStore) return;
+    if (!selection || analysis.saving || !learningStore || !vocabularySaves) return;
+    const generation = phraseAnalysisGeneration;
     phraseAnalysis = { ...analysis, saving: true };
+    logLearningAction('phrase save started', { term: analysis.canonicalText || selection.text, type: analysis.expressionType });
     renderExpressionInspector();
     try {
       const canonicalText = U.normalizeTerm(analysis.canonicalText || selection.text);
       const context = expressionContextForSelection(selection);
-      const entry = await learningStore.setState({
-        kind: 'phrase',
-        expressionType: analysis.expressionType,
-        state: analysis.entry?.state === 'known' ? 'known' : 'saved',
-        toggle: false,
-        sourceLang: sourceLanguage(),
-        targetLang: settings.learning_target_lang,
-        sourceText: canonicalText,
-        normalizedText: canonicalText,
-        lemma: canonicalText,
-        partOfSpeech: 'phrase',
-        analysisConfidence: analysis.confidence || 'high',
+      const saved = await vocabularySaves.save({
+        word: canonicalText,
         observedForms: [selection.text, canonicalText],
-        translation: analysis.translation || '',
-        translationSource: analysis.translation ? 'machine' : '',
         contexts: [{
           videoId: videoMeta.videoId,
           videoUrl: currentMediaUrl(),
@@ -2440,12 +2995,20 @@
           createdAt: Date.now(),
         }],
       });
+      await learningStore.sync({ fresh: true });
+      const entry = await learningStore.getEntry({ remoteId: saved.item.id, kind: 'phrase',
+        sourceLang: sourceLanguage(), targetLang: settings.learning_target_lang, sourceText: canonicalText });
+      if (!entry) throw new Error('Сохранённая фраза не появилась в словаре. Откройте карточку снова.');
       registerExpressionEntry(entry);
+      logLearningAction('phrase save completed', { term: canonicalText, key: entry.key, state: entry.state });
+      if (generation !== phraseAnalysisGeneration || !phraseSelectionOpen || phraseAnalysis?.selection !== selection) return;
       phraseAnalysis = { ...phraseAnalysis, saving: false, entry, canonicalText: entry.sourceText, expressionType: entry.expressionType };
       applyCurrentCueExpressionMarks();
       renderTranslationForCue(currentCueIndex);
       renderExpressionInspector();
     } catch (error) {
+      logLearningAction('phrase save failed', { term: analysis.canonicalText || selection.text, error: error?.message || String(error) });
+      if (generation !== phraseAnalysisGeneration || !phraseSelectionOpen || phraseAnalysis?.selection !== selection) return;
       phraseAnalysis = { ...phraseAnalysis, saving: false, error: error?.message || String(error) };
       renderExpressionInspector();
     }
@@ -2458,14 +3021,17 @@
     const context = expressionContextForSelection(selection);
     const contextTranslation = expressionContextTranslation(selection);
     try {
-      const result = await bridgeJson('/learning/expression', {
+      const result = await bridgeJson('/learning/catalogue', {
         method: 'POST',
         body: {
           selectedText: selection.text,
+          action: 'classify',
           context,
           contextTranslation,
           sourceLang: sourceLanguage(),
           targetLang: settings.learning_target_lang,
+          meaningModeVersion: 1,
+          ...(settings.learning_ai_explanation ? { compositionVersion: 1 } : {}),
         },
       });
       if (generation !== phraseAnalysisGeneration || !phraseSelectionOpen) return;
@@ -2478,6 +3044,7 @@
         normalizedText: canonicalText,
         lemma: canonicalText,
       }).catch(() => null);
+      if (generation !== phraseAnalysisGeneration || !phraseSelectionOpen || phraseAnalysis?.selection !== selection) return;
       phraseAnalysis = {
         selection,
         loading: false,
@@ -2487,6 +3054,8 @@
         translation: existing?.translation || result?.translation || '',
         confidence: result?.confidence || 'low',
         entry: existing,
+        meaningMode: result?.meaningMode || result?.composition?.meaningMode,
+        composition: window.__scPhraseComposition?.normalize(result?.composition, selection.text),
         error: result?.online === false ? result.error || 'Voice Record недоступен' : '',
       };
       renderExpressionInspector();
@@ -2541,6 +3110,18 @@
     };
     renderExpressionInspector();
     void publishPhraseSelection(selection, { updateHint: false });
+    if (settings.learning_ai_explanation) {
+      const generation = phraseAnalysisGeneration;
+      void bridgeJson('/learning/catalogue', { method: 'POST', body: {
+        action: 'classify', selectedText: selection.text, context: expressionContextForSelection(selection),
+        contextTranslation: expressionContextTranslation(selection), compositionVersion: 1, meaningModeVersion: 1,
+        sourceLang: sourceLanguage(), targetLang: settings.learning_target_lang,
+      } }).then(result => {
+        if (generation !== phraseAnalysisGeneration || !phraseSelectionOpen || phraseAnalysis?.selection !== selection) return;
+        const composition = window.__scPhraseComposition?.normalize(result?.composition, selection.text);
+        if (composition) { phraseAnalysis = { ...phraseAnalysis, composition }; renderExpressionInspector(); }
+      }).catch(error => log('phrase composition failed', { error: error?.message || String(error) }));
+    }
   }
 
   function renderWordExpressionLinks(refs) {
@@ -2624,6 +3205,7 @@
   }
 
   function clearPhraseSelection({ resume = true, keepAnchor = false, notify = true } = {}) {
+    window.__scLearningChoicesPopover?.closeFor(phraseHint);
     const hadSelection = phraseSelectionOpen || !!phraseSelection;
     phraseSelectionOpen = false;
     phraseSelection = null;
@@ -2719,6 +3301,7 @@
   }
 
   function enterPhraseSelectionMode(wordIndex, cueIndex, reason = 'explicit') {
+    hideQuickWordPopover();
     closeWordPopover({ resume: false });
     clearPhraseSelection({ resume: false, notify: true });
     phraseSelectionOpen = true;
@@ -2787,10 +3370,16 @@
   function renderCue(index, force = false) {
     ensureRoot();
     if (!force && index === currentCueIndex) return;
+    const quickAnchorBeforeRender = quickWordHoverAnchor;
+    const previousCueIndex = currentCueIndex;
+    if (index !== previousCueIndex) clearRussianSelection({ resume: false });
     currentCueIndex = index;
+    reprioritizeLiteralRequestQueue(index);
+    scheduleBufferDiagnosticsUpdate();
     hoveredPhraseWord = null;
     root.dataset.cueIndex = String(index);
     sourceRow.replaceChildren();
+    if (quickAnchorBeforeRender) scheduleHideQuickWordPopover(quickAnchorBeforeRender);
     if (index < 0 || !cues[index]) {
       delete root.dataset.cueStartMs;
       delete root.dataset.cueEndMs;
@@ -2799,6 +3388,7 @@
       subtitleCard.style.display = 'none';
       if (copyCueControl) copyCueControl.dataset.visible = '0';
       if (subtitleDragHandle) subtitleDragHandle.dataset.visible = '0';
+      scheduleBufferDiagnosticsUpdate();
       return;
     }
     subtitleCard.style.display = '';
@@ -2824,6 +3414,9 @@
       wordIndex += 1;
       applyLearningStateToWord(word, cue);
       word.addEventListener('click', event => {
+        clearRussianSelection({ resume: false });
+        clearTimeout(pendingWordClickTimer); pendingWordClickTimer = null;
+        hideQuickWordPopover();
         event.preventDefault();
         event.stopPropagation();
         if (event.shiftKey) {
@@ -2841,7 +3434,9 @@
           WORD_DOUBLE_CLICK_MS,
         );
         const popoverOpen = !!document.getElementById(WORD_POPOVER_ID);
-        if (repeatKind !== 'different' && popoverOpen) {
+        logLearningAction('word click received', { term: part.text, cueIndex: index, sourceWordIndex: currentWordIndex,
+          detail: event.detail, trusted: event.isTrusted, repeatKind, popoverOpen });
+        if (repeatKind === 'quick' || (repeatKind === 'slow' && popoverOpen)) {
           lastWordClick = null;
           if (repeatKind === 'quick') enterPhraseSelectionMode(currentWordIndex, index, 'double-click');
           else closeWordPopover({ resume: true });
@@ -2849,19 +3444,29 @@
         }
         clearPhraseSelection({ resume: false });
         lastWordClick = { cueIndex: index, wordIndex: currentWordIndex, at: clickedAt };
-        openWordPopover(word, part.text, index, currentWordIndex);
+        const clickedAnchor = fixedAnchorReference(word);
+        pendingWordClickTimer = setTimeout(() => {
+          pendingWordClickTimer = null;
+          void openWordPopover(clickedAnchor, part.text, index, currentWordIndex);
+        }, WORD_DOUBLE_CLICK_MS);
       });
-      word.addEventListener('pointerenter', () => {
+      word.addEventListener('pointerenter', event => {
+        quickWordPointer = { x: event.clientX, y: event.clientY };
         hoveredPhraseWord = { cueIndex: index, wordIndex: currentWordIndex };
         if (phraseSelectionOpen && !phraseSelection) previewPhraseTo(currentWordIndex, index);
+        else scheduleQuickWordPopover(word, part.text, index, currentWordIndex);
       });
+      word.addEventListener('pointermove', event => { quickWordPointer = { x: event.clientX, y: event.clientY }; });
       word.addEventListener('pointerleave', () => {
+        if (word.isConnected && quickWordHoverAnchor === word) quickWordPointer = null;
+        scheduleHideQuickWordPopover(word);
         if (hoveredPhraseWord?.cueIndex === index && hoveredPhraseWord?.wordIndex === currentWordIndex) {
           hoveredPhraseWord = null;
         }
       });
       word.addEventListener('keydown', event => {
         if (event.key === 'Enter' || event.key === ' ') {
+          hideQuickWordPopover();
           event.preventDefault();
           if (event.shiftKey) {
             lastWordClick = null;
@@ -2871,7 +3476,7 @@
           if (phraseSelectionOpen && selectPhraseTo(currentWordIndex, index)) return;
           clearPhraseSelection({ resume: false });
           lastWordClick = { cueIndex: index, wordIndex: currentWordIndex, at: performance.now() };
-          openWordPopover(word, part.text, index, currentWordIndex);
+          openWordPopover(word, part.text, index, currentWordIndex, { trigger: 'keyboard' });
         }
       });
       sourceRow.appendChild(word);
@@ -2879,6 +3484,16 @@
     if (phraseSelectionOpen) renderPhraseRangeForCurrentCue({ preview: !phraseSelection });
     applyCurrentCueExpressionMarks();
     renderTranslationForCue(index);
+    if (quickAnchorBeforeRender && previousCueIndex === index && quickWordPointer) {
+      const replacement = document.elementFromPoint(quickWordPointer.x, quickWordPointer.y)?.closest('.sc-learning-word');
+      if (replacement && sourceRow.contains(replacement)
+          && replacement.dataset.normalized === quickAnchorBeforeRender.dataset.normalized) {
+        scheduleQuickWordPopover(replacement, replacement.textContent, index, Number(replacement.dataset.wordIndex));
+      }
+    }
+    if (settings.learning_hover_word_translation) void prefetchQuickWordTranslations(cue);
+    void startTranslationPrefetch();
+    if (settings.learning_translation_order === 'source') void prefetchLiteralWindow(index);
   }
 
   function renderCurrentVideoCue(video, force = false) {
@@ -2969,7 +3584,6 @@
     const index = U.findCueIndex(cues, timeMs);
     if (index !== currentCueIndex) {
       renderCue(index);
-      if (index >= 0 && settings.learning_translation_mode !== 'never') startTranslationPrefetch();
     }
   }
 
@@ -2977,14 +3591,21 @@
     try {
       const url = new URL(location.href);
       if (url.pathname.startsWith('/watch')) return url.searchParams.get('v') || '';
-      if (url.pathname.startsWith('/shorts/')) return url.pathname.split('/').filter(Boolean)[1] || '';
+      if (url.pathname.startsWith('/live/') || url.pathname.startsWith('/shorts/')) {
+        return url.pathname.split('/').filter(Boolean)[1] || '';
+      }
     } catch {}
     return '';
   }
 
   function positionPopover(popover, anchor, { force = false } = {}) {
     if (!popover.isConnected || !anchor?.isConnected) return;
-    if (!force && popover.__scScrollDetached) return;
+    if (!force && popover.__scScrollDetached) {
+      const rect = popover.getBoundingClientRect();
+      U.fitFloatingElement(popover, { getBoundingClientRect: () => ({ ...rect.toJSON(), bottom: rect.top }) },
+        { gap: 0, preferBelow: true, scroll: false });
+      return;
+    }
     const margin = 12;
     const gap = 8;
     const a = anchor.getBoundingClientRect();
@@ -3019,17 +3640,28 @@
       tail.hidden = !layout.tailVisible;
       popover.dataset.tailLeft = String(Math.round(layout.tailLeft));
     }
-    const positionSignature = `${Math.round(layout.left)}:${Math.round(layout.top)}:${Math.round(p.width)}:${Math.round(p.height)}:${Math.round(a.left)}`;
+    const fitted = U.fitFloatingElement(popover, anchor, { margin, gap, scroll: false });
+    if (fitted && (Math.abs(fitted.left - layout.left) > 1 || Math.abs(fitted.top - layout.top) > 1)) {
+      popover.dataset.placement = 'viewport';
+      if (tail) tail.hidden = true;
+    }
+    const placed = popover.getBoundingClientRect();
+    if (tail) {
+      tail.style.left = `${Math.round(Math.max(10, Math.min(placed.width - 32, a.left + a.width / 2 - placed.left - 11)))}px`;
+      tail.hidden = placed.bottom + gap > a.top + 1;
+      popover.dataset.placement = tail.hidden ? 'viewport' : 'above';
+    }
+    const positionSignature = `${Math.round(placed.left)}:${Math.round(placed.top)}:${Math.round(placed.width)}:${Math.round(placed.height)}:${Math.round(a.left)}`;
     if (popover.__scPositionSignature !== positionSignature) {
       popover.__scPositionSignature = positionSignature;
       log('word popover positioned', {
         anchorLeft: Math.round(a.left),
         anchorCenterX: Math.round(a.left + a.width / 2),
         desiredLeft: Math.round(layout.desiredLeft),
-        left: Math.round(layout.left),
-        top: Math.round(layout.top),
-        width: Math.round(p.width),
-        height: Math.round(p.height),
+        left: Math.round(placed.left),
+        top: Math.round(placed.top),
+        width: Math.round(placed.width),
+        height: Math.round(placed.height),
         maxHeight: Math.round(layout.maxHeight),
         overlapsAnchor: layout.overlapsAnchor,
         safeLeft: margin,
@@ -3056,11 +3688,203 @@
     };
   }
 
-  function closeWordPopover({ resume = true } = {}) {
+  function quickTranslationKey(word) {
+    return [
+      sourceLanguage().toLocaleLowerCase('en-US'),
+      String(settings.learning_target_lang || 'ru').toLocaleLowerCase('en-US'),
+      U.normalizeTerm(word),
+    ].join('|');
+  }
+
+  function fixedQuickWordRows(word) {
+    const normalized = U.normalizeTerm(word);
+    if (normalized === 'the') return [{ value: 'определённый артикль', partOfSpeech: '' }];
+    if (normalized === 'a' || normalized === 'an') return [{ value: 'неопределённый артикль', partOfSpeech: '' }];
+    return [];
+  }
+
+  function quickAlignedFallbacks(word, cueIndex, sourceWordIndex, anchor) {
+    const cue = cues[cueIndex];
+    const key = quickTranslationKey(word);
+    const fallbacks = [...fixedQuickWordRows(word), ...(quickWordTranslations.get(key) || [])];
+    const literal = cue ? literalTranslationsByText.get(cue.text) : null;
+    if (literal?.literalText && Number.isInteger(sourceWordIndex) && sourceWordIndex >= 0) {
+      for (const range of literal.alignments || []) {
+        if (Number(range?.sourceWordIndex) !== sourceWordIndex) continue;
+        const value = literal.literalText.slice(Number(range.targetStart), Number(range.targetEnd)).trim();
+        if (value) fallbacks.push(value);
+      }
+    }
+    const natural = cue ? translationsByText.get(cue.text) || '' : '';
+    const projection = cue ? translationAlignmentsByText.get(cue.text) || '' : '';
+    if (cue && natural && projection) {
+      for (const range of U.alignedTargetRanges(cue.text, natural, word, projection, sourceLanguage())) {
+        const value = natural.slice(range.start, range.end).trim();
+        if (value) fallbacks.push(value);
+      }
+    }
+    const stored = String(anchor?.__scLearningState?.translation || '').trim();
+    if (stored) fallbacks.push(...stored.split(/\s*;\s*/).filter(Boolean));
+    return U.quickWordTranslationRows(null, fallbacks, 3, word);
+  }
+
+  function positionQuickWordPopover(popover, anchor) {
+    if (!popover?.isConnected || !anchor?.isConnected) return;
+    const margin = 10;
+    const gap = 6;
+    const anchorRect = anchor.getBoundingClientRect();
+    const popoverRect = popover.getBoundingClientRect();
+    const left = U.quickWordPopoverLeft({
+      anchorLeft: anchorRect.left,
+      anchorWidth: anchorRect.width,
+      popoverWidth: popoverRect.width,
+      viewportWidth: innerWidth,
+      margin,
+    });
+    const above = anchorRect.top - popoverRect.height - gap;
+    const top = above >= margin
+      ? above
+      : Math.min(innerHeight - popoverRect.height - margin, anchorRect.bottom + gap);
+    popover.style.left = `${Math.round(left)}px`;
+    popover.style.top = `${Math.round(Math.max(margin, top))}px`;
+    U.fitFloatingElement(popover, anchor, { margin, gap });
+  }
+
+  function renderQuickWordPopover(popover = document.getElementById(QUICK_WORD_POPOVER_ID)) {
+    const refs = popover?.__scQuickWordRefs;
+    if (!popover || !refs) return;
+    const fallbackRows = quickAlignedFallbacks(refs.word, refs.cueIndex, refs.sourceWordIndex, refs.anchor);
+    const rows = U.quickWordTranslationRows(null, fallbackRows, 1, refs.word);
+    refs.rows.replaceChildren();
+    const visibleRows = rows.length ? rows : [{ value: 'Перевожу…', partOfSpeech: '' }];
+    popover.dataset.loading = rows.length ? '0' : '1';
+    for (const row of visibleRows) {
+      const line = document.createElement('div');
+      line.className = 'sc-quick-word-row';
+      const value = document.createElement('span');
+      value.textContent = row.value;
+      line.appendChild(value);
+      refs.rows.appendChild(line);
+    }
+    positionQuickWordPopover(popover, refs.anchor);
+  }
+
+  function showQuickWordPopover(anchor, word, cueIndex, sourceWordIndex) {
+    if (!settings.learning_hover_word_translation || !anchor?.isConnected
+        || (phraseSelectionOpen && !phraseSelection)) return;
+    let popover = document.getElementById(QUICK_WORD_POPOVER_ID);
+    let rows = popover?.__scQuickWordRefs?.rows || null;
+    if (!popover) {
+      popover = document.createElement('div');
+      popover.id = QUICK_WORD_POPOVER_ID;
+      popover.setAttribute('role', 'tooltip');
+      rows = document.createElement('div');
+      popover.appendChild(rows);
+      document.body.appendChild(popover);
+    }
+    popover.__scQuickWordRefs = {
+      anchor,
+      word,
+      cueIndex,
+      sourceWordIndex,
+      key: quickTranslationKey(word),
+      rows,
+    };
+    renderQuickWordPopover(popover);
+  }
+
+  function scheduleQuickWordPopover(anchor, word, cueIndex, sourceWordIndex) {
+    if (!settings.learning_hover_word_translation || (phraseSelectionOpen && !phraseSelection)) return;
+    if (quickWordHideTimer != null) clearTimeout(quickWordHideTimer);
+    quickWordHideTimer = null;
+    if (quickWordHoverTimer != null) clearTimeout(quickWordHoverTimer);
+    quickWordHoverTimer = null;
+    quickWordHoverAnchor = anchor;
+    const token = ++quickWordHoverToken;
+    if (document.getElementById(QUICK_WORD_POPOVER_ID)) {
+      showQuickWordPopover(anchor, word, cueIndex, sourceWordIndex);
+      return;
+    }
+    quickWordHoverTimer = setTimeout(() => {
+      quickWordHoverTimer = null;
+      if (token !== quickWordHoverToken || quickWordHoverAnchor !== anchor
+          || !anchor?.isConnected) return;
+      const pointerTarget = quickWordPointer && document.elementFromPoint(quickWordPointer.x, quickWordPointer.y);
+      if (!anchor.matches(':hover') && !(pointerTarget && (pointerTarget === anchor || anchor.contains(pointerTarget)))) return;
+      showQuickWordPopover(anchor, word, cueIndex, sourceWordIndex);
+    }, QUICK_WORD_HOVER_DELAY_MS);
+  }
+
+  function scheduleHideQuickWordPopover(anchor) {
+    if (anchor && quickWordHoverAnchor && quickWordHoverAnchor !== anchor) return;
+    if (quickWordHideTimer != null) clearTimeout(quickWordHideTimer);
+    quickWordHideTimer = setTimeout(() => {
+      quickWordHideTimer = null;
+      hideQuickWordPopover(anchor);
+    }, 110);
+  }
+
+  function hideQuickWordPopover(anchor = null) {
+    if (anchor && quickWordHoverAnchor && quickWordHoverAnchor !== anchor) return;
+    if (quickWordHoverTimer != null) clearTimeout(quickWordHoverTimer);
+    if (quickWordHideTimer != null) clearTimeout(quickWordHideTimer);
+    quickWordHoverTimer = null;
+    quickWordHideTimer = null;
+    quickWordHoverAnchor = null;
+    quickWordHoverToken += 1;
+    document.getElementById(QUICK_WORD_POPOVER_ID)?.remove();
+  }
+
+  async function prefetchQuickWordTranslations(cue) {
+    if (!settings.learning_hover_word_translation || !cue
+        || sourceLanguage().toLocaleLowerCase('en-US') === String(settings.learning_target_lang || '').toLocaleLowerCase('en-US')) return;
+    const unique = [];
+    const seen = new Set();
+    for (const part of U.segmentWords(cue.text, sourceLanguage())) {
+      if (!part.word || seen.has(part.normalized)) continue;
+      seen.add(part.normalized);
+      const key = quickTranslationKey(part.text);
+      const fixedRows = fixedQuickWordRows(part.text);
+      if (fixedRows.length) {
+        quickWordTranslations.set(key, fixedRows);
+        continue;
+      }
+      if (quickWordTranslations.has(key) || quickTranslationPending.has(key)) continue;
+      quickTranslationPending.add(key);
+      unique.push({ text: part.normalized || part.text, key });
+      if (unique.length >= 25) break;
+    }
+    if (!unique.length) return;
+    try {
+      const payload = await bridgeJson('/translator/translate', {
+        method: 'POST',
+        body: { texts: unique.map(item => item.text), from: sourceLanguage(), to: settings.learning_target_lang },
+      });
+      for (const item of payload?.translations || []) {
+        const key = quickTranslationKey(item.source_text);
+        const value = String(item.translated_text || '').trim();
+        if (value) quickWordTranslations.set(key, [{ value, partOfSpeech: '' }]);
+      }
+    } catch {
+      // Alignment and stored vocabulary still provide an immediate fallback.
+    } finally {
+      for (const item of unique) quickTranslationPending.delete(item.key);
+      const popover = document.getElementById(QUICK_WORD_POPOVER_ID);
+      if (popover) renderQuickWordPopover(popover);
+    }
+  }
+
+  function closeWordPopover({ resume = true, preserveHistory = false, reason = 'dismiss' } = {}) {
+    const pendingClick = pendingWordClickTimer != null;
+    clearTimeout(pendingWordClickTimer); pendingWordClickTimer = null;
+    if (!preserveHistory) wordPopoverHistory.length = 0;
     popoverResizeObserver?.disconnect();
     popoverResizeObserver = null;
     const popover = document.getElementById(WORD_POPOVER_ID);
     const highlightedCueIndex = popover?.__scWordRefs?.cueIndex;
+    if (popover || pendingClick) logLearningAction('word closed', { term: popover?.__scWordRefs?.word || '',
+      cueIndex: highlightedCueIndex, reason, pendingClick });
+    window.__scLearningChoicesPopover?.closeFor(popover);
     popover?.remove();
     wordPopoverOpen = false;
     applyActiveSourceWordMark();
@@ -3095,10 +3919,13 @@
     }
     if (!state.detached && state.playerVisible) {
       positionPopover(popover, refs.anchor, { force: true });
+    } else if (state.playerVisible) {
+      positionPopover(popover, refs.anchor);
     }
   }
 
   function onViewportScroll() {
+    hideQuickWordPopover();
     updateGeometry();
     if (viewportScrollFrame != null) return;
     viewportScrollFrame = requestAnimationFrame(() => {
@@ -3150,16 +3977,19 @@
   }
 
   function cueContext(cue, surfaceForm = '', partOfSpeech = 'unknown', meaning = '') {
+    if (cue?.origin === 'dictionary') return { sourceText: cue.text, translation: cue.translation || '',
+      surfaceForm: U.normalizeTerm(surfaceForm), origin: 'manual', partOfSpeech, meaning };
     const cueIndex = Number.isInteger(cue?.index) ? cue.index : cues.indexOf(cue);
-    const sourceText = U.sentenceForCueTerm(cues, cueIndex, surfaceForm, sourceLanguage());
+    const sourceText = U.sentenceForCueTerm(cues, cueIndex, surfaceForm, sourceLanguage(), cue?.contextWordIndex);
     if (!U.sentenceIsComplete(sourceText, sourceLanguage())) return null;
-    const rawTranslation = cue ? translationsByText.get(cue.text) || '' : '';
+    const rawTranslation = cue ? cue.translation || translationsByText.get(cue.text) || '' : '';
     const translationPair = U.parallelSentenceForTerm(
       cue?.text || '',
       rawTranslation,
       surfaceForm,
       sourceLanguage(),
       settings.learning_target_lang,
+      cue?.contextWordIndex,
     );
     return {
       videoId: videoMeta.videoId,
@@ -3177,8 +4007,9 @@
   }
 
   function wordIdentity(word, cue, overrides = {}) {
+    const kind = String(word).trim().includes(' ') ? 'phrase' : 'word';
     const identity = Lexeme?.canonicalIdentity?.({
-      kind: 'word',
+      kind,
       sourceLang: sourceLanguage(),
       targetLang: settings.learning_target_lang,
       sourceText: word,
@@ -3191,7 +4022,7 @@
       normalizedSurface: U.normalizeTerm(word),
     };
     return {
-      kind: 'word',
+      kind,
       sourceLang: sourceLanguage(),
       targetLang: settings.learning_target_lang,
       sourceText: word,
@@ -3225,7 +4056,7 @@
 
   async function saveLearning({ kind, state: nextState, sourceText, normalizedText, translation, cue, contexts = [], contextMeaning = '', toggle = true, identity = null, surfaceForm = '' }) {
     if (!learningStore) throw new Error('Локальный словарь недоступен');
-    return learningStore.setState(localLearningPayload({
+    const payload = localLearningPayload({
       kind,
       state: nextState,
       sourceText,
@@ -3237,7 +4068,9 @@
       toggle,
       identity,
       surfaceForm,
-    }));
+    });
+    return learningStore.setState({ ...payload, contextAdditions: payload.contexts,
+      observedFormAdditions: payload.observedForms || [] });
   }
 
   function applyLearningStateToWord(word, cue) {
@@ -3250,6 +4083,9 @@
       delete word.dataset.learningState;
     }
     updateWordLearningTitle(word);
+    const phrasePending = word.__scExampleCue && U.pendingSaveWordIndexes([cue], 0, vocabularySaves?.all(), sourceLanguage())
+      .includes(Number(word.dataset.wordIndex));
+    word.dataset.saving = phrasePending || vocabularySaves?.pending(vocabularySaves.get(word.textContent, resolved.identity?.lemma, resolved.state?.lemma)) ? '1' : '0';
     return resolved;
   }
 
@@ -3261,7 +4097,9 @@
       sourceLanguage(),
     );
     const words = Array.from(sourceRow?.querySelectorAll?.('.sc-learning-word[data-word-index]') || []);
+    const saving = new Set(U.pendingSaveWordIndexes(cues, currentCueIndex, vocabularySaves?.all(), sourceLanguage()));
     for (const word of words) {
+      if (saving.has(Number(word.dataset.wordIndex))) word.dataset.saving = '1';
       delete word.dataset.expressionState;
       delete word.dataset.expressionType;
       word.__scExpressionMatch = null;
@@ -3369,8 +4207,124 @@
     return annotations;
   }
 
+  function clearRussianSelection({ resume = true } = {}) {
+    clearTimeout(russianClickTimer); russianClickTimer = null;
+    const previous = russianSelection; russianSelection = null;
+    previous?.popup?.close({ notify: false });
+    applyRussianSelectionMarks();
+    if (resume) settleHoverAfterDismissal();
+    else updateHoverHoldState();
+  }
+
+  function applyRussianSelectionMarks() {
+    const selected = russianSelection;
+    const sourceParts = U.segmentWords(cues[currentCueIndex]?.text || '', sourceLanguage()).filter(p => p.word);
+    for (const word of translationRow?.querySelectorAll('.sc-learning-ru-word') || []) {
+      const start = Number(word.dataset.start), end = Number(word.dataset.end);
+      word.toggleAttribute('data-ru-selected', !!selected && start >= selected.targetStart && end <= selected.targetEnd);
+    }
+    for (const word of sourceRow?.querySelectorAll('.sc-learning-word') || []) {
+      const part = sourceParts[Number(word.dataset.wordIndex)];
+      const matched = !!part && selected?.sourceRanges?.some(range => range.start < part.index + part.text.length && range.end > part.index);
+      word.toggleAttribute('data-ru-match', !!matched);
+    }
+  }
+
+  function openRussianSelection(firstIndex, lastIndex = firstIndex, selecting = false) {
+    const text = translationRow?.textContent || '', cue = cues[currentCueIndex];
+    if (!cue || !/^en(?:-|$)/i.test(sourceLanguage()) || !/^ru(?:-|$)/i.test(settings.learning_target_lang)
+      || translationRow.getAttribute('aria-busy') === 'true') return;
+    const parts = U.segmentWords(text, 'ru').filter(p => p.word);
+    const first = parts[Math.min(firstIndex, lastIndex)], last = parts[Math.max(firstIndex, lastIndex)];
+    if (!first || !last || !window.__scLearningChoicesPopover) return;
+    clearRussianSelection({ resume: false });
+    closeWordPopover({ resume: false }); clearPhraseSelection({ resume: false }); hideQuickWordPopover();
+    const selection = { cueIndex: currentCueIndex, text, firstIndex, selecting,
+      targetStart: first.index, targetEnd: last.index + last.text.length, sourceRanges: [], request: 0 };
+    russianSelection = selection;
+    pauseForPhraseSelection(currentCueIndex);
+    const anchor = { contains: node => translationRow.contains(node), getBoundingClientRect: () => {
+      const nodes = Array.from(translationRow.querySelectorAll('.sc-learning-ru-word')).filter(node => Number(node.dataset.start) >= selection.targetStart && Number(node.dataset.end) <= selection.targetEnd);
+      const rects = nodes.map(node => node.getBoundingClientRect());
+      if (!rects.length) return translationRow.getBoundingClientRect();
+      const left = Math.min(...rects.map(r => r.left)), right = Math.max(...rects.map(r => r.right));
+      const top = Math.min(...rects.map(r => r.top)), bottom = Math.max(...rects.map(r => r.bottom));
+      return { left, right, top, bottom, width: right - left, height: bottom - top };
+    } };
+    const title = text.slice(selection.targetStart, selection.targetEnd);
+    const load = async () => {
+      const request = ++selection.request;
+      selection.popup.update({ model: { title, phase: 'loading', loadingText: 'Разбираю перевод в этой реплике…' } });
+      try {
+        const result = await bridgeJson('/learning/catalogue', { method: 'POST', body: {
+          action: 'context-choice', context: cue.text, contextTranslation: text,
+          targetStart: selection.targetStart, targetEnd: selection.targetEnd,
+        } });
+        if (russianSelection !== selection || request !== selection.request || currentCueIndex !== selection.cueIndex) return;
+        if (result.context !== cue.text || result.contextTranslation !== text || result.targetStart !== selection.targetStart
+          || result.targetEnd !== selection.targetEnd || !Array.isArray(result.sourceRanges)
+          || result.sourceRanges.some(r => !Number.isInteger(r.start) || !Number.isInteger(r.end) || r.start < 0 || r.end <= r.start || r.end > cue.text.length)) {
+          throw new Error('Разбор относится к другому выделению. Повторите запрос.');
+        }
+        selection.sourceRanges = result.sourceRanges; applyRussianSelectionMarks();
+        selection.popup.update({ model: { ...result, title, phase: 'ready', description: result.explanation } });
+      } catch (error) {
+        if (russianSelection === selection && request === selection.request) selection.popup.update({ model: { title, phase: 'error', error: error.message } });
+      }
+    };
+    selection.popup = window.__scLearningChoicesPopover.create({ owner: translationRow, anchor,
+      model: { title, phase: selecting ? 'selecting' : 'loading' }, onRetry: load,
+      onClose: ({ event } = {}) => {
+        if (russianSelection !== selection) return;
+        const nativePlayback = !!event && U.dismissalPlaybackOwner({ via: 'outside-pointer', insidePlayer: !!playerAnchor()?.contains(event.target) }) === 'native-player';
+        clearRussianSelection({ resume: !nativePlayback });
+        if (nativePlayback) relinquishHoverPauseOwnership();
+      },
+      isSaved: term => ['saved', 'known'].includes(learningStateForWord(term, cue)?.state?.state),
+      onChoice: (choice, node) => {
+        const fixed = fixedAnchorReference(node); clearRussianSelection({ resume: false });
+        void openWordPopover(fixed, choice.term, selection.cueIndex, null, { context: { ...cue, translation: text, origin: 'video' } });
+      },
+    });
+    applyRussianSelectionMarks();
+    if (!selecting) void load();
+  }
+
+  function russianWordClick(event, index) {
+    event.preventDefault(); event.stopPropagation();
+    clearTimeout(russianClickTimer); russianClickTimer = null;
+    const at = performance.now();
+    if (event.shiftKey) { lastRussianClick = null; openRussianSelection(index, index, true); return; }
+    if (russianSelection?.selecting) { openRussianSelection(russianSelection.firstIndex, index); lastRussianClick = null; return; }
+    const repeated = lastRussianClick?.cueIndex === currentCueIndex && lastRussianClick.index === index && at - lastRussianClick.at < WORD_DOUBLE_CLICK_MS;
+    if (repeated) { lastRussianClick = null; openRussianSelection(index, index, true); return; }
+    lastRussianClick = { index, at, cueIndex: currentCueIndex };
+    const cueIndex = currentCueIndex;
+    russianClickTimer = setTimeout(() => { russianClickTimer = null; if (cueIndex === currentCueIndex) openRussianSelection(index); }, WORD_DOUBLE_CLICK_MS);
+  }
+
   function renderAnnotatedTranslation(container, text, annotations) {
     container.replaceChildren();
+    if (container === translationRow && /^en(?:-|$)/i.test(sourceLanguage()) && /^ru(?:-|$)/i.test(settings.learning_target_lang)) {
+      if (russianSelection && (russianSelection.text !== text || russianSelection.cueIndex !== currentCueIndex)) clearRussianSelection({ resume: false });
+      let index = 0;
+      for (const part of U.segmentWords(text, 'ru')) {
+        if (!part.word) { container.append(document.createTextNode(part.text)); continue; }
+        const word = document.createElement('span'), wordIndex = index++;
+        word.className = 'sc-learning-ru-word'; word.textContent = part.text; word.tabIndex = 0; word.setAttribute('role', 'button');
+        word.dataset.start = part.index; word.dataset.end = part.index + part.text.length;
+        const marks = annotations.filter(a => a.start < part.index + part.text.length && a.end > part.index);
+        const state = marks.find(a => a.state)?.state;
+        if (state) word.dataset.learningState = state;
+        if (marks.some(a => a.active)) word.dataset.active = '1';
+        word.addEventListener('click', event => russianWordClick(event, wordIndex));
+        word.addEventListener('pointerenter', () => { hoveredRussianWord = wordIndex; });
+        word.addEventListener('pointerleave', () => { if (hoveredRussianWord === wordIndex) hoveredRussianWord = null; });
+        word.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') russianWordClick(event, wordIndex); });
+        container.append(word);
+      }
+      applyRussianSelectionMarks(); russianSelection?.popup?.position(); return;
+    }
     for (const segment of U.annotatedTextSegments(text, annotations)) {
       if (!segment.state && !segment.active) {
         container.appendChild(document.createTextNode(segment.text));
@@ -3399,37 +4353,25 @@
   function renderTranslationForCue(index) {
     if (!translationRow || index !== currentCueIndex || !cues[index]) return;
     const cue = cues[index];
+    const sameLanguage = !literalTranslationNeeded();
+    translationRow.hidden = sameLanguage;
+    if (sameLanguage) {
+      delete translationRow.dataset.literalState;
+      translationRow.removeAttribute('aria-busy');
+      translationRow.replaceChildren();
+      scheduleSubtitleLayout();
+      return;
+    }
     const cueKey = `${cue.startMs}:${cue.endMs}`;
     if (translationRow.dataset.cueKey !== cueKey) {
       translationRow.dataset.cueKey = cueKey;
       translationRow.style.minWidth = '';
       translationRow.style.minHeight = '';
     }
-    if (settings.learning_translation_mode === 'never') {
-      delete translationRow.dataset.literalState;
-      translationRow.removeAttribute('aria-busy');
-      translationRow.removeAttribute('aria-hidden');
-      translationRow.style.minWidth = '';
-      translationRow.style.minHeight = '';
-      translationRow.replaceChildren();
-      scheduleSubtitleLayout();
-      return;
-    }
     let translated = translationsByText.get(cue.text);
-    if (settings.learning_translation_mode === 'always' && !translated) {
+    if (!translated) {
       ensureCueTranslation(index);
       translated = translationsByText.get(cue.text);
-    }
-    if (settings.learning_translation_mode === 'hover' && !translated) {
-      if (translationError && !pendingTranslationTexts.has(cue.text)) {
-        delete translationRow.dataset.literalState;
-        translationRow.removeAttribute('aria-busy');
-        translationRow.textContent = 'Перевод временно недоступен';
-      } else {
-        renderPendingTranslation(cue.text, 'translation-pending', cueKey);
-      }
-      scheduleSubtitleLayout();
-      return;
     }
     if (translated) {
       const literal = settings.learning_translation_order === 'source'
@@ -3547,8 +4489,6 @@
   function skeletonRow() {
     const row = document.createElement('div');
     row.className = 'sc-word-skeleton-row';
-    const circle = document.createElement('span');
-    circle.className = 'sc-word-skeleton';
     const lines = document.createElement('span');
     lines.className = 'sc-word-skeleton-lines';
     const first = document.createElement('span');
@@ -3556,13 +4496,68 @@
     const second = document.createElement('span');
     second.className = 'sc-word-skeleton';
     lines.append(first, second);
-    row.append(circle, lines);
+    row.append(lines);
     return row;
+  }
+
+  function setPopoverActionStatus(refs, stateName, { loading = false, error = false, label = '', message = '' } = {}) {
+    const button = refs?.stateButtons?.get(stateName);
+    if (!button) return;
+    button.dataset.loading = loading ? '1' : '0';
+    button.dataset.error = error ? '1' : '0';
+    button.setAttribute('aria-busy', String(loading));
+    if (message) button.title = message;
+    else button.removeAttribute('title');
+    const text = button.querySelector('span');
+    if (text) text.textContent = label || button.dataset.defaultLabel || '';
+    if (error && refs.actionError) {
+      refs.actionError.textContent = message || 'Не удалось изменить состояние слова. Повторите попытку.';
+      refs.actionError.hidden = false;
+    }
+  }
+
+  function resetPopoverActionStatuses(refs) {
+    if (refs?.actionError) { refs.actionError.hidden = true; refs.actionError.textContent = ''; }
+    for (const name of refs?.stateButtons?.keys?.() || []) setPopoverActionStatus(refs, name);
+  }
+
+  function wordStateOperationKey(refs) {
+    return [refs.query?.sourceLang || sourceLanguage(), refs.query?.targetLang || settings.learning_target_lang,
+      U.normalizeTerm(refs.word)].join('|');
+  }
+
+  function joinWordStateOperation(refs) {
+    const operation = wordStateOperations.get(wordStateOperationKey(refs));
+    if (!operation) return applySharedSaveStatus(refs);
+    operation.views.add(refs);
+    refs.busy = true;
+    for (const button of refs.stateButtons.values()) button.disabled = true;
+    setPopoverActionStatus(refs, operation.stateName, { loading: true, label: operation.label });
+    return true;
+  }
+
+  function applySharedSaveStatus(refs) {
+    if (!vocabularySaves || !refs) return false;
+    const operation = vocabularySaves.get(refs.word, refs.query?.lemma);
+    if (vocabularySaves.pending(operation)) {
+      refs.sharedSaveBusy = true; refs.busy = true;
+      for (const button of refs.stateButtons.values()) button.disabled = true;
+      setPopoverActionStatus(refs, 'saved', { loading: true, label: operation.phase === 'saving' ? 'Сохраняю…' : 'Проверяю…' });
+      return true;
+    }
+    if (refs.sharedSaveBusy && !wordStateOperations.has(wordStateOperationKey(refs))) {
+      refs.sharedSaveBusy = false; refs.busy = false;
+      for (const button of refs.stateButtons.values()) button.disabled = false;
+      resetPopoverActionStatuses(refs);
+    }
+    if (operation?.phase === 'error' && !refs.busy) setPopoverActionStatus(refs, 'saved', { error: true, label: 'Повторить', message: operation.error });
+    return false;
   }
 
   function applyPopoverState(refs, entry) {
     if (!refs) return;
     refs.entry = entry || null;
+    if (!refs.busy) resetPopoverActionStatuses(refs);
     const state = entry?.state || 'none';
     for (const [name, button] of refs.stateButtons) {
       button.dataset.active = state === name ? '1' : '0';
@@ -3570,6 +4565,7 @@
     }
     updatePopoverContextButton(refs);
     updatePopoverSourceTitle(refs);
+    applySharedSaveStatus(refs);
   }
 
   function updatePopoverSourceTitle(refs, displaySource = '') {
@@ -3702,11 +4698,77 @@
     return entry;
   }
 
+  async function saveCheckedPopoverWord(refs) {
+    if (!vocabularySaves) throw new Error('Обновите страницу: модуль словаря ещё не загрузился.');
+    const context = refs.cue?.origin === 'dictionary' ? { sourceText: refs.cue.text, translation: refs.cue.translation || '',
+      surfaceForm: refs.word, origin: 'manual', createdAt: Date.now() }
+      : refs.cue ? cueContext(refs.cue, refs.word, refs.query?.partOfSpeech) : null;
+    const saved = await vocabularySaves.save({ word: refs.query.lemma || refs.word,
+      observedForms: [refs.word], contexts: context ? [context] : [], source: 'youtube-word-card' });
+    await learningStore.sync({ fresh: true });
+    const entry = await learningStore.getEntry({ remoteId: saved.item.id,
+      lemma: saved.item.lemma || saved.item.term, normalizedText: saved.item.lemma || saved.item.term });
+    if (!entry) throw new Error('Сохранённая карточка не появилась в словаре. Откройте её снова.');
+    applyPopoverState(refs, entry);
+    if (entry.senseCatalog?.validatedAt && entry.state !== 'none') {
+      try {
+        const full = await bridgeJson('/learning/catalogue', { method: 'POST', body: { action: 'read', entryId: saved.item.id } });
+        if (refs.popover.isConnected) applyCheckedPopoverCatalogue(refs, full.catalogue, entry.lemma || entry.sourceText);
+      } catch (error) { log('saved catalogue display failed', { term: refs.word, error: error.message }); }
+    }
+    return entry;
+  }
+
   async function togglePopoverState(refs, stateName) {
     if (!learningStore || refs.busy) return;
+    if (joinWordStateOperation(refs)) return;
     refs.busy = true;
+    let failed = false;
+    resetPopoverActionStatuses(refs);
     for (const button of refs.stateButtons.values()) button.disabled = true;
+    const needsCheckedCard = (stateName === 'easy' || (stateName === 'saved' && refs.entry?.state !== 'saved'))
+      && !refs.entry?.senseCatalog?.validatedAt;
+    const operationKey = wordStateOperationKey(refs);
+    const operation = { stateName, label: needsCheckedCard ? 'Проверяю…' : 'Сохраняю…', views: new Set([refs]), error: '' };
+    wordStateOperations.set(operationKey, operation);
+    logLearningAction('word save started', { term: refs.word, action: stateName, operationKey });
+    setPopoverActionStatus(refs, stateName, { loading: true, label: operation.label });
     try {
+      if (stateName === 'easy') {
+        let entry = refs.entry;
+        if (!entry || entry.state !== 'saved') {
+          entry = needsCheckedCard
+            ? await saveCheckedPopoverWord(refs)
+            : await saveLearning({
+                kind: 'word',
+                state: 'saved',
+                sourceText: refs.word,
+                normalizedText: refs.query.normalizedText,
+                translation: refs.canonicalPrimary || refs.primary || refs.entry?.translation || '',
+                cue: refs.cue,
+                contexts: refs.dictionaryContexts || [],
+                contextMeaning: refs.contextualMeaning || '',
+                toggle: false,
+                identity: refs.query,
+                surfaceForm: refs.word,
+              });
+        }
+        if (entry?.state !== 'saved') throw new Error('Состояние слова изменилось. Откройте карточку снова.');
+        const reviewed = await learningStore.queueReview({ key: entry.key, result: 'known', mode: 'scheduled' });
+        entry = reviewed?.entry || entry;
+        applyPopoverState(refs, entry);
+        registerWordState(entry);
+        void learningStore.sync?.({}).catch(() => {});
+        if (currentCueIndex >= 0) applyCurrentCueLearningMarks();
+        return;
+      }
+      if (stateName === 'saved' && needsCheckedCard) {
+        const entry = await saveCheckedPopoverWord(refs);
+        applyPopoverState(refs, entry);
+        registerWordState(entry);
+        if (currentCueIndex >= 0) applyCurrentCueLearningMarks();
+        return;
+      }
       const entry = await saveLearning({
         kind: 'word',
         state: stateName,
@@ -3728,16 +4790,34 @@
       }
       if (currentCueIndex >= 0) applyCurrentCueLearningMarks();
     } catch (error) {
-      log('word state save failed', { error: error?.message || String(error) });
+      failed = true;
+      operation.error = error?.message || String(error);
+      setPopoverActionStatus(refs, stateName, {
+        error: true,
+        label: 'Повторить',
+        message: error?.message || String(error),
+      });
+      logLearningAction('word state save failed', { term: refs.word, action: stateName, error: operation.error });
     } finally {
-      refs.busy = false;
-      for (const button of refs.stateButtons.values()) button.disabled = false;
-      updatePopoverContextButton(refs);
+      wordStateOperations.delete(operationKey);
+      for (const view of operation.views) {
+        view.busy = false;
+        for (const button of view.stateButtons.values()) button.disabled = false;
+        if (failed) setPopoverActionStatus(view, stateName, { error: true, label: 'Повторить', message: operation.error });
+        else {
+          applyPopoverState(view, refs.entry);
+          if (view !== refs && view.popover.isConnected && refs.senseCatalog) {
+            applyCheckedPopoverCatalogue(view, refs.senseCatalog, refs.query.lemma || refs.word);
+          }
+        }
+        updatePopoverContextButton(view);
+      }
+      if (!failed) logLearningAction('word save completed', { term: refs.word, action: stateName, key: refs.entry?.key, state: refs.entry?.state });
     }
   }
 
-  function createWordPopoverShell(popover, anchor, word, cueIndex) {
-    const cue = cues[cueIndex];
+  function createWordPopoverShell(popover, anchor, word, cueIndex, contextOverride = null) {
+    const cue = contextOverride || cues[cueIndex];
     const query = wordIdentity(word, cue);
     const tail = document.createElement('div');
     tail.className = 'sc-word-anchor-tail';
@@ -3757,14 +4837,21 @@
     target.dataset.loading = '1';
     target.setAttribute('aria-label', 'Перевод загружается');
     titles.append(source, target);
+    if (wordPopoverHistory.length) head.appendChild(iconButton('left', 'К предыдущему слову', () => {
+      const previous = wordPopoverHistory.pop();
+      if (previous) void openWordPopover(previous.anchor, previous.word, previous.cueIndex, previous.sourceWordIndex,
+        { context: previous.context, back: true });
+    }));
     head.append(
       titles,
       iconButton('book', 'Открыть словарь и карточки', openStudyPage),
       iconButton('speaker', 'Произнести слово', () => speak(word)),
-      iconButton('close', 'Закрыть', closeWordPopover),
+      iconButton('close', 'Закрыть', () => closeWordPopover({ reason: 'close-button' })),
     );
     const expressionLinks = document.createElement('div');
     expressionLinks.className = 'sc-word-expression-links';
+    const actionError = document.createElement('div');
+    actionError.className = 'sc-word-action-error'; actionError.setAttribute('role', 'status'); actionError.hidden = true;
 
     const meanings = document.createElement('div');
     meanings.className = 'sc-word-section sc-word-meanings';
@@ -3794,6 +4881,7 @@
       const button = document.createElement('button');
       button.type = 'button';
       button.innerHTML = `${ICONS[icon]}<span>${label}</span>`;
+      button.dataset.defaultLabel = label;
       button.dataset.active = '0';
       button.setAttribute('aria-pressed', 'false');
       installSafeClick(button, () => togglePopoverState(refs, stateName));
@@ -3807,6 +4895,7 @@
       clickedNormalized: U.normalizeTerm(word),
       cueIndex,
       cue,
+      contextOverride,
       query,
       tail,
       panel,
@@ -3814,6 +4903,7 @@
       target,
       meanings,
       meaningsList,
+      choicePopup: null,
       aiExplanation,
       examples,
       footer,
@@ -3822,6 +4912,7 @@
       canonicalPrimary: '',
       targetTerms: [],
       expressionLinks,
+      actionError,
       entry: null,
       busy: false,
       dictionaryExamples: null,
@@ -3831,11 +4922,21 @@
       invalidMeaningValues: [],
       meaningPairsFinalized: false,
       dictionaryPayload: null,
+      senseCatalog: null,
+      catalogueError: '',
+      catalogueErrorCause: null,
+      cataloguePromise: null,
+      preparedPreview: null,
+      preparedExisting: null,
+      examplesDictionary: null,
+      expandedExamples: new Set(),
+      checkedCatalogueApplied: false,
       contextualMeaning: '',
       contextButton: null,
     };
-    addState('known', 'known', 'Знаю');
+    addState('easy', 'known', 'Знаю');
     addState('saved', 'save', 'В словарь');
+    addState('known', 'ignore', 'Не учить');
     const contextButton = document.createElement('button');
     contextButton.type = 'button';
     contextButton.className = 'sc-word-context-button';
@@ -3844,10 +4945,64 @@
     installSafeClick(contextButton, () => saveCurrentPopoverExample(refs));
     refs.contextButton = contextButton;
     footer.appendChild(contextButton);
-    panel.append(head, expressionLinks, meanings, examples, footer);
+    panel.append(head, actionError, expressionLinks, meanings, examples, footer);
     popover.append(tail, panel);
     popover.__scWordRefs = refs;
     return refs;
+  }
+
+  function catalogueGroupLabel(group) {
+    return String(group?.shortMeaning || group?.preferredTranslation || group?.meaning || '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  let showSupportMeanings = true;
+  async function refreshStudyPreferences() {
+    try {
+      const state = await learningStore.getStudyState({}), next = state.preferences.showSupport !== false;
+      const changed = next !== showSupportMeanings; showSupportMeanings = next;
+      const refs = document.getElementById(WORD_POPOVER_ID)?.__scWordRefs;
+      if (changed && refs?.senseCatalog) { renderCatalogueMeaningSummary(refs, refs.senseCatalog); renderExamples(refs); }
+    } catch {}
+  }
+
+  function catalogueVisibleGroups(catalogue) {
+    return [
+      ...(catalogue?.groups || []).map(group => ({ ...group, support: false })),
+      ...(catalogue?.supportGroups || []).map(group => ({ ...group, support: true })),
+    ];
+  }
+
+  function renderCatalogueMeaningSummary(refs, catalogue) {
+    const core = (catalogue?.groups || []).map(catalogueGroupLabel).filter(Boolean);
+    const support = (showSupportMeanings ? catalogue?.supportGroups || [] : []).map(catalogueGroupLabel).filter(Boolean);
+    if (!core.length) return false;
+    refs.target.classList.remove('sc-word-skeleton', 'sc-word-error');
+    refs.target.dataset.loading = '0';
+    refs.target.removeAttribute('aria-label');
+    refs.target.replaceChildren();
+    const append = (values, groups, className = '') => values.forEach((value, index) => {
+      if (index) refs.target.appendChild(document.createTextNode(' / '));
+      const span = document.createElement('button');
+      span.type = 'button';
+      span.className = 'sc-word-meaning-trigger ' + className;
+      span.textContent = value;
+      installSafeClick(span, () => showEnglishChoices(refs, groups[index], false, false, span));
+      refs.target.appendChild(span);
+    });
+    append(core, catalogue.groups || []);
+    if (support.length) {
+      const divider = document.createElement('span');
+      divider.className = 'sc-word-meaning-divider';
+      divider.textContent = '│';
+      refs.target.appendChild(divider);
+      append(support, catalogue.supportGroups || [], 'sc-word-support-meaning');
+    }
+    refs.targetTerms = [...core, ...support];
+    refs.meaningsList.replaceChildren();
+    refs.meanings.dataset.long = core.length + support.length > 5 || [...core, ...support].join(' / ').length > 82 ? '1' : '0';
+    return true;
   }
 
   function renderDictionaryContent(refs, payload) {
@@ -3855,43 +5010,105 @@
     refs.dictionaryPayload = payload;
     refs.primary = primaryDictionaryTranslation(payload);
     updatePopoverSourceTitle(refs, payload?.dictionary?.displaySource || refs.word);
-    refs.target.classList.remove('sc-word-skeleton');
-    refs.target.dataset.loading = '0';
-    refs.target.removeAttribute('aria-label');
-    refs.target.textContent = refs.primary || 'Перевод не найден';
     const alternatives = payload?.dictionary?.translations || [];
-    refs.targetTerms = [refs.primary, ...alternatives.map(item => item.displayTarget || item.normalizedTarget || '')]
-      .filter(Boolean);
-    refs.meaningsList.replaceChildren();
-    if (!alternatives.length) {
-      const value = document.createElement('div');
-      value.className = 'sc-word-meaning';
-      value.textContent = refs.primary || 'Дополнительных значений нет.';
-      refs.meaningsList.appendChild(value);
+    const catalogueRendered = renderCatalogueMeaningSummary(refs, refs.senseCatalog);
+    if (!catalogueRendered) {
+      refs.target.classList.remove('sc-word-skeleton');
+      refs.target.dataset.loading = '0';
+      refs.target.removeAttribute('aria-label');
+      refs.target.replaceChildren();
+      const quickMeanings = refs.aiMeaningPairs?.length ? refs.aiMeaningPairs : U.dictionaryMeaningPairs(payload?.dictionary);
+      if (quickMeanings.length) quickMeanings.forEach((group, index) => {
+        if (index) refs.target.appendChild(document.createTextNode(' / '));
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'sc-word-meaning-trigger';
+        button.textContent = group.label || group.targets.join(', ');
+        installSafeClick(button, () => showEnglishChoices(refs, { meaning: button.textContent,
+          partOfSpeech: group.partOfSpeech || group.posTag || group.pos || '' }, true, false, button));
+        refs.target.appendChild(button);
+      });
+      else refs.target.textContent = refs.primary || 'Перевод не найден';
+      refs.targetTerms = [refs.primary, ...alternatives.map(item => item.displayTarget || item.normalizedTarget || '')]
+        .filter(Boolean);
+      refs.meaningsList.replaceChildren();
+      if (!alternatives.length) {
+        const value = document.createElement('div');
+        value.className = 'sc-word-meaning';
+        value.textContent = refs.primary || 'Дополнительных значений нет.';
+        refs.meaningsList.appendChild(value);
+      }
     }
-    const meaningGroups = refs.meaningPairsFinalized
-      ? refs.aiMeaningPairs
-      : refs.aiMeaningPairs?.length
-        ? refs.aiMeaningPairs
-        : U.dictionaryMeaningPairs(payload?.dictionary);
-    for (const group of meaningGroups) {
-      const row = document.createElement('div');
-      row.className = 'sc-word-meaning';
-      const pos = document.createElement('span');
-      pos.className = 'sc-word-pos';
-      pos.textContent = partOfSpeechLabel(group.pos) ? `(${partOfSpeechLabel(group.pos)})` : '';
-      pos.title = group.pos;
-      const value = document.createElement('span');
-      value.textContent = group.targets.join(' / ');
-      if (pos.textContent) row.append(value, pos);
-      else row.append(value);
-      refs.meaningsList.appendChild(row);
+    const meaningGroups = refs.meaningPairsFinalized ? refs.aiMeaningPairs
+      : refs.aiMeaningPairs?.length ? refs.aiMeaningPairs : U.dictionaryMeaningPairs(payload?.dictionary);
+    if (!catalogueRendered) {
+      const meaningTextLength = meaningGroups.flatMap(group => group.targets).join(' / ').length;
+      refs.meanings.dataset.long = meaningGroups.length > 5 || meaningTextLength > 82 ? '1' : '0';
     }
-    const meaningTextLength = meaningGroups.flatMap(group => group.targets).join(' / ').length;
-    refs.meanings.dataset.long = meaningGroups.length > 5 || meaningTextLength > 82 ? '1' : '0';
     renderExamples(refs);
     if (currentCueIndex === refs.cueIndex) renderTranslationForCue(currentCueIndex);
     positionPopover(refs.popover, refs.anchor);
+  }
+
+  function expressionChoiceInput(analysis, meaning) {
+    return { word: analysis.canonicalText || analysis.selection.text, meaning, partOfSpeech: '',
+      context: expressionContextForSelection(analysis.selection), contextTranslation: expressionContextTranslation(analysis.selection) };
+  }
+
+  async function showExpressionEnglishChoices(analysis, meaning, anchor, retry = false) {
+    if (phraseAnalysis !== analysis || !phraseSelectionOpen || !phraseHint?.isConnected) return;
+    const input = expressionChoiceInput(analysis, meaning), key = JSON.stringify(input);
+    if (!retry && analysis.choiceKey === key && analysis.choicePopup?.element.isConnected) { analysis.choicePopup.close(); return; }
+    analysis.choicePopup?.close();
+    const generation = analysis.choiceGeneration = (analysis.choiceGeneration || 0) + 1;
+    analysis.choiceKey = key;
+    const popup = analysis.choicePopup = window.__scLearningChoicesPopover.create({
+      owner: phraseHint, anchor: () => anchor.isConnected ? anchor : phraseHint.querySelector('.sc-expression-translation') || phraseHint,
+      model: { title: meaning, phase: 'loading' },
+      onClose: () => { analysis.choiceKey = ''; analysis.choiceGeneration++; },
+      onRetry: () => void showExpressionEnglishChoices(analysis, meaning, anchor, true),
+      isSaved: term => ['saved', 'known'].includes(learningStateForWord(term, null).state?.state),
+      onChoice: (choice, node) => void openWordPopover(node, choice.term, -1, -1, { nested: true }),
+    });
+    try {
+      const value = await bridgeJson('/learning/catalogue', { method: 'POST', body: { ...input, action: 'alternatives' } });
+      if (phraseAnalysis !== analysis || analysis.choiceGeneration !== generation || analysis.choiceKey !== key) return;
+      popup.update({ model: { title: meaning, phase: 'ready', ...value } });
+    } catch (error) {
+      if (analysis.choiceGeneration === generation && analysis.choiceKey === key) popup.update({ model: { title: meaning, phase: 'error', error: error.message } });
+    }
+  }
+
+  async function showEnglishChoices(refs, sense, quick = false, retry = false, anchor = null) {
+    const meaning = sense.meaning || sense.shortMeaning || '';
+    const observed = refs.contextOverride ? { sourceText: refs.contextOverride.text, translation: refs.contextOverride.translation }
+      : refs.cue ? cueContext(refs.cue, refs.word) : null;
+    const input = { word: refs.query?.lemma || refs.word, meaning, partOfSpeech: sense.partOfSpeech || '',
+      context: observed?.sourceText || '', contextTranslation: observed?.translation || '' };
+    const key = JSON.stringify(input);
+    if (!meaning || !refs.popover.isConnected) return;
+    if (!retry && refs.choiceKey === key && refs.choicePopup?.element.isConnected) { refs.choicePopup.close(); return; }
+    refs.choicePopup?.close();
+    const generation = refs.choiceGeneration = (refs.choiceGeneration || 0) + 1;
+    refs.choiceKey = key;
+    const title = sense.shortMeaning || meaning;
+    const popup = refs.choicePopup = window.__scLearningChoicesPopover.create({
+      owner: refs.popover, anchor: () => anchor?.isConnected ? anchor : refs.target,
+      model: { title, phase: 'loading' },
+      onClose: () => { refs.choiceKey = ''; refs.choiceGeneration++; },
+      onRetry: () => void showEnglishChoices(refs, sense, quick, true, anchor),
+      isSaved: term => ['saved', 'known'].includes(learningStateForWord(term, refs.cue).state?.state),
+      onChoice: (choice, node) => void openWordPopover(node, choice.term, -1, -1, { nested: true }),
+    });
+    try {
+      const result = quick ? await bridgeJson('/learning/catalogue', { method: 'POST', body: { ...input, action: 'alternatives' } })
+        : { headwordChoice: sense.headwordChoice || (sense.activeEquivalent ? { term: sense.focusEn || refs.word, nuance: '' } : null),
+          englishAlternatives: sense.englishAlternatives || (sense.activeEquivalent ? [{ term: sense.activeEquivalent.en, nuance: sense.activeEquivalent.ru }] : []) };
+      if (!refs.popover.isConnected || refs.choiceKey !== key || refs.choiceGeneration !== generation) return;
+      popup.update({ model: { title, phase: 'ready', ...result,
+        russianAlternatives: !quick && sense.alternatives?.length ? sense.alternatives.join(', ') : '' } });
+    } catch (error) {
+      if (!refs.popover.isConnected || refs.choiceKey !== key || refs.choiceGeneration !== generation) return;
+      popup.update({ model: { title, phase: 'error', error: error.message || 'Не удалось получить варианты.' } });
+    }
   }
 
   function renderAiExplanation(refs, text, { error = false } = {}) {
@@ -3921,6 +5138,7 @@
       const first = byValue.get(targets[0].toLocaleLowerCase('ru-RU'));
       return {
         text: dictionary?.normalizedSource || dictionary?.displaySource || '',
+        label: String(group?.label || '').trim() || targets.join(' / '),
         translation: first?.normalizedTarget || targets[0],
         targets,
         pos: String(group?.partOfSpeech || first?.posTag || '').toUpperCase(),
@@ -3942,13 +5160,15 @@
         value: item?.normalizedTarget || item?.displayTarget || '',
         partOfSpeech: Lexeme?.normalizePartOfSpeech?.(item?.posTag) || String(item?.posTag || '').toLocaleLowerCase('en-US'),
       })).filter((item) => item.value);
-      const payload = await bridgeJson('/learning/explain', {
+      const payload = await bridgeJson('/learning/catalogue', {
         method: 'POST',
         body: {
           word: refs.word,
+          action: 'explain',
+          contextOnly: true,
           wordTranslation: refs.primary || '',
           context: refs.cue.text,
-          contextTranslation: translationsByText.get(refs.cue.text) || '',
+          contextTranslation: refs.cue.translation || translationsByText.get(refs.cue.text) || '',
           sourceLang: sourceLanguage(),
           targetLang: settings.learning_target_lang,
           knownMeanings,
@@ -3992,6 +5212,51 @@
     container.appendChild(document.createTextNode(String(suffix || '')));
   }
 
+  function appendInteractiveExample(container, text, focusTerms, contextTranslation, refs, sourceCue = null) {
+    const cue = sourceCue ? { ...sourceCue, text, translation: contextTranslation || '', origin: 'video' }
+      : { text, translation: contextTranslation || '', origin: 'dictionary', startMs: -1 };
+    const ranges = U.exactTermRanges(text, focusTerms.filter(Boolean), sourceLanguage());
+    const buttons = [];
+    const gesture = window.__scCreateWordGesture?.({ getText: () => text,
+      onRange: range => { for (const { element, start, end } of buttons) element.dataset.phraseSelected = range && start < range.end && end > range.start ? '1' : '0'; },
+      onSelect: selected => { if (refs.popover.isConnected) void openWordPopover(selected.anchor, selected.word, -1, -1, { nested: true, context: cue }); },
+    });
+    let offset = 0, wordIndex = 0;
+    for (const part of U.segmentWords(text, sourceLanguage())) {
+      const start = offset, end = start + part.text.length; offset = end;
+      if (!part.word) { container.appendChild(document.createTextNode(part.text)); continue; }
+      const element = document.createElement('button'); element.type = 'button';
+      element.className = 'sc-word-example-token'; element.textContent = part.text;
+      element.dataset.wordIndex = String(wordIndex++);
+      element.dataset.focus = ranges.some(range => start < range.end && end > range.start) ? '1' : '0';
+      element.__scExampleCue = cue; applyLearningStateToWord(element, cue);
+      const selection = () => ({ ...part, start, end, anchor: fixedAnchorReference(element) });
+      element.addEventListener('click', event => { event.stopPropagation(); event.preventDefault();
+        if (gesture) gesture.click(selection(), event); else void openWordPopover(element, part.text, -1, -1, { nested: true, context: cue }); });
+      element.addEventListener('dblclick', event => { event.stopPropagation(); event.preventDefault(); gesture?.doubleClick(selection()); });
+      element.addEventListener('pointerenter', () => gesture?.hover({ start, end }));
+      element.addEventListener('keydown', event => { event.stopPropagation(); if (event.key === 'Escape') gesture?.reset(); });
+      buttons.push({ element, start, end }); container.appendChild(element);
+    }
+  }
+
+  function exampleToggle(body, expanded, callback) {
+    body.setAttribute('role', 'button'); body.tabIndex = 0;
+    body.setAttribute('aria-expanded', String(expanded));
+    installSafeClick(body, callback);
+    body.addEventListener('keydown', event => {
+      if (event.target !== body || !['Enter', ' '].includes(event.key)) return;
+      event.preventDefault(); event.stopPropagation(); callback();
+    });
+  }
+
+  function exampleSourceRow(text, expanded) {
+    const row = document.createElement('div'); row.className = 'sc-word-example-source';
+    const chevron = document.createElement('span'); chevron.className = 'sc-word-chevron';
+    chevron.setAttribute('aria-hidden', 'true'); chevron.textContent = expanded ? '⌄' : '›';
+    row.append(chevron, text); return row;
+  }
+
   function normalizedDictionaryExampleRows(payload, pairs) {
     return U.dictionaryExampleRows(payload, pairs, sourceLanguage(), settings.learning_target_lang)
       .map((row) => ({
@@ -4012,7 +5277,7 @@
       sourceText: row.sourceText,
       surfaceForm: U.normalizeTerm(row.sourceTerm),
       translation: row.targetText,
-      meaning: (row.meanings || []).filter(Boolean).join(' / ') || row.meaning || row.targetTerm,
+      meaning: row.label || (row.meanings || []).filter(Boolean).join(' / ') || row.meaning || row.targetTerm,
       origin: 'dictionary',
       partOfSpeech: row.partOfSpeech || 'unknown',
       createdAt: timestamp - index,
@@ -4022,20 +5287,26 @@
   function appendVideoExampleRow(container, refs, example, forms) {
     const row = document.createElement('div');
     row.className = 'sc-word-example';
-    row.appendChild(iconButton('play', 'Проиграть реплику', () => seekCue(example.cueIndex)));
+    const key = `video:${example.cueIndex}:${example.text}`;
+    const expanded = refs.expandedExamples.has(key);
     const body = document.createElement('div');
+    body.className = 'sc-word-example-toggle';
+    body.setAttribute('aria-expanded', String(expanded));
     const text = document.createElement('div');
     text.className = 'sc-word-example-text';
-    renderExampleSegments(text, U.learningExamplePresentation({
-      sourceText: example.text,
-      sourceTerms: forms,
-      sourceLanguage: sourceLanguage(),
-    }).sourceSegments);
-    body.appendChild(text);
-    const translatedNode = document.createElement('div');
-    translatedNode.className = 'sc-word-example-translation';
-    renderExampleTranslation(translatedNode, example, refs, forms);
-    body.appendChild(translatedNode);
+    appendInteractiveExample(text, example.text, forms, translationsByText.get(example.text), refs, cues[example.cueIndex]);
+    body.appendChild(exampleSourceRow(text, expanded));
+    if (expanded) {
+      const translatedNode = document.createElement('div');
+      translatedNode.className = 'sc-word-example-translation';
+      renderExampleTranslation(translatedNode, example, refs, forms);
+      body.appendChild(translatedNode);
+    }
+    exampleToggle(body, expanded, () => {
+      if (refs.expandedExamples.has(key)) refs.expandedExamples.delete(key);
+      else refs.expandedExamples.add(key);
+      renderExamples(refs);
+    });
     row.appendChild(body);
     const actions = document.createElement('div');
     actions.className = 'sc-example-actions';
@@ -4080,6 +5351,9 @@
     menu.append(copy, save);
     actions.append(savePhrase, more, menu);
     row.appendChild(actions);
+    const play = iconButton('play', 'Проиграть реплику', () => seekCue(example.cueIndex));
+    play.classList.add('sc-word-example-play');
+    row.appendChild(play);
     container.appendChild(row);
   }
 
@@ -4095,30 +5369,40 @@
     } else if (!refs.dictionaryExamples.length) {
       const empty = document.createElement('div');
       empty.style.color = '#71717a';
-      empty.textContent = 'Словарных примеров для этого значения нет.';
+      empty.textContent = refs.catalogueError || 'Словарных примеров для этого значения нет.';
       refs.examples.appendChild(empty);
     } else {
-      refs.dictionaryExamples.forEach((example, index) => {
+      refs.dictionaryExamples.filter(example => showSupportMeanings || !example.support).forEach((example, index) => {
         const row = document.createElement('div');
-        row.className = 'sc-word-example';
-        const sense = document.createElement('span');
-        sense.className = 'sc-word-example-sense';
-        sense.textContent = String(index + 1);
+        row.className = `sc-word-example${example.support ? ' support' : ''}`;
+        const exampleIdentity = example.groupId || (Number.isInteger(example.pairIndex) ? example.pairIndex : index);
+        const key = `dictionary:${exampleIdentity}:${example.sourceText}`;
+        const expanded = refs.expandedExamples.has(key);
         const body = document.createElement('div');
+        body.className = 'sc-word-example-toggle';
+        body.setAttribute('aria-expanded', String(expanded));
         const meaning = document.createElement('div');
         meaning.className = 'sc-word-example-meaning';
-        meaning.textContent = (example.meanings || []).filter(Boolean).join(' / ') || example.meaning || '';
-        const meaningPos = partOfSpeechLabel(example.partOfSpeech);
-        if (meaningPos) meaning.textContent += ` (${meaningPos})`;
+        meaning.textContent = example.label || (example.meanings || []).filter(Boolean).join(' / ') || example.meaning || '';
         const source = document.createElement('div');
         source.className = 'sc-word-example-text';
-        appendTermExample(source, example.sourcePrefix, example.sourceTerm, example.sourceSuffix);
-        const target = document.createElement('div');
-        target.className = 'sc-word-example-translation';
-        appendTermExample(target, example.targetPrefix, example.targetTerm, example.targetSuffix);
+        appendInteractiveExample(source, example.sourceText, [example.sourceTerm], example.targetText, refs);
         if (meaning.textContent) body.appendChild(meaning);
-        body.append(source, target);
-        row.append(sense, body);
+        body.appendChild(exampleSourceRow(source, expanded));
+        if (expanded) {
+          const target = document.createElement('div');
+          target.className = 'sc-word-example-translation';
+          appendTermExample(target, example.targetPrefix, example.targetTerm, example.targetSuffix);
+          body.appendChild(target);
+        }
+        exampleToggle(body, expanded, () => {
+          if (refs.expandedExamples.has(key)) refs.expandedExamples.delete(key);
+          else refs.expandedExamples.add(key);
+          renderExamples(refs);
+        });
+        const play = iconButton('play', 'Произнести пример', () => speak(example.sourceText));
+        play.classList.add('sc-word-example-play');
+        row.append(body, play);
         refs.examples.appendChild(row);
       });
     }
@@ -4162,9 +5446,78 @@
     void learningStore.sync?.({}).catch(() => {});
   }
 
+  function applyCheckedPopoverCatalogue(refs, catalogue, word) {
+    if (!catalogue?.validatedAt || !catalogue.groups?.length) {
+      throw new Error('Проверенные примеры ещё не готовы');
+    }
+    refs.senseCatalog = catalogue;
+    refs.checkedCatalogueApplied = true;
+    const visibleGroups = catalogueVisibleGroups(catalogue);
+    refs.aiMeaningPairs = visibleGroups.map(group => ({
+      text: refs.query.lemma || word,
+      label: catalogueGroupLabel(group),
+      targets: [group.shortMeaning, group.meaning, ...(group.alternatives || [])].filter(Boolean),
+      translation: group.shortMeaning || group.meaning,
+      pos: String(group.partOfSpeech || 'unknown').toUpperCase(),
+      example: group.example,
+      exampleTranslation: group.exampleTranslation,
+      support: group.support,
+      groupId: group.id,
+    }));
+    refs.meaningPairs = refs.aiMeaningPairs;
+    refs.meaningPairsFinalized = true;
+    refs.dictionaryExamples = normalizedDictionaryExampleRows(
+      { examples: visibleGroups.map(() => ({ examples: [] })) }, refs.aiMeaningPairs,
+    ).map(row => ({
+      ...row,
+      support: refs.aiMeaningPairs[row.pairIndex]?.support === true,
+      groupId: refs.aiMeaningPairs[row.pairIndex]?.groupId || '',
+    }));
+    if (refs.dictionaryExamples.length !== visibleGroups.length) {
+      throw new Error('Не все проверенные примеры удалось отобразить');
+    }
+    refs.dictionaryContexts = visibleGroups.map((group, index) => ({
+      videoId: '', videoUrl: '', videoTitle: 'Словарный пример', startMs: -1,
+      sourceText: group.example, translation: group.exampleTranslation, surfaceForm: refs.query.lemma || word,
+      meaning: group.meaning, senseId: group.id, partOfSpeech: group.partOfSpeech,
+      origin: 'dictionary', createdAt: catalogue.validatedAt - index,
+    }));
+    refs.catalogueError = '';
+    refs.catalogueErrorCause = null;
+    if (refs.dictionaryPayload) renderDictionaryContent(refs, refs.dictionaryPayload);
+    else renderExamples(refs);
+    return catalogue;
+  }
+
   async function requestDictionaryExamples(refs, dictionary, preferredPairs = []) {
     if (!refs?.popover?.isConnected) return;
-    const pairs = U.mergeDictionaryMeaningPairs(dictionary, preferredPairs, refs.invalidMeaningValues);
+    const checkedLanguage = sourceLanguage().toLowerCase().startsWith('en')
+      && settings.learning_target_lang === 'ru';
+    const hasCheckedStoredCatalogue = checkedLanguage
+      && refs.entry?.state !== 'none'
+      && refs.entry?.senseCatalog?.validatedAt;
+    if (hasCheckedStoredCatalogue) {
+      try {
+        const word = refs.query.lemma || refs.clickedNormalized;
+        const response = refs.entry.senseCatalog?.groups?.length
+          ? { catalogue: refs.entry.senseCatalog }
+          : await bridgeJson('/learning/catalogue', {
+              method: 'POST', body: { action: 'read', entryId: refs.entry.remoteId },
+            });
+        if (!refs.popover.isConnected) return;
+        return applyCheckedPopoverCatalogue(refs, response.catalogue, word);
+      } catch (error) {
+        if (!refs.popover.isConnected) return;
+        refs.catalogueError = 'Проверка словарных примеров не завершена. Откройте слово ещё раз, чтобы повторить.';
+        refs.catalogueErrorCause = error;
+        refs.dictionaryExamples = [];
+        renderExamples(refs);
+        log('verified catalogue failed', { error: error?.message || String(error) });
+        return null;
+      }
+    }
+    if (refs.checkedCatalogueApplied) return refs.senseCatalog;
+    const pairs = U.mergeDictionaryMeaningPairs(dictionary, preferredPairs, refs.invalidMeaningValues).slice(0, 5);
     refs.meaningPairs = pairs;
     refs.dictionaryExamples = null;
     renderExamples(refs);
@@ -4188,6 +5541,7 @@
           log('dictionary example batch failed', { offset, count: batch.length, error: error?.message || String(error) });
         }
         if (!refs.popover.isConnected) return;
+        if (refs.checkedCatalogueApplied) return refs.senseCatalog;
         const fallbackPayload = payload || { examples: batch.map(() => ({ examples: [] })) };
         rows.push(...U.dictionaryExampleRows(
           fallbackPayload,
@@ -4212,6 +5566,7 @@
       await persistDictionaryContexts(refs);
     } catch (error) {
       if (!refs.popover.isConnected) return;
+      if (refs.checkedCatalogueApplied) return refs.senseCatalog;
       refs.dictionaryExamples = normalizedDictionaryExampleRows(
         { examples: pairs.map(() => ({ examples: [] })) },
         pairs,
@@ -4229,11 +5584,16 @@
     if (refs) renderExamples(refs);
   }
 
-  async function openWordPopover(anchor, word, cueIndex, sourceWordIndex = -1) {
+  async function openWordPopover(anchor, word, cueIndex, sourceWordIndex = -1, options = {}) {
+    clearRussianSelection({ resume: false });
+    hideQuickWordPopover();
     // Capture geometry before closing the previous card: closeWordPopover()
     // rerenders the subtitle and disconnects the clicked span.
     const positionAnchor = fixedAnchorReference(anchor);
-    closeWordPopover({ resume: false });
+    const previous = document.getElementById(WORD_POPOVER_ID)?.__scWordRefs;
+    if (options.nested && previous) wordPopoverHistory.push({ anchor: fixedAnchorReference(previous.anchor), word: previous.word,
+      cueIndex: previous.cueIndex, sourceWordIndex: previous.sourceWordIndex, context: previous.contextOverride });
+    closeWordPopover({ resume: false, preserveHistory: options.nested || options.back, reason: 'replace' });
     wordPopoverOpen = true;
     const video = playerVideo();
     if (video && !video.paused) {
@@ -4248,11 +5608,16 @@
     popover.addEventListener('selectstart', event => event.preventDefault());
     popover.addEventListener('dragstart', event => event.preventDefault());
     popover.addEventListener('wheel', event => event.stopPropagation(), { passive: true });
-    const refs = createWordPopoverShell(popover, positionAnchor, word, cueIndex);
+    const refs = createWordPopoverShell(popover, positionAnchor, word, cueIndex, options.context);
     refs.sourceWordIndex = sourceWordIndex;
+    if (refs.cue && sourceWordIndex >= 0) refs.cue = { ...refs.cue, contextWordIndex: sourceWordIndex };
     refs.openedScrollX = scrollX;
     refs.openedScrollY = scrollY;
     document.body.appendChild(popover);
+    joinWordStateOperation(refs);
+    logLearningAction('word opened', { term: word, cueIndex, sourceWordIndex,
+      trigger: options.trigger || (options.back ? 'back' : options.nested ? 'nested-click' : 'source-click'),
+      origin: options.context?.origin || 'subtitle', contextChars: refs.cue?.text?.length || 0, pending: refs.busy });
     applyActiveSourceWordMark();
     renderWordExpressionLinks(refs);
     positionPopover(popover, positionAnchor);
@@ -4287,10 +5652,11 @@
         method: 'POST',
         body: { text: word, from: sourceLanguage(), to: settings.learning_target_lang },
       });
-      if (!popover.isConnected) return;
+      if (!popover.isConnected) { logLearningAction('word late lookup ignored', { term: word, cueIndex }); return; }
       renderDictionaryContent(refs, dictionary);
       let examplesDictionary = dictionary?.dictionary || null;
-      await refinePopoverLexeme(refs, {
+      refs.examplesDictionary = examplesDictionary;
+      if (refs.query.kind !== 'phrase') await refinePopoverLexeme(refs, {
         posCandidates: (dictionary?.dictionary?.translations || []).map((item) => item.posTag).filter(Boolean),
       });
       if (refs.query.lemma && refs.query.lemma !== refs.clickedNormalized) {
@@ -4299,7 +5665,10 @@
           body: { text: refs.query.lemma, from: sourceLanguage(), to: settings.learning_target_lang },
         }).catch(() => null);
         refs.canonicalPrimary = primaryDictionaryTranslation(lemmaDictionary);
-        if (lemmaDictionary?.dictionary?.translations?.length) examplesDictionary = lemmaDictionary.dictionary;
+        if (lemmaDictionary?.dictionary?.translations?.length) {
+          examplesDictionary = lemmaDictionary.dictionary;
+          refs.examplesDictionary = examplesDictionary;
+        }
       }
       const stored = await learningStore?.getEntry(refs.query).catch(() => null);
       if (stored) applyPopoverState(refs, stored);
@@ -4313,8 +5682,11 @@
         }).catch(() => null);
         if (updated) applyPopoverState(refs, updated);
       }
+      // Fast dictionary examples must not wait for the optional contextual AI
+      // explanation. The checked Gemini catalogue starts only after Save.
+      const examplesRequest = requestDictionaryExamples(refs, examplesDictionary, []);
       await requestAiExplanation(refs, examplesDictionary);
-      void requestDictionaryExamples(refs, examplesDictionary, refs.aiMeaningPairs || []);
+      void examplesRequest;
     } catch (error) {
       if (!popover.isConnected) return;
       void requestAiExplanation(refs, null);
@@ -4333,6 +5705,7 @@
   }
 
   function resetForNavigation() {
+    hideQuickWordPopover();
     const nextVideoId = extractVideoIdFromLocation();
     if (nextVideoId && nextVideoId === videoMeta.videoId) {
       updateGeometry();
@@ -4340,6 +5713,7 @@
     }
     loadGeneration += 1;
     prefetchGeneration += 1;
+    prefetchRerunRequested = false;
     lastTrackIdentity = '';
     lastSnapshotAt = 0;
     sourceCues = [];
@@ -4354,10 +5728,13 @@
     resetLiteralTranslationState();
     translationError = '';
     literalTranslationError = '';
+    naturalLastLatencyMs = 0;
+    lastBufferDiagnosticsSignature = '';
     autoPausedCueKey = '';
     lastVideoTimeMs = null;
     closeWordPopover();
     deactivateOverlay();
+    scheduleBufferDiagnosticsUpdate();
     setTimeout(() => syncOverlay({ force: true }), 0);
   }
 
@@ -4369,12 +5746,46 @@
       settings = sanitizeYoutubeSettings(raw.__yt || {});
     } catch {}
     if (learningStore) {
+      await refreshStudyPreferences();
       await refreshLearningWordStates({ rerender: false }).catch(() => {});
-      learningStore.subscribe(() => refreshLearningWordStates().catch(() => {}));
+      learningStore.subscribe(() => refreshStudyPreferences().then(() => refreshLearningWordStates()).catch(() => {}));
       learningStore.migrateLegacy()
         .then(() => refreshLearningWordStates())
         .then(() => learningStore.sync())
         .catch(() => {});
+    }
+    if (vocabularySaves) {
+      let completed = '';
+      vocabularySaves.subscribe(() => {
+        for (const word of document.querySelectorAll(`#${ROOT_ID} .sc-learning-word, #${WORD_POPOVER_ID} .sc-word-example-token`)) {
+          applyLearningStateToWord(word, word.__scExampleCue || cues[currentCueIndex]);
+        }
+        applyCurrentCueExpressionMarks();
+        const refs = document.getElementById(WORD_POPOVER_ID)?.__scWordRefs;
+        if (refs) applySharedSaveStatus(refs);
+        if (phraseAnalysis) {
+          const pending = vocabularySaves.pending(vocabularySaves.get(phraseAnalysis.canonicalText, phraseAnalysis.selection?.text));
+          if (phraseAnalysis.saving !== pending) { phraseAnalysis.saving = pending; renderExpressionInspector(); }
+        }
+        const revision = vocabularySaves.all().filter(operation => ['ready', 'reconciled'].includes(operation.phase))
+          .map(operation => operation.key + ':' + operation.updatedAt).join('|');
+        if (revision !== completed) {
+          completed = revision;
+          void learningStore?.sync({ fresh: true }).then(async () => {
+            await refreshLearningWordStates();
+            const current = document.getElementById(WORD_POPOVER_ID)?.__scWordRefs;
+            if (current) {
+              const entry = await learningStore.getEntry(current.query);
+              if (!current.popover.isConnected) return;
+              applyPopoverState(current, entry);
+              if (entry?.senseCatalog?.validatedAt && entry.state !== 'none') {
+                const full = await bridgeJson('/learning/catalogue', { method: 'POST', body: { action: 'read', entryId: entry.remoteId || entry.key } });
+                if (current.popover.isConnected) applyCheckedPopoverCatalogue(current, full.catalogue, entry.lemma || entry.sourceText);
+              }
+            }
+          }).catch(error => log('save result refresh failed', { error: error.message }));
+        }
+      });
     }
     await syncSettingsFromDesktop();
     updateRootSettings();
@@ -4390,14 +5801,48 @@
     requestAnimationFrame(playbackTick);
 
     window.addEventListener('resize', updateGeometry);
+    window.visualViewport?.addEventListener('resize', updateGeometry);
+    window.visualViewport?.addEventListener('scroll', updateGeometry);
     window.addEventListener('scroll', onViewportScroll, { passive: true });
     window.addEventListener('yt-navigate-finish', resetForNavigation);
     window.addEventListener('blur', () => {
+      fullTranslationMetaDown = false;
+      updateFullSubtitleReveal();
       if (settingsPanel) settingsPanel.hidden = true;
       setControlsHovered(false);
     });
     document.addEventListener('keydown', event => {
+      if (event.key === 'Meta' && !fullTranslationMetaDown) {
+        fullTranslationMetaDown = true;
+        updateFullSubtitleReveal();
+      }
       const editable = event.target?.closest?.('input, textarea, select, [contenteditable="true"]');
+      const interactive = event.target?.closest?.('button, a, summary, [role="button"]');
+      const spaceAction = U.externalMediaSpaceAction({
+        external: !!externalMedia,
+        code: event.code,
+        modifier: event.metaKey || event.ctrlKey || event.altKey || event.shiftKey,
+        editable: !!editable,
+        interactive: !!interactive,
+        repeat: event.repeat,
+        interactionOpen: !!document.getElementById(WORD_POPOVER_ID) || phraseSelectionOpen || !!russianSelection,
+      });
+      if (spaceAction !== 'ignore') {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (spaceAction === 'toggle') {
+          const video = playerVideo();
+          if (video) {
+            if (video.paused) video.play().catch(() => {});
+            else video.pause();
+            if (document.activeElement === video) video.blur();
+          }
+        }
+        return;
+      }
+      if (event.key === 'Shift' && hoveredRussianWord != null && !editable && !event.repeat && !event.metaKey && !event.ctrlKey && !event.altKey) {
+        event.preventDefault(); openRussianSelection(hoveredRussianWord, hoveredRussianWord, true); return;
+      }
       if (event.key === 'Shift' && hoveredPhraseWord && !phraseSelectionOpen && !editable && !event.repeat
           && !event.metaKey && !event.ctrlKey && !event.altKey) {
         event.preventDefault();
@@ -4425,7 +5870,7 @@
         return;
       }
       if (event.key === 'Escape') {
-        if (document.getElementById(WORD_POPOVER_ID)) closeWordPopover();
+        if (document.getElementById(WORD_POPOVER_ID) || pendingWordClickTimer != null) closeWordPopover({ reason: 'escape' });
         else if (phraseSelectionOpen) clearPhraseSelection();
         else if (settingsPanel && !settingsPanel.hidden) {
           settingsPanel.hidden = true;
@@ -4433,18 +5878,27 @@
         }
       }
     }, true);
+    document.addEventListener('keyup', event => {
+      if (event.key !== 'Meta') return;
+      fullTranslationMetaDown = false;
+      updateFullSubtitleReveal();
+    }, true);
     document.addEventListener('pointerdown', event => {
       const player = playerAnchor();
-      const insidePlayer = event.target instanceof Node && !!player?.contains(event.target);
+      const inSubtitleGap = event.target === subtitleLines;
+      // This hit is direct proof of the hover owner. Removing a fixed word
+      // card can momentarily clear :hover before Chromium updates hit testing.
+      if (inSubtitleGap) subtitleHovered = true;
+      const insidePlayer = !inSubtitleGap && event.target instanceof Node && !!player?.contains(event.target);
       const playbackOwner = U.dismissalPlaybackOwner({ via: 'outside-pointer', insidePlayer });
-      const resumeAfterDismissal = playbackOwner === 'extension';
+      const resumeAfterDismissal = !inSubtitleGap && playbackOwner === 'extension';
       let interactionDismissed = false;
       const popover = document.getElementById(WORD_POPOVER_ID);
-      if (popover && !popover.contains(event.target) && !event.target.closest?.('.sc-learning-word')) {
-        closeWordPopover({ resume: resumeAfterDismissal });
+      if ((popover || pendingWordClickTimer != null) && !popover?.contains(event.target) && !window.__scLearningChoicesPopover?.contains(popover, event.target) && !event.target.closest?.('.sc-learning-word, .sc-learning-ru-word')) {
+        closeWordPopover({ resume: resumeAfterDismissal, reason: 'outside-pointer' });
         interactionDismissed = true;
       }
-      if (phraseSelectionOpen && !event.target.closest?.('.sc-learning-word') && !phraseHint?.contains?.(event.target)) {
+      if (phraseSelectionOpen && !event.target.closest?.('.sc-learning-word, .sc-learning-ru-word') && !phraseHint?.contains?.(event.target) && !window.__scLearningChoicesPopover?.contains(phraseHint, event.target)) {
         clearPhraseSelection({ resume: resumeAfterDismissal });
         interactionDismissed = true;
       }
@@ -4473,19 +5927,22 @@
         translationAlignmentsByText.clear();
         resetLiteralTranslationState();
         prefetchGeneration += 1;
+        prefetchRerunRequested = false;
+        naturalLastLatencyMs = 0;
         refreshLearningWordStates().catch(() => {});
-        if (settings.learning_translation_mode !== 'never') startTranslationPrefetch();
+        startTranslationPrefetch();
       }
       if (previousTranslationOrder !== settings.learning_translation_order) {
         renderTranslationForCue(currentCueIndex);
-        if (settings.learning_translation_mode !== 'never' && settings.learning_translation_order === 'source') {
+        if (settings.learning_translation_order === 'source') {
           prefetchLiteralWindow(currentCueIndex);
         }
       }
       if (previousTranslationMode !== settings.learning_translation_mode) {
         prefetchGeneration += 1;
+        prefetchRerunRequested = false;
         renderTranslationForCue(currentCueIndex);
-        if (settings.learning_translation_mode !== 'never') startTranslationPrefetch();
+        startTranslationPrefetch();
       }
       syncOverlay({ force: true });
     });
@@ -4495,6 +5952,7 @@
     openMedia: openExternalMedia,
     closeMedia: closeExternalMedia,
     state() {
+      const buffer = currentTranslationBufferSnapshot();
       return {
         active: overlayActive,
         external: !!externalMedia,
@@ -4505,6 +5963,16 @@
         literalReady: literalTranslationsByText.size,
         literalPending: pendingLiteralTexts.size,
         literalQueued: literalRequestQueue.length,
+        literalActive: literalRequestsActive,
+        naturalPending: pendingTranslationTexts.size,
+        naturalActive: naturalRequestsActive,
+        readyAhead: buffer.readyAhead,
+        targetAhead: buffer.targetAhead,
+        bufferStage: buffer.stage,
+        naturalLastLatencyMs,
+        literalLastLatencyMs,
+        translationError,
+        literalTranslationError,
       };
     },
   });

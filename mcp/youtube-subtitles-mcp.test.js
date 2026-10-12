@@ -22,10 +22,33 @@ test('publishes and calls the YouTube subtitle tool over MCP stdio', async t => 
   t.after(() => fs.rmSync(dataRoot, { recursive: true, force: true }))
 
   let postSeen = false
+  let postedOrigin = null
+  let searchSeen = false
   const api = http.createServer((req, res) => {
     assert.equal(req.headers.authorization, `Bearer ${token}`)
+    if (req.method === 'POST' && req.url === '/api/youtube/search') {
+      searchSeen = true
+      return sendJson(res, 200, {
+        ok: true,
+        query: 'Bob McGrew agents',
+        limit: 1,
+        offset: 0,
+        items: [{
+          video_id: 'abcdefghijk',
+          title: 'Bob McGrew interview',
+          url: 'https://www.youtube.com/watch?v=abcdefghijk',
+        }],
+      })
+    }
     if (req.method === 'POST' && req.url === '/api/imports') {
       postSeen = true
+      // The app disables automatic clipboard delivery based on this field,
+      // so the MCP client must always identify itself as a machine caller.
+      let raw = ''
+      req.on('data', chunk => { raw += chunk })
+      req.on('end', () => {
+        try { postedOrigin = JSON.parse(raw).origin } catch {}
+      })
       return sendJson(res, 200, {
         ok: true,
         import: {
@@ -65,8 +88,14 @@ test('publishes and calls the YouTube subtitle tool over MCP stdio', async t => 
   const listed = await client.listTools()
   const names = new Set(listed.tools.map(tool => tool.name))
   assert.equal(names.has('youtube_get_subtitles'), true)
+  assert.equal(names.has('youtube_search'), true)
   assert.equal(names.has('youtube_subtitles_status'), true)
   assert.equal(names.has('youtube_subtitles_cancel'), true)
+  assert.equal(names.has('youtube_list_channels'), true)
+  assert.equal(names.has('youtube_channel_index'), true)
+  assert.equal(names.has('youtube_channel_index_status'), true)
+  assert.equal(names.has('youtube_channel_semantic_search'), true)
+  assert.equal(names.has('youtube_channel_context'), true)
 
   const response = await client.callTool({
     name: 'youtube_get_subtitles',
@@ -79,6 +108,16 @@ test('publishes and calls the YouTube subtitle tool over MCP stdio', async t => 
   assert.equal(response.isError, undefined)
   const result = JSON.parse(response.content[0].text)
   assert.equal(postSeen, true)
+  assert.equal(postedOrigin, 'mcp')
   assert.equal(result.status, 'done')
   assert.equal(result.text, 'fixture subtitles')
+
+  const searchResponse = await client.callTool({
+    name: 'youtube_search',
+    arguments: { query: 'Bob McGrew agents', limit: 1 },
+  })
+  const searchResult = JSON.parse(searchResponse.content[0].text)
+  assert.equal(searchSeen, true)
+  assert.equal(searchResult.count, 1)
+  assert.equal(searchResult.items[0].title, 'Bob McGrew interview')
 })

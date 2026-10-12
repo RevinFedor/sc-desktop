@@ -165,7 +165,9 @@ const YouTubeBatchPicker = forwardRef(function YouTubeBatchPicker({
   const [chipInput, setChipInput] = useState('')
   const [chipError, setChipError] = useState(null)
   const [search, setSearch] = useState('')
-  const [autoAi, setAutoAi] = useState(true)
+  // Free subtitles are the safe default. AI fallback can create real cost,
+  // especially after "select all", so it requires an explicit opt-in.
+  const [autoAi, setAutoAi] = useState(false)
   const [engine, setEngine] = useState('assemblyai')
   const [lang, setLang] = useState('ru')
   const [withTs, setWithTs] = useState(false)
@@ -192,7 +194,7 @@ const YouTubeBatchPicker = forwardRef(function YouTubeBatchPicker({
     let alive = true
     setLoaded(false)
     window.api.itemsList({
-      source_id: sourceId, limit: 1000, offset: 0,
+      source_id: sourceId, limit: 20000, offset: 0,
       order: 'published_at DESC', type: 'video',
     }).then(items => {
       if (!alive) return
@@ -776,11 +778,11 @@ const YouTubeBatchPicker = forwardRef(function YouTubeBatchPicker({
           {alreadyTranscribedCount > 0 && (
             <> · готово: <span className="text-emerald-400">{alreadyTranscribedCount}</span></>
           )}
-          {/* DB-запрос капится limit:1000 — если упёрлись, честно пометить,
+          {/* Safety ceiling for pathological channels — if reached, report
               что «Выбрать все» выбирает не весь канал. */}
-          {!providedVideos && videos.length >= 1000 && (
-            <span className="text-amber-400/80 ml-2" title="Показаны первые 1000 видео из БД — хвост канала не загружен в picker">
-              · показаны первые 1000
+          {!providedVideos && videos.length >= 20000 && (
+            <span className="text-amber-400/80 ml-2" title="Показаны первые 20 000 видео из БД — хвост канала не загружен в список">
+              · показаны первые 20 000
             </span>
           )}
         </span>
@@ -1100,7 +1102,7 @@ const YouTubeBatchPicker = forwardRef(function YouTubeBatchPicker({
         <ToggleSwitch
           checked={autoAi}
           onChange={setAutoAi}
-          label="Авто-транскрипция при отсутствии субтитров"
+          label="AI-расшифровка, если субтитров нет"
         />
         {autoAi && (
           <select
@@ -1165,13 +1167,15 @@ const YouTubeBatchPicker = forwardRef(function YouTubeBatchPicker({
             }`}
             title={allTranscribed
               ? 'Все выбранные уже транскрибированы — копируем в буфер'
-              : 'Запустить транскрипцию выбранных'}
+              : autoAi
+                ? 'Получить субтитры; если их нет — явно разрешена AI-расшифровка'
+                : 'Получить доступные субтитры бесплатно; видео без субтитров будут пропущены'}
           >
             {copyToast
               ? copyToast
               : (allTranscribed
                 ? <span className="inline-flex items-center justify-center gap-1.5"><Copy size={16} />Скопировать{selectionCount ? ` (${selectionCount})` : ''}</span>
-                : `Транскрибировать${selectionCount ? ` (${selectionCount})` : ''}`)}
+                : `Получить тексты${selectionCount ? ` (${selectionCount})` : ''}`)}
           </button>
         </div>
       </div>

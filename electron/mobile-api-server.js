@@ -4,6 +4,8 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
+const { createYoutubeLibraryLink } = require('./youtube-library-link')
+const { createYoutubeCommentsControl } = require('./youtube-comments-control')
 const {
   extractInstagramShortcode,
   processInstagramSingleReel,
@@ -164,11 +166,18 @@ function writeRequests(requests) {
   fs.renameSync(tmp, REQUESTS_PATH)
 }
 
+function normalizeImportOrigin(value) {
+  return String(value || '').trim().toLowerCase() === 'mcp' ? 'mcp' : 'client'
+}
+
 function reconcilePersistedRequest(item) {
   // Job ids are process-local counters. A restarted Electron process starts
   // counting from 1 again, so a persisted id must never be allowed to match a
   // new job's snapshots.
   item.jobId = null
+  // Records written before `origin` existed default to 'client': an unknown
+  // origin must never be silently upgraded to the clipboard-free MCP path.
+  item.origin = normalizeImportOrigin(item?.origin)
   if (item?.resultFile && fs.existsSync(item.resultFile)) {
     item.status = 'done'
     item.stage = 'done'
@@ -234,6 +243,50 @@ function youtubeVideoId(rawUrl) {
   }
 }
 
+function youtubeSearchInteger(value, fallback, minimum, maximum, name) {
+  const resolved = value == null ? fallback : Number(value)
+  if (!Number.isInteger(resolved) || resolved < minimum || resolved > maximum) {
+    throw Object.assign(
+      new Error(`${name} must be an integer between ${minimum} and ${maximum}`),
+      { status: 400 },
+    )
+  }
+  return resolved
+}
+
+function normalizeYoutubeSearchRequest(body = {}) {
+  const rawQuery = String(body.query || '').trim()
+  if (!rawQuery) {
+    throw Object.assign(new Error('query is required'), { status: 400 })
+  }
+  if (rawQuery.length > 4096) {
+    throw Object.assign(new Error('query must be at most 4096 characters'), { status: 400 })
+  }
+
+  let query = rawQuery
+  if (/^https?:\/\//i.test(rawQuery)) {
+    let parsed
+    try { parsed = new URL(rawQuery) } catch {
+      throw Object.assign(new Error('query URL is invalid'), { status: 400 })
+    }
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '')
+    const allowedHost = host === 'youtube.com' || host === 'm.youtube.com'
+    if (!allowedHost || parsed.pathname !== '/results' || !parsed.searchParams.get('search_query')?.trim()) {
+      throw Object.assign(
+        new Error('query URL must be a YouTube results URL with search_query'),
+        { status: 400 },
+      )
+    }
+    query = parsed.toString()
+  }
+
+  return {
+    query,
+    limit: youtubeSearchInteger(body.limit, 20, 1, 100, 'limit'),
+    offset: youtubeSearchInteger(body.offset, 0, 0, 1000, 'offset'),
+  }
+}
+
 function classifyUrl(rawUrl) {
   const url = firstHttpUrl(rawUrl)
   if (!/^https?:\/\//i.test(url)) return null
@@ -294,6 +347,7 @@ function publicRequest(item) {
     errorCode: item.errorCode || null,
     error: item.error || null,
     resultReady: item.status === 'done' && !!item.resultFile,
+    ...(item.libraryLink ? { libraryLink: item.libraryLink } : {}),
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
   }
@@ -352,6 +406,8 @@ function sendJson(res, status, value) {
 
 function startMobileApiServer({ db, jobRunner, readScSettings }) {
   const token = ensureToken()
+  const youtubeLibrary = createYoutubeLibraryLink({ db, libRoot: jobRunner.LIB_ROOT })
+  const youtubeComments = createYoutubeCommentsControl({ db, jobRunner, libRoot: jobRunner.LIB_ROOT })
   const requests = readRequests()
   for (const item of requests) {
     if (item?.platform === 'youtube' && item?.externalId) {
@@ -400,6 +456,10 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
     const item = {
       id: crypto.randomUUID(),
       clientRequestId: String(input.clientRequestId || '').trim() || null,
+      // Who asked. 'mcp' = a local AI agent through Terminal/Claude; anything
+      // else (the SC Desk iOS app) counts as a human request. Only the sound
+      // depends on this — every other behaviour is identical.
+      origin: normalizeImportOrigin(input.origin),
       platform: classified.platform,
       url: classified.url,
       externalId: classified.externalId,
@@ -517,9 +577,27 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
     const cached = jobRunner.lookupYoutubeCache(item.externalId)
     if (cached?.file_path) {
       finishWithFile(item, cached.file_path)
+      // A jobs-origin cache result can predate the channel's Library item.
+      // Reuse the same file, never fetch/ASR again to repair that association.
+      try {
+        item.libraryLink = youtubeLibrary.linkCached(item)
+      } catch (error) {
+        // Returning the cached original remains supported even when linkage
+        // needs explicit identity/conflict resolution. Do not falsify counts.
+        item.libraryLink = { linked: false, code: error.code || 'LIBRARY_LINK_FAILED' }
+        console.warn(`[MobileAPI] YouTube cache linkage ${item.externalId}: ${item.libraryLink.code}`)
+      }
+      emit(item)
       return
     }
-    item.jobId = jobRunner.startYoutubeSingle({ url: item.url, lang: 'ru' })
+    // Preserve caller provenance through completion/resume. MCP returns text
+    // through the API without touching clipboard; the human iOS path is unchanged.
+    item.jobId = jobRunner.startYoutubeSingle({
+      url: item.url,
+      lang: 'ru',
+      origin: item.origin,
+      autoCopy: item.origin !== 'mcp',
+    })
     item.status = 'running'
     item.stage = 'fetching_metadata'
     item.backend = 'youtube_subtitles'
@@ -583,8 +661,42 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
       if (req.method === 'GET' && url.pathname === '/api/me') {
         return sendJson(res, 200, {
           ok: true,
-          capabilities: ['instagram_single', 'youtube_single', 'youtube_resume_ai', 'events'],
+          capabilities: [
+            'instagram_single',
+            'youtube_single',
+            'youtube_search',
+            'youtube_import_library_state',
+            'youtube_import_library_link',
+            'youtube_comments_archive_v1',
+            'youtube_resume_ai',
+            'events',
+          ],
         })
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/youtube/search') {
+        const params = normalizeYoutubeSearchRequest(await readJson(req))
+        const result = await jobRunner.runYoutubeSearch(params)
+        return sendJson(res, 200, {
+          ok: true,
+          query: params.query,
+          limit: params.limit,
+          offset: params.offset,
+          entity: result?.entity || null,
+          items: Array.isArray(result?.items) ? result.items : [],
+        })
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/youtube/comments/capabilities') {
+        return sendJson(res, 200, { ok: true, ...youtubeComments.capabilities() })
+      }
+      if (req.method === 'GET' && url.pathname === '/api/youtube/comments/status') {
+        return sendJson(res, 200, { ok: true, ...youtubeComments.status({ request_id: url.searchParams.get('request_id') }) })
+      }
+      const commentActions = { start: 'start', state: 'state', search: 'search', original: 'original', archive: 'archive', thread: 'thread' }
+      const commentAction = /^\/api\/youtube\/comments\/(start|state|search|original|archive|thread)$/.exec(url.pathname)?.[1]
+      if (req.method === 'POST' && commentAction) {
+        return sendJson(res, 200, { ok: true, ...youtubeComments[commentActions[commentAction]](await readJson(req)) })
       }
 
       if (req.method === 'GET' && url.pathname === '/api/events') {
@@ -635,7 +747,7 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
         return sendJson(res, duplicate ? 200 : 202, { ok: true, import: publicRequest(item) })
       }
 
-      const match = /^\/api\/imports\/([0-9a-f-]+)(?:\/(result|resume-ai|cancel))?$/.exec(url.pathname)
+      const match = /^\/api\/imports\/([0-9a-f-]+)(?:\/(result|resume-ai|cancel|library-state|link-library))?$/.exec(url.pathname)
       if (match) {
         const item = requests.find(candidate => candidate.id === match[1])
         if (!item) return sendJson(res, 404, { ok: false, error: 'import not found' })
@@ -643,6 +755,15 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
 
         if (req.method === 'GET' && !action) {
           return sendJson(res, 200, { ok: true, import: publicRequest(item) })
+        }
+        if (req.method === 'GET' && action === 'library-state') {
+          return sendJson(res, 200, { ok: true, ...youtubeLibrary.inspect(item) })
+        }
+        if (req.method === 'POST' && action === 'link-library') {
+          const result = youtubeLibrary.link(item, await readJson(req))
+          item.libraryLink = result
+          emit(item)
+          return sendJson(res, 200, result)
         }
         if (req.method === 'GET' && action === 'result') {
           if (item.status !== 'done' || !item.resultFile) {
@@ -690,7 +811,7 @@ function startMobileApiServer({ db, jobRunner, readScSettings }) {
       return sendJson(res, 404, { ok: false, error: 'not found' })
     } catch (err) {
       console.warn(`[MobileAPI] ${req.method} ${url.pathname} failed: ${err?.message || err}`)
-      return sendJson(res, err?.status || 500, { ok: false, error: err?.message || 'internal error' })
+      return sendJson(res, err?.status || 500, { ok: false, ...(err?.code ? { code: err.code } : {}), error: err?.message || 'internal error' })
     }
   })
 
@@ -730,6 +851,8 @@ module.exports = {
   isCancellableImport,
   isInstagramHost,
   publicRequest,
+  normalizeImportOrigin,
+  normalizeYoutubeSearchRequest,
   reconcilePersistedRequest,
   resolveInstagramShareUrl,
   startMobileApiServer,

@@ -10,9 +10,14 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { EXT_PORT, MCP_PORT, APP_URL } from './runtime-config.js';
 
-const EXT_PORT = 3457;
-const MCP_PORT = 3458;
+const manifest = JSON.parse(readFileSync(new URL('../../browser-extension/manifest.json', import.meta.url), 'utf8'));
+const extensionId = createHash('sha256').update(Buffer.from(manifest.key, 'base64'))
+  .digest('hex').slice(0, 32).replace(/[0-9a-f]/g, digit => String.fromCharCode(97 + parseInt(digit, 16)));
+const extensionOrigin = 'chrome-extension://' + extensionId;
 
 // ── Extension side (port 3457) ────────────────────────────────────────
 
@@ -23,7 +28,7 @@ let extensionWs = null;
 let extReconnectWaiters = [];
 let lastWakeAt = 0;
 const WAKE_COOLDOWN_MS = 10_000; // не спамить reload при пачке параллельных команд
-const SC_BRIDGE = 'http://127.0.0.1:53127';
+const SC_BRIDGE = APP_URL;
 
 // Будит дремлющий/мёртвый SW расширения через существующий канал sc-desktop:
 // POST /reload-extension кладёт команду в очередь, SW-alarm (каждые 3с,
@@ -68,7 +73,10 @@ function waitForExtension(timeoutMs = 6000) {
 const pendingCommands = new Map(); // bridgeId -> { mcpSocket, originalId }
 let bridgeCommandSeq = 0;
 
-const extServer = new WebSocketServer({ port: EXT_PORT });
+const extServer = new WebSocketServer({
+  port: EXT_PORT, host: '127.0.0.1',
+  verifyClient: ({ origin }) => !origin || origin.replace(/\/$/, '') === extensionOrigin,
+});
 
 extServer.on('listening', () => {
   console.log(`[Bridge] Extension port: ws://localhost:${EXT_PORT}`);
@@ -126,7 +134,11 @@ extServer.on('connection', (socket) => {
 
 // ── MCP client side (port 3458) ───────────────────────────────────────
 
-const mcpServer = new WebSocketServer({ port: MCP_PORT });
+const mcpServer = new WebSocketServer({
+  port: MCP_PORT, host: '127.0.0.1',
+  // stdio clients are local Node processes. Web pages must not control tabs.
+  verifyClient: ({ origin }) => !origin,
+});
 
 mcpServer.on('listening', () => {
   console.log(`[Bridge] MCP client port: ws://localhost:${MCP_PORT}`);

@@ -160,9 +160,13 @@ const CLAUDE_AVAILABLE_MODELS = Object.freeze([
 ]);
 
 const CHATGPT_AVAILABLE_MODELS = Object.freeze([
-  { id: '5.5',       label: 'GPT-5.5 Instant', modes: ['chat'] },
+  { id: '6',         label: 'GPT-6', modes: ['chat'] },
+  { id: '6-astra',   label: 'GPT-6 Astra', modes: ['chat', 'work'] },
+  { id: '6.1-sol',   label: 'GPT-6.1 Sol', modes: ['work'] },
+  { id: '6-sol',     label: 'GPT-6 Sol', modes: ['work'] },
+  { id: '6-luna',    label: 'GPT-6 Luna', modes: ['work'] },
   { id: '5.6-sol',   label: 'GPT-5.6 Sol',     modes: ['chat', 'work'] },
-  { id: 'o3',        label: 'o3 · до 26 августа', modes: ['chat'] },
+  { id: '5.5',       label: 'GPT-5.5 · до 14 октября', modes: ['chat', 'work'] },
   { id: '5.6-terra', label: 'GPT-5.6 Terra',   modes: ['work'] },
   { id: '5.6-luna',  label: 'GPT-5.6 Luna',    modes: ['work'] },
 ]);
@@ -178,7 +182,7 @@ const CHATGPT_AVAILABLE_EFFORTS = Object.freeze([
   { id: 'ultra', label: 'Ultra' },
 ]);
 
-const CHATGPT_RETIRED_MODELS = Object.freeze(new Set(['5.4', '5.3', '5.2', '4.5']));
+const CHATGPT_RETIRED_MODELS = Object.freeze(new Set(['o3', '5.4', '5.3', '5.2', '4.5']));
 
 const CHATGPT_WORK_SPEEDS = Object.freeze([
   { id: 'standard', label: 'Стандартный' },
@@ -199,16 +203,18 @@ function chatgptModelsForMode(mode) {
 function chatgptEffortsFor(mode, model) {
   const byId = Object.fromEntries(CHATGPT_AVAILABLE_EFFORTS.map(effort => [effort.id, effort]));
   if (mode === 'work') {
+    if (model === '5.5') return ['low', 'medium', 'high', 'xhigh'].map(id => byId[id]);
+    if (model === '6-luna' || model === '5.6-luna') return ['low', 'medium', 'high', 'xhigh', 'max'].map(id => byId[id]);
     return ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(id => byId[id]);
   }
+  if (model === '6-astra') return [byId.pro];
   if (model === '5.5') return [byId.instant];
-  if (model === 'o3') return [byId.medium];
   return ['instant', 'medium', 'high', 'xhigh', 'pro'].map(id => byId[id]);
 }
 
 function defaultChatgptEffort(mode, model) {
+  if (mode === 'chat' && model === '6-astra') return 'pro';
   if (mode === 'chat' && model === '5.5') return 'instant';
-  if (mode === 'chat' && model === 'o3') return 'medium';
   return 'xhigh';
 }
 
@@ -218,10 +224,13 @@ function normalizeChatgptPair(mode, rawModel, rawEffort) {
 
   // GPT-5.6 originally shipped here as one numeric id. Preserve that choice
   // as Sol, and map retired Chat models to the current equivalent capability.
+  if (model === 'gpt-6-astra') model = '6-astra';
+  if (['gpt-6', '6'].includes(model)) model = mode === 'work' ? '6-astra' : '6';
+  if (['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'].includes(model)) model = model.slice(4);
   if (model === '5.6') model = '5.6-sol';
   if (effort === 'pro-extended') effort = 'pro';
   if (mode === 'work') {
-    if (model === '5.5' || CHATGPT_RETIRED_MODELS.has(model)) model = '5.6-sol';
+    if (CHATGPT_RETIRED_MODELS.has(model)) model = '5.6-sol';
   } else {
     if (CHATGPT_RETIRED_MODELS.has(model)) model = effort === 'instant' ? '5.5' : '5.6-sol';
     // Since the GPT-5.6 rollout, every reasoning level above Instant runs Sol.
@@ -312,7 +321,7 @@ const YOUTUBE_TARGET_LABELS = Object.freeze({
 const YOUTUBE_ENGINES = Object.freeze(['gemini', 'assemblyai']);
 const YOUTUBE_SUBTITLE_POSITIONS = Object.freeze(['top', 'bottom']);
 const YOUTUBE_SUBTITLE_LANGUAGE_ORDERS = Object.freeze(['source_first', 'target_first']);
-const YOUTUBE_TRANSLATION_MODES = Object.freeze(['never', 'hover', 'always']);
+const YOUTUBE_TRANSLATION_MODES = Object.freeze(['never', 'always']);
 const YOUTUBE_TRANSLATION_ORDERS = Object.freeze(['natural', 'source']);
 const YOUTUBE_SETTINGS_SCHEMA_VERSION = 2;
 
@@ -332,12 +341,15 @@ const YOUTUBE_DEFAULT_SETTINGS = Object.freeze({
   learning_subtitle_width_px: 1600,
   learning_subtitle_source_font_px: 34,
   learning_subtitle_target_font_px: 25,
+  learning_subtitle_target_font_percent: 73.53,
   learning_controls_mirrored: false,
   learning_translation_mode: 'always',
   learning_translation_order: 'natural',
   learning_hide_native_subtitles: true,
+  learning_hover_word_translation: false,
   learning_ai_explanation: true,
   learning_card_autoplay: false,
+  learning_practice_hide_translations: true,
   // Движок AI-транскрипции когда субтитров нет (awaiting_ai → resume).
   // gemini (дёшево, быстро) | assemblyai (длинные файлы 1-10ч). Прокидывается
   // в __sc_track_job → trackJob.engine → POST /yt-resume-ai. Дефолт gemini.
@@ -388,6 +400,34 @@ const YOUTUBE_DEFAULT_SETTINGS = Object.freeze({
   chatgpt_effort: 'xhigh',
 });
 
+function youtubeSubtitleFontSettings(raw = {}) {
+  const number = (value, fallback, min, max) => Number.isFinite(Number(value))
+    ? Math.max(min, Math.min(max, Number(value))) : fallback;
+  const source = Math.round(number(raw.learning_subtitle_source_font_px, 34, 16, 64));
+  const legacyTarget = Math.round(number(raw.learning_subtitle_target_font_px, 25, 14, 52));
+  const supplied = Number(raw.learning_subtitle_target_font_percent);
+  const percent = Math.round(Math.max(20, Math.min(325,
+    Number.isFinite(supplied) && supplied > 0 ? supplied : legacyTarget * 100 / source)) * 100) / 100;
+  return {
+    learning_subtitle_source_font_px: source,
+    learning_subtitle_target_font_percent: percent,
+    learning_subtitle_target_font_px: Math.max(14, Math.min(52, Math.round(source * percent / 100))),
+  };
+}
+
+function applyYoutubeSettingsPatch(current, patch) {
+  const normalized = sanitizeYoutubeSettings(current);
+  const effective = { ...patch };
+  if (Object.hasOwn(patch, 'learning_subtitle_target_font_px')
+      && !Object.hasOwn(patch, 'learning_subtitle_target_font_percent')
+      && Number(patch.learning_subtitle_target_font_px) !== normalized.learning_subtitle_target_font_px) {
+    effective.learning_subtitle_target_font_percent = youtubeSubtitleFontSettings({
+      ...normalized, ...patch, learning_subtitle_target_font_percent: undefined,
+    }).learning_subtitle_target_font_percent;
+  }
+  return sanitizeYoutubeSettings({ ...normalized, ...effective });
+}
+
 function sanitizeYoutubeSettings(raw = {}) {
   const s = { ...YOUTUBE_DEFAULT_SETTINGS };
   const cb = (v, fb) => typeof v === 'boolean' ? v : fb;
@@ -410,15 +450,14 @@ function sanitizeYoutubeSettings(raw = {}) {
   const subtitleOffsetX = Number(raw.learning_subtitle_offset_x);
   const subtitleOffsetY = Number(raw.learning_subtitle_offset_y);
   const subtitleWidth = Number(raw.learning_subtitle_width_px);
-  const subtitleSourceFont = Number(raw.learning_subtitle_source_font_px);
-  const subtitleTargetFont = Number(raw.learning_subtitle_target_font_px);
   if (Number.isFinite(subtitleOffsetX)) s.learning_subtitle_offset_x = Math.max(-1, Math.min(1, subtitleOffsetX));
   if (Number.isFinite(subtitleOffsetY)) s.learning_subtitle_offset_y = Math.max(-1, Math.min(1, subtitleOffsetY));
   if (Number.isFinite(subtitleWidth)) s.learning_subtitle_width_px = Math.max(320, Math.min(2400, Math.round(subtitleWidth)));
-  if (Number.isFinite(subtitleSourceFont)) s.learning_subtitle_source_font_px = Math.max(16, Math.min(64, Math.round(subtitleSourceFont)));
-  if (Number.isFinite(subtitleTargetFont)) s.learning_subtitle_target_font_px = Math.max(14, Math.min(52, Math.round(subtitleTargetFont)));
+  Object.assign(s, youtubeSubtitleFontSettings(raw));
   s.learning_controls_mirrored = cb(raw.learning_controls_mirrored, s.learning_controls_mirrored);
-  if (YOUTUBE_TRANSLATION_MODES.includes(raw.learning_translation_mode)) {
+  if (raw.learning_translation_mode === 'hover') {
+    s.learning_translation_mode = 'never';
+  } else if (YOUTUBE_TRANSLATION_MODES.includes(raw.learning_translation_mode)) {
     s.learning_translation_mode = raw.learning_translation_mode;
   }
   if (YOUTUBE_TRANSLATION_ORDERS.includes(raw.learning_translation_order)) {
@@ -428,6 +467,10 @@ function sanitizeYoutubeSettings(raw = {}) {
     raw.learning_hide_native_subtitles,
     s.learning_hide_native_subtitles,
   );
+  s.learning_hover_word_translation = cb(
+    raw.learning_hover_word_translation,
+    s.learning_hover_word_translation,
+  );
   s.learning_ai_explanation = cb(
     raw.learning_ai_explanation,
     s.learning_ai_explanation,
@@ -435,6 +478,10 @@ function sanitizeYoutubeSettings(raw = {}) {
   s.learning_card_autoplay = cb(
     raw.learning_card_autoplay,
     s.learning_card_autoplay,
+  );
+  s.learning_practice_hide_translations = cb(
+    raw.learning_practice_hide_translations,
+    s.learning_practice_hide_translations,
   );
   if (typeof raw.engine === 'string' && YOUTUBE_ENGINES.includes(raw.engine)) {
     s.engine = raw.engine;
@@ -508,6 +555,12 @@ function diffYoutubeSettings(before, after) {
   for (const [key, value] of Object.entries(after || {})) {
     if (!before || before[key] !== value) patch[key] = value;
   }
+  // The px projection also changes with English size. Without the unchanged
+  // percentage the desktop must interpret it as an old client's absolute edit.
+  if (Object.hasOwn(patch, 'learning_subtitle_source_font_px')
+      || Object.hasOwn(patch, 'learning_subtitle_target_font_px')) {
+    patch.learning_subtitle_target_font_percent = sanitizeYoutubeSettings(after).learning_subtitle_target_font_percent;
+  }
   return patch;
 }
 
@@ -517,7 +570,9 @@ function reconcileYoutubeSettingsPatch(localSettings, sentPatch, remoteSettings)
   const confirmedPatch = {};
   const pendingPatch = {};
   for (const key of Object.keys(sentPatch || {})) {
-    if (Object.is(remote[key], local[key])) confirmedPatch[key] = local[key];
+    const missingPercentAck = key === 'learning_subtitle_target_font_percent'
+      && !Object.hasOwn(remoteSettings || {}, key);
+    if (!missingPercentAck && Object.is(remote[key], local[key])) confirmedPatch[key] = local[key];
     else {
       pendingPatch[key] = local[key];
       remote[key] = local[key];

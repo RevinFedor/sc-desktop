@@ -1,0 +1,12 @@
+{
+  "requestId": "setup-check-REPLACE-WITH-A-NEW-UUID",
+  "provider": "chatgpt",
+  "prompt": "Reply with SC_RESEARCH_OK. This is an explicitly approved setup check.",
+  "options": {
+    "mode": "chat",
+    "model": "5.6-sol",
+    "effort": "medium",
+    "temporaryChat": false,
+    "autoClose": true
+  }
+}

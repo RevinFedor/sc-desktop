@@ -1,9 +1,16 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from yt_single_ndjson import _format_timestamp_ms, extract_subtitles, write_text_file
+from yt_single_ndjson import (
+    _format_timestamp_ms,
+    build_audio_download_command,
+    download_youtube_audio,
+    extract_subtitles,
+    write_text_file,
+)
 
 
 class YoutubeTimedTranscriptTests(unittest.TestCase):
@@ -48,6 +55,21 @@ class YoutubeTimedTranscriptTests(unittest.TestCase):
             timed_text = Path(timed).read_text(encoding="utf-8")
             self.assertIn("timestamps: yes", timed_text)
             self.assertTrue(timed_text.endswith("[00:00:03] Текст с таймкодом"))
+
+    def test_ai_audio_prefers_audio_only_and_lowest_muxed_fallback(self):
+        command = build_audio_download_command("https://www.youtube.com/watch?v=inEFOFIEYlk", "/tmp/audio.mp3")
+
+        self.assertEqual(command[command.index("--format") + 1], "bestaudio/worst")
+        self.assertEqual(command[command.index("--concurrent-fragments") + 1], "4")
+        self.assertIn("--no-playlist", command)
+
+    @patch("yt_single_ndjson.subprocess.run", side_effect=subprocess.TimeoutExpired("yt-dlp", 600))
+    def test_ai_audio_timeout_says_assemblyai_did_not_start(self, _run):
+        size, code, message = download_youtube_audio("https://www.youtube.com/watch?v=inEFOFIEYlk", "/tmp/audio.mp3")
+
+        self.assertIsNone(size)
+        self.assertEqual(code, "youtube_audio_timeout")
+        self.assertIn("AssemblyAI ещё не запускался", message)
 
 
 if __name__ == "__main__":

@@ -61,17 +61,24 @@ const {
 } = require('./app-settings')
 const {
   MAX_ATTACHMENT_BYTES,
-  normalizeResearchAttachments,
-  materializeResearchAttachments,
+  inspectResearchAttachmentSpecs,
+  researchAttachmentPackingSummary,
   publicAttachmentMeta,
   researchResultForPersist,
 } = require('./research-attachments')
+const { prepareResearchAttachments } = require('./research-attachment-preparer')
 const {
   normalizeChatgptConversationUrl,
   chatgptResearchEntryUrl,
 } = require('./chatgpt-url')
 const { withResearchAutoClose } = require('./research-tab-policy')
 const { reconcileResearchTabOpen, researchIdFromUrl } = require('./research-tab-open')
+const {
+  normalizeResearchRequestId,
+  researchRequestFingerprint,
+} = require('./research-request-identity')
+const { createResearchRequestCoordinator, restoreResearchRequest } = require('./research-request-coordinator')
+const { shouldAutoCopy, mcpJobParams } = require('./clipboard-policy')
 
 const BODY_LIMITS = {
   default: 64 * 1024,
@@ -91,11 +98,13 @@ function db() {
   if (!_db) { try { _db = require('./database') } catch (e) { console.log('[BrowserBridge] db load failed:', e.message) } }
   return _db
 }
-function persistResearchJob(snap) {
-  if (!snap || (snap.status !== 'done' && snap.status !== 'error')) return
+function persistResearchJob(snap, { strict = false } = {}) {
+  if (!snap || (!snap.requestFingerprint && snap.status !== 'done' && snap.status !== 'error')) return
   try {
     const r = researchResultForPersist(snap)
-    db()?.upsertResearchJob({
+    const storage = db()
+    if (!storage?.upsertResearchJob) throw new Error('Research persistence is unavailable')
+    storage.upsertResearchJob({
       jobId: snap.id, kind: 'research', provider: snap.provider,
       modelId: snap.provider === 'chatgpt'
         ? researchState.chatgptModelLabel(snap.options)
@@ -108,10 +117,19 @@ function persistResearchJob(snap) {
       url: snap.url, responseTextLen: r.text ? r.text.length : null,
       linkCount: Array.isArray(r.sources) ? r.sources.length : null,
       result: r,
+      requestFingerprint: snap.requestFingerprint || null,
+      requestMetadata: snap.requestFingerprint ? {
+        options: snap.options, attachments: snap.attachments, tabId: snap.tabId,
+        title: snap.title, targetUrl: snap.targetUrl, dispatchState: snap.dispatchState,
+        conversationModeProof: snap.conversationModeProof || null,
+      } : null,
       error: snap.error, createdAt: snap.createdAt, updatedAt: snap.updatedAt, doneAt: snap.doneAt,
     })
     invalidateResearchHistoryCache()
-  } catch (e) { console.log('[BrowserBridge] persistResearchJob failed:', e.message) }
+  } catch (e) {
+    console.log('[BrowserBridge] persistResearchJob failed:', e.message)
+    if (strict) throw e
+  }
 }
 function persistAistudioJob(j) {
   if (!j || (j.status !== 'done' && j.status !== 'error')) return
@@ -289,6 +307,11 @@ function listExternalJobsForUi({ summary = false, jobId = null } = {}) {
     return (b.updatedAt || 0) - (a.updatedAt || 0)
   })
   const selected = jobId ? out.filter(job => job.jobId === jobId) : out
+  // Explicit detail navigation is not limited to the navbar's recent100.
+  if (jobId && selected.length === 0) {
+    const stored = db()?.getResearchHistoryJob(jobId)
+    if (stored) selected.push(stored)
+  }
   return summary ? selected.map(externalJobSummary) : selected
 }
 
@@ -450,6 +473,124 @@ const LEARNING_MEDIA_MIME = Object.freeze({
   '.webm': 'video/webm',
   '.mkv': 'video/x-matroska',
 })
+const learningMediaLanguageCache = new Map()
+
+function parseJsonRecord(value) {
+  try {
+    const parsed = value ? JSON.parse(value) : {}
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function plainBoostyText(value, limit = 4_000) {
+  return String(value || '')
+    .replace(/<\s*br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|h[1-6])\s*>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;|&#160;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n\s*\n+/g, '\n')
+    .trim()
+    .slice(0, Math.max(0, Number(limit) || 0))
+}
+
+const INTERVIEW_OUTCOME_LABELS = Object.freeze({
+  offer: 'Оффер получен',
+  passed: 'Прошёл',
+  rejected: 'Отказ',
+  candidate_declined: 'Кандидат отказался',
+  ongoing: 'Процесс продолжается',
+  unknown: 'Итог не указан',
+})
+
+function interviewOutcomeFromDescription(value) {
+  const text = plainBoostyText(value)
+  const rules = [
+    ['candidate_declined', /(отказал(?:ся|ась)\s+от\s+оффера|не\s+принял(?:а)?\s+оффер|отклонил(?:а)?\s+оффер|declined\s+(?:the\s+)?offer)/i],
+    ['rejected', /(оффер\s+не\s+(?:дали|получен)|не\s+получил(?:а)?\s+оффер|получил(?:а)?\s+отказ|приш[её]л\s+отказ|(?:компания|работодатель)\s+отказал(?:а|и)|отказали|не\s+прош[её]л(?:а)?(?=$|[\s✅❌.,!])|не\s+пройден(?:о|а|ы)?(?=$|[\s✅❌.,!])|(?:^|[\s❌])отказ(?:$|[\s.!❌])|провален(?:о|а|ы)?(?=$|[\s✅❌.,!])|провалил(?:а)?(?=$|[\s✅❌.,!])|rejected|failed|no\s+offer)/i],
+    ['offer', /(получил(?:а)?\s+оффер|дали\s+оффер|сделали\s+оффер|оффер\s+получен|принял(?:а)?\s+оффер|accepted\s+(?:the\s+)?offer|got\s+(?:an?\s+)?offer|offer\s+received)/i],
+    ['passed', /(прош[её]л(?:а|и)?(?=$|[\s✅❌.,!])|пройден(?:о|а|ы)?(?=$|[\s✅❌.,!])|успешно\s+завершил(?:а)?|passed)/i],
+    ['ongoing', /(процесс\s+(?:ещ[её]\s+)?продолжается|жд[её]м\s+(?:ответ|результат|фидбек)|ожида(?:ем|ет)\s+(?:ответ|результат|фидбек)|process\s+is\s+ongoing)/i],
+  ]
+  for (const [code, pattern] of rules) {
+    const match = pattern.exec(text)
+    if (!match) continue
+    const lines = text.split(/(?<=[.!?])\s+|\n+/).map(item => item.trim()).filter(Boolean)
+    const evidence = lines.find(item => pattern.test(item)) || match[0]
+    return {
+      code,
+      label: INTERVIEW_OUTCOME_LABELS[code],
+      evidence: String(evidence || '').slice(0, 240),
+      explicit: true,
+    }
+  }
+  return { code: 'unknown', label: INTERVIEW_OUTCOME_LABELS.unknown, evidence: '', explicit: false }
+}
+
+function boostyInterviewDetails(value) {
+  const description = plainBoostyText(value)
+  const lines = description.split(/\n+/).map(line => line.trim()).filter(Boolean)
+  const takeMarked = (marker) => {
+    const line = lines.find(item => marker.test(item)) || ''
+    return line ? line.replace(marker, '').trim() : ''
+  }
+  const companyMarker = /^\s*🏢\s*/u
+  const compensationMarker = /^\s*💵\s*/u
+  const roleMarker = /^\s*⚠(?:️)?\s*/u
+  const company = takeMarked(companyMarker)
+  const compensation = takeMarked(compensationMarker)
+  const role = takeMarked(roleMarker)
+  const outcome = interviewOutcomeFromDescription(description)
+  const isOutcomeMetadataLine = (line) => {
+    if (/^\s*[✅😔❌]/u.test(line) && interviewOutcomeFromDescription(line).explicit) return true
+    return /^\s*(?:не\s+)?(?:прош[её]л(?:а|и)?|пройден(?:о|а|ы)?|провален(?:о|а|ы)?|отказ|n\s*\/\s*a)(?:\s|$|[✅❌])/i.test(line)
+  }
+  const notes = lines
+    .filter(line => !companyMarker.test(line))
+    .filter(line => !compensationMarker.test(line))
+    .filter(line => !roleMarker.test(line))
+    .filter(line => !isOutcomeMetadataLine(line))
+    .join('\n')
+  return { company, compensation, role, notes, outcome }
+}
+
+function subtitleLanguageFromText(value) {
+  const text = String(value || '')
+  const cyrillic = (text.match(/[\u0400-\u04FF]/g) || []).length
+  const latin = (text.match(/[A-Za-z]/g) || []).length
+  const letters = cyrillic + latin
+  if (letters < 40) {
+    return { code: 'unknown', label: 'Язык не определён', cyrillicRatio: null, confidence: 0 }
+  }
+  const ratio = cyrillic / letters
+  const code = ratio >= 0.65 ? 'ru' : ratio <= 0.35 ? 'en' : 'mixed'
+  const label = code === 'ru' ? 'Русский' : code === 'en' ? 'Английский' : 'Смешанный'
+  const confidence = code === 'mixed' ? 1 - Math.abs(ratio - 0.5) * 2 : Math.abs(ratio - 0.5) * 2
+  return {
+    code,
+    label,
+    cyrillicRatio: Number(ratio.toFixed(4)),
+    confidence: Number(Math.max(0, Math.min(1, confidence)).toFixed(4)),
+  }
+}
+
+function subtitleLanguageForFile(file) {
+  if (!file?.path || !file?.stat) return subtitleLanguageFromText('')
+  const cacheKey = `${file.path}:${file.stat.size}:${file.stat.mtimeMs}`
+  const cached = learningMediaLanguageCache.get(cacheKey)
+  if (cached) return cached
+  let language = subtitleLanguageFromText('')
+  try { language = subtitleLanguageFromText(fs.readFileSync(file.path, 'utf8')) } catch {}
+  learningMediaLanguageCache.set(cacheKey, language)
+  return language
+}
 
 function existingAllowedFile(filePath, roots) {
   if (!filePath || typeof filePath !== 'string') return null
@@ -481,11 +622,23 @@ function learningMediaRows(jobRunner) {
   const sources = database.listSources('boosty') || []
   const rows = []
   for (const source of sources) {
-    for (const item of database.listBoostyVideos(source.id) || []) {
+    const sourceItems = database.listBoostyItems(source.id) || []
+    const parents = new Map(sourceItems
+      .filter(item => item.type === 'boosty_post')
+      .map(item => [String(item.external_id), item]))
+    for (const item of sourceItems.filter(item => item.type === 'boosty_video')) {
       const video = existingAllowedFile(item.video_path, [jobRunner.LIB_ROOT, storage.video_dir])
       const subtitles = existingAllowedFile(srtPathForTranscript(item.transcript_path), [jobRunner.LIB_ROOT])
       const audio = existingAllowedFile(item.media_path, [jobRunner.LIB_ROOT, storage.audio_dir])
-      rows.push({ source, item, video, subtitles, audio })
+      rows.push({
+        source,
+        item,
+        parent: parents.get(String(item.parent_external_id || '')) || null,
+        videoMeta: parseJsonRecord(item.raw_meta_json),
+        video,
+        subtitles,
+        audio,
+      })
     }
   }
   return rows.sort((left, right) => Number(right.item.published_at || 0) - Number(left.item.published_at || 0))
@@ -493,7 +646,8 @@ function learningMediaRows(jobRunner) {
 
 function publicLearningMedia(row, accessToken = '') {
   if (!row) return null
-  const { source, item, video, subtitles, audio } = row
+  const { source, item, parent, videoMeta, video, subtitles, audio } = row
+  const language = subtitleLanguageForFile(subtitles)
   return {
     id: item.id,
     sourceId: item.source_id,
@@ -501,16 +655,89 @@ function publicLearningMedia(row, accessToken = '') {
     title: item.title || 'Видео Boosty',
     author: source.display_name || source.handle || 'Boosty',
     sourceUrl: item.url || '',
+    postExternalId: String(item.parent_external_id || ''),
+    postTitle: parent?.title || item.title || 'Видео Boosty',
+    position: Number(videoMeta?.position || 0),
     durationSeconds: Number(item.duration_seconds || 0),
     publishedAt: Number(item.published_at || 0),
     videoReady: !!video,
     videoBytes: Number(video?.stat?.size || 0),
     subtitlesReady: !!subtitles,
+    languageCode: language.code,
+    languageLabel: language.label,
+    languageConfidence: language.confidence,
+    cyrillicRatio: language.cyrillicRatio,
     audioReady: !!audio,
     downloadStatus: item.download_status || 'none',
     transcribeStatus: item.transcribe_status || 'none',
     videoUrl: video ? `/learning/media/${item.id}/video?token=${encodeURIComponent(accessToken)}` : '',
     subtitlesUrl: subtitles ? `/learning/media/${item.id}/subtitles?token=${encodeURIComponent(accessToken)}` : '',
+  }
+}
+
+function publicLearningMediaLibrary(rows, accessToken = '') {
+  const items = (rows || []).map(row => publicLearningMedia(row, accessToken)).filter(Boolean)
+  const groupMap = new Map()
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index]
+    const row = rows[index]
+    const parent = row?.parent || null
+    const groupId = `${item.sourceId}:${item.postExternalId || `video:${item.externalId || item.id}`}`
+    if (!groupMap.has(groupId)) {
+      const description = plainBoostyText(parent?.caption || '')
+      const details = boostyInterviewDetails(description)
+      groupMap.set(groupId, {
+        id: groupId,
+        sourceId: item.sourceId,
+        parentExternalId: item.postExternalId,
+        title: parent?.title || item.postTitle || item.title,
+        author: item.author,
+        sourceUrl: parent?.url || item.sourceUrl,
+        description,
+        descriptionPreview: description.length > 320 ? `${description.slice(0, 317).trim()}…` : description,
+        details: {
+          company: details.company,
+          compensation: details.compensation,
+          role: details.role,
+          notes: details.notes,
+        },
+        outcome: details.outcome,
+        publishedAt: Number(parent?.published_at || item.publishedAt || 0),
+        videoIds: [],
+      })
+    }
+    groupMap.get(groupId).videoIds.push(item.id)
+  }
+  const byId = new Map(items.map(item => [Number(item.id), item]))
+  const groups = [...groupMap.values()].map(group => {
+    group.videoIds.sort((leftId, rightId) => {
+      const left = byId.get(Number(leftId))
+      const right = byId.get(Number(rightId))
+      return Number(left?.position || 0) - Number(right?.position || 0) || Number(leftId) - Number(rightId)
+    })
+    const videos = group.videoIds.map(id => byId.get(Number(id))).filter(Boolean)
+    return {
+      ...group,
+      videoCount: videos.length,
+      downloadedCount: videos.filter(video => video.videoReady).length,
+      subtitlesCount: videos.filter(video => video.subtitlesReady).length,
+      durationSeconds: videos.reduce((sum, video) => sum + Number(video.durationSeconds || 0), 0),
+      languageCodes: [...new Set(videos.map(video => video.languageCode).filter(Boolean))],
+    }
+  }).sort((left, right) => Number(right.publishedAt || 0) - Number(left.publishedAt || 0))
+  return {
+    items,
+    groups,
+    stats: {
+      videos: items.length,
+      posts: groups.length,
+      downloaded: items.filter(item => item.videoReady).length,
+      subtitles: items.filter(item => item.subtitlesReady).length,
+      languages: items.reduce((result, item) => {
+        result[item.languageCode] = Number(result[item.languageCode] || 0) + 1
+        return result
+      }, {}),
+    },
   }
 }
 
@@ -941,6 +1168,7 @@ async function dictionaryExamples(settingsAccess, rawPairs, rawFrom, rawTo, opti
 const VOICE_DISCOVERY_DIR = path.join(os.homedir(), '.noted-terminal')
 const VOICE_TOKEN_FILE = path.join(VOICE_DISCOVERY_DIR, 'web-token.txt')
 const VOICE_DISCOVERY_RE = /^voice-web-server-\d+\.json$/
+const VOICE_CANONICAL_PORT = 7888
 
 function normalizeVocabularyTerm(value) {
   return String(value || '')
@@ -965,18 +1193,35 @@ function vocabularyIdentityKey(item) {
     : `${kind}|${sourceLang}|${targetLang}|${lemma}`
 }
 
+function orderVoiceServerCandidates(candidates) {
+  return [...candidates].sort((a, b) => (
+    Number(b.port === VOICE_CANONICAL_PORT) - Number(a.port === VOICE_CANONICAL_PORT)
+    || b.updatedAt - a.updatedAt
+  ))
+}
+
 function voiceServerCandidates() {
   let files = []
+  const seenPorts = new Set()
   try { files = fs.readdirSync(VOICE_DISCOVERY_DIR).filter((name) => VOICE_DISCOVERY_RE.test(name)) }
   catch { return [] }
-  return files.map((name) => {
+  const candidates = files.map((name) => {
     try {
       const raw = JSON.parse(fs.readFileSync(path.join(VOICE_DISCOVERY_DIR, name), 'utf8'))
       const port = Number(raw?.port)
       if (!Number.isInteger(port) || port < 1 || port > 65535) return null
       return { port, updatedAt: Number(raw?.updatedAt) || 0 }
     } catch { return null }
-  }).filter(Boolean).sort((a, b) => b.updatedAt - a.updatedAt)
+  }).filter(Boolean)
+  // The installed Voice Record owns the stable 7888 endpoint. A newer
+  // discovery file may belong to an isolated dev/E2E runtime with an empty
+  // vocabulary, so freshness is only the fallback when 7888 is unavailable.
+  return orderVoiceServerCandidates(candidates)
+    .filter(candidate => {
+      if (seenPorts.has(candidate.port)) return false
+      seenPorts.add(candidate.port)
+      return true
+    })
 }
 
 async function voiceVocabularyRequest(method, route, body = null, timeoutMs = 4_000) {
@@ -1016,6 +1261,7 @@ async function voiceVocabularyRequest(method, route, body = null, timeoutMs = 4_
       }
       return payload
     } catch (error) {
+      if (error.status && ![401, 404].includes(error.status)) throw error
       lastError = error
     } finally {
       clearTimeout(timer)
@@ -1029,7 +1275,7 @@ async function voiceVocabularyRequest(method, route, body = null, timeoutMs = 4_
 }
 
 const LEARNING_EXPLANATION_MODEL = 'gemini-3.7-flash'
-const LEARNING_EXPLANATION_VERSION = 'v13'
+const LEARNING_EXPLANATION_VERSION = 'v15'
 const learningExplanationInflight = new Map()
 const LEARNING_LITERAL_MODEL = 'gemini-3.1-flash-lite'
 const LEARNING_LITERAL_VERSION = 'v4'
@@ -1056,6 +1302,7 @@ function normalizeLearningExplanationPayload(raw = {}) {
     .slice(0, 20)
   return {
     word,
+    contextOnly: raw.contextOnly === true,
     wordTranslation: String(raw.wordTranslation || '').replace(/\s+/g, ' ').trim().slice(0, 500),
     context,
     contextTranslation: String(raw.contextTranslation || '').replace(/\s+/g, ' ').trim().slice(0, 3000),
@@ -1075,6 +1322,9 @@ function learningExplanationCacheKey(payload) {
       payload.targetLang,
       payload.word.toLocaleLowerCase('en-US'),
       payload.context,
+      payload.contextTranslation,
+      payload.wordTranslation,
+      payload.contextOnly === true ? 'context' : 'full',
       JSON.stringify(payload.knownMeanings),
       JSON.stringify(payload.dictionaryTranslations),
     ].join('\u0000'))
@@ -1095,6 +1345,7 @@ function normalizeLearningExplanationResult(result) {
     matchedMeaning: String(result?.matchedMeaning || '').replace(/\s+/g, ' ').trim().slice(0, 300),
     expressionText: String(result?.expressionText || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase('en-US').slice(0, 160),
     meaningGroups: (Array.isArray(result?.meaningGroups) ? result.meaningGroups : []).slice(0, 20).map((group) => ({
+      label: String(group?.label || '').replace(/\s+/g, ' ').trim().slice(0, 300),
       values: Array.from(new Set((Array.isArray(group?.values) ? group.values : [])
         .map((value) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 160))
         .filter(Boolean))),
@@ -1112,7 +1363,7 @@ async function learningWordExplanation(raw) {
   const payload = normalizeLearningExplanationPayload(raw)
   const cacheKey = learningExplanationCacheKey(payload)
   const cached = db()?.getUiPreference(cacheKey)
-  if (cached?.explanation) {
+  if (cached?.explanation && !/^\s*(?:Означает\s*)?[{[]/.test(cached.explanation)) {
     return {
       explanation: String(cached.explanation),
       model: cached.model || LEARNING_EXPLANATION_MODEL,
@@ -1133,10 +1384,10 @@ async function learningWordExplanation(raw) {
       'POST',
       '/api/desktop/learning-explain',
       payload,
-      20_000,
+      150_000,
     )
     const normalized = normalizeLearningExplanationResult(result)
-    if (!normalized.explanation) throw new Error('Voice Record returned an empty learning explanation')
+    if (!normalized.explanation || /^\s*(?:Означает\s*)?[{[]/.test(normalized.explanation)) throw new Error('Voice Record returned an invalid learning explanation')
     const value = {
       ...normalized,
       createdAt: Date.now(),
@@ -1311,8 +1562,13 @@ async function learningLiteralTranslation(raw) {
   finally { learningLiteralInflight.delete(cacheKey) }
 }
 
+const VOCABULARY_PRACTICE_THEMES = new Set(['general', 'technical_interview'])
+
 function normalizeVocabularyPracticeRequest(raw = {}) {
   const action = raw.action === 'start' ? 'start' : 'turn'
+  const theme = VOCABULARY_PRACTICE_THEMES.has(String(raw.theme || ''))
+    ? String(raw.theme)
+    : 'general'
   const vocabulary = []
   const seen = new Set()
   for (const item of Array.isArray(raw.vocabulary) ? raw.vocabulary : []) {
@@ -1329,14 +1585,25 @@ function normalizeVocabularyPracticeRequest(raw = {}) {
     if (vocabulary.length >= 16) break
   }
   if (!vocabulary.length) throw new Error('practice vocabulary is empty')
-  const history = (Array.isArray(raw.history) ? raw.history : []).slice(-16).map((message) => ({
+  const candidates = (Array.isArray(raw.history) ? raw.history : []).slice(-16).map((message) => ({
     role: message?.role === 'user' ? 'user' : 'assistant',
-    english: String(message?.english || message?.content || '').replace(/\s+/g, ' ').trim().slice(0, 2000),
-    russian: String(message?.russian || '').replace(/\s+/g, ' ').trim().slice(0, 2000),
+    english: String(message?.english || message?.content || '').trim().slice(0, 24000),
+    russian: message?.role === 'user' ? '' : String(message?.russian || '').trim().slice(0, 8000),
+    feedbackRussian: String(message?.feedbackRussian || '').trim().slice(0, 12000),
+    correctedEnglish: String(message?.correctedEnglish || '').trim().slice(0, 24000),
   })).filter((message) => message.english)
-  const answer = String(raw.answer || '').replace(/\s+/g, ' ').trim().slice(0, 3000)
-  if (action === 'turn' && !answer) throw new Error('English answer is required')
-  return { action, vocabulary, history, answer }
+  const history = []
+  let historyChars = 0
+  for (const message of candidates.reverse()) {
+    const size = message.english.length + message.russian.length + message.feedbackRussian.length + message.correctedEnglish.length
+    if (historyChars + size > 64000) break
+    history.unshift(message)
+    historyChars += size
+  }
+  const answer = String(raw.answer || '').trim()
+  if (answer.length > 24000) throw new Error('practice answer is too long (maximum 24000 characters)')
+  if (action === 'turn' && !answer) throw new Error('practice answer is required')
+  return { action, theme, vocabulary, history, answer, requestId: String(raw.requestId || '').trim().slice(0, 220) }
 }
 
 async function vocabularyPracticeTurn(raw) {
@@ -1345,17 +1612,20 @@ async function vocabularyPracticeTurn(raw) {
     'POST',
     '/api/desktop/vocabulary-practice',
     payload,
-    45_000,
+    120_000,
   )
   return {
     online: true,
-    feedbackRussian: String(result?.feedbackRussian || '').slice(0, 1200),
-    correctedEnglish: String(result?.correctedEnglish || '').slice(0, 2000),
-    assistantEnglish: String(result?.assistantEnglish || '').slice(0, 2000),
-    assistantRussian: String(result?.assistantRussian || '').slice(0, 2000),
+    feedbackRussian: String(result?.feedbackRussian || '').slice(0, 12000),
+    correctedEnglish: String(result?.correctedEnglish || '').slice(0, 24000),
+    assistantEnglish: String(result?.assistantEnglish || '').slice(0, 4000),
+    assistantRussian: String(result?.assistantRussian || '').slice(0, 8000),
     usedVocabularyIds: Array.isArray(result?.usedVocabularyIds) ? result.usedVocabularyIds.slice(0, 8) : [],
-    model: String(result?.model || 'gemini-3.1-flash-lite'),
+    model: String(result?.model || 'gemini-3.8-flash'),
     usage: result?.usage || null,
+    practice: result?.practice || null,
+    ...(result?.practiceStatisticsError ? { practiceStatisticsError: result.practiceStatisticsError,
+      practiceStatisticsErrorCode: result.practiceStatisticsErrorCode } : {}),
   }
 }
 
@@ -1364,7 +1634,7 @@ function vocabularySyncPayload(entry) {
     term: String(entry?.sourceText || entry?.term || '').trim(),
     translation: String(entry?.translation || ''),
     translationSource: entry?.translationSource === 'manual' ? 'manual' : 'machine',
-    state: ['saved', 'known'].includes(entry?.state) ? entry.state : 'none',
+    state: ['saved', 'known', 'archived'].includes(entry?.state) ? entry.state : 'none',
     kind: entry?.kind === 'phrase' ? 'phrase' : 'word',
     expressionType: LEARNING_EXPRESSION_TYPES.has(String(entry?.expressionType || '')) ? String(entry.expressionType) : '',
     sourceLang: String(entry?.sourceLang || 'auto').slice(0, 32),
@@ -1376,6 +1646,7 @@ function vocabularySyncPayload(entry) {
     observedForms: Array.isArray(entry?.observedForms) ? entry.observedForms.slice(0, 100) : [],
     contexts: Array.isArray(entry?.contexts) ? entry.contexts.slice(0, 100) : [],
     ...(entry?.replaceContexts === true ? { replaceContexts: true } : {}),
+    ...(entry?.inheritSenseSchedule === true ? { inheritSenseSchedule: true } : {}),
   }
 }
 
@@ -1393,7 +1664,7 @@ function remoteVocabularyIndex(items) {
   return { byId, byTerm, byIdentity }
 }
 
-async function syncVocabularyWithVoice(rawBody) {
+async function syncVocabularyWithVoice(rawBody, revisionRetries = 0) {
   const localEntries = Array.isArray(rawBody?.entries) ? rawBody.entries.slice(0, 5000) : []
   const reviewOps = Array.isArray(rawBody?.reviews) ? rawBody.reviews.slice(0, 5000) : []
   let remotePayload = await voiceVocabularyRequest('GET', '/api/vocabulary?limit=5000&includeInactive=1')
@@ -1471,6 +1742,9 @@ async function syncVocabularyWithVoice(rawBody) {
       }
     }
 
+    // A later context heuristic from an old client cannot rename a headword
+    // whose identity and meanings have already been checked against a source.
+    if (!remote.senseCatalog?.validatedAt) {
     if (payload.kind !== (remote.kind || 'word')) patch.kind = payload.kind
     if (payload.expressionType !== (remote.expressionType || '')) patch.expressionType = payload.expressionType
     if (payload.sourceLang && payload.sourceLang !== remote.sourceLang) patch.sourceLang = payload.sourceLang
@@ -1479,17 +1753,30 @@ async function syncVocabularyWithVoice(rawBody) {
     if (payload.partOfSpeech !== (remote.partOfSpeech || 'unknown')) patch.partOfSpeech = payload.partOfSpeech
     if (JSON.stringify(payload.partsOfSpeech) !== JSON.stringify(remote.partsOfSpeech || [])) patch.partsOfSpeech = payload.partsOfSpeech
     if (payload.analysisConfidence !== (remote.analysisConfidence || 'low')) patch.analysisConfidence = payload.analysisConfidence
+    }
     if (payload.observedForms.length) patch.observedForms = payload.observedForms
     if (payload.contexts.length || payload.replaceContexts === true) {
       patch.contexts = payload.contexts
       if (payload.replaceContexts === true) patch.replaceContexts = true
+      if (payload.inheritSenseSchedule === true) patch.inheritSenseSchedule = true
     }
     if (Object.keys(patch).length) {
-      const updated = await voiceVocabularyRequest(
-        'PATCH',
-        `/api/vocabulary/${encodeURIComponent(remote.id)}`,
-        patch,
-      )
+      let updated
+      try {
+        updated = await voiceVocabularyRequest(
+          'PATCH',
+          `/api/vocabulary/${encodeURIComponent(remote.id)}`,
+          { ...patch, expectedUpdatedAt: remote.updatedAt },
+        )
+      } catch (error) {
+        // GET and PATCH are separate requests: another device can change this
+        // card between them. Recompute against the current server version;
+        // review operation ids make replay of this bounded round idempotent.
+        if (error.status === 409 && revisionRetries < 2) {
+          return syncVocabularyWithVoice(rawBody, revisionRetries + 1)
+        }
+        throw error
+      }
       remote = updated?.item || remote
       index.byId.set(remote.id, remote)
       index.byTerm.set(normalizeVocabularyTerm(remote.term), remote)
@@ -1506,8 +1793,21 @@ async function syncVocabularyWithVoice(rawBody) {
       || index.byIdentity.get(vocabularyIdentityKey(operation))
       || index.byTerm.get(normalizeVocabularyTerm(operation.term))
     if (!operationId || !remote?.id) continue
-    if (operation?.type === 'review') {
-      const result = operation?.result === 'forgotten' ? 'forgotten' : operation?.result === 'remembered' ? 'remembered' : ''
+    if (operation?.type === 'skip' || operation?.type === 'undo-skip') {
+      const skipped = await voiceVocabularyRequest('POST', `/api/vocabulary/${encodeURIComponent(remote.id)}/skip${operation.type === 'undo-skip' ? '/undo' : ''}`,
+        { operationId: operation.type === 'undo-skip' ? operation.skipOperationId : operationId, skippedAt: operation.skippedAt });
+      if (skipped?.item) {
+        index.byId.set(skipped.item.id, skipped.item);
+        index.byTerm.set(normalizeVocabularyTerm(skipped.item.term), skipped.item);
+        index.byIdentity.set(vocabularyIdentityKey(skipped.item), skipped.item);
+        acknowledgedReviews.push(operationId);
+      }
+    } else if (operation?.type === 'review') {
+      const result = operation?.result === 'forgotten'
+        ? 'forgotten'
+        : operation?.result === 'known'
+          ? 'known'
+          : operation?.result === 'remembered' ? 'remembered' : operation?.result === 'partial' ? 'partial' : ''
       if (!result) continue
       const reviewed = await voiceVocabularyRequest(
         'POST',
@@ -1517,6 +1817,11 @@ async function syncVocabularyWithVoice(rawBody) {
           mode: operation.mode === 'practice' ? 'practice' : 'scheduled',
           operationId,
           reviewedAt: Number(operation.reviewedAt) || Date.now(),
+          senseId: String(operation.senseId || ''),
+          durationMs: operation.durationMs,
+          recallVersion: operation.recallVersion,
+          trace: operation.trace,
+          meaningRecall: operation.meaningRecall,
         },
       )
       if (reviewed?.item) {
@@ -1544,6 +1849,12 @@ async function syncVocabularyWithVoice(rawBody) {
 
   remotePayload = await voiceVocabularyRequest('GET', '/api/vocabulary?limit=5000&includeInactive=1')
   remoteItems = Array.isArray(remotePayload?.items) ? remotePayload.items : []
+  let study = {}
+  if (rawBody?.studyStateVersion === 1) {
+    try { study = await voiceVocabularyRequest('POST', '/api/vocabulary/study-state', {
+      studyEvents: rawBody.studyEvents || [], preferenceOperations: rawBody.preferenceOperations || [],
+    }) } catch (error) { study = { studyStateError: error?.message || String(error) } }
+  }
   return {
     online: true,
     items: remoteItems,
@@ -1551,16 +1862,61 @@ async function syncVocabularyWithVoice(rawBody) {
     syncedKeys,
     skippedKeys,
     acknowledgedReviews,
+    ...study,
   }
 }
 
-function startServer({ jobRunner, notificationService, settingsAccess }) {
+function startServer({ jobRunner, notificationService, settingsAccess, researchNavigation, port = PORT, requestExtension = sendToExtension, prepareAttachments = prepareResearchAttachments }) {
+  const telegramRagApi = require('./telegram-rag-api').createTelegramRagApi({
+    jobRunner, indexJob: require('./index-job'), database: db, readBody, sendJson,
+  })
+  const prepareInputFiles = input => prepareAttachments({
+    libRoot: jobRunner.LIB_ROOT || path.join(os.homedir(), 'Library', 'Application Support', 'sc-desktop'),
+    id: input.id, specs: input.attachments, mode: input.options?.mode || 'chat',
+  }, {
+    onProgress: progress => {
+      // Filename/operation are diagnostic; file contents and prompts never
+      // enter the log. Progress runs in the child before potentially slow I/O.
+      console.log(`[BrowserBridge] attachment id=${input.id} op=${progress.operation} path=${progress.path}`)
+    },
+  })
+  const researchRequests = createResearchRequestCoordinator({
+    state: researchState,
+    load: id => db()?.getResearchJob?.(id),
+    save: job => persistResearchJob(job, { strict: true }),
+    prepare: prepareInputFiles,
+    packing: researchAttachmentPackingSummary,
+    find: targetUrl => requestExtension('mcp_find_research_tab', { url: targetUrl }, 10000),
+    open: (targetUrl, id) => reconcileResearchTabOpen({
+      openTab: () => requestExtension('mcp_open_research_tab', { url: targetUrl }, 15000),
+      findTab: () => requestExtension('mcp_find_research_tab', { url: targetUrl }, 10000),
+      getSnapshot: () => researchState.get(id),
+      delay: () => new Promise(resolve => setTimeout(resolve, 350)),
+      retryAfterMissing: false,
+    }),
+  })
   const terminalNotificationRoute = createTerminalNotificationRoute({
     notificationService,
   })
   let localCliToken = null
   try { localCliToken = ensureNotificationToken().token }
   catch (err) { console.warn(`[BrowserBridge] local CLI auth unavailable: ${err?.message || err}`) }
+  const boostyRagApi = require('./boosty-rag-api').createBoostyRagApi({
+    token: localCliToken, database: db, indexJob: require('./index-job'),
+    read: (action, args) => require('./database-read-client').request('boostyRag', action, args),
+    embedQuery: query => require('./embedder').embedQuery(query), readBody, sendJson,
+  })
+  const boostyCatalogApi = require('./boosty-catalog-api').createBoostyCatalogApi({
+    token: localCliToken, runner: jobRunner,
+    read: (action, args) => require('./database-read-client').request('boostyCatalog', action, args),
+    readBody, sendJson,
+  })
+  const boostyWorkflowApi = require('./boosty-workflow-api').createBoostyWorkflowApi({
+    token: localCliToken,
+    workflow: Object.fromEntries(['preflight', 'storage', 'status', 'start', 'resume', 'cancel', 'cleanup', 'diarization']
+      .map(operation => [operation, (...args) => jobRunner.getBoostyWorkflow()[operation](...args)])),
+    readBody, sendJson,
+  })
 
   const defaultResearchAutoClose = () => {
     try {
@@ -1568,6 +1924,24 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
     } catch (error) {
       console.log(`[BrowserBridge] research auto-close settings read failed: ${error?.message || error}`)
       return false
+    }
+  }
+
+  const defaultResearchTemporaryChat = () => {
+    try {
+      return publicAppSettings(settingsAccess?.readScSettings?.() || {}).main.external_research_temporary_chat !== false
+    } catch (error) {
+      console.log(`[BrowserBridge] research temporary-chat settings read failed: ${error?.message || error}`)
+      return true
+    }
+  }
+
+  const defaultYoutubeTemporaryChat = () => {
+    try {
+      return publicAppSettings(settingsAccess?.readScSettings?.() || {}).main.youtube_ai_temporary_chat !== false
+    } catch (error) {
+      console.log(`[BrowserBridge] YouTube temporary-chat settings read failed: ${error?.message || error}`)
+      return true
     }
   }
 
@@ -1581,12 +1955,16 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
 
     try {
       if (await terminalNotificationRoute.handle(req, res, url)) return
+      if (await telegramRagApi.handle(req, res, url)) return
+      if (await boostyRagApi.handle(req, res, url)) return
+      if (await boostyCatalogApi.handle(req, res, url)) return
+      if (await boostyWorkflowApi.handle(req, res, url)) return
 
       if (req.method === 'GET' && url.pathname === '/healthz') {
         return sendJson(res, 200, { ok: true, version: 1 })
       }
 
-      // MCP-first Telegram live retrieval. Browser pages are explicitly
+      // MCP-first Telegram live retrieval and confirmed membership actions. Browser pages are explicitly
       // rejected: these routes can access the user's signed-in Telegram
       // account and are only for origin-less local processes (our MCP server).
       // All operations are created in the app's real job-runner, so Activity
@@ -1598,7 +1976,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         if (req.method === 'POST' && url.pathname === '/telegram-live/start') {
           const body = await readBody(req, BODY_LIMITS.telegramLive)
           try {
-            const desktopId = jobRunner.startTelegramLive(body)
+            const desktopId = jobRunner.startTelegramLive(mcpJobParams(body))
             return sendJson(res, 200, {
               ok: true,
               job_id: `desktop:${desktopId}`,
@@ -1651,7 +2029,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
             return sendJson(res, 400, { ok: false, error: 'too many message_ids (max 5000)' })
           }
           try {
-            const desktopId = jobRunner.startTelegramFetch({
+            const desktopId = jobRunner.startTelegramFetch(mcpJobParams({
               target: chat,
               mode: 'id_list',
               message_ids: messageIds,
@@ -1662,7 +2040,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
               process_polls: body.process_polls !== false,
               transcribe_engine: body.transcribe_engine || undefined,
               transcribe_lang: body.transcribe_lang || undefined,
-            })
+            }))
             return sendJson(res, 200, {
               ok: true,
               job_id: `desktop:${desktopId}`,
@@ -1678,6 +2056,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
       if (url.pathname.startsWith('/translator/')
           || url.pathname.startsWith('/learning/')
           || url.pathname === '/vocabulary/sync'
+          || url.pathname === '/vocabulary/catalogue'
           || url.pathname === '/yt-learning-cues') {
         const origin = req.headers.origin || ''
         if (origin && !isAllowedOrigin(origin)) {
@@ -1689,8 +2068,8 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         if (!isLearningMediaRequest(req, url)) {
           return sendJson(res, 403, { ok: false, error: 'extension origin required' })
         }
-        const items = learningMediaRows(jobRunner).map(row => publicLearningMedia(row, LEARNING_MEDIA_ACCESS_TOKEN))
-        return sendJson(res, 200, { ok: true, items })
+        const library = publicLearningMediaLibrary(learningMediaRows(jobRunner), LEARNING_MEDIA_ACCESS_TOKEN)
+        return sendJson(res, 200, { ok: true, ...library })
       }
 
       const mediaSubtitlesMatch = url.pathname.match(/^\/learning\/media\/(\d+)\/subtitles$/)
@@ -1705,7 +2084,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         return sendJson(res, 200, {
           ok: true,
           item: publicLearningMedia(media, LEARNING_MEDIA_ACCESS_TOKEN),
-          languageCode: 'en',
+          languageCode: subtitleLanguageForFile(media.subtitles).code,
           cues,
         })
       }
@@ -1773,6 +2152,29 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           endpoint: config.endpoint,
           provider: 'azure',
         })
+      }
+
+      if (req.method === 'POST' && url.pathname === '/learning/catalogue') {
+        try {
+          const body = await readBody(req, BODY_LIMITS.vocabularySync)
+          const result = await voiceVocabularyRequest('POST', '/api/desktop/learning-catalogue', body, 600_000)
+          return sendJson(res, 200, { ok: true, online: true, ...result })
+        } catch (error) {
+          console.log(`[Vocabulary:Catalogue] build failed: ${error?.message || error}`)
+          return sendJson(res, Number(error?.status) || 502, { ok: false, error: error?.message || String(error) })
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/vocabulary/catalogue') {
+        try {
+          const body = await readBody(req, BODY_LIMITS.vocabularySync)
+          if (!body.id) return sendJson(res, 400, { ok: false, error: 'vocabulary id required' })
+          const result = await voiceVocabularyRequest('POST', `/api/vocabulary/${encodeURIComponent(body.id)}/enrich`, { force: body.force === true, feedback: String(body.feedback || '').slice(0, 12000) }, 600_000)
+          return sendJson(res, 200, { ok: true, online: true, ...result })
+        } catch (error) {
+          console.log(`[Vocabulary:Catalogue] enrich failed: ${error?.message || error}`)
+          return sendJson(res, Number(error?.status) || 502, { ok: false, error: error?.message || String(error) })
+        }
       }
 
       if (req.method === 'POST' && url.pathname === '/translator/translate') {
@@ -1953,6 +2355,29 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         }
       }
 
+      if (url.pathname === '/learning/statistics' && req.method === 'GET') {
+        try {
+          const timeZone = String(url.searchParams.get('timeZone') || Intl.DateTimeFormat().resolvedOptions().timeZone)
+          const result = await voiceVocabularyRequest('GET', `/api/vocabulary/statistics?timeZone=${encodeURIComponent(timeZone)}`)
+          return sendJson(res, 200, { ...result, ok: true, online: true })
+        } catch (error) {
+          console.log(`[Vocabulary] statistics failed: ${error?.message || error}`)
+          return sendJson(res, Number(error?.status) || 502, { ok: false, error: error?.message || String(error) })
+        }
+      }
+
+      if (url.pathname === '/learning/usage' && req.method === 'GET') {
+        try {
+          const period = String(url.searchParams.get('period') || 'today')
+          const timeZone = String(url.searchParams.get('timeZone') || Intl.DateTimeFormat().resolvedOptions().timeZone)
+          const result = await voiceVocabularyRequest('GET', `/api/ai-usage/summary?period=${encodeURIComponent(period)}&timeZone=${encodeURIComponent(timeZone)}`)
+          return sendJson(res, 200, { ...result, ok: true, online: true })
+        } catch (error) {
+          console.log(`[Vocabulary:Usage] read failed: ${error?.message || error}`)
+          return sendJson(res, Number(error?.status) || 502, { ok: false, error: error?.message || String(error) })
+        }
+      }
+
       if (url.pathname === '/vocabulary/sync' && req.method === 'POST') {
         try {
           const body = await readBody(req, BODY_LIMITS.vocabularySync)
@@ -2056,6 +2481,24 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         return sendJson(res, 200, { ok: true })
       }
 
+      // Main owns automation-wide policy that must be read fresh for every
+      // YouTube AI launch. Keep it outside the YouTube extension schema so a
+      // popup bootstrap cannot duplicate or overwrite the desktop setting.
+      if (url.pathname === '/extension-settings/main') {
+        if (!isExtensionSettingsRequest(req)) {
+          return sendJson(res, 403, { ok: false, error: 'extension origin required' })
+        }
+        if (req.method !== 'GET') {
+          return sendJson(res, 405, { ok: false, error: 'method not allowed' })
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          settings: {
+            youtube_ai_temporary_chat: defaultYoutubeTemporaryChat(),
+          },
+        })
+      }
+
       // Desktop Settings and the browser popup share one YouTube parsing
       // configuration. Only the installed extension may use this route;
       // ordinary allowed web pages must not be able to change preferences.
@@ -2145,12 +2588,13 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           // не всё подряд, чтобы не считать mtime логов и .git'а.
           const files = [
             'manifest.json', 'background.js', 'youtube-content.js',
-            'english-lexeme.js', 'youtube-learning-utils.js', 'learning-store.js', 'youtube-learning.js', 'youtube-main-bridge.js',
+            'english-lexeme.js', 'youtube-learning-utils.js', 'learning-store.js', 'learning-save-state.js', 'learning-word-gesture.js', 'learning-phrase-composition.js', 'learning-choices-popover.js', 'youtube-learning.js', 'youtube-main-bridge.js',
             'study/index.html', 'study/study.js', 'study/study.css',
-            'aistudio-autoscrape.js', 'aistudio-core.js', 'aistudio-mcp.js',
+            'logger.js', 'aistudio-export.js', 'aistudio-autoscrape.js', 'aistudio-core.js', 'aistudio-mcp.js',
+            'perplexity-content.js', 'claude-content.js',
             'claude-autoscrape.js',
             'claude-research.js', 'perplexity-research.js', 'chatgpt-research.js',
-            'research-badge.js',
+            'research-badge.js', 'research-startup-recovery.js',
             'popup.html', 'popup.js', 'settings.js',
             'mcp-handlers.js', 'mcp-content.js',
           ]
@@ -2176,6 +2620,10 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           return sendJson(res, 400, { error: 'not a youtube watch url' })
         }
         const lang = (body.lang && /^[a-z]{2}(-[A-Z]{2})?$/.test(body.lang)) ? body.lang : 'ru'
+        // Missing origin is still the human extension flow (MV3 may omit the
+        // HTTP Origin header). Explicit MCP provenance governs both child jobs
+        // and the bridge's cache/combined-copy bypasses of scheduleAutoCopy.
+        const deliveryParams = { origin: body.origin, autoCopy: body.autoCopy }
 
         // Cache-first: если транскрипт уже есть в Library (single-paste,
         // batch-transcribe, items.transcript_path) — не плодим повторный job.
@@ -2211,6 +2659,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
                 if (commentsCache.id != null) commentsJobId = commentsCache.id
               } else {
                 commentsJobId = jobRunner.startYoutubeComments({
+                  ...deliveryParams,
                   url: targetUrl, sort: 'new', limit: 500, includeReplies: false,
                 })
               }
@@ -2223,42 +2672,44 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
             // итоговая склейка остаётся на стороне расширения (autoscrape
             // уже умеет concat, см. main() в aistudio-autoscrape.js). Юзер
             // ждал «нажал → в буфере появилось».
-            try {
-              const { clipboard } = require('electron')
-              const transcriptText = fs.readFileSync(cached.file_path, 'utf-8')
-              let txt = transcriptText
-              if (commentsFilePath) {
-                try { txt += '\n\n' + fs.readFileSync(commentsFilePath, 'utf-8') } catch {}
-              }
-              clipboard.writeText(txt)
-              console.log(`[BrowserBridge] cache-hit copied to clipboard: ${txt.length} chars`)
-              // Edge-case: транскрипт-cache HIT, но comments — MISS и
-              // запущен свежий comments-job. Через минуту его 'saved' event
-              // в job-runner.js перезапишет clipboard ОДНИМИ комментами,
-              // затирая транскрипт. Подписываемся: ждём done → склеиваем
-              // обратно. Без этого юзер через минуту получает в буфере
-              // только комменты.
-              if (commentsJobId && !commentsFilePath) {
-                const off = jobRunner.subscribe(j => {
-                  if (!j || j.id !== commentsJobId) return
-                  if (j.status === 'error' || j.status === 'cancelled') {
-                    try { off() } catch {}
-                    return
-                  }
-                  if (j.status === 'done' && j.file_path) {
-                    try {
-                      let combined = transcriptText + '\n\n' + fs.readFileSync(j.file_path, 'utf-8')
-                      clipboard.writeText(combined)
-                      console.log(`[BrowserBridge] cache-hit + late-comments combined to clipboard: ${combined.length} chars`)
-                    } catch (e2) {
-                      console.log(`[BrowserBridge] late-comments clipboard write failed: ${e2?.message || e2}`)
+            if (shouldAutoCopy(deliveryParams)) {
+              try {
+                const { clipboard } = require('electron')
+                const transcriptText = fs.readFileSync(cached.file_path, 'utf-8')
+                let txt = transcriptText
+                if (commentsFilePath) {
+                  try { txt += '\n\n' + fs.readFileSync(commentsFilePath, 'utf-8') } catch {}
+                }
+                clipboard.writeText(txt)
+                console.log(`[BrowserBridge] cache-hit copied to clipboard: ${txt.length} chars`)
+                // Edge-case: транскрипт-cache HIT, но comments — MISS и
+                // запущен свежий comments-job. Через минуту его 'saved' event
+                // в job-runner.js перезапишет clipboard ОДНИМИ комментами,
+                // затирая транскрипт. Подписываемся: ждём done → склеиваем
+                // обратно. Без этого юзер через минуту получает в буфере
+                // только комменты.
+                if (commentsJobId && !commentsFilePath) {
+                  const off = jobRunner.subscribe(j => {
+                    if (!j || j.id !== commentsJobId) return
+                    if (j.status === 'error' || j.status === 'cancelled') {
+                      try { off() } catch {}
+                      return
                     }
-                    try { off() } catch {}
-                  }
-                })
+                    if (j.status === 'done' && j.file_path) {
+                      try {
+                        let combined = transcriptText + '\n\n' + fs.readFileSync(j.file_path, 'utf-8')
+                        clipboard.writeText(combined)
+                        console.log(`[BrowserBridge] cache-hit + late-comments combined to clipboard: ${combined.length} chars`)
+                      } catch (e2) {
+                        console.log(`[BrowserBridge] late-comments clipboard write failed: ${e2?.message || e2}`)
+                      }
+                      try { off() } catch {}
+                    }
+                  })
+                }
+              } catch (e) {
+                console.log(`[BrowserBridge] cache-hit clipboard write failed: ${e?.message || e}`)
               }
-            } catch (e) {
-              console.log(`[BrowserBridge] cache-hit clipboard write failed: ${e?.message || e}`)
             }
             return sendJson(res, 200, {
               jobId: cached.id || null,
@@ -2270,13 +2721,14 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           }
         }
 
-        const jobId = jobRunner.startYoutubeSingle({ url: targetUrl, lang })
+        const jobId = jobRunner.startYoutubeSingle({ ...deliveryParams, url: targetUrl, lang })
 
         let commentsJobId = null
         if (body.withComments) {
           // sort=new, limit=500, replies=false — те же дефолты что у YouTubeSingleForm
           // (paste-flow). Расширение пока тоже не различает.
           commentsJobId = jobRunner.startYoutubeComments({
+            ...deliveryParams,
             url: targetUrl,
             sort: 'new',
             limit: 500,
@@ -2287,7 +2739,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         // 'saved'. Второй (comments) затирает первый — итог: в буфере
         // только комменты, без транскрипта. Подписываемся на оба и при
         // обоих done переписываем clipboard склейкой.
-        if (commentsJobId) {
+        if (commentsJobId && shouldAutoCopy(deliveryParams)) {
           ;(() => {
             let savedTranscript = null
             let savedComments = null
@@ -2474,15 +2926,42 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         return sendJson(res, 200, { id: job.id, provider, hash: 'sc-research=' + job.id })
       }
 
+      if (req.method === 'GET' && url.pathname === '/research-capabilities') {
+        return sendJson(res, 200, {
+          ok: true,
+          version: 1,
+          idempotentRequestId: true,
+          statusRecovery: ['memory', 'durable-request', 'browser-tab-registry', 'terminal-history'],
+          providers: ['chatgpt', 'claude', 'perplexity'],
+          continuation: { conversationUrl: true, separateJobPerTurn: true },
+          ...(researchNavigation ? { navigation: { version: 1, endpoint: '/research-open', renderedAck: true } } : {}),
+        })
+      }
+
       // Один-вызов flow: create job + попросить extension открыть вкладку.
       // Возвращает {id, provider, tabId, url}. Это объединяет /research-create
       // + ранее-MCP-only mcp_open_research_tab в один HTTP вызов так чтобы
       // юзер мог дёргать всё curl'ом без MCP-tools.
+      if (req.method === 'POST' && url.pathname === '/research-open') {
+        if (req.headers.origin) return sendJson(res, 403, { ok: false, error: 'research_navigation_local_only' })
+        if (!researchNavigation) return sendJson(res, 503, { ok: false, error: 'research_navigation_unavailable' })
+        const body = await readBody(req)
+        try {
+          const result = await researchNavigation.open({ jobId: body.jobId, requestId: body.requestId })
+          return sendJson(res, result.ok ? 200 : result.error === 'research_job_not_found' ? 404 : 409, result)
+        } catch (error) { return sendJson(res, error.statusCode || 500, { ok: false, error: error.message }) }
+      }
       if (req.method === 'POST' && url.pathname === '/research-start') {
         const body = await readBody(req, BODY_LIMITS.researchStart)
         const prompt = typeof body.prompt === 'string' ? body.prompt : ''
         if (!prompt.trim()) return sendJson(res, 400, { error: 'empty prompt' })
-        const options = withResearchAutoClose(body.options, defaultResearchAutoClose())
+        let requestedId = ''
+        try {
+          requestedId = normalizeResearchRequestId(body.requestId || body.id)
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message, code: error.code })
+        }
+        let options = withResearchAutoClose(body.options, defaultResearchAutoClose())
 
         // ── AI Studio (Gemini) provider ──────────────────────────────
         // Раньше запускался через MCP-tool aistudio_run (browser-MCP). Теперь
@@ -2492,6 +2971,12 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         // Состояние живёт в AISTUDIO_JOBS (CS PATCH'ит через /aistudio-state),
         // jobId имеет префикс aim_ — по нему /research-status роутит в нужный store.
         if (body.provider === 'aistudio' || body.provider === 'gemini') {
+          if (requestedId) {
+            return sendJson(res, 400, {
+              error: 'idempotent requestId is not supported for provider=aistudio',
+              code: 'research_request_id_provider_unsupported',
+            })
+          }
           const opts = options
           try {
             const extResp = await sendToExtension('mcp_aistudio_start', {
@@ -2534,6 +3019,14 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         const provider = body.provider === 'perplexity' ? 'perplexity'
           : body.provider === 'chatgpt' ? 'chatgpt'
           : 'claude'
+        if (provider === 'chatgpt') {
+          options = {
+            ...options,
+            temporaryChat: typeof options.temporaryChat === 'boolean'
+              ? options.temporaryChat
+              : defaultResearchTemporaryChat(),
+          }
+        }
         const rawAttachments = Array.isArray(body.attachments)
           ? body.attachments
           : (Array.isArray(body.files) ? body.files : [])
@@ -2546,13 +3039,19 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         if (rawAttachments.length && req.headers.origin) {
           return sendJson(res, 403, { error: 'local file attachments require a local origin-less request' })
         }
-        let attachments
+        const attachments = rawAttachments
+        let attachmentInfo
         try {
-          attachments = normalizeResearchAttachments(rawAttachments)
+          attachmentInfo = inspectResearchAttachmentSpecs(rawAttachments)
         } catch (error) {
-          return sendJson(res, 400, { error: String(error?.message || error) })
+          return sendJson(res, 400, {
+            error: String(error?.message || error),
+            stage: 'attachment_validation',
+            jobCreated: false,
+            sourceFileCount: rawAttachments.length,
+          })
         }
-        const hasDocuments = attachments.some(attachment => attachment.kind !== 'image')
+        const hasDocuments = attachmentInfo.hasDocuments
         if (hasDocuments && options.mode == null) options.mode = 'chat'
         if (hasDocuments && options.mode !== 'chat') {
           return sendJson(res, 400, { error: 'document attachments are currently supported only in Chat mode; Work image uploads remain supported' })
@@ -2561,33 +3060,72 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         const chatgptConversationUrl = provider === 'chatgpt' && conversationUrl
           ? normalizeChatgptConversationUrl(conversationUrl)
           : ''
-        const job = researchState.create({ provider, prompt, options, attachments })
-        if (attachments.length) {
-          try {
-            const materialized = materializeResearchAttachments({
-              libRoot: jobRunner.LIB_ROOT || path.join(os.homedir(), 'Library', 'Application Support', 'sc-desktop'),
-              id: job.id,
-              attachments,
-            })
-            researchState.update(job.id, { attachments: materialized })
-          } catch (error) {
-            researchState.update(job.id, { status: 'error', stage: 'attachment_validation', error: String(error?.message || error) })
-            return sendJson(res, 400, { error: String(error?.message || error) })
-          }
-        }
-        // chatgpt: query + дубль в hash — SPA срезает query на pushState,
-        // hash страхует ре-инжект CS до того как window.name установлен.
+        const conversationModeProof = chatgptConversationUrl
+          ? db()?.findResearchConversationMode?.(chatgptConversationUrl) : null
+        const preparedId = requestedId || researchState.newRequestId()
         const targetUrl = provider === 'perplexity'
-          ? `https://www.perplexity.ai/?sc-research=${encodeURIComponent(job.id)}`
+          ? `https://www.perplexity.ai/?sc-research=${encodeURIComponent(preparedId)}`
           : provider === 'chatgpt'
             ? chatgptResearchEntryUrl({
-              id: job.id,
+              id: preparedId,
               mode: options.mode,
               conversationUrl: chatgptConversationUrl,
+              temporaryChat: options.temporaryChat,
             })
-            : `https://claude.ai/new#sc-research=${encodeURIComponent(job.id)}`
+            : `https://claude.ai/new#sc-research=${encodeURIComponent(preparedId)}`
+        const requestFingerprint = researchRequestFingerprint({
+          provider,
+          prompt,
+          options: body.options && typeof body.options === 'object' ? body.options : {},
+          attachments: rawAttachments,
+          conversationUrl: chatgptConversationUrl,
+        })
+
+        if (requestedId) {
+          try {
+            const result = await researchRequests.start({
+              id: preparedId, requestFingerprint, provider, prompt, options,
+              attachments, targetUrl, conversationUrl: chatgptConversationUrl,
+              conversationModeProof,
+            })
+            return sendJson(res, 200, result)
+          } catch (error) {
+            const status = error.code === 'research_request_id_reused' ? 409
+              : error.code === 'research_request_identity_unavailable' ? 422
+                : Number(error.statusCode) || 503
+            return sendJson(res, status, {
+              error: error.message || String(error), code: error.code || 'research_start_failed',
+              id: preparedId,
+              deliveryUnknown: !!researchState.get(preparedId) && researchState.get(preparedId).dispatchState !== 'prepared',
+            })
+          }
+        }
+        let preparedAttachments = []
+        if (attachments.length) {
+          try {
+            preparedAttachments = await prepareInputFiles({ id: preparedId, attachments, options })
+          } catch (error) {
+            return sendJson(res, 400, {
+              error: String(error?.message || error),
+              stage: 'attachment_validation',
+              jobCreated: false,
+              sourceFileCount: attachments.length,
+            })
+          }
+        }
+        const attachmentPacking = researchAttachmentPackingSummary(preparedAttachments)
+        const job = researchState.create({
+          id: preparedId,
+          provider,
+          prompt,
+          options,
+          attachments: preparedAttachments,
+          conversationModeProof,
+        })
+        // chatgpt: query + дубль в hash — SPA срезает query на pushState,
+        // hash страхует ре-инжект CS до того как window.name установлен.
         if (chatgptConversationUrl) researchState.update(job.id, { url: chatgptConversationUrl, title: null })
-        console.log(`[BrowserBridge] research-start id=${job.id} provider=${provider} prompt-len=${prompt.length} attachments=${researchState.get(job.id)?.attachments?.length || 0}/${attachments.length} continue=${chatgptConversationUrl ? 1 : 0}`)
+        console.log(`[BrowserBridge] research-start id=${job.id} provider=${provider} prompt-len=${prompt.length} attachments=${attachmentPacking.uploadFileCount}/${attachmentPacking.sourceFileCount} bundles=${attachmentPacking.bundleCount} complete=${attachmentPacking.packingComplete ? 1 : 0} continue=${chatgptConversationUrl ? 1 : 0}`)
         const open = await reconcileResearchTabOpen({
           openTab: () => sendToExtension('mcp_open_research_tab', { url: targetUrl }, 15000),
           findTab: () => sendToExtension('mcp_find_research_tab', { url: targetUrl }, 10000),
@@ -2612,6 +3150,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           url: targetUrl,
           status: liveJob.status,
           openState: open.openState,
+          attachmentPacking,
           ...(open.openWarning ? { openWarning: open.openWarning } : {}),
           ...(open.openError ? { openError: open.openError } : {}),
         })
@@ -2627,7 +3166,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
       if (req.method === 'GET' && url.pathname === '/research-job') {
         const id = url.searchParams.get('id')
         if (!id) return sendJson(res, 400, { error: 'missing id' })
-        const job = researchState.get(id)
+        const job = researchState.get(id) || restoreResearchRequest(researchState, db()?.getResearchJob?.(id))
         if (!job) return sendJson(res, 404, { error: 'job not found' })
         // Snapshot + prompt + options. После выдачи могли бы удалять prompt
         // чтобы не светить повторно — но CS может попросить ещё раз после
@@ -2637,7 +3176,9 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           provider: job.provider,
           prompt: job.prompt,
           options: job.options,
+          conversationModeProof: job.conversationModeProof || null,
           attachments: (job.attachments || []).map(publicAttachmentMeta),
+          attachmentPacking: researchAttachmentPackingSummary(job.attachments || []),
           status: job.status,
         })
       }
@@ -2649,7 +3190,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         const id = url.searchParams.get('id')
         const index = parseInt(url.searchParams.get('index') || '0', 10)
         if (!id) return sendJson(res, 400, { error: 'missing id' })
-        const job = researchState.get(id)
+        const job = researchState.get(id) || restoreResearchRequest(researchState, db()?.getResearchJob?.(id))
         if (!job) return sendJson(res, 404, { error: 'job not found' })
         const att = (job.attachments || []).find(a => a.index === index)
         if (!att) return sendJson(res, 404, { error: 'attachment not found' })
@@ -2767,7 +3308,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         const body = await readBody(req, BODY_LIMITS.researchState)
         const id = body.id
         if (!id) return sendJson(res, 400, { error: 'missing id' })
-        let cur = researchState.get(id)
+        let cur = researchState.get(id) || restoreResearchRequest(researchState, db()?.getResearchJob?.(id))
         if (!cur) {
           if (body.provider) {
             cur = researchState.recreate({ id, provider: body.provider })
@@ -2777,6 +3318,12 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           }
         }
         const patch = {}
+        // A delayed heartbeat/tab-close error cannot turn a completed answer
+        // back into a running request. Error -> done remains available for
+        // the existing explicit recovery of a result after bridge timeout.
+        if (cur.status === 'done' && body.status && body.status !== 'done') {
+          return sendJson(res, 200, researchState.publicSnapshot(cur))
+        }
         if (typeof body.status === 'string') patch.status = body.status
         if (typeof body.stage === 'string')  patch.stage = body.stage
         if (typeof body.url === 'string')    patch.url = body.url
@@ -2845,11 +3392,16 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
           req.on('close', () => { aiResolved = true; clearInterval(aiTimer); clearTimeout(aiHard) })
           return
         }
-        const initial = researchState.get(id)
+        const initial = await researchRequests.restore(id)
         const waitRaw = parseInt(url.searchParams.get('wait') || '0', 10)
         const wait = Number.isFinite(waitRaw) ? Math.max(0, Math.min(60000, waitRaw)) : 0
 
         if (!initial) {
+          const persisted = db()?.getResearchJob?.(id)
+          if (persisted) {
+            console.log(`[BrowserBridge] research-status id=${reqShortId} → 200 restored terminal status=${persisted.status}`)
+            return sendJson(res, 200, researchState.publicSnapshot(persisted))
+          }
           console.log(`[BrowserBridge] research-status id=${reqShortId} → 404 (job not found in RAM map; wait=${wait}ms requested but bailed immediately)`)
           return sendJson(res, 404, { error: 'job not found' })
         }
@@ -3069,6 +3621,10 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
     }
   })
 
+  server.once('close', () => telegramRagApi.close())
+  server.once('close', () => boostyRagApi.close())
+  server.once('close', () => boostyCatalogApi.close())
+  server.once('close', () => boostyWorkflowApi.close())
   server.on('error', err => {
     if (err.code === 'EADDRINUSE') {
       console.log(`[BrowserBridge] port ${PORT} занят — другой инстанс sc-desktop уже слушает, расширение работать не будет`)
@@ -3077,8 +3633,8 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
     }
   })
 
-  server.listen(PORT, '127.0.0.1', () => {
-    console.log(`[BrowserBridge] listening on 127.0.0.1:${PORT}`)
+  server.listen(port, '127.0.0.1', () => {
+    console.log(`[BrowserBridge] listening on 127.0.0.1:${server.address().port}`)
   })
 
   // ── Hot-reload WebSocket (dev only) ─────────────────────────────────
@@ -3087,7 +3643,7 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
   // видим изменение mtime в browser-extension/ → шлём 'reload' → SW делает
   // chrome.runtime.reload(). Hot-reload < 1 секунды без зависимости от
   // chrome.alarms (которые в Yandex.Browser спят 5+ минут).
-  if (WS) {
+  if (WS && port === PORT) {
     try {
       // В dev `__dirname` = `<repo>/electron/`, browser-extension/ рядом.
       // В production .app `__dirname` = внутри asar — там browser-extension
@@ -3124,11 +3680,11 @@ function startServer({ jobRunner, notificationService, settingsAccess }) {
         // и надёжный watcher без зависимости от chokidar.
         const watchFiles = [
           'manifest.json', 'background.js', 'youtube-content.js',
-          'aistudio-autoscrape.js', 'aistudio-core.js', 'aistudio-mcp.js',
-          'claude-autoscrape.js', 'claude-research.js', 'perplexity-research.js',
+          'logger.js', 'aistudio-export.js', 'aistudio-autoscrape.js', 'aistudio-core.js', 'aistudio-mcp.js',
+          'perplexity-content.js', 'claude-content.js', 'claude-autoscrape.js', 'claude-research.js', 'perplexity-research.js',
           'chatgpt-research.js', 'research-badge.js',
-          'chatgpt-entry-url.js', 'tab-placement.js', 'pill-event-guard.js', 'research-tab-policy.js', 'research-tab-registry.js',
-          'english-lexeme.js', 'youtube-learning-utils.js', 'learning-store.js', 'youtube-learning.js', 'youtube-main-bridge.js',
+          'chatgpt-entry-url.js', 'tab-placement.js', 'pill-event-guard.js', 'research-tab-policy.js', 'research-tab-registry.js', 'research-startup-recovery.js',
+          'english-lexeme.js', 'youtube-learning-utils.js', 'learning-store.js', 'learning-save-state.js', 'learning-word-gesture.js', 'learning-phrase-composition.js', 'learning-choices-popover.js', 'youtube-learning.js', 'youtube-main-bridge.js',
           'study/index.html', 'study/study.js', 'study/study.css',
           'mcp-window-model.js',
           'popup.html', 'popup.js', 'settings.js', 'mcp-handlers.js', 'mcp-content.js',
@@ -3197,7 +3753,13 @@ module.exports = {
     parseTimestampedTranscript,
     parseSrtCues,
     parseByteRange,
+    plainBoostyText,
+    subtitleLanguageFromText,
+    interviewOutcomeFromDescription,
+    boostyInterviewDetails,
+    publicLearningMediaLibrary,
     normalizeVocabularyTerm,
     vocabularySyncPayload,
+    orderVoiceServerCandidates,
   },
 }

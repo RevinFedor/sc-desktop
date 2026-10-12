@@ -5,6 +5,7 @@
 const path = require('node:path')
 const fs = require('node:fs')
 const os = require('node:os')
+const crypto = require('node:crypto')
 const Database = require('better-sqlite3')
 const sqliteVec = require('sqlite-vec')
 
@@ -101,6 +102,102 @@ CREATE INDEX IF NOT EXISTS idx_items_source_caption_present ON items(source_id)
   WHERE caption IS NOT NULL AND length(trim(caption)) > 0;
 CREATE INDEX IF NOT EXISTS idx_items_status     ON items(download_status, transcribe_status);
 CREATE INDEX IF NOT EXISTS idx_items_type       ON items(source_id, type);
+
+-- Generic long-form semantic corpus. Telegram messages remain one-vector-per
+-- item in items_vec; YouTube transcripts are split into bounded chunks here so
+-- a model can retrieve the relevant passage instead of one vector for an
+-- entire hour-long video.
+CREATE TABLE IF NOT EXISTS semantic_chunks (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id              INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  source_id            INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  chunk_index          INTEGER NOT NULL,
+  start_char           INTEGER NOT NULL,
+  end_char             INTEGER NOT NULL,
+  start_seconds        REAL,
+  end_seconds          REAL,
+  position_approximate INTEGER NOT NULL DEFAULT 1,
+  text                 TEXT NOT NULL,
+  document_hash        TEXT NOT NULL,
+  indexed_at           INTEGER,
+  created_at           INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(item_id, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_chunks_source ON semantic_chunks(source_id, item_id, chunk_index);
+CREATE INDEX IF NOT EXISTS idx_semantic_chunks_document ON semantic_chunks(item_id, document_hash);
+
+-- Boosty saved-text publication. Partial embeddings are resumable but never
+-- searchable; active vectors live in the same semantic_chunks/vec corpus.
+CREATE TABLE IF NOT EXISTS boosty_rag_generations (
+  generation_id TEXT PRIMARY KEY,
+  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  document_hash TEXT NOT NULL,
+  index_version TEXT NOT NULL,
+  fragments_total INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('staging', 'active', 'obsolete')),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  published_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_boosty_rag_item ON boosty_rag_generations(item_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_boosty_rag_active ON boosty_rag_generations(item_id) WHERE status = 'active';
+CREATE TABLE IF NOT EXISTS boosty_rag_staging (
+  generation_id TEXT NOT NULL REFERENCES boosty_rag_generations(generation_id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
+  chunk_json TEXT NOT NULL,
+  embedding BLOB,
+  PRIMARY KEY(generation_id, chunk_index)
+);
+
+-- Telegram-only RAG publication ledger. Staging embeddings never enter vec0.
+CREATE TABLE IF NOT EXISTS telegram_rag_source_state (
+  source_id        INTEGER PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+  content_revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS telegram_rag_item_state (
+  item_id               INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+  local_revision        INTEGER NOT NULL DEFAULT 1,
+  stale                 INTEGER NOT NULL DEFAULT 0,
+  migrated              INTEGER NOT NULL DEFAULT 0,
+  active_generation_id  TEXT,
+  desired_generation_id TEXT
+);
+CREATE TABLE IF NOT EXISTS telegram_rag_generations (
+  generation_id      TEXT PRIMARY KEY,
+  item_id            INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  source_id          INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  input_hash         TEXT NOT NULL,
+  index_version      TEXT NOT NULL,
+  target_revision    INTEGER NOT NULL,
+  target_content_hash TEXT NOT NULL,
+  source_revision    INTEGER NOT NULL,
+  context_refs_json  TEXT NOT NULL,
+  status             TEXT NOT NULL CHECK(status IN ('staging', 'active', 'obsolete')),
+  fragments_total    INTEGER NOT NULL,
+  created_at         INTEGER NOT NULL DEFAULT (unixepoch()),
+  published_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_rag_generations_item
+  ON telegram_rag_generations(item_id, status);
+CREATE TABLE IF NOT EXISTS telegram_rag_generation_chunks (
+  generation_id TEXT NOT NULL REFERENCES telegram_rag_generations(generation_id) ON DELETE CASCADE,
+  chunk_index   INTEGER NOT NULL,
+  chunk_json    TEXT NOT NULL,
+  embedding     BLOB,
+  PRIMARY KEY(generation_id, chunk_index)
+);
+CREATE TABLE IF NOT EXISTS telegram_rag_dependencies (
+  generation_id TEXT NOT NULL REFERENCES telegram_rag_generations(generation_id) ON DELETE CASCADE,
+  source_id     INTEGER NOT NULL,
+  external_id   TEXT NOT NULL,
+  item_id       INTEGER,
+  local_revision INTEGER,
+  content_hash  TEXT,
+  role          TEXT NOT NULL,
+  PRIMARY KEY(generation_id, source_id, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_rag_dependencies_external
+  ON telegram_rag_dependencies(source_id, external_id);
 
 CREATE TABLE IF NOT EXISTS jobs (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -264,10 +361,150 @@ CREATE TABLE IF NOT EXISTS schema_version (
   applied_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 INSERT OR IGNORE INTO schema_version (version) VALUES (1);
+CREATE TABLE IF NOT EXISTS research_jobs (
+  job_id TEXT PRIMARY KEY, kind TEXT, provider TEXT, model_id TEXT, mode TEXT,
+  status TEXT, stage TEXT, prompt TEXT, response_text TEXT, url TEXT,
+  response_len INTEGER, link_count INTEGER, result_json TEXT,
+  request_fingerprint TEXT, request_metadata_json TEXT, error TEXT,
+  created_at INTEGER, updated_at INTEGER, done_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_research_jobs_created ON research_jobs(created_at DESC);
+
+
+`
+
+const TELEGRAM_RAG_TRIGGERS = `
+-- Triggers cover BOTH SQLite writers; they deliberately never touch vec0.
+CREATE TRIGGER IF NOT EXISTS telegram_rag_item_insert AFTER INSERT ON items
+WHEN EXISTS (SELECT 1 FROM sources WHERE id = NEW.source_id AND platform = 'telegram')
+BEGIN
+  INSERT INTO telegram_rag_source_state(source_id) SELECT NEW.source_id
+    WHERE NOT EXISTS (SELECT 1 FROM telegram_rag_source_state WHERE source_id = NEW.source_id);
+  UPDATE telegram_rag_source_state SET content_revision = content_revision + 1 WHERE source_id = NEW.source_id;
+  INSERT INTO telegram_rag_item_state(item_id) SELECT NEW.id
+    WHERE NOT EXISTS (SELECT 1 FROM telegram_rag_item_state WHERE item_id = NEW.id);
+
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE item_id IN (
+     SELECT g.item_id FROM telegram_rag_dependencies d
+     JOIN telegram_rag_generations g ON g.generation_id = d.generation_id
+     WHERE d.source_id = NEW.source_id AND d.external_id = NEW.external_id
+       AND g.status IN ('staging', 'active')
+   );
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE (active_generation_id IS NOT NULL OR desired_generation_id IS NOT NULL)
+     AND item_id IN (
+       SELECT i.id FROM items i WHERE i.source_id = NEW.source_id
+         AND i.id != NEW.id
+         AND COALESCE(i.topic_id, 0) = COALESCE(NEW.topic_id, 0)
+         AND i.published_at BETWEEN NEW.published_at AND NEW.published_at + 86400
+         AND (i.published_at > NEW.published_at
+           OR (i.published_at = NEW.published_at
+             AND CAST(i.external_id AS INTEGER) > CAST(NEW.external_id AS INTEGER)))
+     );
+
+END;
+CREATE TRIGGER IF NOT EXISTS telegram_rag_item_update AFTER UPDATE ON items
+WHEN EXISTS (SELECT 1 FROM sources WHERE id = NEW.source_id AND platform = 'telegram')
+ AND (OLD.caption IS NOT NEW.caption
+  OR OLD.sender IS NOT NEW.sender
+  OR OLD.type IS NOT NEW.type
+  OR OLD.published_at IS NOT NEW.published_at
+  OR OLD.topic_id IS NOT NEW.topic_id
+  OR OLD.topic_title IS NOT NEW.topic_title
+  OR OLD.parent_external_id IS NOT NEW.parent_external_id
+  OR OLD.source_id IS NOT NEW.source_id
+  OR OLD.external_id IS NOT NEW.external_id
+  OR (CASE WHEN json_valid(OLD.raw_meta_json) THEN json_extract(OLD.raw_meta_json, '$.forward') END)
+     IS NOT (CASE WHEN json_valid(NEW.raw_meta_json) THEN json_extract(NEW.raw_meta_json, '$.forward') END)
+  OR (CASE WHEN json_valid(OLD.raw_meta_json) THEN json_extract(OLD.raw_meta_json, '$.telegram_reply') END)
+     IS NOT (CASE WHEN json_valid(NEW.raw_meta_json) THEN json_extract(NEW.raw_meta_json, '$.telegram_reply') END)
+  OR (CASE WHEN json_valid(OLD.raw_meta_json) THEN json_type(OLD.raw_meta_json, '$.telegram_reply') END)
+     IS NOT (CASE WHEN json_valid(NEW.raw_meta_json) THEN json_type(NEW.raw_meta_json, '$.telegram_reply') END)
+  OR (CASE WHEN json_valid(OLD.raw_meta_json) THEN json_extract(OLD.raw_meta_json, '$.external_reply') END)
+     IS NOT (CASE WHEN json_valid(NEW.raw_meta_json) THEN json_extract(NEW.raw_meta_json, '$.external_reply') END)
+  OR (CASE WHEN json_valid(OLD.raw_meta_json) THEN json_type(OLD.raw_meta_json, '$.external_reply') END)
+     IS NOT (CASE WHEN json_valid(NEW.raw_meta_json) THEN json_type(NEW.raw_meta_json, '$.external_reply') END))
+BEGIN
+  INSERT INTO telegram_rag_source_state(source_id) SELECT NEW.source_id
+    WHERE NOT EXISTS (SELECT 1 FROM telegram_rag_source_state WHERE source_id = NEW.source_id);
+  UPDATE telegram_rag_source_state SET content_revision = content_revision + 1
+    WHERE source_id IN (NEW.source_id, OLD.source_id);
+  INSERT INTO telegram_rag_item_state(item_id) SELECT NEW.id
+    WHERE NOT EXISTS (SELECT 1 FROM telegram_rag_item_state WHERE item_id = NEW.id);
+  UPDATE telegram_rag_item_state SET local_revision = local_revision + 1, stale = 1 WHERE item_id = NEW.id;
+
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE item_id IN (
+     SELECT g.item_id FROM telegram_rag_dependencies d
+     JOIN telegram_rag_generations g ON g.generation_id = d.generation_id
+     WHERE d.source_id = NEW.source_id AND d.external_id = NEW.external_id
+       AND g.status IN ('staging', 'active')
+   );
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE (active_generation_id IS NOT NULL OR desired_generation_id IS NOT NULL)
+     AND item_id IN (
+       SELECT i.id FROM items i WHERE i.source_id = NEW.source_id
+         AND i.id != NEW.id
+         AND COALESCE(i.topic_id, 0) = COALESCE(NEW.topic_id, 0)
+         AND i.published_at BETWEEN NEW.published_at AND NEW.published_at + 86400
+         AND (i.published_at > NEW.published_at
+           OR (i.published_at = NEW.published_at
+             AND CAST(i.external_id AS INTEGER) > CAST(NEW.external_id AS INTEGER)))
+     );
+
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE item_id IN (
+     SELECT g.item_id FROM telegram_rag_dependencies d
+     JOIN telegram_rag_generations g ON g.generation_id = d.generation_id
+     WHERE d.source_id = OLD.source_id AND d.external_id = OLD.external_id
+       AND g.status IN ('staging', 'active')
+   );
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE (active_generation_id IS NOT NULL OR desired_generation_id IS NOT NULL)
+     AND item_id IN (
+       SELECT i.id FROM items i WHERE i.source_id = OLD.source_id
+         AND i.id != OLD.id
+         AND COALESCE(i.topic_id, 0) = COALESCE(OLD.topic_id, 0)
+         AND i.published_at BETWEEN OLD.published_at AND OLD.published_at + 86400
+         AND (i.published_at > OLD.published_at
+           OR (i.published_at = OLD.published_at
+             AND CAST(i.external_id AS INTEGER) > CAST(OLD.external_id AS INTEGER)))
+     );
+
+END;
+CREATE TRIGGER IF NOT EXISTS telegram_rag_item_delete AFTER DELETE ON items
+WHEN EXISTS (SELECT 1 FROM sources WHERE id = OLD.source_id AND platform = 'telegram')
+BEGIN
+  INSERT INTO telegram_rag_source_state(source_id) SELECT OLD.source_id
+    WHERE NOT EXISTS (SELECT 1 FROM telegram_rag_source_state WHERE source_id = OLD.source_id);
+  UPDATE telegram_rag_source_state SET content_revision = content_revision + 1 WHERE source_id = OLD.source_id;
+
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE item_id IN (
+     SELECT g.item_id FROM telegram_rag_dependencies d
+     JOIN telegram_rag_generations g ON g.generation_id = d.generation_id
+     WHERE d.source_id = OLD.source_id AND d.external_id = OLD.external_id
+       AND g.status IN ('staging', 'active')
+   );
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE (active_generation_id IS NOT NULL OR desired_generation_id IS NOT NULL)
+     AND item_id IN (
+       SELECT i.id FROM items i WHERE i.source_id = OLD.source_id
+         AND i.id != OLD.id
+         AND COALESCE(i.topic_id, 0) = COALESCE(OLD.topic_id, 0)
+         AND i.published_at BETWEEN OLD.published_at AND OLD.published_at + 86400
+         AND (i.published_at > OLD.published_at
+           OR (i.published_at = OLD.published_at
+             AND CAST(i.external_id AS INTEGER) > CAST(OLD.external_id AS INTEGER)))
+     );
+
+END;
 `
 
 let _db = null
 let _itemsVecAvailable = null
+let _semanticChunksVecAvailable = null
 
 function itemsVecAvailable(db) {
   if (_itemsVecAvailable != null) return _itemsVecAvailable
@@ -278,6 +515,17 @@ function itemsVecAvailable(db) {
   `).get()
   _itemsVecAvailable = !!row
   return _itemsVecAvailable
+}
+
+function semanticChunksVecAvailable(db) {
+  if (_semanticChunksVecAvailable != null) return _semanticChunksVecAvailable
+  const row = db.prepare(`
+    SELECT 1 AS ok FROM sqlite_master
+    WHERE type = 'table' AND name = 'semantic_chunks_vec'
+    LIMIT 1
+  `).get()
+  _semanticChunksVecAvailable = !!row
+  return _semanticChunksVecAvailable
 }
 
 function getDb() {
@@ -319,36 +567,21 @@ function getDb() {
   } catch (err) {
     console.error('[DB] items_vec create failed:', err.message)
   }
-  // research_jobs — история external-research (claude/perplexity/aistudio).
-  // DESKTOP-ONLY: CLI про неё не знает, поэтому НЕ в основной SCHEMA (которая
-  // sync'ается с library_db.py), а отдельным exec. Раньше история жила только
-  // в RAM (AISTUDIO_JOBS + research-state Map) и терялась при рестарте — теперь
-  // терминальные джобы persist'ятся сюда. jobId — наш id (aim_…/r…), PK.
   try {
-    _db.exec(`CREATE TABLE IF NOT EXISTS research_jobs (
-      job_id        TEXT PRIMARY KEY,
-      kind          TEXT,              -- 'research' | 'aistudio'
-      provider      TEXT,              -- 'claude' | 'perplexity' | 'aistudio'
-      model_id      TEXT,
-      mode          TEXT,              -- perplexity: 'search' | 'deep'
-      status        TEXT,              -- done | error
-      stage         TEXT,
-      prompt        TEXT,
-      response_text TEXT,
-      url           TEXT,
-      response_len  INTEGER,
-      link_count    INTEGER,
-      result_json   TEXT,
-      error         TEXT,
-      created_at    INTEGER,
-      updated_at    INTEGER,
-      done_at       INTEGER
+    _db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS semantic_chunks_vec USING vec0(
+      chunk_id INTEGER PRIMARY KEY,
+      embedding float[${EMBEDDING_DIM}],
+      source_id INTEGER PARTITION KEY
     )`)
-    _db.exec("CREATE INDEX IF NOT EXISTS idx_research_jobs_created ON research_jobs(created_at DESC)")
-    _db.exec("ALTER TABLE research_jobs ADD COLUMN result_json TEXT")
   } catch (err) {
-    if (!/duplicate column name/i.test(String(err?.message || ''))) {
-      console.error('[DB] research_jobs create failed:', err.message)
+    console.error('[DB] semantic_chunks_vec create failed:', err.message)
+  }
+  // Both database writers know the research schema. The desktop owns its
+  // records; these additive migrations retain existing history and requests.
+  for (const column of ['result_json', 'request_fingerprint', 'request_metadata_json']) {
+    try { _db.exec(`ALTER TABLE research_jobs ADD COLUMN ${column} TEXT`) }
+    catch (err) {
+      if (!/duplicate column name/i.test(String(err?.message || ''))) throw err
     }
   }
   // Desktop-only UI preferences. Not part of the CLI-shared SCHEMA:
@@ -371,6 +604,16 @@ function getDb() {
   try { _db.exec("ALTER TABLE items ADD COLUMN topic_title TEXT") } catch {}
   try { _db.exec("CREATE INDEX IF NOT EXISTS idx_items_topic ON items(source_id, topic_id)") } catch {}
   try { _db.exec("ALTER TABLE items ADD COLUMN parent_external_id TEXT") } catch {}
+  // Replace only our triggers in one transaction. CREATE IF NOT EXISTS alone
+  // would leave an older installed trigger body running after an upgrade.
+  _db.transaction(() => {
+    _db.exec(`
+      DROP TRIGGER IF EXISTS telegram_rag_item_insert;
+      DROP TRIGGER IF EXISTS telegram_rag_item_update;
+      DROP TRIGGER IF EXISTS telegram_rag_item_delete;
+    `)
+    _db.exec(TELEGRAM_RAG_TRIGGERS)
+  }).immediate()
   try { _db.exec("ALTER TABLE items ADD COLUMN depth INTEGER") } catch {}
   try { _db.exec("CREATE INDEX IF NOT EXISTS idx_items_parent ON items(source_id, parent_external_id)") } catch {}
   // reply_resolved separates "checked, has no reply" (=1, parent_external_id NULL)
@@ -548,6 +791,8 @@ function close() {
   if (_db) {
     _db.close()
     _db = null
+    _itemsVecAvailable = null
+    _semanticChunksVecAvailable = null
   }
 }
 
@@ -742,7 +987,79 @@ function setSourceSession(sourceId, sessionName) {
     .run(sess, sourceId)
 }
 
+// Adjust the already-computed, caption-eligible legacy counts. Only changed
+// ledger IDs need vector eligibility checks; never rescan the entire Telegram
+// corpus or both vec0 tables after listSources' physical-vector aggregate.
+function telegramRagCatalogueStats(sourceRows, { includeLegacy = true } = {}) {
+  const handle = getDb()
+  const ids = sourceRows.filter(row => row.platform === 'telegram').map(row => Number(row.id))
+  if (!ids.length) return []
+  const legacy = includeLegacy && itemsVecAvailable(handle) ? `
+    SELECT c.source_id, COUNT(*) AS excluded
+      FROM items_vec v JOIN changed c ON c.item_id = v.item_id
+     WHERE v.item_id IN (SELECT item_id FROM changed WHERE migrated = 1 OR stale = 1)
+     GROUP BY c.source_id
+  ` : 'SELECT NULL AS source_id, 0 AS excluded WHERE 0'
+  const fragments = semanticChunksVecAvailable(handle) ? `
+    SELECT c.item_id, COUNT(*) AS n
+      FROM semantic_chunks_vec v
+      JOIN fragment_ids c ON c.id = v.chunk_id AND c.source_id = v.source_id
+     WHERE v.chunk_id IN (SELECT id FROM fragment_ids)
+     GROUP BY c.item_id
+  ` : 'SELECT NULL AS item_id, 0 AS n WHERE 0'
+  return handle.prepare(`
+    WITH changed AS MATERIALIZED (
+      SELECT r.item_id, i.source_id, r.migrated, r.stale, r.local_revision,
+             r.active_generation_id
+        FROM telegram_rag_item_state r CROSS JOIN items i
+       WHERE (r.migrated = 1 OR r.stale = 1 OR r.active_generation_id IS NOT NULL)
+         AND i.id = r.item_id AND i.source_id IN (SELECT value FROM json_each(?))
+         AND i.caption IS NOT NULL AND length(trim(i.caption)) > 0
+    ), candidates AS MATERIALIZED (
+      SELECT c.item_id, c.source_id, g.fragments_total, g.input_hash
+        FROM changed c JOIN telegram_rag_generations g ON g.generation_id = c.active_generation_id
+       WHERE c.stale = 0 AND g.status = 'active' AND g.target_revision = c.local_revision
+         AND g.index_version = ? AND g.item_id = c.item_id AND g.source_id = c.source_id
+    ), fragment_ids AS MATERIALIZED (
+      SELECT c.id, c.item_id, c.source_id
+        FROM semantic_chunks c JOIN candidates g ON g.item_id = c.item_id AND g.source_id = c.source_id
+       WHERE c.document_hash = g.input_hash
+    ), legacy_excluded AS (${legacy}), fragments AS (${fragments}), ready AS (
+      SELECT c.source_id, COUNT(*) AS current_messages
+        FROM candidates c JOIN fragments v ON v.item_id = c.item_id
+       WHERE v.n = c.fragments_total GROUP BY c.source_id
+    ), ledger_counts AS (
+      SELECT source_id, SUM(stale) AS stale_messages FROM changed GROUP BY source_id
+    )
+    SELECT c.source_id, COALESCE(l.excluded, 0) AS legacy_excluded,
+           COALESCE(r.current_messages, 0) AS current_messages, c.stale_messages
+      FROM ledger_counts c LEFT JOIN legacy_excluded l ON l.source_id = c.source_id
+      LEFT JOIN ready r ON r.source_id = c.source_id
+  `).all(JSON.stringify(ids), require('./telegram-rag-index').INDEX_VERSION)
+}
+
+function withTelegramRagCounts(rows) {
+  if (!rows.some(row => row.platform === 'telegram')) return rows
+  const counts = new Map(telegramRagCatalogueStats(rows).map(row => [row.source_id, row]))
+  return rows.map(row => {
+    if (row.platform !== 'telegram') return row
+    const count = counts.get(row.id)
+    const current = Number(count?.current_messages || 0)
+    const legacy = Math.max(0, Number(row.semantic_indexed_count || 0) - Number(count?.legacy_excluded || 0))
+    return { ...row, semantic_indexed_count: current + legacy,
+      semantic_current_count: current,
+      semantic_legacy_count: legacy,
+      semantic_stale_count: Number(count?.stale_messages || 0) }
+  })
+}
+
 function listSources(platform = null) {
+  // Physical base counts and ledger adjustments must observe one revision,
+  // including a publication or caption edit from another writer between them.
+  return getDb().transaction(() => listSourcesCatalogueSnapshot(platform))()
+}
+
+function listSourcesCatalogueSnapshot(platform = null) {
   const db = getDb()
   const hasVec = itemsVecAvailable(db)
   if (platform) {
@@ -752,12 +1069,16 @@ function listSources(platform = null) {
           FROM items_vec v
           JOIN items i ON i.id = v.item_id
           JOIN wanted_sources w ON w.id = i.source_id
+         WHERE v.item_id IN (
+           SELECT i.id FROM items i JOIN wanted_sources w ON w.id = i.source_id
+           WHERE w.platform != 'telegram' OR (i.caption IS NOT NULL AND length(trim(i.caption)) > 0)
+         )
          GROUP BY i.source_id
       )
     ` : ''
     const indexedJoin = hasVec ? 'LEFT JOIN vector_stats iv ON iv.source_id = s.id' : ''
     const indexedExpr = hasVec ? 'COALESCE(iv.semantic_indexed_count, 0)' : '0'
-    return db.prepare(`
+    return withTelegramRagCounts(db.prepare(`
       WITH wanted_sources AS (
         SELECT * FROM sources WHERE platform = ?
       ),
@@ -798,7 +1119,7 @@ function listSources(platform = null) {
       LEFT JOIN item_stats ia ON ia.source_id = s.id
       ${indexedJoin}
       ORDER BY s.platform, COALESCE(s.last_synced_at, 0) DESC
-    `).all(platform)
+    `).all(platform))
   }
   const indexedExpr = hasVec ? `COALESCE(iv.semantic_indexed_count, 0)` : `0`
   const itemStatsJoin = `
@@ -825,6 +1146,8 @@ function listSources(platform = null) {
       SELECT i.source_id, COUNT(*) AS semantic_indexed_count
         FROM items_vec v
         JOIN items i ON i.id = v.item_id
+        JOIN sources s ON s.id = i.source_id
+       WHERE s.platform != 'telegram' OR (i.caption IS NOT NULL AND length(trim(i.caption)) > 0)
        GROUP BY i.source_id
     ) iv ON iv.source_id = s.id
   ` : ''
@@ -852,7 +1175,7 @@ function listSources(platform = null) {
     ${platform ? 'WHERE s.platform = ?' : ''}
     ORDER BY s.platform, COALESCE(s.last_synced_at, 0) DESC
   `
-  return db.prepare(sql).all()
+  return withTelegramRagCounts(db.prepare(sql).all())
 }
 
 /**
@@ -1012,6 +1335,13 @@ function listTelegramAutoSources() {
 }
 
 function semanticIndexCountsForSources(sourceIds) {
+  // The scheduler asks whether current indexing is complete, not how many
+  // physical compatibility vectors remain. Read base and ledger counts from
+  // one snapshot so a concurrent publication cannot change that decision.
+  return getDb().transaction(() => semanticIndexCountsSnapshot(sourceIds)).deferred()
+}
+
+function semanticIndexCountsSnapshot(sourceIds) {
   const db = getDb()
   const ids = Array.isArray(sourceIds)
     ? sourceIds.map(Number).filter(Number.isFinite)
@@ -1019,39 +1349,62 @@ function semanticIndexCountsForSources(sourceIds) {
   if (!ids.length) return new Map()
   const placeholders = ids.map(() => '?').join(',')
   const hasVec = itemsVecAvailable(db)
-  const vectorCte = hasVec ? `,
+  const hasChunkVec = semanticChunksVecAvailable(db)
+  const itemVectorSql = hasVec ? `
+        SELECT i.source_id, COUNT(*) AS n
+          FROM items_vec v
+          JOIN items i ON i.id = v.item_id
+          JOIN wanted_sources w ON w.id = i.source_id
+         WHERE w.platform != 'telegram'
+         GROUP BY i.source_id
+  ` : 'SELECT NULL AS source_id, 0 AS n WHERE 0'
+  const chunkVectorSql = hasChunkVec ? `
+        SELECT c.source_id, COUNT(DISTINCT c.item_id) AS n
+          FROM semantic_chunks_vec v
+          JOIN semantic_chunks c ON c.id = v.chunk_id
+          JOIN wanted_sources w ON w.id = c.source_id
+         WHERE w.platform != 'telegram'
+         GROUP BY c.source_id
+  ` : 'SELECT NULL AS source_id, 0 AS n WHERE 0'
+  const vectorCte = (hasVec || hasChunkVec) ? `,
     vector_counts AS (
-      SELECT i.source_id, COUNT(*) AS semantic_indexed_count
-        FROM items_vec v
-        JOIN items i ON i.id = v.item_id
-        JOIN wanted_sources w ON w.id = i.source_id
-       GROUP BY i.source_id
+      SELECT source_id, SUM(n) AS semantic_indexed_count
+        FROM (
+          ${itemVectorSql}
+          UNION ALL
+          ${chunkVectorSql}
+        )
+       GROUP BY source_id
     )
   ` : ''
-  const vectorJoin = hasVec ? 'LEFT JOIN vector_counts vc ON vc.source_id = w.id' : ''
-  const indexedExpr = hasVec ? 'COALESCE(vc.semantic_indexed_count, 0)' : '0'
+  const vectorJoin = (hasVec || hasChunkVec) ? 'LEFT JOIN vector_counts vc ON vc.source_id = w.id' : ''
+  const indexedExpr = (hasVec || hasChunkVec) ? 'COALESCE(vc.semantic_indexed_count, 0)' : '0'
   const rows = db.prepare(`
     WITH wanted_sources AS (
-      SELECT id FROM sources WHERE id IN (${placeholders})
+      SELECT id, platform FROM sources WHERE id IN (${placeholders})
     ),
     item_counts AS (
       SELECT i.source_id, COUNT(*) AS semantic_indexable_count
         FROM items i
         JOIN wanted_sources w ON w.id = i.source_id
-       WHERE i.caption IS NOT NULL AND length(trim(i.caption)) > 0
+       WHERE (w.platform = 'youtube' AND i.transcript_path IS NOT NULL)
+          OR (w.platform != 'youtube' AND i.caption IS NOT NULL AND length(trim(i.caption)) > 0)
        GROUP BY i.source_id
     )
     ${vectorCte}
-    SELECT w.id,
+    SELECT w.id, w.platform,
       COALESCE(ic.semantic_indexable_count, 0) AS semantic_indexable_count,
       ${indexedExpr} AS semantic_indexed_count
     FROM wanted_sources w
     LEFT JOIN item_counts ic ON ic.source_id = w.id
     ${vectorJoin}
   `).all(...ids)
+  const current = new Map(telegramRagCatalogueStats(rows, { includeLegacy: false })
+    .map(row => [Number(row.source_id), Number(row.current_messages) || 0]))
   return new Map(rows.map(r => [Number(r.id), {
     semantic_indexable_count: Number(r.semantic_indexable_count) || 0,
-    semantic_indexed_count: Number(r.semantic_indexed_count) || 0,
+    semantic_indexed_count: r.platform === 'telegram'
+      ? current.get(Number(r.id)) || 0 : Number(r.semantic_indexed_count) || 0,
   }]))
 }
 
@@ -2229,7 +2582,7 @@ function updateJob(id, patch) {
   const fields = []
   const values = []
   const map = {
-    status: 'status', items_total: 'items_total', items_done: 'items_done',
+    status: 'status', source_id: 'source_id', items_total: 'items_total', items_done: 'items_done',
     items_failed: 'items_failed', cost_usd: 'cost_usd', error: 'error',
     finished_at: 'finished_at', started_at: 'started_at', file_path: 'file_path',
   }
@@ -2607,6 +2960,7 @@ function deleteSource(source_id) {
   const tx = db.transaction((id) => {
     db.prepare('DELETE FROM jobs WHERE source_id = ?').run(id)
     db.prepare('DELETE FROM source_coverage WHERE source_id = ?').run(id)
+    deleteSemanticChunkVectorsForSource(id)
     // FTS: remove all FTS rows whose item belonged to this source.
     db.prepare(`DELETE FROM items_fts WHERE rowid IN (SELECT id FROM items WHERE source_id = ?)`).run(id)
     db.prepare('DELETE FROM items WHERE source_id = ?').run(id)
@@ -2627,6 +2981,7 @@ function clearJobsForSource(source_id) {
 
 function deleteItem(item_id) {
   const db = getDb()
+  deleteSemanticChunkVectorsForItem(item_id)
   db.prepare('DELETE FROM items_fts WHERE rowid = ?').run(item_id)
   db.prepare('DELETE FROM items WHERE id = ?').run(item_id)
 }
@@ -2690,6 +3045,22 @@ function bulkUpdateParentExternalId(source_id, rows) {
                      updated_at = unixepoch()
      WHERE source_id = ? AND external_id = ?
   `)
+  const metaRow = db.prepare('SELECT raw_meta_json FROM items WHERE source_id = ? AND external_id = ?')
+  const writeMeta = db.prepare('UPDATE items SET raw_meta_json = ?, updated_at = unixepoch() WHERE source_id = ? AND external_id = ?')
+  const patchMetadata = row => {
+    if (!row.raw_meta_patch || typeof row.raw_meta_patch !== 'object' || Array.isArray(row.raw_meta_patch)) return
+    const saved = metaRow.get(source_id, String(row.external_id))
+    if (!saved) return
+    let meta = {}
+    try { meta = JSON.parse(saved.raw_meta_json || '{}') || {} } catch {}
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) meta = {}
+    // Preserve forward/media and every unrelated key. Explicit null must be
+    // retained (not RFC7396-deleted) so fetch/backfill fingerprints agree.
+    for (const key of ['telegram_reply', 'external_reply']) {
+      if (Object.prototype.hasOwnProperty.call(row.raw_meta_patch, key)) meta[key] = row.raw_meta_patch[key]
+    }
+    writeMeta.run(JSON.stringify(meta), source_id, String(row.external_id))
+  }
   const tx = db.transaction((rs) => {
     let n = 0
     for (const r of rs) {
@@ -2698,6 +3069,7 @@ function bulkUpdateParentExternalId(source_id, rows) {
         const res = stmtReply.run(r.parent_external_id || null,
                                   source_id, String(r.external_id))
         n += res.changes
+        patchMetadata(r)
         continue
       }
       let json = null
@@ -2713,6 +3085,7 @@ function bulkUpdateParentExternalId(source_id, rows) {
         source_id, String(r.external_id),
       )
       n += res.changes
+      patchMetadata(r)
     }
     return n
   })
@@ -2831,8 +3204,10 @@ function vectorCountForSource(source_id) {
  *   text        — SUM(octet_length(caption)). Real UTF-8 bytes of every
  *                 caption regardless of message type (a captioned photo's
  *                 words count here, mirroring the copy/index «Текст» model).
- *   index       — vectors live in items_vec as raw float32: one vector is
- *                 EMBEDDING_DIM × 4 bytes. vec0 is a virtual table (no
+ *   index       — legacy message and semantic-chunk vectors are raw float32:
+ *                 one vector is EMBEDDING_DIM × 4 bytes. Present staged
+ *                 generation embeddings add their actual BLOB lengths.
+ *                 vec0 is a virtual table (no
  *                 queryable page count per row), so we COMPUTE the logical
  *                 size: count × dim × 4. This is the data weight, the bulk of
  *                 what bloats library.db on a fully-indexed channel.
@@ -2841,7 +3216,8 @@ function vectorCountForSource(source_id) {
  *                 return the path lists so one DB round-trip feeds both the
  *                 count and the on-disk measurement.
  *
- * Returns { text_bytes, index_vectors, index_bytes, media_paths[],
+ * Returns { text_bytes, index_vectors, index_bytes, index_legacy_vectors,
+ *           index_chunk_vectors, index_staged_vectors, index_staged_bytes, media_paths[],
  *           video_paths[], transcript_paths[] }.
  */
 function storageBreakdownForSource(source_id) {
@@ -2850,7 +3226,21 @@ function storageBreakdownForSource(source_id) {
     SELECT COALESCE(SUM(octet_length(caption)), 0) AS text_bytes
       FROM items WHERE source_id = ?
   `).get(source_id)
-  const vectors = vectorCountForSource(source_id)
+  const legacyVectors = vectorCountForSource(source_id)
+  const chunkVectors = semanticChunksVecAvailable(db) ? Number(db.prepare(`
+    SELECT COUNT(*) AS n FROM semantic_chunks_vec
+    WHERE chunk_id IN (SELECT id FROM semantic_chunks WHERE source_id = ?)
+      AND source_id = ?
+  `).get(source_id, BigInt(source_id))?.n || 0) : 0
+  const staged = db.prepare(`
+    SELECT COUNT(*) AS vectors, COALESCE(SUM(length(c.embedding)), 0) AS bytes
+      FROM telegram_rag_generation_chunks c
+      JOIN telegram_rag_generations g ON g.generation_id = c.generation_id
+     WHERE g.source_id = ? AND c.embedding IS NOT NULL
+  `).get(source_id) || {}
+  const stagedVectors = Number(staged.vectors || 0)
+  const stagedBytes = Number(staged.bytes || 0)
+  const vectors = legacyVectors + chunkVectors + stagedVectors
   const media = db.prepare(`
     SELECT media_path FROM items
      WHERE source_id = ? AND media_path IS NOT NULL
@@ -2870,7 +3260,11 @@ function storageBreakdownForSource(source_id) {
   return {
     text_bytes:    t?.text_bytes || 0,
     index_vectors: vectors,
-    index_bytes:   vectors * EMBEDDING_DIM * 4,   // float32 = 4 bytes/dim
+    index_bytes:   (legacyVectors + chunkVectors) * EMBEDDING_DIM * 4 + stagedBytes,
+    index_legacy_vectors: legacyVectors,
+    index_chunk_vectors: chunkVectors,
+    index_staged_vectors: stagedVectors,
+    index_staged_bytes: stagedBytes,
     media_paths:       media,
     video_paths:       videos,
     transcript_paths:  transcripts,
@@ -2899,6 +3293,8 @@ function indexedItemIds(source_id, item_ids) {
  *   query_embedding — Float32Array of the same dimensionality as items_vec
  *   source_id       — restrict to one source (required for chat-search)
  *   limit           — final number of items to return
+ *   date_from/to    — optional inclusive Unix-second bounds
+ *   topic_id        — optional topic; 0 includes NULL/0 (General)
  *
  * `query` parameter is accepted for forward-compat (the IPC layer passes it)
  * but ignored — FTS branch was removed deliberately. If you need exact-word
@@ -2907,25 +3303,670 @@ function indexedItemIds(source_id, item_ids) {
  * sqlite-vec returns Euclidean distance by default. Since both stored and
  * query vectors are L2-normalised by the embedder, cos = 1 - d²/2 ∈ [-1, 1].
  */
-function hybridSearch({ query_embedding, source_id, limit = 10 }) {
+function hybridSearch({ query_embedding, source_id, limit = 10,
+                        date_from = null, date_to = null, topic_id = null, legacy_only = false }) {
+  if (limit <= 0) return []
   const db = getDb()
   const qbuf = Buffer.from(query_embedding.buffer, query_embedding.byteOffset, query_embedding.byteLength)
+  const scope = ['source_id = ?',
+    'NOT EXISTS (SELECT 1 FROM telegram_rag_item_state r WHERE r.item_id = items.id AND r.stale = 1)']
+  if (legacy_only) {
+    scope.push('NOT EXISTS (SELECT 1 FROM telegram_rag_item_state r WHERE r.item_id = items.id AND r.migrated = 1)')
+  }
+  const scopeParams = [source_id]
+  if (date_from != null) {
+    scope.push('published_at >= ?')
+    scopeParams.push(date_from)
+  }
+  if (date_to != null) {
+    scope.push('published_at <= ?')
+    scopeParams.push(date_to)
+  }
+  if (topic_id != null) {
+    if (Number(topic_id) === 0) {
+      scope.push('(topic_id IS NULL OR topic_id = 0)')
+    } else {
+      scope.push('topic_id = ?')
+      scopeParams.push(topic_id)
+    }
+  }
+  // sqlite-vec 0.1.9 applies the primary-key IN constraint before KNN. A
+  // global top-k followed by a JOIN/source filter loses valid chat results
+  // whenever another source has more than k closer vectors. Restrict the
+  // candidate IDs here, including optional date/topic filters, so no global
+  // overfetch heuristic (or vector-table migration) is needed.
+  // This installed vec0 has a hard KNN k<=4096. The UI's progressive limit
+  // predates that boundary; exact distance over eligible IDs preserves it.
+  const nearest = Number(limit) > 4096 ? `
+    SELECT item_id, vec_distance_L2(embedding, ?) AS distance FROM items_vec
+    WHERE item_id IN (SELECT id FROM items WHERE ${scope.join(' AND ')})
+    ORDER BY distance, item_id LIMIT ?
+  ` : `
+    SELECT item_id, distance FROM items_vec
+    WHERE embedding MATCH ? AND k = ?
+      AND item_id IN (SELECT id FROM items WHERE ${scope.join(' AND ')})
+  `
+  const nearestParams = Number(limit) > 4096 ? [qbuf, ...scopeParams, limit] : [qbuf, limit, ...scopeParams]
   const rows = db.prepare(`
-    SELECT i.*, v.distance AS _dist
-      FROM (
-        SELECT item_id, distance FROM items_vec
-         WHERE embedding MATCH ? AND k = ?
-      ) v
+    SELECT i.*, COALESCE(r.local_revision, 1) AS local_revision,
+           COALESCE(r.stale, 0) AS index_stale, v.distance AS _dist
+      FROM (${nearest}) v
       JOIN items i ON i.id = v.item_id
-     WHERE i.source_id = ?
-     ORDER BY v.distance
+      LEFT JOIN telegram_rag_item_state r ON r.item_id = i.id
+     ORDER BY v.distance, i.id
      LIMIT ?
-  `).all(qbuf, Math.max(limit, 100), source_id, limit)
+  `).all(...nearestParams, limit)
   return rows.map(r => {
     const cos = 1 - (r._dist * r._dist) / 2
     const { _dist, ...rest } = r
     return { ...rest, _cos: cos, _score: cos, _branches: ['vec'] }
   })
+}
+
+// ─── Long-form semantic chunks (YouTube RAG) ─────────────────────────
+
+function deleteSemanticChunkVectors(chunkIds) {
+  if (!chunkIds?.length) return 0
+  const db = getDb()
+  if (!semanticChunksVecAvailable(db)) return 0
+  const del = db.prepare('DELETE FROM semantic_chunks_vec WHERE chunk_id = ?')
+  let removed = 0
+  for (const chunkId of chunkIds) {
+    removed += del.run(BigInt(chunkId)).changes || 0
+  }
+  return removed
+}
+
+function deleteSemanticChunkVectorsForItem(itemId) {
+  const db = getDb()
+  const ids = db.prepare('SELECT id FROM semantic_chunks WHERE item_id = ?').all(itemId).map(row => row.id)
+  return deleteSemanticChunkVectors(ids)
+}
+
+function deleteSemanticChunkVectorsForSource(sourceId) {
+  const db = getDb()
+  const ids = db.prepare('SELECT id FROM semantic_chunks WHERE source_id = ?').all(sourceId).map(row => row.id)
+  return deleteSemanticChunkVectors(ids)
+}
+
+function replaceSemanticChunksForItem({ itemId, sourceId, documentHash, chunks }) {
+  const db = getDb()
+  const values = Array.isArray(chunks) ? chunks : []
+  const existing = db.prepare(`
+    SELECT document_hash, COUNT(*) AS n
+      FROM semantic_chunks
+     WHERE item_id = ?
+     GROUP BY document_hash
+     LIMIT 1
+  `).get(itemId)
+  if (existing?.document_hash === documentHash && Number(existing.n || 0) === values.length) {
+    return { changed: false, chunks: values.length }
+  }
+
+  const tx = db.transaction(() => {
+    deleteSemanticChunkVectorsForItem(itemId)
+    db.prepare('DELETE FROM semantic_chunks WHERE item_id = ?').run(itemId)
+    const insert = db.prepare(`
+      INSERT INTO semantic_chunks (
+        item_id, source_id, chunk_index, start_char, end_char,
+        start_seconds, end_seconds, position_approximate, text, document_hash
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    for (const chunk of values) {
+      insert.run(
+        itemId,
+        sourceId,
+        chunk.chunk_index,
+        chunk.start_char,
+        chunk.end_char,
+        chunk.start_seconds ?? null,
+        chunk.end_seconds ?? null,
+        chunk.position_approximate ? 1 : 0,
+        chunk.text,
+        documentHash,
+      )
+    }
+  })
+  tx()
+  return { changed: true, chunks: values.length }
+}
+
+function listYoutubeTranscriptItemsForIndex(sourceId, limit = null) {
+  const db = getDb()
+  const n = Number(limit)
+  const limitSql = Number.isFinite(n) && n > 0 ? 'LIMIT ?' : ''
+  const sql = `
+    SELECT i.id, i.source_id, i.external_id, i.url, i.title, i.published_at,
+           i.duration_seconds, i.transcript_path, i.updated_at,
+           s.display_name AS source_title, s.handle AS source_handle
+      FROM items i
+      JOIN sources s ON s.id = i.source_id
+     WHERE i.source_id = ? AND s.platform = 'youtube'
+       AND i.transcript_path IS NOT NULL
+     ORDER BY i.published_at DESC, i.id DESC
+     ${limitSql}
+  `
+  return limitSql ? db.prepare(sql).all(sourceId, Math.floor(n)) : db.prepare(sql).all(sourceId)
+}
+
+function semanticChunkIndexStatus(sourceId) {
+  const db = getDb()
+  const total = db.prepare(`
+    SELECT COUNT(*) AS chunks, COUNT(DISTINCT item_id) AS videos
+      FROM semantic_chunks WHERE source_id = ?
+  `).get(sourceId) || {}
+  let indexed = { chunks: 0, videos: 0 }
+  if (semanticChunksVecAvailable(db)) {
+    indexed = db.prepare(`
+      SELECT COUNT(*) AS chunks, COUNT(DISTINCT c.item_id) AS videos
+        FROM semantic_chunks_vec v
+        JOIN semantic_chunks c ON c.id = v.chunk_id
+       WHERE v.source_id = ?
+    `).get(BigInt(sourceId)) || indexed
+  }
+  return {
+    state: 'idle',
+    done: Number(indexed.chunks || 0),
+    total: Number(total.chunks || 0),
+    videos_done: Number(indexed.videos || 0),
+    videos_total: Number(total.videos || 0),
+    unit: 'fragments',
+  }
+}
+
+function listUnindexedSemanticChunks(sourceId, itemIds = null) {
+  const db = getDb()
+  if (!semanticChunksVecAvailable(db)) throw new Error('semantic chunk vector index is unavailable')
+  const ids = Array.isArray(itemIds) ? itemIds.map(Number).filter(Number.isSafeInteger) : []
+  const itemFilter = ids.length ? `AND c.item_id IN (${ids.map(() => '?').join(',')})` : ''
+  return db.prepare(`
+    SELECT c.*, i.external_id, i.url, i.title, i.duration_seconds,
+           s.display_name AS source_title, s.handle AS source_handle
+      FROM semantic_chunks c
+      JOIN items i ON i.id = c.item_id
+      JOIN sources s ON s.id = c.source_id
+      LEFT JOIN semantic_chunks_vec v ON v.chunk_id = c.id
+     WHERE c.source_id = ? AND v.chunk_id IS NULL
+       ${itemFilter}
+     ORDER BY i.published_at DESC, c.item_id DESC, c.chunk_index ASC
+  `).all(sourceId, ...ids)
+}
+
+function bulkUpsertSemanticChunkVectors(rows) {
+  if (!rows?.length) return 0
+  const db = getDb()
+  if (!semanticChunksVecAvailable(db)) throw new Error('semantic chunk vector index is unavailable')
+  const del = db.prepare('DELETE FROM semantic_chunks_vec WHERE chunk_id = ?')
+  const ins = db.prepare('INSERT INTO semantic_chunks_vec(chunk_id, embedding, source_id) VALUES (?, ?, ?)')
+  const mark = db.prepare('UPDATE semantic_chunks SET indexed_at = unixepoch() WHERE id = ?')
+  const tx = db.transaction(values => {
+    for (const row of values) {
+      const chunkId = BigInt(row.chunk_id)
+      del.run(chunkId)
+      ins.run(
+        chunkId,
+        Buffer.from(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength),
+        BigInt(row.source_id),
+      )
+      mark.run(Number(row.chunk_id))
+    }
+  })
+  tx(rows)
+  return rows.length
+}
+
+function semanticChunkSearch({ query_embedding, source_id, limit = 10 }) {
+  const db = getDb()
+  if (!semanticChunksVecAvailable(db)) return []
+  const qbuf = Buffer.from(query_embedding.buffer, query_embedding.byteOffset, query_embedding.byteLength)
+  const k = Math.max(1, Math.min(200, Number(limit) || 10))
+  const rows = db.prepare(`
+    SELECT c.*, i.external_id, i.url, i.title, i.published_at,
+           i.duration_seconds, i.transcript_path,
+           s.handle AS source_handle, s.display_name AS source_title,
+           v.distance AS _dist
+      FROM (
+        SELECT chunk_id, distance
+          FROM semantic_chunks_vec
+         WHERE embedding MATCH ? AND k = ? AND source_id = ?
+      ) v
+      JOIN semantic_chunks c ON c.id = v.chunk_id
+      JOIN items i ON i.id = c.item_id
+      JOIN sources s ON s.id = c.source_id
+     ORDER BY v.distance
+     LIMIT ?
+  `).all(qbuf, k, BigInt(source_id), k)
+  return rows.map(row => {
+    const cos = 1 - (row._dist * row._dist) / 2
+    const { _dist, ...rest } = row
+    return { ...rest, _cos: cos, _score: cos }
+  })
+}
+
+/**
+ * Fragment candidates for Telegram RAG. The caller groups candidates by
+ * item_id; `limit` is therefore a fragment budget, bounded to 1000. Source,
+ * inclusive dates and topic constrain the vector search BEFORE top-k.
+ * Existing YouTube chunk search and legacy message vectors stay independent.
+ */
+function telegramRagItemContentHash(row) {
+  const topic = Number(row.topic_id)
+  let raw = {}
+  try { raw = JSON.parse(row.raw_meta_json || '{}') || {} } catch {}
+  return crypto.createHash('sha256').update(JSON.stringify({
+    source_id: row.source_id,
+    external_id: String(row.external_id),
+    caption: String(row.caption || ''),
+    sender: row.sender ?? null,
+    type: row.type ?? null,
+    published_at: row.published_at ?? null,
+    topic_id: Number.isSafeInteger(topic) && topic > 0 ? topic : 0,
+    parent_external_id: row.parent_external_id ?? null,
+    ...(Object.prototype.hasOwnProperty.call(raw, 'telegram_reply') ? { telegram_reply: raw.telegram_reply } : {}),
+    ...(Object.prototype.hasOwnProperty.call(raw, 'external_reply') ? { external_reply: raw.external_reply } : {}),
+  })).digest('hex')
+}
+
+function getTelegramRagSourceRevision(sourceId) {
+  return Number(getDb().prepare(`
+    SELECT COALESCE(r.content_revision, 1) AS revision FROM sources s
+    LEFT JOIN telegram_rag_source_state r ON r.source_id = s.id
+    WHERE s.id = ? AND s.platform = 'telegram'
+  `).get(sourceId)?.revision || 1)
+}
+
+function telegramRagTarget(db, itemId) {
+  return db.prepare(`
+    SELECT i.*, COALESCE(r.local_revision, 1) AS local_revision,
+           r.active_generation_id, r.desired_generation_id, COALESCE(r.stale, 0) AS rag_stale
+      FROM items i JOIN sources s ON s.id = i.source_id
+      LEFT JOIN telegram_rag_item_state r ON r.item_id = i.id
+     WHERE i.id = ? AND s.platform = 'telegram'
+  `).get(itemId) || null
+}
+
+function telegramRagReferenceIsCurrent(db, ref) {
+  const current = db.prepare(`
+    SELECT i.*, COALESCE(r.local_revision, 1) AS local_revision
+    FROM items i LEFT JOIN telegram_rag_item_state r ON r.item_id = i.id
+    WHERE i.source_id = ? AND i.external_id = ?
+  `).get(ref.source_id, String(ref.external_id))
+  if (ref.item_id == null) return !current
+  return !!current && Number(current.id) === Number(ref.item_id)
+    && Number(current.local_revision) === Number(ref.local_revision)
+    && telegramRagItemContentHash(current) === ref.content_hash
+}
+
+function telegramRagGenerationSnapshot(db, generationId) {
+  const row = db.prepare('SELECT * FROM telegram_rag_generations WHERE generation_id = ?').get(generationId)
+  if (!row) return null
+  return { ...row, contextRefs: JSON.parse(row.context_refs_json) }
+}
+
+function stageTelegramRagGeneration({ itemId, sourceId, documentHash, indexVersion,
+                                      targetRevision = 1, targetContentHash,
+                                      sourceRevision = null, contextRefs = [], chunks = [] }) {
+  const db = getDb()
+  const refs = contextRefs.map(ref => ({
+    source_id: Number(ref.source_id), item_id: ref.item_id == null ? null : Number(ref.item_id),
+    external_id: String(ref.external_id),
+    local_revision: ref.item_id == null ? null : Number(ref.local_revision || 1),
+    content_hash: ref.item_id == null ? null : String(ref.content_hash), role: String(ref.role || 'context'),
+  }))
+  const manifest = chunks.map((chunk, index) => ({ ...chunk, chunk_index: index }))
+  const generationId = crypto.createHash('sha256').update(JSON.stringify({
+    itemId, sourceId, documentHash, indexVersion, targetRevision, targetContentHash, refs, manifest,
+  })).digest('hex')
+  return db.transaction(() => {
+    const target = telegramRagTarget(db, itemId)
+    const reject = rejection => ({ generationId: null, changed: false, published: false, pendingChunks: [], rejection })
+    if (!target || target.source_id !== Number(sourceId)) return reject('target_not_found')
+    if (Number(target.local_revision) !== Number(targetRevision)
+      || telegramRagItemContentHash(target) !== targetContentHash) return reject('target_changed')
+    if (refs.some(ref => ref.source_id !== Number(sourceId) || !telegramRagReferenceIsCurrent(db, ref))) {
+      return reject('dependency_changed')
+    }
+    const existing = telegramRagGenerationSnapshot(db, generationId)
+    db.prepare('INSERT OR IGNORE INTO telegram_rag_item_state(item_id) VALUES (?)').run(itemId)
+    db.prepare(`
+      UPDATE telegram_rag_generations SET status = 'obsolete'
+      WHERE item_id = ? AND generation_id != ? AND status = 'staging'
+    `).run(itemId, generationId)
+    db.prepare(`
+      DELETE FROM telegram_rag_generation_chunks WHERE generation_id IN (
+        SELECT generation_id FROM telegram_rag_generations WHERE item_id = ? AND status = 'obsolete'
+      )
+    `).run(itemId)
+    db.prepare('UPDATE telegram_rag_item_state SET desired_generation_id = ? WHERE item_id = ?').run(generationId, itemId)
+    if (!existing) {
+      db.prepare(`
+        INSERT INTO telegram_rag_generations(generation_id, item_id, source_id, input_hash,
+          index_version, target_revision, target_content_hash, source_revision,
+          context_refs_json, status, fragments_total)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'staging', ?)
+      `).run(generationId, itemId, sourceId, documentHash, indexVersion, targetRevision,
+        targetContentHash, sourceRevision ?? getTelegramRagSourceRevision(sourceId), JSON.stringify(refs), manifest.length)
+      const insert = db.prepare(`
+        INSERT INTO telegram_rag_generation_chunks(generation_id, chunk_index, chunk_json)
+        VALUES (?, ?, ?)
+      `)
+      manifest.forEach(chunk => insert.run(generationId, chunk.chunk_index, JSON.stringify(chunk)))
+      const dependency = db.prepare(`
+        INSERT OR IGNORE INTO telegram_rag_dependencies(generation_id, source_id, external_id,
+          item_id, local_revision, content_hash, role) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `)
+      refs.forEach(ref => dependency.run(generationId, ref.source_id, ref.external_id,
+        ref.item_id, ref.local_revision, ref.content_hash, ref.role))
+    } else if (existing.status === 'obsolete') {
+      db.prepare("UPDATE telegram_rag_generations SET status = 'staging' WHERE generation_id = ?").run(generationId)
+      const insert = db.prepare(`
+        INSERT INTO telegram_rag_generation_chunks(generation_id, chunk_index, chunk_json)
+        VALUES (?, ?, ?)
+      `)
+      manifest.forEach(chunk => insert.run(generationId, chunk.chunk_index, JSON.stringify(chunk)))
+    }
+    const pending = db.prepare(`
+      SELECT chunk_index, chunk_json FROM telegram_rag_generation_chunks
+      WHERE generation_id = ? AND embedding IS NULL ORDER BY chunk_index
+    `).all(generationId)
+    return {
+      generationId, changed: !existing,
+      published: existing?.status === 'active' && !target.rag_stale,
+      pendingChunks: pending.map(row => ({ ...JSON.parse(row.chunk_json), chunk_index: row.chunk_index })),
+    }
+  }).immediate()
+}
+
+function saveTelegramRagGenerationVectors(generationId, rows) {
+  const values = (rows || []).map(row => {
+    const embedding = row.embedding
+    if (!(embedding instanceof Float32Array) || embedding.length !== EMBEDDING_DIM
+      || !embedding.every(Number.isFinite)) throw new Error('invalid Telegram fragment embedding')
+    return { index: Number(row.chunk_index), buffer: Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength) }
+  })
+  const db = getDb()
+  return db.transaction(() => {
+    const generation = telegramRagGenerationSnapshot(db, generationId)
+    const state = generation && telegramRagTarget(db, generation.item_id)
+    if (!generation || generation.status !== 'staging' || state?.desired_generation_id !== generationId) {
+      return { saved: 0, obsolete: true }
+    }
+    const update = db.prepare(`
+      UPDATE telegram_rag_generation_chunks SET embedding = ?
+      WHERE generation_id = ? AND chunk_index = ? AND embedding IS NULL
+    `)
+    let saved = 0
+    for (const row of values) {
+      if (!db.prepare('SELECT 1 FROM telegram_rag_generation_chunks WHERE generation_id = ? AND chunk_index = ?')
+        .get(generationId, row.index)) throw new Error('Telegram fragment index is outside generation')
+      saved += update.run(row.buffer, generationId, row.index).changes
+    }
+    return { saved, obsolete: false }
+  }).immediate()
+}
+
+function publishTelegramRagGeneration(generationId, { validateSnapshot = null } = {}) {
+  const db = getDb()
+  return db.transaction(() => {
+    const generation = telegramRagGenerationSnapshot(db, generationId)
+    const reject = rejection => ({ published: false, rejection, fragments: 0 })
+    if (!generation) return reject('generation_not_found')
+    const target = telegramRagTarget(db, generation.item_id)
+    if (!target || target.desired_generation_id !== generationId || generation.status === 'obsolete') {
+      return reject('generation_superseded')
+    }
+    if (target.local_revision !== generation.target_revision
+      || telegramRagItemContentHash(target) !== generation.target_content_hash) return reject('target_changed')
+    if (generation.contextRefs.some(ref => !telegramRagReferenceIsCurrent(db, ref))) return reject('dependency_changed')
+    const currentSourceRevision = getTelegramRagSourceRevision(generation.source_id)
+    if (currentSourceRevision !== generation.source_revision || target.rag_stale) {
+      if (typeof validateSnapshot !== 'function') return reject('source_changed_requires_validation')
+      const validation = validateSnapshot({ generation, handle: db, target })
+      if (validation && typeof validation.then === 'function') throw new Error('Telegram snapshot validation must be synchronous')
+      const currentHash = typeof validation === 'string' ? validation : validation?.documentHash
+      if (currentHash !== generation.input_hash) return reject('context_selection_changed')
+    }
+    if (generation.status !== 'active') {
+      const staged = db.prepare(`
+        SELECT chunk_index, chunk_json, embedding FROM telegram_rag_generation_chunks
+        WHERE generation_id = ? ORDER BY chunk_index
+      `).all(generationId)
+      if (staged.length !== generation.fragments_total || staged.some(row => !row.embedding)) return reject('generation_incomplete')
+      const parsed = staged.map(row => ({ ...JSON.parse(row.chunk_json), embedding: row.embedding }))
+      deleteSemanticChunkVectorsForItem(target.id)
+      db.prepare('DELETE FROM semantic_chunks WHERE item_id = ?').run(target.id)
+      const insert = db.prepare(`
+        INSERT INTO semantic_chunks(item_id, source_id, chunk_index, start_char, end_char,
+          start_seconds, end_seconds, position_approximate, text, document_hash, indexed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+      `)
+      const vector = db.prepare('INSERT INTO semantic_chunks_vec(chunk_id, embedding, source_id) VALUES (?, ?, ?)')
+      for (const row of parsed) {
+        const id = insert.run(target.id, target.source_id, row.chunk_index, row.start_char, row.end_char,
+          row.start_seconds ?? null, row.end_seconds ?? null, row.position_approximate ? 1 : 0,
+          row.text, generation.input_hash).lastInsertRowid
+        vector.run(BigInt(id), row.embedding, BigInt(target.source_id))
+      }
+      db.prepare("UPDATE telegram_rag_generations SET status = 'obsolete' WHERE item_id = ? AND generation_id != ? AND status = 'active'")
+        .run(target.id, generationId)
+      db.prepare("UPDATE telegram_rag_generations SET status = 'active', published_at = unixepoch() WHERE generation_id = ?")
+        .run(generationId)
+      // Searchable vec0 now owns the embeddings; drop duplicate stage blobs.
+      db.prepare('DELETE FROM telegram_rag_generation_chunks WHERE generation_id = ?').run(generationId)
+    }
+    db.prepare(`
+      UPDATE telegram_rag_item_state SET active_generation_id = ?, desired_generation_id = ?,
+        migrated = 1, stale = 0 WHERE item_id = ?
+    `).run(generationId, generationId, target.id)
+    db.prepare('UPDATE telegram_rag_generations SET source_revision = ? WHERE generation_id = ?')
+      .run(currentSourceRevision, generationId)
+    return { published: true, rejection: null, fragments: generation.fragments_total, generationId }
+  }).immediate()
+}
+
+function telegramSemanticChunkSearch({ query_embedding, source_id, limit = 10,
+                                       date_from = null, date_to = null, topic_id = null,
+                                       index_version = null }) {
+  const sourceId = Number(source_id)
+  if (!Number.isSafeInteger(sourceId) || sourceId <= 0 || limit <= 0) return []
+  const db = getDb()
+  if (!semanticChunksVecAvailable(db)) return []
+  const qbuf = Buffer.from(query_embedding.buffer, query_embedding.byteOffset, query_embedding.byteLength)
+  const k = Math.max(1, Math.min(1000, Math.floor(Number(limit) || 10)))
+  const scope = ['c.source_id = ?', "s.platform = 'telegram'", 'r.stale = 0',
+    "g.status = 'active'", 'g.target_revision = r.local_revision', 'c.document_hash = g.input_hash']
+  const scopeParams = [sourceId]
+  if (index_version != null) {
+    scope.push('g.index_version = ?')
+    scopeParams.push(index_version)
+  }
+  if (date_from != null) {
+    scope.push('i.published_at >= ?')
+    scopeParams.push(date_from)
+  }
+  if (date_to != null) {
+    scope.push('i.published_at <= ?')
+    scopeParams.push(date_to)
+  }
+  if (topic_id != null) {
+    if (Number(topic_id) === 0) {
+      scope.push('(i.topic_id IS NULL OR i.topic_id = 0)')
+    } else {
+      scope.push('i.topic_id = ?')
+      scopeParams.push(topic_id)
+    }
+  }
+  const rows = db.prepare(`
+    SELECT c.*, i.external_id, i.url, i.title, i.caption, i.published_at,
+           i.type, i.sender, i.parent_external_id, i.reply_resolved,
+           i.topic_id, i.topic_title, i.raw_meta_json,
+           i.has_media, i.reactions, i.reactions_resolved,
+           i.duration_seconds, i.transcript_path, i.media_path, i.video_path,
+           i.thumbnail_path, i.download_status, i.transcribe_status, i.transcribe_engine,
+           s.handle AS source_handle, s.display_name AS source_title,
+           g.generation_id, g.index_version, g.input_hash AS indexed_input_hash,
+           g.target_content_hash AS indexed_content_hash,
+           g.target_revision AS indexed_revision, r.local_revision,
+           g.context_refs_json, g.published_at AS generation_published_at,
+           v.distance AS _dist
+      FROM (
+        SELECT chunk_id, distance
+          FROM semantic_chunks_vec
+         WHERE embedding MATCH ? AND k = ? AND source_id = ?
+           AND chunk_id IN (
+             SELECT c.id FROM semantic_chunks c
+             JOIN items i ON i.id = c.item_id AND i.source_id = c.source_id
+             JOIN sources s ON s.id = c.source_id
+             JOIN telegram_rag_item_state r ON r.item_id = i.id
+             JOIN telegram_rag_generations g ON g.generation_id = r.active_generation_id
+             WHERE ${scope.join(' AND ')}
+           )
+      ) v
+      JOIN semantic_chunks c ON c.id = v.chunk_id
+      JOIN items i ON i.id = c.item_id AND i.source_id = c.source_id
+      JOIN sources s ON s.id = c.source_id
+      JOIN telegram_rag_item_state r ON r.item_id = i.id
+      JOIN telegram_rag_generations g ON g.generation_id = r.active_generation_id
+     ORDER BY v.distance, c.item_id, c.chunk_index
+     LIMIT ?
+  `).all(qbuf, k, BigInt(sourceId), ...scopeParams, k)
+  return rows.map(row => {
+    const cos = 1 - (row._dist * row._dist) / 2
+    const { _dist, ...rest } = row
+    return { ...rest, _cos: cos, _score: cos }
+  })
+}
+
+/**
+ * Coverage of caption-indexable Telegram messages. `messages_complete`
+ * requires an actual vector for EVERY prepared fragment, not just indexed_at
+ * or one vector in a long message. Staged vectors stay out of this ready
+ * count. Legacy-only messages are reported separately as unverified.
+ * `done`/`total` aliases are message counts, not fragment counts.
+ */
+function telegramRagIndexStatus(sourceId, { index_version = null } = {}) {
+  const db = getDb()
+  const id = Number(sourceId)
+  const hasChunksVec = semanticChunksVecAvailable(db)
+  const hasLegacyVec = itemsVecAvailable(db)
+  const indexedChunks = hasChunksVec ? `
+    SELECT c.item_id, COUNT(*) AS indexed
+      FROM semantic_chunks_vec v
+      JOIN semantic_chunks c ON c.id = v.chunk_id AND c.source_id = v.source_id
+      JOIN wanted i ON i.id = c.item_id AND i.source_id = c.source_id
+      JOIN telegram_rag_generations g ON g.generation_id = i.active_generation_id
+     WHERE v.source_id = ?
+       AND c.document_hash = g.input_hash
+     GROUP BY c.item_id
+  ` : 'SELECT NULL AS item_id, 0 AS indexed WHERE 0'
+  const legacyVectors = hasLegacyVec ? `
+    SELECT v.item_id FROM items_vec v
+     WHERE v.item_id IN (SELECT id FROM wanted)
+  ` : 'SELECT NULL AS item_id WHERE 0'
+  const params = [Number.isSafeInteger(id) ? id : -1]
+  if (hasChunksVec) params.push(BigInt(Number.isSafeInteger(id) ? id : -1))
+  const counts = db.prepare(`
+    WITH wanted AS (
+      SELECT i.id, i.source_id, COALESCE(r.local_revision, 1) AS local_revision,
+             COALESCE(r.stale, 0) AS stale, COALESCE(r.migrated, 0) AS migrated,
+             r.active_generation_id, r.desired_generation_id
+        FROM items i JOIN sources s ON s.id = i.source_id
+        LEFT JOIN telegram_rag_item_state r ON r.item_id = i.id
+       WHERE i.source_id = ? AND s.platform = 'telegram'
+         AND i.caption IS NOT NULL AND length(trim(i.caption)) > 0
+    ), indexed AS (${indexedChunks}), legacy AS (${legacyVectors}),
+    staged AS (
+      SELECT g.item_id, g.fragments_total AS fragments,
+             COUNT(c.embedding) AS indexed
+        FROM telegram_rag_generations g
+        JOIN wanted i ON i.desired_generation_id = g.generation_id
+          AND i.local_revision = g.target_revision
+        LEFT JOIN telegram_rag_generation_chunks c ON c.generation_id = g.generation_id
+       WHERE g.status = 'staging' GROUP BY g.item_id
+    ), classified AS (
+      SELECT i.*, g.index_version,
+             CASE WHEN i.stale = 0 AND g.status = 'active'
+                    ${index_version != null ? 'AND g.index_version = ?' : ''}
+                    AND g.target_revision = i.local_revision
+                    AND COALESCE(v.indexed, 0) = g.fragments_total
+                  THEN 1 ELSE 0 END AS ready,
+             COALESCE(g.fragments_total, 0) AS active_fragments,
+             st.fragments AS staged_fragments, COALESCE(st.indexed, 0) AS staged_indexed,
+             CASE WHEN l.item_id IS NOT NULL THEN 1 ELSE 0 END AS has_legacy
+        FROM wanted i
+        LEFT JOIN telegram_rag_generations g ON g.generation_id = i.active_generation_id
+        LEFT JOIN indexed v ON v.item_id = i.id
+        LEFT JOIN staged st ON st.item_id = i.id
+        LEFT JOIN legacy l ON l.item_id = i.id
+    )
+    SELECT COUNT(*) AS messages_total,
+           SUM(CASE WHEN active_generation_id IS NOT NULL OR staged_fragments IS NOT NULL
+                    THEN 1 ELSE 0 END) AS messages_prepared,
+           SUM(ready) AS messages_complete,
+           SUM(stale) AS stale_messages,
+           SUM(CASE WHEN staged_indexed > 0 AND staged_indexed < staged_fragments
+                    THEN 1 ELSE 0 END) AS messages_partial,
+           SUM(CASE WHEN has_legacy = 1 AND migrated = 0 AND stale = 0
+                    THEN 1 ELSE 0 END) AS legacy_only_messages,
+           SUM(has_legacy) AS legacy_indexed,
+           SUM(COALESCE(staged_fragments, active_fragments, 0)) AS fragments_total,
+           SUM(CASE WHEN ready = 1 THEN active_fragments ELSE 0 END) AS fragments_indexed,
+           SUM(COALESCE(staged_fragments, 0)) AS staged_fragments,
+           SUM(staged_indexed) AS staged_fragments_indexed,
+           GROUP_CONCAT(DISTINCT CASE WHEN ready = 1 THEN index_version END) AS index_versions
+      FROM classified
+  `).get(...params, ...(index_version != null ? [index_version] : [])) || {}
+  const complete = Number(counts.messages_complete || 0)
+  const legacyOnly = Number(counts.legacy_only_messages || 0)
+  const total = Number(counts.messages_total || 0)
+  const versions = counts.index_versions ? counts.index_versions.split(',') : []
+  const saved = db.prepare(`
+    SELECT COUNT(*) AS n FROM items i JOIN sources s ON s.id = i.source_id
+    WHERE i.source_id = ? AND s.platform = 'telegram'
+  `).get(params[0])?.n || 0
+  return {
+    state: 'idle', unit: 'messages',
+    done: complete, total,
+    messages_indexed: complete, messages_done: complete,
+    messages_total: total,
+    messages_complete: complete,
+    ready_current_messages: complete,
+    stale_messages: Number(counts.stale_messages || 0),
+    partial_messages: Number(counts.messages_partial || 0),
+    messages_partial: Number(counts.messages_partial || 0),
+    messages_prepared: Number(counts.messages_prepared || 0),
+    legacy_only_messages: legacyOnly,
+    fragments_indexed: Number(counts.fragments_indexed || 0),
+    fragments_total: Number(counts.fragments_total || 0),
+    staged_fragments: Number(counts.staged_fragments || 0),
+    staged_fragments_indexed: Number(counts.staged_fragments_indexed || 0),
+    pending_messages: total - complete,
+    needs_reindex: total > complete,
+    legacy_indexed: Number(counts.legacy_indexed || 0),
+    legacy_unverified_messages: legacyOnly,
+    searchable_messages: complete + legacyOnly,
+    saved_messages: Number(saved),
+    index_version: versions.length === 1 ? versions[0] : versions.length ? 'mixed' : null,
+    index_versions: versions,
+    freshness: 'revision-checked',
+  }
+}
+
+function semanticChunkContext({ item_id, chunk_index, before = 2, after = 2 }) {
+  const db = getDb()
+  const itemId = Number(item_id)
+  const center = Number(chunk_index)
+  const left = Math.max(0, center - Math.max(0, Number(before) || 0))
+  const right = center + Math.max(0, Number(after) || 0)
+  return db.prepare(`
+    SELECT c.*, i.external_id, i.url, i.title, i.duration_seconds,
+           s.handle AS source_handle, s.display_name AS source_title
+      FROM semantic_chunks c
+      JOIN items i ON i.id = c.item_id
+      JOIN sources s ON s.id = c.source_id
+     WHERE c.item_id = ? AND c.chunk_index BETWEEN ? AND ?
+     ORDER BY c.chunk_index ASC
+  `).all(itemId, left, right)
 }
 
 // ─── Assembly (Copy-saved) ────────────────────────────────────────────
@@ -3359,11 +4400,11 @@ function upsertResearchJob(j) {
   db.prepare(`
     INSERT INTO research_jobs
       (job_id, kind, provider, model_id, mode, status, stage, prompt,
-       response_text, url, response_len, link_count, result_json, error,
+      response_text, url, response_len, link_count, result_json, request_fingerprint, request_metadata_json, error,
        created_at, updated_at, done_at)
     VALUES
       (@job_id, @kind, @provider, @model_id, @mode, @status, @stage, @prompt,
-       @response_text, @url, @response_len, @link_count, @result_json, @error,
+       @response_text, @url, @response_len, @link_count, @result_json, @request_fingerprint, @request_metadata_json, @error,
        @created_at, @updated_at, @done_at)
     ON CONFLICT(job_id) DO UPDATE SET
       status=excluded.status, stage=excluded.stage,
@@ -3371,6 +4412,8 @@ function upsertResearchJob(j) {
       url=COALESCE(excluded.url, research_jobs.url),
       response_len=excluded.response_len, link_count=excluded.link_count,
       result_json=COALESCE(excluded.result_json, research_jobs.result_json),
+      request_fingerprint=COALESCE(excluded.request_fingerprint, research_jobs.request_fingerprint),
+      request_metadata_json=COALESCE(excluded.request_metadata_json, research_jobs.request_metadata_json),
       error=excluded.error, updated_at=excluded.updated_at, done_at=excluded.done_at
   `).run({
     job_id: j.jobId,
@@ -3386,11 +4429,62 @@ function upsertResearchJob(j) {
     response_len: j.responseTextLen ?? (j.responseText ? j.responseText.length : null),
     link_count: j.linkCount ?? null,
     result_json: researchResultJson(j),
+    request_fingerprint: j.requestFingerprint || null,
+    request_metadata_json: j.requestMetadata ? JSON.stringify(j.requestMetadata) : null,
     error: j.error || null,
     created_at: j.createdAt || null,
     updated_at: j.updatedAt || Date.now(),
     done_at: j.doneAt || null,
   })
+}
+
+function getResearchJob(jobId) {
+  if (!jobId) return null
+  const row = getDb().prepare(`
+    SELECT job_id AS jobId, kind, provider, model_id AS modelId, mode,
+           status, stage, prompt AS fullPrompt, response_text AS responseText,
+           url, response_len AS responseTextLen, link_count AS linkCount,
+           result_json AS resultJson, request_fingerprint AS requestFingerprint,
+           request_metadata_json AS requestMetadataJson,
+           error, created_at AS createdAt, updated_at AS updatedAt, done_at AS doneAt
+    FROM research_jobs
+    WHERE job_id = ?
+  `).get(String(jobId))
+  if (!row) return null
+  const result = parseResearchResult(row.resultJson) || (row.responseText
+    ? { text: row.responseText, url: row.url || null, text_kind: 'answer' }
+    : null)
+  return {
+    id: row.jobId,
+    provider: row.provider,
+    status: row.status,
+    stage: row.stage,
+    url: row.url,
+    error: row.error,
+    result,
+    requestFingerprint: row.requestFingerprint || null,
+    prompt: row.fullPrompt || '',
+    requestMetadata: parseResearchResult(row.requestMetadataJson),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    doneAt: row.doneAt,
+  }
+}
+
+// Existing ChatGPT conversations no longer show the new-chat Chat/Work
+// switch. Reuse only the mode of our successful request to this exact chat;
+// caller-supplied options are not proof of an existing conversation's mode.
+function findResearchConversationMode(conversationUrl) {
+  const { chatgptConversationIdentity } = require('./chatgpt-url')
+  const identity = chatgptConversationIdentity(conversationUrl)
+  if (!identity) return null
+  const canonical = `https://chatgpt.com/c/${identity.conversationId}`
+  const row = getDb().prepare(`
+    SELECT mode FROM research_jobs WHERE provider = 'chatgpt' AND status = 'done'
+      AND mode IN ('chat', 'work') AND (url = ? OR url LIKE ? OR url LIKE ?)
+    ORDER BY done_at DESC LIMIT 1
+  `).get(canonical, canonical + '?%', canonical + '#%')
+  return row ? { conversationId: identity.conversationId, mode: row.mode } : null
 }
 
 // Последние N джобов из БД (хронология, свежие сверху).
@@ -3407,6 +4501,20 @@ function listResearchJobs(limit = 100) {
     LIMIT ?
   `).all(limit)
   return rows.map(normalizeResearchHistoryRow)
+}
+
+// UI detail shape, unlike getResearchJob's browser/recovery snapshot.
+function getResearchHistoryJob(jobId) {
+  if (!jobId) return null
+  const row = getDb().prepare(`
+    SELECT job_id AS jobId, kind, provider, model_id AS modelId, mode,
+           status, stage, prompt AS fullPrompt, response_text AS responseText,
+           url, response_len AS responseTextLen, link_count AS linkCount,
+           result_json AS resultJson, error, created_at AS createdAt,
+           updated_at AS updatedAt, done_at AS doneAt
+    FROM research_jobs WHERE job_id = ?
+  `).get(String(jobId))
+  return row ? normalizeResearchHistoryRow(row) : null
 }
 
 function researchResultJson(j) {
@@ -3568,6 +4676,9 @@ function normalizeResearchFiles(raw) {
         lineEnd: Number.isFinite(it?.line_end) ? it.line_end : (Number.isFinite(it?.lineEnd) ? it.lineEnd : null),
         sourceLineCount: Number.isFinite(it?.source_line_count) ? it.source_line_count : null,
         bundledCount: Number.isFinite(it?.bundled_count) ? it.bundled_count : null,
+        bundleIndex: Number.isFinite(it?.bundle_index) ? it.bundle_index : null,
+        bundleCount: Number.isFinite(it?.bundle_count) ? it.bundle_count : null,
+        sourceTotalCount: Number.isFinite(it?.source_total_count) ? it.source_total_count : null,
       }
     })
     .filter((file) => file.filePath)
@@ -3847,7 +4958,7 @@ function listLearningEntries(limit = 5000) {
 }
 
 module.exports = {
-  upsertResearchJob, listResearchJobs, deleteResearchJob,
+  upsertResearchJob, getResearchJob, getResearchHistoryJob, findResearchConversationMode, listResearchJobs, deleteResearchJob,
   getUiPreference, setUiPreference,
   getTranslationCache, upsertTranslationCache,
   upsertLearningEntry, getLearningEntry, listLearningExamples, listLearningEntries,
@@ -3886,6 +4997,13 @@ module.exports = {
   indexItemForFts, searchItems,
   // vectors
   bulkUpsertVectors, vectorCountForSource, indexedItemIds, hybridSearch,
+  replaceSemanticChunksForItem, listYoutubeTranscriptItemsForIndex,
+  semanticChunkIndexStatus, listUnindexedSemanticChunks,
+  bulkUpsertSemanticChunkVectors, semanticChunkSearch, semanticChunkContext,
+  telegramSemanticChunkSearch, telegramRagIndexStatus,
+  telegramRagItemContentHash, getTelegramRagSourceRevision,
+  stageTelegramRagGeneration, saveTelegramRagGenerationVectors, publishTelegramRagGeneration,
+  deleteSemanticChunkVectorsForItem, deleteSemanticChunkVectorsForSource,
   storageBreakdownForSource, EMBEDDING_DIM,
   // folders
   listFolders, getFolder, findFolderByTgId, upsertFolder, updateFolderParams,

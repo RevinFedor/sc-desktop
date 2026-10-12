@@ -2,10 +2,13 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const MAX_ATTACHMENT_COUNT = 20
-const MAX_ATTACHMENT_SPECS = 200
+const MAX_ATTACHMENT_SPECS = 1000
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 const MAX_TOTAL_ATTACHMENT_BYTES = 100 * 1024 * 1024
 const MAX_BUNDLE_BYTES = 20 * 1024 * 1024
+const MAX_BUNDLE_PAYLOAD_BYTES = MAX_BUNDLE_BYTES - 4096
+const TARGET_BUNDLE_SOURCE_COUNT = 10
+const TEXT_SNIFF_BYTES = 64 * 1024
 
 const MIME_BY_EXT = Object.freeze({
   '.png': 'image/png',
@@ -49,6 +52,11 @@ const MIME_BY_EXT = Object.freeze({
   '.sql': 'application/sql',
   '.toml': 'application/toml',
   '.log': 'text/plain',
+  '.lock': 'text/plain',
+  '.b64': 'text/plain',
+  '.mts': 'text/plain',
+  '.cts': 'text/plain',
+  '.svg': 'image/svg+xml',
   '.pdf': 'application/pdf',
   '.doc': 'application/msword',
   '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -63,7 +71,8 @@ const TEXT_EXTENSIONS = new Set([
   '.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.yaml', '.yml',
   '.xml', '.html', '.htm', '.css', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx',
   '.py', '.rb', '.go', '.rs', '.java', '.kt', '.swift', '.c', '.cc', '.cpp', '.h',
-  '.hpp', '.sh', '.zsh', '.sql', '.toml', '.log',
+  '.hpp', '.sh', '.zsh', '.sql', '.toml', '.log', '.lock', '.b64', '.mts',
+  '.cts', '.svg',
 ])
 
 function fileMime(filePath) {
@@ -107,9 +116,27 @@ function lineRangeFromSpec(spec) {
 }
 
 function isTextAttachment(filePath, mime) {
-  return String(mime || '').startsWith('text/')
+  if (String(mime || '').startsWith('text/')
     || ['application/json', 'application/x-ndjson', 'application/yaml', 'application/xml', 'application/sql', 'application/toml'].includes(mime)
-    || TEXT_EXTENSIONS.has(path.extname(filePath || '').toLowerCase())
+    || TEXT_EXTENSIONS.has(path.extname(filePath || '').toLowerCase())) return true
+  // Unknown source-code extensions are common in repository snapshots. Sniff
+  // only application/octet-stream; known PDFs, archives, Office files and
+  // raster images remain binary even when their first bytes happen to be ASCII.
+  if (mime !== 'application/octet-stream') return false
+  let fd = null
+  try {
+    const size = Math.min(fs.statSync(filePath).size, TEXT_SNIFF_BYTES)
+    const sample = Buffer.alloc(size)
+    fd = fs.openSync(filePath, 'r')
+    fs.readSync(fd, sample, 0, size, 0)
+    if (sample.includes(0)) return false
+    new TextDecoder('utf-8', { fatal: true }).decode(sample)
+    return true
+  } catch {
+    return false
+  } finally {
+    if (fd != null) try { fs.closeSync(fd) } catch {}
+  }
 }
 
 function decodeUtf8(buffer, filePath) {
@@ -182,6 +209,22 @@ function normalizeResearchAttachments(raw) {
   return out
 }
 
+// Structural inspection is safe in the HTTP/main process. File type/size and
+// text sniffing stay in normalizeResearchAttachments inside the I/O child.
+function inspectResearchAttachmentSpecs(raw) {
+  if (!Array.isArray(raw)) throw new Error('attachments must be an array')
+  if (raw.length > MAX_ATTACHMENT_SPECS) throw new Error(`too many attachment paths (${raw.length}); maximum input list is ${MAX_ATTACHMENT_SPECS}`)
+  let hasDocuments = false
+  for (const spec of raw) {
+    const name = typeof spec === 'string' ? spec : spec?.path || spec?.file_path
+    if (typeof name !== 'string' || !path.isAbsolute(name)) throw new Error(`attachment path must be absolute: ${name || ''}`)
+    lineRangeFromSpec(spec)
+    const mime = typeof spec?.mime === 'string' && spec.mime.trim() ? spec.mime.trim() : fileMime(name)
+    if (!mime.startsWith('image/')) hasDocuments = true
+  }
+  return { hasDocuments }
+}
+
 function rangeName(name, range) {
   if (!range) return name
   const ext = path.extname(name)
@@ -189,7 +232,7 @@ function rangeName(name, range) {
   return `${stem}.L${range.start}-L${range.end == null ? 'end' : range.end}${ext || '.txt'}`
 }
 
-function materializeOne(dir, attachment, position) {
+function materializeOne(dir, attachment, position, sourceTotal = 1) {
   const requestedName = rangeName(attachment.name, attachment.line_range)
   const ext = path.extname(requestedName) || (attachment.line_range ? '.txt' : '')
   const stem = safeFileName(path.basename(requestedName, ext), `input-${position + 1}`)
@@ -219,33 +262,79 @@ function materializeOne(dir, attachment, position) {
     line_end: attachment.line_range ? actualEnd : null,
     source_line_count: sourceLineCount,
     artifact_role: 'input',
+    source_indexes: [attachment.index],
+    source_total_count: sourceTotal,
   }
 }
 
-function materializeBundle(dir, attachments) {
-  if (!attachments.every(attachment => isTextAttachment(attachment.path, attachment.mime))) {
-    throw new Error(`ChatGPT accepts at most ${MAX_ATTACHMENT_COUNT} files per message; more than ${MAX_ATTACHMENT_COUNT} can be auto-bundled only when every file is text`)
+function bundleEntry(attachment, sourceTotal) {
+  const selection = selectedText(attachment)
+  const value = typeof selection === 'string' ? selection : selection.value
+  const range = attachment.line_range
+    ? ` · lines ${attachment.line_range.start}-${selection.actualEnd}`
+    : ''
+  const sourceIndex = Number.isInteger(attachment.index) ? attachment.index : 0
+  const text = `===== FILE ${sourceIndex + 1}/${sourceTotal}: ${attachment.name}${range} =====\n${value}`
+  return {
+    attachment,
+    sourceIndex,
+    text,
+    bytes: Buffer.byteLength(text, 'utf8'),
   }
-  const chunks = []
-  for (let i = 0; i < attachments.length; i++) {
-    const attachment = attachments[i]
-    const selection = selectedText(attachment)
-    const value = typeof selection === 'string' ? selection : selection.value
-    const range = attachment.line_range
-      ? ` · lines ${attachment.line_range.start}-${selection.actualEnd}`
-      : ''
-    chunks.push(`===== FILE ${i + 1}/${attachments.length}: ${attachment.name}${range} =====\n${value}`)
+}
+
+function tryPackBundleEntries(entries, bundleCount) {
+  const bins = Array.from({ length: bundleCount }, (_, index) => ({ index, entries: [], bytes: 0 }))
+  const largestFirst = [...entries].sort((a, b) => b.bytes - a.bytes || a.sourceIndex - b.sourceIndex)
+  for (const entry of largestFirst) {
+    const candidates = bins
+      .filter(bin => bin.bytes + (bin.entries.length ? 2 : 0) + entry.bytes <= MAX_BUNDLE_PAYLOAD_BYTES)
+      .sort((a, b) => a.bytes - b.bytes || a.entries.length - b.entries.length || a.index - b.index)
+    const bin = candidates[0]
+    if (!bin) return null
+    if (bin.entries.length) bin.bytes += 2
+    bin.entries.push(entry)
+    bin.bytes += entry.bytes
   }
-  const text = chunks.join('\n\n') + '\n'
+  if (bins.some(bin => bin.entries.length === 0)) return null
+  return bins
+    .map(bin => bin.entries.sort((a, b) => a.sourceIndex - b.sourceIndex))
+    .sort((a, b) => a[0].sourceIndex - b[0].sourceIndex)
+}
+
+function packBundleEntries(entries, maxBundleCount) {
+  if (!entries.length) return []
+  if (maxBundleCount < 1) {
+    throw new Error(`attachment packing needs at least one free browser slot for ${entries.length} text files`)
+  }
+  const totalPayloadBytes = entries.reduce((sum, entry) => sum + entry.bytes + 2, 0)
+  const minByBytes = Math.ceil(totalPayloadBytes / MAX_BUNDLE_PAYLOAD_BYTES)
+  if (minByBytes > maxBundleCount) {
+    throw new Error(`text attachments need at least ${minByBytes} bundles by size, but only ${maxBundleCount} browser slots remain`)
+  }
+  const preferredByCount = Math.ceil(entries.length / TARGET_BUNDLE_SOURCE_COUNT)
+  const firstCount = Math.max(1, minByBytes, Math.min(preferredByCount, maxBundleCount))
+  for (let count = firstCount; count <= maxBundleCount; count++) {
+    const packed = tryPackBundleEntries(entries, count)
+    if (packed) return packed
+  }
+  throw new Error(`text attachments cannot be packed into ${maxBundleCount} browser files without exceeding ${MAX_BUNDLE_BYTES} bytes per file`)
+}
+
+function materializeBundle(dir, entries, { position, bundleIndex, bundleCount, sourceTotal }) {
+  const header = `===== SC FILE BUNDLE ${bundleIndex}/${bundleCount} · ${entries.length}/${sourceTotal} SOURCE FILES =====`
+  const text = `${header}\n\n${entries.map(entry => entry.text).join('\n\n')}\n`
   const bytes = Buffer.byteLength(text, 'utf8')
   if (bytes > MAX_BUNDLE_BYTES) {
-    throw new Error(`auto-bundled attachments are too large (${bytes} bytes; limit ${MAX_BUNDLE_BYTES}); pass narrower line ranges`)
+    throw new Error(`auto-bundled attachment ${bundleIndex}/${bundleCount} is too large (${bytes} bytes; limit ${MAX_BUNDLE_BYTES})`)
   }
-  const name = `01-sc-file-bundle-${attachments.length}.txt`
+  const width = String(bundleCount).length
+  const name = `${String(position + 1).padStart(2, '0')}-sc-file-bundle-${String(bundleIndex).padStart(width, '0')}-of-${bundleCount}.txt`
   const dest = path.join(dir, name)
   fs.writeFileSync(dest, text, 'utf8')
-  return [{
-    index: 0,
+  const sourceIndexes = entries.map(entry => entry.sourceIndex)
+  return {
+    index: position,
     path: dest,
     original_path: null,
     name,
@@ -253,23 +342,106 @@ function materializeBundle(dir, attachments) {
     size: bytes,
     kind: 'file',
     artifact_role: 'input',
-    bundled_count: attachments.length,
-    bundled_names: attachments.map(a => a.name),
+    bundled_count: entries.length,
+    bundled_names: entries.map(entry => entry.attachment.name),
+    bundled_source_indexes: sourceIndexes,
+    bundle_index: bundleIndex,
+    bundle_count: bundleCount,
+    source_indexes: sourceIndexes,
+    source_total_count: sourceTotal,
     line_range: null,
     line_start: null,
     line_end: null,
     source_line_count: null,
-  }]
+  }
+}
+
+function assertPackingComplete(materialized, sourceTotal) {
+  if (materialized.length > MAX_ATTACHMENT_COUNT) {
+    throw new Error(`attachment packing produced ${materialized.length} browser files; limit is ${MAX_ATTACHMENT_COUNT}`)
+  }
+  const covered = materialized.flatMap(attachment => Array.isArray(attachment.source_indexes) ? attachment.source_indexes : [])
+  const unique = new Set(covered)
+  const invalid = covered.filter(index => !Number.isInteger(index) || index < 0 || index >= sourceTotal)
+  const missing = Array.from({ length: sourceTotal }, (_, index) => index).filter(index => !unique.has(index))
+  if (invalid.length || unique.size !== covered.length || covered.length !== sourceTotal || missing.length) {
+    throw new Error(
+      `attachment packing incomplete: covered ${unique.size}/${sourceTotal}, duplicates=${covered.length - unique.size}, invalid=${invalid.length}, missing=${missing.slice(0, 20).join(',') || 'none'}`,
+    )
+  }
+}
+
+function researchAttachmentPackingSummary(materialized) {
+  const list = Array.isArray(materialized) ? materialized : []
+  const covered = list.flatMap(attachment => Array.isArray(attachment.source_indexes) ? attachment.source_indexes : [])
+  const unique = new Set(covered)
+  const declaredTotals = list.map(attachment => attachment.source_total_count).filter(Number.isFinite)
+  const sourceFileCount = declaredTotals.length ? Math.max(...declaredTotals) : covered.length
+  const bundleCount = list.filter(attachment => Number.isFinite(attachment.bundle_index)).length
+  return {
+    sourceFileCount,
+    packedSourceFileCount: unique.size,
+    uploadFileCount: list.length,
+    bundleCount,
+    individualFileCount: list.length - bundleCount,
+    packingComplete: unique.size === sourceFileCount && covered.length === unique.size,
+  }
+}
+
+function materializeResearchAttachmentsInDirectory(dir, attachments) {
+  const sourceTotal = attachments.length
+  if (sourceTotal <= MAX_ATTACHMENT_COUNT) {
+    const materialized = attachments.map((attachment, i) => materializeOne(dir, attachment, i, sourceTotal))
+    assertPackingComplete(materialized, sourceTotal)
+    return materialized.map((attachment, index) => ({ ...attachment, index }))
+  }
+
+  const direct = []
+  const bundleEntries = []
+  for (const attachment of attachments) {
+    if (!isTextAttachment(attachment.path, attachment.mime)) {
+      direct.push(attachment)
+      continue
+    }
+    const entry = bundleEntry(attachment, sourceTotal)
+    if (entry.bytes > MAX_BUNDLE_PAYLOAD_BYTES) direct.push(attachment)
+    else bundleEntries.push(entry)
+  }
+  if (direct.length > MAX_ATTACHMENT_COUNT) {
+    throw new Error(`ChatGPT accepts at most ${MAX_ATTACHMENT_COUNT} browser files; ${direct.length} inputs cannot be text-bundled`)
+  }
+  const groups = packBundleEntries(bundleEntries, MAX_ATTACHMENT_COUNT - direct.length)
+  const descriptors = [
+    ...direct.map(attachment => ({ type: 'single', sourceIndex: attachment.index, attachment })),
+    ...groups.map(entries => ({ type: 'bundle', sourceIndex: entries[0].sourceIndex, entries })),
+  ].sort((a, b) => a.sourceIndex - b.sourceIndex)
+  let bundleIndex = 0
+  const materialized = descriptors.map((descriptor, position) => {
+    if (descriptor.type === 'single') return materializeOne(dir, descriptor.attachment, position, sourceTotal)
+    bundleIndex++
+    return materializeBundle(dir, descriptor.entries, {
+      position,
+      bundleIndex,
+      bundleCount: groups.length,
+      sourceTotal,
+    })
+  })
+  assertPackingComplete(materialized, sourceTotal)
+  return materialized.map((attachment, index) => ({ ...attachment, index }))
 }
 
 function materializeResearchAttachments({ libRoot, id, attachments }) {
   if (!Array.isArray(attachments) || attachments.length === 0) return []
   const dir = path.join(libRoot, 'research-artifacts', safeFileName(id, 'research'), 'input')
   fs.mkdirSync(dir, { recursive: true })
-  const materialized = attachments.length > MAX_ATTACHMENT_COUNT
-    ? materializeBundle(dir, attachments)
-    : attachments.map((attachment, i) => materializeOne(dir, attachment, i))
-  return materialized.map((attachment, index) => ({ ...attachment, index }))
+  try {
+    return materializeResearchAttachmentsInDirectory(dir, attachments)
+  } catch (error) {
+    // A rejected preflight must not leave a partial set that could later be
+    // mistaken for the complete request. The job id owns this directory.
+    try { fs.rmSync(dir, { recursive: true, force: true }) } catch {}
+    throw error
+  }
 }
 
 function publicAttachmentMeta(attachment) {
@@ -282,6 +454,9 @@ function publicAttachmentMeta(attachment) {
     line_start: attachment.line_start ?? null,
     line_end: attachment.line_end ?? null,
     bundled_count: attachment.bundled_count ?? null,
+    bundle_index: attachment.bundle_index ?? null,
+    bundle_count: attachment.bundle_count ?? null,
+    source_total_count: attachment.source_total_count ?? null,
   }
 }
 
@@ -298,6 +473,9 @@ function researchInputMeta(attachment) {
     line_end: attachment.line_end ?? null,
     source_line_count: attachment.source_line_count ?? null,
     bundled_count: attachment.bundled_count ?? null,
+    bundle_index: attachment.bundle_index ?? null,
+    bundle_count: attachment.bundle_count ?? null,
+    source_total_count: attachment.source_total_count ?? null,
   }
 }
 
@@ -321,9 +499,15 @@ function researchResultForPersist(snapshot) {
 
 module.exports = {
   MAX_ATTACHMENT_COUNT,
+  MAX_ATTACHMENT_SPECS,
   MAX_ATTACHMENT_BYTES,
+  MAX_TOTAL_ATTACHMENT_BYTES,
+  MAX_BUNDLE_BYTES,
+  TARGET_BUNDLE_SOURCE_COUNT,
   normalizeResearchAttachments,
+  inspectResearchAttachmentSpecs,
   materializeResearchAttachments,
+  researchAttachmentPackingSummary,
   publicAttachmentMeta,
   researchInputMeta,
   researchResultForPersist,

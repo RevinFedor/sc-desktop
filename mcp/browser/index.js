@@ -16,11 +16,27 @@ import { z } from 'zod';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { existsSync, openSync } from 'node:fs';
+import { existsSync, openSync, mkdirSync, closeSync } from 'node:fs';
 import net from 'node:net';
+import { NativeDialogClient } from './native-dialog-client.js';
+import { MCP_PORT, DATA_DIR, BRIDGE_LOG } from './runtime-config.js';
 
-const BRIDGE_URL = 'ws://localhost:3458';
-const BRIDGE_PORT = 3458;
+const nativeDialogs = new NativeDialogClient({ log: (tag, data) => {
+  fetch('http://127.0.0.1:53127/research-log', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tag, data }), signal: AbortSignal.timeout(3000),
+  }).catch(() => {});
+} });
+
+async function readNativeDialog(args) {
+  const connected = await sendToExtension({ action: 'mcp_native_browser_info' });
+  return connected.browser !== args.browser
+    ? { success: false, errorCode: 'NATIVE_BROWSER_MISMATCH', error: 'Requested native browser is not the connected Browser MCP browser' }
+    : nativeDialogs.call({ action: 'read', ...args });
+}
+
+const BRIDGE_URL = 'ws://127.0.0.1:' + MCP_PORT;
+const BRIDGE_PORT = MCP_PORT;
 // 90s — covers harvest_list / wait_for_selector with long timeouts and slow
 // SPAs. Per-tool wait_for_selector has its own timeout (default 10s) — this is
 // just the outer kill switch.
@@ -29,7 +45,6 @@ const RECONNECT_INTERVAL = 3000;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BRIDGE_PATH = resolve(__dirname, 'bridge.js');
-const BRIDGE_LOG = '/tmp/hh-extension-bridge.log';
 
 let bridgeSpawnAttempted = false;
 let bridgeProbe = null;
@@ -57,11 +72,15 @@ function ensureBridgeRunning() {
       return;
     }
     try {
+      mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
       const out = openSync(BRIDGE_LOG, 'a');
-      const child = spawn(process.execPath, [BRIDGE_PATH], {
-        detached: true,
-        stdio: ['ignore', out, out],
-      });
+      let child;
+      try {
+        child = spawn(process.execPath, [BRIDGE_PATH], {
+          detached: true,
+          stdio: ['ignore', out, out],
+        });
+      } finally { closeSync(out); }
       child.unref();
       console.error(`[MCP] Spawned bridge (pid ${child.pid}), logs: ${BRIDGE_LOG}`);
     } catch (e) {
@@ -184,6 +203,16 @@ function sendToExtension(command) {
 
 // ── MCP Server ────────────────────────────────────────────────────────
 
+function nativeDialogToolResult(result) {
+  if (result?.nativeDialogObservation) return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+    isError: result.success === false };
+  if (!result?.errorCode || !/^(NATIVE_DIALOG_|DIALOG_|PAGE_ACTION_PENDING)/.test(result.errorCode)) return null;
+  // Retain identity and delivery evidence. "Failed: ..." loses the dialogId
+  // and encourages a duplicate destructive click after a successful opening.
+  return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+    isError: result.status !== 'awaiting_dialog' };
+}
+
 const server = new McpServer(
   {
     name: 'extension-bridge',
@@ -192,12 +221,15 @@ const server = new McpServer(
   {
     instructions: `
 Browser automation through a real Chromium browser via the SC Browser Parser extension.
-Real user profile, no CDP, no \`navigator.webdriver\` — undetectable on hh.ru, LinkedIn, Cloudflare-protected sites.
+Real user profile, no headless/alternate browser and no webdriver session.
+Page DOM uses extension scripts. Native JS dialogs use the same tab's extension
+debugger or an identity-checked macOS AX helper; debugger observation can show a
+browser debugging banner, so do not promise that every operation is undetectable.
 
 ## Architecture (3 processes)
   Claude session ─(stdio)→ mcp/browser/index.js ─(WS:3458)→ bridge.js ─(WS:3457)→ Browser Extension → DOM
 - Each Claude session spawns its own \`index.js\` (this process). One \`bridge.js\` is shared by all sessions.
-- Bridge auto-spawns on first tool call if port 3458 is free (detached, survives session). Logs: /tmp/hh-extension-bridge.log
+- Bridge auto-spawns on first tool call if port 3458 is free (detached, survives session). Logs: ~/Library/Application Support/sc-desktop/browser-mcp/bridge.log
 - Multiple Claude sessions in parallel: safe. Bridge dispatches responses by commandId per client socket.
 
 ## Flow when a tool call fails
@@ -207,7 +239,7 @@ Real user profile, no CDP, no \`navigator.webdriver\` — undetectable on hh.ru,
    - Click the SC Browser Parser toolbar icon to wake the service worker
    Then retry.
 3. \`No tab with id: X\` — tab was closed. Call \`list_tabs\` for the current id and retry.
-4. \`No response from any frame\` — content script not injected on that page. Retry once, or \`reload_tab\` the tab.
+4. \`No response from any frame\` or a page-action timeout — check tab/channel state before retrying. A native dialog can suspend JavaScript: use \`read_dialog\`, or the macOS native recovery path for a pre-existing window. Never repeat a destructive click from a timeout alone.
 5. \`Cannot access contents of the page\` — page predates extension reload. Ask user to F5 / use \`reload_tab\`.
 6. \`chrome.userScripts unavailable\` / \`Allow user scripts\` — user must enable the toggle on the extension's details page (Chrome 138+) for \`evaluate_raw\` to work on CSP-locked sites like aistudio.google.com or banks. The DSL-based \`evaluate\` (selector/extract/click/fill) still works without it.
 
@@ -218,24 +250,31 @@ Real user profile, no CDP, no \`navigator.webdriver\` — undetectable on hh.ru,
 - \`list_tabs\` — every open tab across every window, including windowId, windowType, openerTabId, and per-window active/focus state.
 - \`snapshot\` — simplified DOM tree of interactive elements with selectors. Prefer this over \`get_text\` for finding things to click.
 - \`click\`, \`fill\` — by CSS selector. \`fill\` works on input/textarea/select AND contenteditable (TipTap, ProseMirror).
-- \`hover\` — synthetic mouse hover via dispatchEvent. Triggers CSS \`:hover\`, JS hover-listeners, tooltips. **Does NOT** trigger trusted-only effects like YouTube inline-preview (those need real OS events via CDP).
+- \`hover\` — synthetic mouse hover via dispatchEvent. Triggers JS hover-listeners; it does not activate CSS \`:hover\` or trusted-only effects like YouTube inline-preview.
 - \`navigate\` — load URL in active tab and wait for load.
 - \`get_text\` — textContent of one element (or whole body).
 - \`scroll\` — scroll the window itself.
 
 **Reading data**
 - \`evaluate\` — restricted DSL. Accepts {selector, extract:[fields], limit} for reading, or {fill:"css", index:N, value} / {click:"css", index:N} for indexed actions. Always works, no toggle required. Use this first.
-- \`evaluate_raw\` — arbitrary JS in USER_SCRIPT world (bypasses page CSP including \`unsafe-eval\`). REQUIRES Chrome 138+ AND the "Allow user scripts" toggle on the extension's details page in chrome://extensions. If unavailable returns a clear error — fall back to \`evaluate\` DSL or write more specific selectors.
+- \`evaluate_raw\` — arbitrary JS in USER_SCRIPT by default (isolated from page globals, exempt from page CSP). Explicit world MAIN reads real page globals/React properties, requires an explicit tabId, and does not promise CSP bypass. REQUIRES Chrome 138+ AND the "Allow user scripts" toggle; unsupported worlds fail rather than falling back silently.
 - \`get_cookies\` — read browser cookies by domain/url/name. Useful for authenticated requests via \`evaluate_raw\` + fetch().
 - \`get_storage\` — read localStorage / sessionStorage with optional keyPrefix.
+- \`export_conversation\` — run the extension's native AI Studio / Perplexity / Claude / ChatGPT exporter for one explicit tab; downloads a durable file by default.
+- \`exporter_logs\` — read the bounded structured fallback log after an exporter failure when the Native Messaging file is empty.
 
 **Tab management**
 - \`new_window\`, \`focus_window\`, \`close_window\` — create and manage independent normal/popup windows.
 - \`new_tab\` — open URL (foreground or background), optionally in a specific windowId. Returns the new tabId and windowId.
 - \`close_tab\`, \`focus_tab\`, \`reload_tab\` — self-explanatory. \`reload_tab\` waits for load completion by default.
 
+**Native JS dialogs (not DOM modals)**
+- \`read_dialog\` / \`handle_dialog\`: explicit tabId + dialogId; alert/confirm/prompt, promptText, verified close. Page actions return awaiting_dialog without repeating the originating click. Read its original result by operationId.
+- A modal opened before observation is not replayed by Page.enable and can even block it. On macOS use \`read_native_dialog\` / \`handle_native_dialog\` for the SAME connected browser, addressing dialogId + nativeWindowId. activate=true is explicit browser activation, not automatic acceptance. The OS path does not guess a tabId from the dialog's site name.
+- If this session's tool catalog is cached, \`batch\` accepts mcp_read_dialog/mcp_handle_dialog/mcp_read_native_dialog/mcp_handle_native_dialog action objects or JSON strings. Handle a dialog only after inspecting its returned identity/text and authorized effect; stale/unknown outcomes never authorize another destructive click.
+
 **Screenshots**
-- \`screenshot\` — viewport PNG/JPEG via captureVisibleTab. No "DevTools is debugging this tab" badge, undetectable. Returns native image.
+- \`screenshot\` — viewport PNG/JPEG via captureVisibleTab. It does not itself attach a debugger and does not capture a native JS-dialog overlay; use dialog tools to inspect that window.
 - \`screenshot_element\` — scrolls element into view, captures viewport, returns image + element rect (in CSS px, with devicePixelRatio) so you can crop afterwards if needed.
 
 **Virtualized lists & async waits**
@@ -268,12 +307,95 @@ This MCP server is for LIVE PARSING only (tabs/click/evaluate/snapshot).
 Send the user the recovery script (above). The two MCPs are not interchangeable — chrome-devtools spawns a new headless Chrome, this MCP drives the user's real session with their cookies/extensions.
 
 ## Source / repo
-This MCP lives in the sc-desktop repo: \`~/Desktop/sc-desktop/mcp/browser/\`. \`bridge.js\` and \`index.js\` plus the \`browser-extension/\` Chrome extension are dev-only — there is no production variant.
+The checkout can live anywhere. Configure an absolute Node path and an absolute path to mcp/browser/index.js. See docs/setup/браузер-mcp.prompt.md in the public repository.
 `.trim(),
   }
 );
 
 // Tool: Get list of open tabs
+server.registerTool(
+  'read_native_dialog',
+  {
+    description: 'macOS recovery for native JS dialogs opened BEFORE tab debugger observation. Reads native alert/confirm/prompt windows in the SAME connected browser, with full text, dialogId and nativeWindowId. Does not infer a tab from an origin or window index. activate=true explicitly permits activating that browser to expose Accessibility text; default false does not steal focus. No dialog is accepted automatically. Requires macOS Accessibility for the Browser MCP executor.',
+    inputSchema: {
+      browser: z.enum(['yandex', 'chrome', 'edge', 'brave']).describe('Explicit connected browser, never a different/headless profile.'),
+      nativeWindowId: z.number().int().positive().optional().describe('Optional exact macOS window identity from an earlier native read.'),
+      activate: z.boolean().optional().describe('Explicitly activate this browser for native inspection. Default false.'),
+    },
+  },
+  async (args) => {
+    try {
+      const result = await readNativeDialog(args);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result.success === false };
+    } catch (e) { return { content: [{ type: 'text', text: e.message }], isError: true }; }
+  }
+);
+
+server.registerTool(
+  'handle_native_dialog',
+  {
+    description: 'Accept/cancel exactly a previously read native macOS JS dialog by dialogId AND nativeWindowId. Revalidates the original AX window/container/text; stale or wrong-window identity never presses a button. promptText applies only to accepting a prompt. Uses native AXPress, not global Enter; success requires the original native AX element to disappear. Native window targeting intentionally does not claim a tabId that the OS cannot prove.',
+    inputSchema: {
+      dialogId: z.string().min(1), nativeWindowId: z.number().int().positive(), accept: z.boolean(),
+      promptText: z.string().optional(),
+    },
+  },
+  async (args) => {
+    const result = await nativeDialogs.call({ action: 'handle', ...args });
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result.success === false };
+  }
+);
+
+server.registerTool(
+  'read_dialog',
+  {
+    description: 'Observe native JavaScript alert/confirm/prompt/beforeunload dialogs on one explicit browser tab. Returns type, full text, dialogId and target/window identity without executing page JavaScript. Starts observation; does not accept anything. Use before actions that can create a dialog, or after an action reports awaiting_dialog. none_observed only covers events since observation began, not a pre-existing unobserved dialog.',
+    inputSchema: {
+      tabId: z.number().int().nonnegative(),
+      operationId: z.string().optional().describe('Original operationId from awaiting_dialog. Wait boundedly for that exact original action result without invoking it again.'),
+    },
+  },
+  async ({ tabId, operationId }) => {
+    try {
+      const result = await sendToExtension({ action: 'mcp_read_dialog', tabId, operationId });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result.success === false };
+    } catch (e) { return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true }; }
+  }
+);
+
+server.registerTool(
+  'handle_dialog',
+  {
+    description: 'Accept or cancel exactly the currently observed native dialog on an explicit tab. Requires dialogId from read_dialog or awaiting_dialog. Rejects a stale identity or wrong tab without input. promptText is only for accepting prompt. Success requires the browser dialog-closed event, not a keypress ACK. Unknown outcome is not retry-safe: read state instead of repeating the original click.',
+    inputSchema: {
+      tabId: z.number().int().nonnegative(),
+      dialogId: z.string().min(1),
+      accept: z.boolean(),
+      promptText: z.string().optional(),
+    },
+  },
+  async (args) => {
+    try {
+      const result = await sendToExtension({ action: 'mcp_handle_dialog', ...args });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result.success === false };
+    } catch (e) { return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true }; }
+  }
+);
+
+server.registerTool(
+  'release_dialog_observer',
+  {
+    description: 'Stop native-dialog observation for an explicit tab after handling and verifying its page action. Refuses while a dialog/action is pending. Releases only an attachment owned by dialog observation; never detaches an active research focus-emulation session.',
+    inputSchema: { tabId: z.number().int().nonnegative() },
+  },
+  async ({ tabId }) => {
+    try {
+      const result = await sendToExtension({ action: 'mcp_release_dialog_observer', tabId });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result.success === false };
+    } catch (e) { return { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true }; }
+  }
+);
+
 server.registerTool(
   'list_tabs',
   {
@@ -300,6 +422,48 @@ server.registerTool(
     try {
       const result = await sendToExtension({ action: 'mcp_list_windows' });
       return { content: [{ type: 'text', text: JSON.stringify(result.windows, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
+    }
+  }
+);
+
+server.registerTool(
+  'export_conversation',
+  {
+    description: 'Trigger the SC Browser Parser conversation exporter for one explicit AI Studio, Perplexity, Claude, or ChatGPT chat tab. This is the programmatic equivalent of clicking the extension popup button "Экспортировать". File download defaults to true so the result is durable. The tool returns when the page accepts the command; use the page overlay, exporter log, or downloaded file to verify completion.',
+    inputSchema: {
+      tabId: z.number().int().nonnegative().describe('Existing chat tab ID from list_tabs.'),
+      downloadFile: z.boolean().optional().describe('Download markdown/zip instead of replacing the clipboard. Default true.'),
+    },
+  },
+  async ({ tabId, downloadFile }) => {
+    try {
+      const result = await sendToExtension({
+        action: 'mcp_export_conversation',
+        tabId,
+        downloadFile: downloadFile !== false,
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
+    }
+  }
+);
+
+server.registerTool(
+  'exporter_logs',
+  {
+    description: 'Read the SC Browser Parser structured exporter log fallback from extension storage. Use after an export fails and the Native Messaging log file is empty. Returns only the last bounded events and does not read page cookies or site storage.',
+    inputSchema: {
+      exportId: z.string().optional().describe('Optional export ID from an EXPORT START event.'),
+      limit: z.number().int().positive().max(500).optional().describe('Last events to return. Default 200, max 500.'),
+    },
+  },
+  async ({ exportId, limit }) => {
+    try {
+      const result = await sendToExtension({ action: 'mcp_exporter_logs', exportId, limit });
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     } catch (e) {
       return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
     }
@@ -340,7 +504,7 @@ server.registerTool(
         tabId: tabId || null,
         fullHtml: fullHtml || false,
       });
-      return { content: [{ type: 'text', text: result.snapshot }] };
+      return nativeDialogToolResult(result) || { content: [{ type: 'text', text: result.snapshot }] };
     } catch (e) {
       return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
     }
@@ -364,7 +528,7 @@ server.registerTool(
         tabId: tabId || null,
         selector,
       });
-      return { content: [{ type: 'text', text: result.success ? 'Clicked' : `Failed: ${result.error}` }] };
+      return nativeDialogToolResult(result) || { content: [{ type: 'text', text: result.success ? 'Clicked' : `Failed: ${result.error}` }] };
     } catch (e) {
       return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
     }
@@ -392,7 +556,7 @@ server.registerTool(
         tabId: tabId || null,
         selector,
       });
-      return { content: [{ type: 'text', text: result.success ? `Hovered (${Math.round(result.rect?.x||0)},${Math.round(result.rect?.y||0)})` : `Failed: ${result.error}` }] };
+      return nativeDialogToolResult(result) || { content: [{ type: 'text', text: result.success ? `Hovered (${Math.round(result.rect?.x||0)},${Math.round(result.rect?.y||0)})` : `Failed: ${result.error}` }] };
     } catch (e) {
       return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
     }
@@ -418,7 +582,7 @@ server.registerTool(
         selector,
         value,
       });
-      return { content: [{ type: 'text', text: result.success ? 'Filled' : `Failed: ${result.error}` }] };
+      return nativeDialogToolResult(result) || { content: [{ type: 'text', text: result.success ? 'Filled' : `Failed: ${result.error}` }] };
     } catch (e) {
       return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
     }
@@ -442,7 +606,7 @@ server.registerTool(
         tabId: tabId || null,
         url,
       });
-      return { content: [{ type: 'text', text: result.success ? `Navigated to ${url}` : `Failed: ${result.error}` }] };
+      return nativeDialogToolResult(result) || { content: [{ type: 'text', text: result.success ? `Navigated to ${url}` : `Failed: ${result.error}` }] };
     } catch (e) {
       return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
     }
@@ -466,6 +630,7 @@ server.registerTool(
         tabId: tabId || null,
         code,
       });
+      if (nativeDialogToolResult(result)) return nativeDialogToolResult(result);
       if (result.error) return { content: [{ type: 'text', text: `Error: ${result.error}` }] };
       const output = result.result !== undefined ? JSON.stringify(result.result, null, 2) : 'undefined';
       return { content: [{ type: 'text', text: output }] };
@@ -492,7 +657,7 @@ server.registerTool(
         tabId: tabId || null,
         selector: selector || 'body',
       });
-      return { content: [{ type: 'text', text: result.text || '' }] };
+      return nativeDialogToolResult(result) || { content: [{ type: 'text', text: result.text || '' }] };
     } catch (e) {
       return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
     }
@@ -518,7 +683,7 @@ server.registerTool(
         direction,
         amount: amount || 600,
       });
-      return { content: [{ type: 'text', text: result.success ? 'Scrolled' : `Failed: ${result.error}` }] };
+      return nativeDialogToolResult(result) || { content: [{ type: 'text', text: result.success ? 'Scrolled' : `Failed: ${result.error}` }] };
     } catch (e) {
       return { content: [{ type: 'text', text: `Error: ${e.message}` }] };
     }
@@ -638,7 +803,7 @@ server.registerTool(
   async ({ tabId, bypassCache, waitForLoad }) => {
     try {
       const result = await sendToExtension({ action: 'mcp_reload_tab', tabId: tabId || null, bypassCache, waitForLoad });
-      return { content: [{ type: 'text', text: result.success ? 'Reloaded' : `Failed: ${result.error}` }] };
+      return nativeDialogToolResult(result) || { content: [{ type: 'text', text: result.success ? 'Reloaded' : `Failed: ${result.error}` }] };
     } catch (e) { return { content: [{ type: 'text', text: `Error: ${e.message}` }] }; }
   }
 );
@@ -769,23 +934,33 @@ server.registerTool(
 server.registerTool(
   'evaluate_raw',
   {
-    description: 'Run arbitrary JavaScript inside the page in a USER_SCRIPT world (full DOM access, bypasses page CSP including unsafe-eval). Bypasses the limited evaluate() DSL. Result is auto-serialized (DOM nodes summarized, cycles broken). Requires Chrome 138+ and the "Allow user scripts" toggle on the extension details page — otherwise returns an error and you should fall back to the evaluate() DSL.',
+    description: 'Run arbitrary JavaScript in USER_SCRIPT by default (DOM access, isolated from page JavaScript, exempt from page CSP). Explicit world MAIN reads the actual page globals/framework state and can affect page JavaScript; MAIN requires an explicit tabId and does not promise CSP bypass. Never falls back between worlds. Result is auto-serialized. Requires Chrome 138+ and the "Allow user scripts" toggle; otherwise use the evaluate() DSL.',
     inputSchema: {
       tabId: z.number().optional(),
       code: z.string().describe('JS code. Use `return` to send a value back, OR set expression:true to treat the input as an expression.'),
       expression: z.boolean().optional().describe('If true, the code is wrapped as `return (code)`.'),
       async: z.boolean().optional().describe('If true, code may use await; the function is wrapped as async.'),
       maxDepth: z.number().optional().describe('Object serialization depth limit (default 4).'),
+      world: z.enum(['USER_SCRIPT', 'MAIN']).optional().describe('Default USER_SCRIPT. MAIN shares page globals and requires explicit tabId.'),
     },
   },
-  async ({ tabId, code, expression, async: isAsync, maxDepth }) => {
+  async ({ tabId, code, expression, async: isAsync, maxDepth, world }) => {
     try {
+      if (world === 'MAIN') {
+        if (!Number.isInteger(tabId)) throw new Error('MAIN execution requires an explicit tabId');
+        const capability = await sendToExtension({ action: 'mcp_native_browser_info' });
+        if (!capability.capabilities?.evaluateRawWorlds?.includes('MAIN')) {
+          throw new Error('The installed Browser MCP extension does not support MAIN execution yet');
+        }
+      }
       const result = await sendToExtension({
         action: 'mcp_evaluate_raw',
         tabId: tabId || null,
-        code, expression, async: isAsync, maxDepth,
+        code, expression, async: isAsync, maxDepth, world,
       });
+      if (nativeDialogToolResult(result)) return nativeDialogToolResult(result);
       if (!result.success) return { content: [{ type: 'text', text: `Error: ${result.error}` }] };
+      if (world === 'MAIN' && result.executionWorld !== 'MAIN') throw new Error('MAIN execution world was not confirmed; do not repeat a mutating action');
       const out = result.result === undefined ? 'undefined' : JSON.stringify(result.result, null, 2);
       return { content: [{ type: 'text', text: out }] };
     } catch (e) { return { content: [{ type: 'text', text: `Error: ${e.message}` }] }; }
@@ -842,7 +1017,26 @@ server.registerTool(
   },
   async ({ actions, stopOnError, tabId }) => {
     try {
-      const result = await sendToExtension({ action: 'mcp_batch', actions, stopOnError, tabId: tabId || null });
+      // Existing full AI sessions can keep a cached tool-name catalog. Their
+      // already available batch tool still reaches the new dialog commands;
+      // no AI session restart is needed just to refresh names. JSON strings
+      // are accepted because some adapters represent z.any arrays that way.
+      const parsed = actions.map(item => typeof item === 'string' ? JSON.parse(item) : item);
+      if (parsed.some(item => item.action === 'mcp_read_native_dialog' || item.action === 'mcp_handle_native_dialog')) {
+        const results = [];
+        for (const item of parsed) {
+          const { action, delayMs, ...args } = item;
+          let result;
+          if (action === 'mcp_read_native_dialog') result = await readNativeDialog(args);
+          else if (action === 'mcp_handle_native_dialog') result = await nativeDialogs.call({ action: 'handle', ...args });
+          else result = await sendToExtension({ ...item, tabId: item.tabId ?? tabId ?? null });
+          results.push(result);
+          if (result.success === false && stopOnError) break;
+          if (delayMs) await new Promise(resolve => setTimeout(resolve, Math.min(5000, Math.max(0, Number(delayMs) || 0))));
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+      }
+      const result = await sendToExtension({ action: 'mcp_batch', actions: parsed, stopOnError, tabId: tabId || null });
       return { content: [{ type: 'text', text: JSON.stringify(result.results, null, 2) }] };
     } catch (e) { return { content: [{ type: 'text', text: `Error: ${e.message}` }] }; }
   }
@@ -1354,6 +1548,7 @@ async function main() {
     if (shutdownPromise) return shutdownPromise;
 
     shuttingDown = true;
+    nativeDialogs.stop();
     shutdownPromise = (async () => {
       console.error(`[MCP] Session closed (${reason}); shutting down`);
 

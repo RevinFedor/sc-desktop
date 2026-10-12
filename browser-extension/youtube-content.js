@@ -4,7 +4,7 @@
 //   • главная             → ytd-rich-item-renderer
 //   • поиск               → ytd-video-renderer / yt-lockup-view-model
 //   • канал /videos       → ytd-rich-item-renderer
-//   • watch /watch?v=…    → плавающий FAB рядом с заголовком
+//   • player /watch?v=… и /live/<id> → плавающий FAB поверх плеера
 //
 // Клик → POST http://127.0.0.1:53127/yt-add → расширение сразу показывает
 // тост «отправлено». Если в настройках YouTube включён «Автоскрапинг
@@ -102,10 +102,22 @@
 
   // ─────────── Helpers ───────────
 
-  // YouTube'овский id одинаков и для /watch и для /shorts: 11-значный
+  function isWatchLikePath(pathname = location.pathname) {
+    return pathname.startsWith('/watch') || pathname.startsWith('/live/');
+  }
+
+  function isShortsPath(pathname = location.pathname) {
+    return pathname.startsWith('/shorts/');
+  }
+
+  function isPlayerPath(pathname = location.pathname) {
+    return isWatchLikePath(pathname) || isShortsPath(pathname);
+  }
+
+  // YouTube'овский id одинаков для /watch, /live и /shorts: 11-значный
   // (исторически 6-20 для обратной совместимости со старыми ссылками).
   // Один id = один файл в sc-desktop'е; никакого «shorts vs watch»
-  // разделения у нас нет, обе формы шлём как `watch?v=<id>`.
+  // разделения у нас нет, все формы шлём как `watch?v=<id>`.
   function extractVideoId(href) {
     if (!href) return null;
     let u;
@@ -113,9 +125,9 @@
     let v = null;
     if (u.pathname.startsWith('/watch')) {
       v = u.searchParams.get('v');
-    } else if (u.pathname.startsWith('/shorts/')) {
-      // /shorts/<id> или /shorts/<id>/ — берём первый сегмент после shorts.
-      const seg = u.pathname.split('/').filter(Boolean); // ['shorts', '<id>']
+    } else if (isShortsPath(u.pathname) || u.pathname.startsWith('/live/')) {
+      // /shorts/<id> и новый watch-like /live/<id> хранят id в pathname.
+      const seg = u.pathname.split('/').filter(Boolean);
       v = seg[1] || null;
     }
     return /^[\w-]{6,20}$/.test(v || '') ? v : null;
@@ -124,17 +136,17 @@
     const v = extractVideoId(href);
     // Канонический URL без трекеров — расширение шлёт ровно это в Electron,
     // чтобы кэш-хит совпал с тем, что считает paste-flow в самой sc-desktop.
-    // Shorts тоже нормализуем в watch-форму: для bridge'а это одна и та же
+    // Shorts и /live тоже нормализуем в watch-форму: для bridge'а это одна и та же
     // платформа (yt-dlp умеет качать оба варианта по watch?v=…).
     return v ? `https://www.youtube.com/watch?v=${v}` : null;
   }
 
   // Селектор для hover-делегации, поиска линков в карточках, поиска по
-  // videoId — единый источник правды. И /watch, и /shorts.
-  const ANCHOR_SELECTOR = 'a[href*="/watch?v="], a[href*="/shorts/"]';
+  // videoId — единый источник правды. /watch, /live и /shorts.
+  const ANCHOR_SELECTOR = 'a[href*="/watch?v="], a[href*="/live/"], a[href*="/shorts/"]';
 
   function findCardLink(card) {
-    // Карточки могут быть разной формы — главное найти href с /watch?v=… или /shorts/<id>.
+    // Карточки могут быть разной формы — главное найти href с /watch, /live или /shorts.
     return card.querySelector(ANCHOR_SELECTOR);
   }
 
@@ -979,7 +991,7 @@
       if (e.shiftKey) return;
       if (isTypingTarget(e.target)) return;
       const p = location.pathname;
-      if (!p.startsWith('/watch') && !p.startsWith('/shorts/')) return;
+      if (!isPlayerPath(p)) return;
       let delta = 0;
       if (e.code === 'Comma')  delta = -0.1;
       else if (e.code === 'Period') delta = +0.1;
@@ -1106,7 +1118,7 @@
   }
 
   function pageVideoTitle() {
-    if (location.pathname.startsWith('/watch')) {
+    if (isWatchLikePath()) {
       const t = document.querySelector('h1.ytd-watch-metadata, h1.title');
       if (t?.textContent?.trim()) return t.textContent.trim();
     }
@@ -1260,9 +1272,9 @@
   // через 5 минут увидел «✓ Готово: <название>» и понял какое видео завершилось.
   function pickCardTitleForVideo(videoId, btnHint) {
     if (!videoId) return null;
-    // /watch на этом самом видосе — берём h1.
-    if (location.pathname.startsWith('/watch')) {
-      const v = new URLSearchParams(location.search).get('v');
+    // /watch или /live на этом самом видео — берём h1.
+    if (isWatchLikePath()) {
+      const v = extractVideoId(location.href);
       if (v === videoId) {
         const h = document.querySelector('h1.ytd-watch-metadata, h1.title');
         if (h?.textContent?.trim()) return h.textContent.trim();
@@ -1270,15 +1282,15 @@
     }
     // /shorts/<id> — на странице активного шорта берём заголовок из
     // нового шаблона ShortsVideoTitle.
-    if (location.pathname.startsWith('/shorts/')) {
+    if (isShortsPath()) {
       const seg = location.pathname.split('/').filter(Boolean);
       if (seg[1] === videoId) {
         const h = document.querySelector('h2[class*="ShortsVideoTitle"], yt-shorts-video-title-view-model');
         if (h?.textContent?.trim()) return h.textContent.trim();
       }
     }
-    // Ищем карточку с этим videoId по anchor'у — учитываем обе формы.
-    const link = document.querySelector(`a[href*="/watch?v=${videoId}"], a[href$="/shorts/${videoId}"], a[href*="/shorts/${videoId}?"]`);
+    // Ищем карточку с этим videoId по anchor'у — учитываем все три формы.
+    const link = document.querySelector(`a[href*="/watch?v=${videoId}"], a[href$="/live/${videoId}"], a[href*="/live/${videoId}?"], a[href$="/shorts/${videoId}"], a[href*="/shorts/${videoId}?"]`);
     if (link) {
       // 1) ближайший контейнер карточки (включая shorts-карточку нового шаблона)
       const card = link.closest('ytd-rich-item-renderer, ytd-video-renderer, yt-lockup-view-model, ytd-grid-video-renderer, ytd-compact-video-renderer, yt-shorts-lockup-view-model');
@@ -1372,7 +1384,7 @@
     return pill;
   }
 
-  // mouseover на body — при наведении на любую карточку с /watch?v=…
+  // mouseover на body — при наведении на любую карточку с /watch, /live или /shorts
   // вытаскиваем videoId, обновляем pill, чтобы клик попал в нужное видео,
   // и перерисовываем pill из stateMap[videoId] (если этот видос в работе —
   // pill покажет «⏳ Транскрипция»; если другой — pill вернётся в idle).
@@ -1384,7 +1396,7 @@
       // Не реагируем на hover внутри самой pill — иначе бесконечный
       // loop при обновлении dataset.
       if (e.target.closest && e.target.closest('#' + PILL_ID)) return;
-      // ВАЖНО: ловим и /watch?v=, и /shorts/<id> — без shorts'ов pill
+      // ВАЖНО: ловим /watch?v=, новый /live/<id> и /shorts/<id>.
       // оставалась на старом videoId, клик отправлял прошлое видео
       // (юзеру казалось что «копирует последнее, что было скопировано»).
       const link = e.target.closest && e.target.closest(ANCHOR_SELECTOR);
@@ -1498,9 +1510,9 @@
       const thumbs = root.querySelectorAll(PER_CARD_THUMB_SELECTOR);
       totalThumbs += thumbs.length;
       for (const thumb of thumbs) {
-        const link = thumb.querySelector('a[href*="/watch?v="]')
-                  || thumb.closest('a[href*="/watch?v="]')
-                  || thumb.parentElement?.querySelector?.('a[href*="/watch?v="]');
+        const link = thumb.querySelector(ANCHOR_SELECTOR)
+                  || thumb.closest(ANCHOR_SELECTOR)
+                  || thumb.parentElement?.querySelector?.(ANCHOR_SELECTOR);
         if (!link) {
           totalNoLink++;
           if (!firstUninjectedSample) {
@@ -1782,17 +1794,17 @@
   }
 
   // Якорь для dock'а:
-  //   /watch  — #movie_player (стандартный плеер, его bbox корректный).
+  //   /watch и /live — #movie_player (стандартный плеер, его bbox корректный).
   //   /shorts/ — #movie_player ВНУТРИ активного reel-renderer'а.
   //              Глобальный document.getElementById('movie_player') на
   //              /shorts/ может вернуть узел с bbox=0 (в неактивном
   //              reel'е). Поэтому ищем его строго в активном reel'е.
   function findDockAnchor() {
-    if (location.pathname.startsWith('/watch')) {
+    if (isWatchLikePath()) {
       return document.getElementById('movie_player')
           || document.querySelector('ytd-player #player');
     }
-    if (location.pathname.startsWith('/shorts/')) {
+    if (isShortsPath()) {
       const reel = findActiveReelRenderer();
       if (!reel) return null;
       // Внутри reel-renderer'а #movie_player может ещё не загрузиться.
@@ -1814,7 +1826,7 @@
     if (aRect.width <= 0 || aRect.height <= 0) { dock.style.visibility = 'hidden'; return; }
 
     let topOffset = 12;
-    if (location.pathname.startsWith('/shorts/')) {
+    if (isShortsPath()) {
       // На /shorts/ сверху плеера — Play+Mute (h~80px). Ставимся под них
       // с зазором.
       const lc = document.querySelector('ytd-shorts-player-controls #left-controls');
@@ -1967,8 +1979,8 @@
   }
 
   function applySpeedAuto() {
-    if (location.pathname.startsWith('/shorts/')) return applyShortsSpeed();
-    if (location.pathname.startsWith('/watch')) return applyWatchSpeed();
+    if (isShortsPath()) return applyShortsSpeed();
+    if (isWatchLikePath()) return applyWatchSpeed();
     return false;
   }
 
@@ -1999,10 +2011,10 @@
   }
 
   function injectShortsSpeedPill() {
-    // Speed-pill теперь живёт и на /shorts/, и на /watch (общее
+    // Speed-pill теперь живёт на /shorts/, /watch и /live (общее
     // хранилище скорости). Решение делать или нет — по pathname.
-    const isShorts = location.pathname.startsWith('/shorts/');
-    const isWatch  = location.pathname.startsWith('/watch');
+    const isShorts = isShortsPath();
+    const isWatch  = isWatchLikePath();
     if (!isShorts && !isWatch) return;
     if (document.getElementById(SHORTS_SPEED_PILL_ID)) return;
     const host = getOrCreateShortsDock();
@@ -2099,8 +2111,8 @@
   // JS-флаг dockHovered (см. bindDockHover / updateShortsDockPosition),
   // НЕ через CSS — dock это position:fixed сосед body, не потомок плеера.
   function injectWatchFab() {
-    const isWatch  = location.pathname.startsWith('/watch');
-    const isShorts = location.pathname.startsWith('/shorts/');
+    const isWatch  = isWatchLikePath();
+    const isShorts = isShortsPath();
     if (!isWatch && !isShorts) return;
 
     const url = extractWatchUrl(location.href);
@@ -2200,7 +2212,7 @@
         // Если #left-controls появился позже init/yt-navigate-finish,
         // инжектим speed-pill сейчас. Дешёвый no-op если уже на месте
         // (injectShortsSpeedPill сам проверяет существование).
-        if (location.pathname.startsWith('/shorts/')) injectShortsSpeedPill();
+        if (isShortsPath()) injectShortsSpeedPill();
       });
     });
     perCardObserver.observe(document.body, { childList: true, subtree: true });
@@ -2214,7 +2226,7 @@
     document.addEventListener('loadedmetadata', e => {
       const t = e.target;
       if (!t || !t.matches || !t.matches('video.html5-main-video, video.video-stream')) return;
-      if (location.pathname.startsWith('/shorts/') || location.pathname.startsWith('/watch')) {
+      if (isPlayerPath()) {
         // На /watch предпочитаем YT-API (нативное меню обновится).
         // Listener'ом сюда тоже попадаем — но ставить дважды не страшно.
         try { t.playbackRate = shortsSpeed; } catch {}
@@ -2233,7 +2245,7 @@
     let pollerActive = true;
     const pollerStep = () => {
       if (!pollerActive) return;
-      const onPlayerPage = location.pathname.startsWith('/shorts/') || location.pathname.startsWith('/watch');
+      const onPlayerPage = isPlayerPath();
       if (onPlayerPage) {
         if (!document.getElementById(SHORTS_SPEED_PILL_ID)) injectShortsSpeedPill();
         if (!document.getElementById('sc-yt-fab')) injectWatchFab();
@@ -2269,8 +2281,8 @@
       // ytd-reel-video-renderer пересобирается, FAB надо пересоздать.
       const oldFab = document.getElementById('sc-yt-fab');
       const cur = extractVideoId(location.href);
-      const isShortsNow = location.pathname.startsWith('/shorts/');
-      const isWatchNow  = location.pathname.startsWith('/watch');
+      const isShortsNow = isShortsPath();
+      const isWatchNow  = isWatchLikePath();
       // FAB теперь живёт в общем sc-dock'е (и для shorts, и для watch).
       // Удаляем если URL сменился (videoId != cur) или пагинация ушла со страницы плеера.
       if (oldFab) {
@@ -2314,7 +2326,7 @@
       // Все dock'и, которые не в активном reel-renderer'е — удалить.
       // Это покрывает свайп между шортами: dock переходит из старого
       // reel'а в новый (старый детачится Polymer'ом).
-      const activeReel = location.pathname.startsWith('/shorts/') ? findActiveReelRenderer() : null;
+      const activeReel = isShortsPath() ? findActiveReelRenderer() : null;
       for (const stale of document.querySelectorAll('#' + SHORTS_DOCK_ID)) {
         if (!stale.isConnected || stale.parentElement !== activeReel) stale.remove();
       }
@@ -2330,7 +2342,7 @@
       // Пере-применить на видимый <video>: при SPA-переходе loadedmetadata
       // мог уже отгреметь до того как content-script был готов.
       applySpeedAuto();
-      if (location.pathname.startsWith('/shorts/') || location.pathname.startsWith('/watch')) {
+      if (isPlayerPath()) {
         // Перезапустим poller — после yt-navigate-finish bbox якоря
         // тоже может быть 0 ещё какое-то время (особенно на /shorts/).
         pollerStartedAt = performance.now();

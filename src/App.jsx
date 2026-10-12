@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { useStore, closeActivity } from './lib/store'
+import { useStore, closeActivity, pushScreen } from './lib/store'
 import TitleBar from './components/TitleBar'
 import LibrarySidebar from './components/LibrarySidebar'
 import ActivityPanel from './components/ActivityPanel'
@@ -9,6 +9,7 @@ import QuickOpen from './components/QuickOpen'
 import ToastHost from './components/ToastHost'
 import { wireJobInvalidation } from './lib/jobInvalidation'
 import { wireSessionToasts } from './lib/sessionToasts'
+import { wireResearchNavigation } from './lib/researchNavigation.mjs'
 
 wireJobInvalidation()
 wireSessionToasts()
@@ -74,6 +75,15 @@ export default function App() {
   const sidebarWidthRef = useRef(DEFAULT_SIDEBAR_WIDTH)
   const workspaceGridRef = useRef(null)
   const resizeLabelRef = useRef(null)
+  const navigationScreenRef = useRef(screen)
+  navigationScreenRef.current = screen
+
+  useEffect(() => wireResearchNavigation({
+    api: window.api, navigate: pushScreen,
+    closeOverlays: () => { closeActivity(); setMcpHistoryOpen(false); setQuickOpen(false) },
+    getScreen: () => navigationScreenRef.current,
+    reportError: error => console.error('[ResearchNavigation] open failed', error),
+  }), [])
 
   useEffect(() => {
     sidebarWidthRef.current = sidebarWidth

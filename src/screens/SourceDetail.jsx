@@ -80,25 +80,33 @@ export default function SourceDetail({ payload }) {
     setTimeout(() => setPageToast(prev => (prev === msg ? null : prev)), 3500)
   }
   async function refreshIdxStatus() {
-    if (!window.api?.tgIndexStatus || !sourceId) return
+    if (!sourceId) return
     try {
-      const s = await window.api.tgIndexStatus(sourceId)
-      if (s) setIdxStatus(s)
+      const platform = data?.source?.platform
+      if (!platform) return
+      const next = platform === 'youtube'
+        ? await window.api?.ytIndexStatus?.(sourceId)
+        : await window.api?.tgIndexStatus?.(sourceId)
+      if (next) setIdxStatus(next)
     } catch (err) {
       console.error('[SourceDetail] tgIndexStatus failed', err)
     }
   }
-  useEffect(() => { refreshIdxStatus() }, [sourceId])
+  useEffect(() => { refreshIdxStatus() }, [sourceId, data?.source?.platform])
   useEffect(() => {
     if (!window.api?.onJobUpdate) return
     const off = window.api.onJobUpdate((job) => {
-      if (job?.type === 'tg_index' && job.source_id === sourceId) {
+      const platform = data?.source?.platform
+      const expectedType = platform === 'youtube' ? 'yt_index' : 'tg_index'
+      if (job?.type === expectedType && job.source_id === sourceId) {
         // The event already contains authoritative progress. Calling
         // tg:indexStatus for every batch doubled IPC traffic and, after a
         // terminal event, used to boot another worker just to read two counts.
         const active = job.status === 'running' || job.status === 'cancelling'
         setIdxStatus({
           state: active ? 'running' : 'idle',
+          phase: job.phase || (active ? 'running' : 'terminal'),
+          unit: job.unit || (platform === 'youtube' ? 'fragments' : 'messages'),
           done: Number(job.items_done || 0),
           total: Number(job.items_total || 0),
           jobId: job.id,
@@ -107,27 +115,41 @@ export default function SourceDetail({ payload }) {
       }
     })
     return off
-  }, [sourceId])
+  }, [sourceId, data?.source?.platform])
 
   async function startIndex(limit) {
-    if (!window.api?.tgIndex) {
-      console.error('[SourceDetail] tgIndex IPC not available')
+    const platform = data?.source?.platform
+    const start = platform === 'youtube' ? window.api?.ytIndex : window.api?.tgIndex
+    if (!start) {
+      console.error('[SourceDetail] semantic index IPC not available')
       return
     }
     if (Number(idxStatus?.total || 0) > 0
         && Number(idxStatus?.done || 0) >= Number(idxStatus?.total || 0)
         && idxStatus?.state !== 'running') {
-      flashToast('Все сообщения уже проиндексированы')
+      flashToast(platform === 'youtube' ? 'Все расшифровки уже проиндексированы' : 'Все сообщения уже проиндексированы')
       return
     }
     try {
-      const r = await window.api.tgIndex({ sourceId, limit })
+      const r = await start({ sourceId, limit })
+      if (r?.ok === false) throw new Error(r.error || 'Не удалось запустить индексацию')
       if (r && r.noop) {
-        flashToast('Все сообщения уже проиндексированы')
+        flashToast(platform === 'youtube' ? 'Все расшифровки уже проиндексированы' : 'Все сообщения уже проиндексированы')
         return
       }
-      // optimistic — handler also fires job:update once running
-      setIdxStatus({ state: 'running', done: 0, total: limit || data?.source?.items_count || 0 })
+      const job = r?.job
+      setIdxStatus(previous => {
+        // A progress/terminal event may arrive before the accepted IPC reply.
+        // Do not roll the same job back to its earlier preparing snapshot.
+        if (job && previous.jobId === job.id && previous.phase !== 'starting') return previous
+        return {
+          state: 'running', phase: job?.phase || 'running',
+          unit: job?.unit || (platform === 'youtube' ? 'fragments' : 'messages'),
+          done: Number(job?.items_done || 0),
+          total: job ? Number(job.items_total || 0) : limit || data?.source?.items_count || 0,
+          jobId: job?.id || r?.jobId || null, dbId: job?.db_id || null,
+        }
+      })
     } catch (err) {
       console.error('[SourceDetail] tgIndex failed', err)
       window.alert(`Ошибка индексации: ${err?.message || err}`)
@@ -294,7 +316,10 @@ export default function SourceDetail({ payload }) {
     return <BoostySourceDetail source={s} jobs={data.jobs || []} />
   }
   const savedTypeBreakdown = data.typeBreakdown || []
+  let sourceMeta = {}
+  try { sourceMeta = JSON.parse(s.meta_json || '{}') || {} } catch {}
   const totalItems = savedTypeBreakdown.reduce((sum, r) => sum + (r.count || 0), 0)
+  const youtubeTranscribed = savedTypeBreakdown.reduce((sum, row) => sum + Number(row.transcribed || 0), 0)
   // Preview analysis and saved rows answer different questions.  Only when
   // there are no saved rows at all do we use the analysis as the distribution
   // fallback; the top «Сохранено сообщений» count intentionally stays zero.
@@ -374,13 +399,19 @@ export default function SourceDetail({ payload }) {
           <div className="grid grid-cols-3 gap-3 mb-6">
             <Stat
               label={
-                s.platform === 'youtube'   ? 'Сохранено видео'
+                s.platform === 'youtube'   ? 'Каталог видео'
                 : s.platform === 'tiktok'    ? 'Сохранено видео'
                 : s.platform === 'instagram' ? 'Сохранено reels'
                 : isSocialSource(s.platform) ? 'Сохранено строк'
                 : 'Сохранено сообщений'
               }
-              value={totalItems.toLocaleString()}
+              value={s.platform === 'youtube'
+                ? sourceMeta.catalog_complete === true
+                  ? `${totalItems.toLocaleString()} · полностью`
+                  : sourceMeta.catalog_total != null
+                    ? `${totalItems.toLocaleString()} из ${Number(sourceMeta.catalog_total).toLocaleString()}`
+                    : `${totalItems.toLocaleString()} загружено`
+                : totalItems.toLocaleString()}
             />
             <Stat
               label="Период"
@@ -456,8 +487,12 @@ export default function SourceDetail({ payload }) {
                   setOverviewOpen(false)
                 }}
                 title="Открыть форму с параметрами запроса"
-                idleLabel={<><Settings size={14} /> Новый запрос…</>}
-                activeLabel={<><Settings size={14} /> Скрыть форму</>}
+                idleLabel={s.platform === 'youtube'
+                  ? <><Settings size={14} /> Обновить каталог…</>
+                  : <><Settings size={14} /> Новый запрос…</>}
+                activeLabel={s.platform === 'youtube'
+                  ? <><Settings size={14} /> Скрыть обновление</>
+                  : <><Settings size={14} /> Скрыть форму</>}
               />
             ) : null}
             {s.platform === 'telegram' && totalItems > 0 && (
@@ -484,8 +519,8 @@ export default function SourceDetail({ payload }) {
                     ? 'Выбрать reels для транскрипции / копирования'
                     : 'Выбрать видео для транскрипции / копирования'
                 }
-                idleLabel={<><ListChecks size={14} /> Picker</>}
-                activeLabel={<><ListChecks size={14} /> Скрыть picker</>}
+                idleLabel={<><ListChecks size={14} /> {s.platform === 'instagram' ? 'Выбрать reels' : 'Выбрать видео'}</>}
+                activeLabel={<><ListChecks size={14} /> Скрыть выбор</>}
               />
             )}
             {/* «Дотянуть комментарии» — Telegram channels with linked
@@ -503,13 +538,21 @@ export default function SourceDetail({ payload }) {
                 postsWithComments={data.postsWithComments || 0}
               />
             )}
-            {/* Semantic-index button — Telegram only for now. Pinned right
-                via ml-auto inside the component itself. */}
-            {s.platform === 'telegram' && (
+            {/* Semantic index: Telegram messages or chunked YouTube
+                transcripts. YouTube stays hidden until at least one text is
+                available — a disabled action with no corpus has no meaning. */}
+            {(s.platform === 'telegram' || (s.platform === 'youtube' && youtubeTranscribed > 0)) && (
               <IndexButton
                 sourceId={sourceId}
                 status={idxStatus}
                 onStart={startIndex}
+                {...(s.platform === 'youtube' ? {
+                  idleVerb: 'Создать смысловой поиск',
+                  completeLabel: `Поиск готов · ${youtubeTranscribed.toLocaleString('ru-RU')} видео`,
+                  inputPlaceholder: 'N видео',
+                  inputTitle: 'Количество последних расшифрованных видео. Пусто = все.',
+                  actionTitle: 'Разбить расшифровки на фрагменты и создать RAG-индекс для смыслового поиска',
+                } : {})}
               />
             )}
             {pageToast && (
@@ -627,7 +670,7 @@ export default function SourceDetail({ payload }) {
                 typeBreakdown={distributionTypeBreakdown}
                 totalItems={distributionTotalItems}
                 platform={s.platform}
-                indexed={idxStatus?.done || 0}
+                indexed={s.platform === 'telegram' ? (idxStatus?.done || 0) : 0}
                 commentsCount={data.commentsCount || 0}
                 analysisOnly={distributionIsAnalysisOnly}
                 analyzedAt={data.telegramAnalysis?.analyzed_at || null}
@@ -1299,13 +1342,13 @@ function jobRowLabel(job, params) {
   // and its progress is "embeddings done / total to embed", not msgs.
   // Reuses the same Activity-bar shape (items_done / items_total),
   // which IndexJob now keeps current via mid-run db.updateJob calls.
-  if (t === 'tg_index') {
+  if (t === 'tg_index' || t === 'yt_index') {
     const total = job.items_total || 0
     const done  = job.items_done || 0
     return {
-      label: `Семантический индекс${params.limit ? ` · N=${params.limit}` : ''}`,
+      label: `${t === 'yt_index' ? 'Смысловой поиск по видео' : 'Семантический индекс'}${params.limit ? ` · N=${params.limit}` : ''}`,
       count: total ? `${done.toLocaleString()} / ${total.toLocaleString()}` : `${done.toLocaleString()}`,
-      kindIcon: { glyph: '🧠', title: 'Векторный индекс — Gemini embedding' },
+      kindIcon: { glyph: '🧠', title: t === 'yt_index' ? 'RAG-фрагменты расшифровок — Gemini embedding' : 'Векторный индекс — Gemini embedding' },
       kindColor: 'text-zinc-400',
     }
   }

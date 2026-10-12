@@ -547,14 +547,16 @@
   // ms-thought-chunk (research reasoning) / ms-tool-activity-chunk (Google Search and other
   // tool-use turns in Deep Research mode).
   function turnHasRenderedContent(chatTurn) {
+    const hasMeaningfulText = (selector) => Array.from(chatTurn.querySelectorAll(selector))
+      .some(el => (el.textContent || '').trim().length > 0);
     return !!(
-      chatTurn.querySelector('ms-text-chunk') ||
+      hasMeaningfulText('ms-text-chunk') ||
       chatTurn.querySelector('ms-file-chunk') ||
       chatTurn.querySelector('img.loaded-image') ||
-      chatTurn.querySelector('.mat-expansion-panel-body') ||
-      chatTurn.querySelector('ms-thought-chunk') ||
-      chatTurn.querySelector('ms-thought-activity-chunk') ||
-      chatTurn.querySelector('ms-tool-activity-chunk')
+      hasMeaningfulText('.mat-expansion-panel-body') ||
+      hasMeaningfulText('ms-thought-chunk') ||
+      hasMeaningfulText('ms-thought-activity-chunk') ||
+      hasMeaningfulText('ms-tool-activity-chunk')
     );
   }
 
@@ -612,8 +614,14 @@
   }
 
   // Process a single chat turn
-  async function processChatTurn(chatTurn, imageCounter, settings, turnIdx) {
+  async function processChatTurn(initialChatTurn, imageCounter, settings, turnIdx, turnId = null) {
     const turnTag = `turn[${turnIdx}]`;
+
+    // AI Studio may replace a virtualized <ms-chat-turn> node after scrolling.
+    // Re-resolve by the stable DOM id before and after hydration so we never
+    // inspect a detached/stale shell captured by the initial querySelectorAll.
+    const resolveTurn = () => (turnId ? document.getElementById(turnId) : null) || initialChatTurn;
+    let chatTurn = resolveTurn();
 
     // Phase C: replaced fixed sleep(700) with scrollIntoView + waitFor(content rendered).
     // Baseline log showed "textChunks:6" out of "chatTurns:63" before scrolling — Angular
@@ -621,7 +629,11 @@
     // TURN_TIMEOUT_MS is shorter than POLL_TIMEOUT_MS — if a turn truly has no content
     // (rare), don't burn 5 sec per empty turn.
     chatTurn.scrollIntoView({ block: 'center' });
-    await waitFor(() => turnHasRenderedContent(chatTurn), `${turnTag}-content-rendered`, CONFIG.TURN_TIMEOUT_MS);
+    await waitFor(() => {
+      chatTurn = resolveTurn();
+      return !!chatTurn && turnHasRenderedContent(chatTurn);
+    }, `${turnTag}-content-rendered`, CONFIG.TURN_TIMEOUT_MS);
+    chatTurn = resolveTurn();
 
     const turnContainer = chatTurn.querySelector('[data-turn-role]');
     if (!turnContainer) {
@@ -742,6 +754,12 @@
           log.info(turnTag, 'matched: model reasoning', { textLen: reasoningText.length, role });
           return { type: roleType, contentType: 'reasoning', text: reasoningText };
         }
+      } else if (chatTurn.querySelector('ms-thought-chunk, ms-thought-activity-chunk, .mat-expansion-panel-body')) {
+        // Reasoning is a real standalone turn in AI Studio. When the user has
+        // disabled it, preserve the turn as an explicit placeholder instead
+        // of falling through to the data-loss guard.
+        log.info(turnTag, 'matched: model reasoning (skipped — reasoning OFF)', { role });
+        return { type: roleType, contentType: 'reasoning-placeholder' };
       }
 
       const text = extractModelMessageText(chatTurn);
@@ -868,7 +886,7 @@
   }
 
   // Main export function
-  async function exportConversation() {
+  async function exportConversation(rawOverrides = null) {
     if (isExporting) {
       log.warn('export', 'export rejected — already in progress');
       return { success: false, message: 'Export already in progress' };
@@ -884,7 +902,16 @@
       shouldCancel = false;
 
       // Load settings
-      const settings = await log.timed('export', 'getSettings', () => getSettings());
+      const storedSettings = await log.timed('export', 'getSettings', () => getSettings());
+      const overrides = rawOverrides && typeof rawOverrides === 'object' && !Array.isArray(rawOverrides)
+        ? rawOverrides
+        : null;
+      const settings = overrides
+        ? {
+            ...sanitizeSettings({ ...storedSettings, ...overrides }),
+            __export: sanitizeExportSettings(overrides.__export || storedSettings.__export || {}),
+          }
+        : storedSettings;
       log.info('export', 'settings loaded', settings);
 
       // Show loading overlay
@@ -930,7 +957,8 @@
       updateLoadingStatus('Scanning conversation...', 'Step 2/4: Scanning');
       log.info('scan', 'STEP 2 START — querySelectorAll(ms-chat-turn)');
       const scanTimer = log.timer();
-      const chatTurns = document.querySelectorAll('ms-chat-turn');
+      const chatTurns = Array.from(document.querySelectorAll('ms-chat-turn'));
+      const chatTurnIds = chatTurns.map(turn => turn.id || null);
       log.info('scan', 'chat turns found', { count: chatTurns.length, query_ms: scanTimer() });
       log.domSnapshot('scan', 'after-scan', {
         chatTurns: 'ms-chat-turn',
@@ -966,7 +994,7 @@
         );
         const turnTimer = log.timer();
         log.debug('turn', `turn ${i + 1}/${chatTurns.length} START`);
-        const turnData = await processChatTurn(chatTurns[i], imageCounter, settings, i);
+        const turnData = await processChatTurn(chatTurns[i], imageCounter, settings, i, chatTurnIds[i]);
         log.info('turn', `turn ${i + 1}/${chatTurns.length} END`, {
           duration_ms: turnTimer(),
           contentType: turnData?.contentType || null,
@@ -1014,6 +1042,8 @@
             conversationData.push({ type: turnData.type, contentType: 'tool-activity', queries: turnData.queries });
           } else if (turnData.contentType === 'tool-activity-placeholder') {
             conversationData.push({ type: turnData.type, contentType: 'tool-activity-placeholder' });
+          } else if (turnData.contentType === 'reasoning-placeholder') {
+            conversationData.push({ type: turnData.type, contentType: 'reasoning-placeholder' });
           } else {
             conversationData.push(turnData);
           }
@@ -1081,11 +1111,13 @@
         } else if (item.type === 'model') {
           if (item.contentType === 'response') stats.model_response++;
           else if (item.contentType === 'reasoning') stats.model_reasoning++;
+          else if (item.contentType === 'reasoning-placeholder') stats.model_reasoning_skipped++;
           else if (item.contentType === 'image') stats.model_image++;
           else if (item.contentType === 'image-placeholder') stats.model_image_skipped++;
         } else if (item.type === 'agent') {
           if (item.contentType === 'response') stats.agent_response++;
           else if (item.contentType === 'reasoning') stats.agent_reasoning++;
+          else if (item.contentType === 'reasoning-placeholder') stats.agent_reasoning_skipped++;
           else if (item.contentType === 'image') stats.agent_image++;
           else if (item.contentType === 'image-placeholder') stats.agent_image_skipped++;
           else if (item.contentType === 'tool-activity') stats.agent_tool_activity++;
@@ -1111,10 +1143,12 @@
         stats.user_attachment_skipped ? `${stats.user_attachment_skipped} вложений User _(пропущены настройками)_` : null,
         stats.model_response     ? `${stats.model_response} ответов Model`   : null,
         stats.model_reasoning    ? `${stats.model_reasoning} рассуждений Model` : null,
+        stats.model_reasoning_skipped ? `${stats.model_reasoning_skipped} рассуждений Model _(пропущены настройками)_` : null,
         stats.model_image        ? `${stats.model_image} картинок Model`     : null,
         stats.model_image_skipped ? `${stats.model_image_skipped} картинок Model _(пропущены настройками)_` : null,
         stats.agent_response     ? `${stats.agent_response} ответов Agent`   : null,
         stats.agent_reasoning    ? `${stats.agent_reasoning} рассуждений Agent` : null,
+        stats.agent_reasoning_skipped ? `${stats.agent_reasoning_skipped} рассуждений Agent _(пропущены настройками)_` : null,
         stats.agent_tool_activity ? `${stats.agent_tool_activity} вызовов инструментов (Google Search и т.п.)` : null,
         stats.agent_tool_activity_skipped ? `${stats.agent_tool_activity_skipped} вызовов инструментов _(пропущены настройками)_` : null,
         stats.agent_image        ? `${stats.agent_image} картинок Agent`     : null,
@@ -1154,6 +1188,9 @@
           if (item.contentType === 'reasoning') {
             markdown += `## 🤖 Model (Reasoning)\n\n`;
             markdown += `${item.text}\n\n`;
+          } else if (item.contentType === 'reasoning-placeholder') {
+            markdown += `## 🤖 Model (Reasoning)\n\n`;
+            markdown += `_[Рассуждение Model пропущено настройками экспорта.]_\n\n`;
           } else if (item.contentType === 'image') {
             markdown += `## 🤖 Model\n\n`;
             markdown += `**Generated Image:**\n\n File Name: ${item.imageName}\n\n Image: ![${item.imageName}](${item.imageName})\n\n`;
@@ -1172,6 +1209,9 @@
           if (item.contentType === 'reasoning') {
             markdown += `## 🤖 Agent (Reasoning)\n\n`;
             markdown += `${item.text}\n\n`;
+          } else if (item.contentType === 'reasoning-placeholder') {
+            markdown += `## 🤖 Agent (Reasoning)\n\n`;
+            markdown += `_[Рассуждение Agent пропущено настройками экспорта.]_\n\n`;
           } else if (item.contentType === 'tool-activity') {
             markdown += `## 🌐 Google Search\n\n`;
             if (item.queries && item.queries.length) {
@@ -1362,7 +1402,7 @@
       // ACK immediately so popup can close without dropping the message.
       // Result is shown in the overlay, errors logged + visible to user.
       sendResponse({ accepted: true });
-      exportConversation().catch(err => {
+      exportConversation(request.settings || null).catch(err => {
         log.error('export', 'unhandled exportConversation rejection', { error: { message: err?.message } });
       });
       return false;

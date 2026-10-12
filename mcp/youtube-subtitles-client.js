@@ -26,6 +26,17 @@ function normalizeArguments(args = {}) {
   }
 }
 
+function normalizeSearchArguments(args = {}) {
+  const query = String(args.query || '').trim()
+  if (!query) throw new Error('query is required')
+  if (query.length > 4096) throw new Error('query must be at most 4096 characters')
+  return {
+    query,
+    limit: integerInRange(args.limit, 20, 1, 100, 'limit'),
+    offset: integerInRange(args.offset, 0, 0, 1000, 'offset'),
+  }
+}
+
 function paginateText(text, offset, maxChars) {
   const value = String(text || '')
   const start = Math.min(offset, value.length)
@@ -125,7 +136,9 @@ function createYoutubeSubtitlesClient(options = {}) {
     }
     if (!response.ok || payload?.ok === false) {
       const reason = String(payload?.error || `HTTP ${response.status}`)
-      throw new Error(`SC Desktop API request failed: ${reason}`)
+      throw Object.assign(new Error(`SC Desktop API request failed: ${reason}`), {
+        status: response.status, ...(payload?.code ? { code: payload.code } : {}),
+      })
     }
     return payload
   }
@@ -209,9 +222,12 @@ function createYoutubeSubtitlesClient(options = {}) {
     }
     const clientRequestId = suppliedRequestId || crypto.randomUUID()
     const pagination = normalizeArguments(args)
+    // `origin: 'mcp'` tells SC Desktop that a local AI agent asked for this
+    // transcript, not a human. The app returns text through the API without
+    // changing the person's clipboard or playing the readiness chime.
     const payload = await request('/api/imports', {
       method: 'POST',
-      body: { url, clientRequestId },
+      body: { url, clientRequestId, origin: 'mcp' },
     })
     if (!payload.import || payload.import.platform !== 'youtube') {
       throw new Error('client_request_id belongs to a non-YouTube import')
@@ -250,7 +266,51 @@ function createYoutubeSubtitlesClient(options = {}) {
     }
   }
 
-  return { start, status, cancel }
+  async function libraryState(args = {}) {
+    const importId = String(args.import_id || '').trim()
+    if (!IMPORT_ID_PATTERN.test(importId)) throw new Error('import_id must be an existing YouTube import UUID')
+    return request(`/api/imports/${encodeURIComponent(importId)}/library-state`)
+  }
+
+  async function linkLibrary(args = {}) {
+    const importId = String(args.import_id || '').trim()
+    if (!IMPORT_ID_PATTERN.test(importId)) throw new Error('import_id must be an existing YouTube import UUID')
+    return request(`/api/imports/${encodeURIComponent(importId)}/link-library`, {
+      method: 'POST',
+      body: { source_id: args.source_id, expected_channel_id: args.expected_channel_id,
+        expected_result_sha256: args.expected_result_sha256 },
+    })
+  }
+
+  async function search(args = {}) {
+    const params = normalizeSearchArguments(args)
+    const payload = await request('/api/youtube/search', {
+      method: 'POST',
+      body: params,
+    })
+    const items = Array.isArray(payload.items) ? payload.items : []
+    return {
+      ok: true,
+      query: payload.query || params.query,
+      limit: Number.isInteger(payload.limit) ? payload.limit : params.limit,
+      offset: Number.isInteger(payload.offset) ? payload.offset : params.offset,
+      count: items.length,
+      ranking: /^https?:\/\//i.test(params.query)
+        ? 'youtube_url_filters'
+        : 'youtube_relevance',
+      items,
+    }
+  }
+
+  return { start, status, cancel, search, libraryState, linkLibrary,
+    capabilities: () => request('/api/me'),
+    commentsCapabilities: () => request('/api/youtube/comments/capabilities'),
+    commentsStatus: args => request(`/api/youtube/comments/status?request_id=${encodeURIComponent(args.request_id || '')}`),
+    ...Object.fromEntries(['start', 'state', 'search', 'original', 'archive', 'thread'].map(action => [
+      `comments${action[0].toUpperCase()}${action.slice(1)}`,
+      args => request(`/api/youtube/comments/${action}`, { method: 'POST', body: args }),
+    ])),
+  }
 }
 
 module.exports = {
@@ -259,6 +319,7 @@ module.exports = {
   MAX_CHARS,
   MAX_WAIT_MS,
   createYoutubeSubtitlesClient,
+  normalizeSearchArguments,
   normalizeYoutubeVideoUrl,
   paginateText,
 }

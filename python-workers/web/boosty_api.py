@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import urllib.error
@@ -69,12 +70,19 @@ def api_get(path, token=None, params=None, timeout=45):
             description = payload.get("error_description") or payload.get("message")
         except Exception:
             pass
+        finally:
+            exc.close()
         if exc.code in (401, 403):
             message = "Boosty не подтвердил доступ текущего аккаунта"
         elif exc.code == 404:
             message = "Страница Boosty не найдена"
         else:
             message = description or f"Boosty API ответил HTTP {exc.code}"
+        # Anonymous machine callers must not relay arbitrary upstream bodies
+        # (which may contain signed URLs) into snapshots/logs.
+        if not token:
+            message = f"Boosty public metadata API ответил HTTP {exc.code}"
+            code = f"boosty_http_{exc.code}"
         raise BoostyApiError(message, status=exc.code, code=code) from exc
     except urllib.error.URLError as exc:
         raise BoostyApiError("Не удалось связаться с Boosty") from exc
@@ -165,12 +173,15 @@ def fetch_post(author, post_id, token=None):
 
 
 def iter_posts(author, token=None, *, order="desc", limit=0, from_ts=None, to_ts=None,
-               tags_ids=None, is_only_allowed=False, page_size=300):
+               tags_ids=None, is_only_allowed=False, page_size=300,
+               metadata_only=False, max_pages=None):
     """Yield ``(posts, extra)`` pages using Boosty's opaque cursor."""
     order = "asc" if order == "asc" else "desc"
     remaining = max(0, int(limit or 0))
     page_size = max(1, min(300, int(page_size or 300)))
     cursor = None
+    seen_cursors = set()
+    page_number = 0
     while True:
         request_limit = min(page_size, remaining) if remaining else page_size
         params = {
@@ -194,21 +205,57 @@ def iter_posts(author, token=None, *, order="desc", limit=0, from_ts=None, to_ts
         rows = rows if isinstance(rows, list) else []
         if remaining:
             rows = rows[:remaining]
-        normalized = [normalize_post(row, author) for row in rows if isinstance(row, dict)]
+        normalized = [normalize_post(row, author, metadata_only=metadata_only)
+                      for row in rows if isinstance(row, dict)]
         extra = payload.get("extra") if isinstance(payload, dict) else {}
         extra = extra if isinstance(extra, dict) else {}
+        page_number += 1
+        next_cursor = extra.get("offset")
+        is_last = extra.get("isLast") if isinstance(extra.get("isLast"), bool) else None
+        stop = ("upstream_isLast_true" if is_last is True else
+                "limit" if remaining and remaining <= len(normalized) else
+                "page_ceiling" if max_pages and page_number >= max_pages else
+                "cursor_missing" if next_cursor is None or next_cursor == "" else
+                "cursor_cycle" if next_cursor == cursor or next_cursor in seen_cursors else
+                "empty_page_without_eof" if not rows else None)
         yield normalized, {
-            "offset": extra.get("offset"),
-            "is_last": bool(extra.get("isLast")),
+            "input_cursor": cursor,
+            "offset": next_cursor,
+            "is_last": is_last,
+            "page": page_number,
+            "raw_rows": len(rows),
+            "invalid_rows": len(rows) - sum(bool(p.get("post_id")) for p in normalized) if metadata_only else 0,
+            "stop_reason": stop,
         }
         if remaining:
             remaining -= len(normalized)
             if remaining <= 0:
                 break
-        next_cursor = extra.get("offset")
-        if extra.get("isLast") or not next_cursor or next_cursor == cursor or not rows:
+        if stop:
             break
+        if cursor is not None:
+            seen_cursors.add(cursor)
         cursor = next_cursor
+
+
+def fetch_public_tiers(author):
+    """All rows in the observed unfiltered tier response; honest continuation.
+
+    nextId=null is the observed upstream EOF proof. A non-null continuation is
+    deliberately NOT guessed to be a feed offset: that parameter is not yet
+    evidenced for this different endpoint.
+    """
+    payload = api_get(f"/blog/{urllib.parse.quote(author, safe='._-')}/subscription_level/")
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return {"status": "unavailable", "tiers": [], "complete": False,
+                "next_id": None, "stop_reason": "tiers_shape_unknown"}
+    rows = [_safe_level(row) for row in payload["data"] if isinstance(row, dict)]
+    next_known = "nextId" in payload
+    complete = next_known and payload["nextId"] is None
+    return {"status": "empty" if not rows else "available", "tiers": rows,
+            "complete": complete, "next_id": payload.get("nextId"),
+            "stop_reason": "upstream_nextId_null" if complete else
+            "tiers_continuation_unverified" if next_known else "tiers_eof_unknown"}
 
 
 def fetch_tags(author, token=None):
@@ -223,9 +270,11 @@ def fetch_tags(author, token=None):
     ]
 
 
-def normalize_post(raw, author):
+def normalize_post(raw, author, *, metadata_only=False):
     post_id = str(raw.get("id") or "")
-    has_access = raw.get("hasAccess") is True
+    if metadata_only and not re.fullmatch(r"[\w-]{1,100}", post_id):
+        return {}
+    has_access = raw.get("hasAccess") if isinstance(raw.get("hasAccess"), bool) else None
     data = raw.get("data") if isinstance(raw.get("data"), list) else []
     teaser = raw.get("teaser") if isinstance(raw.get("teaser"), list) else []
     counters = {}
@@ -237,15 +286,25 @@ def normalize_post(raw, author):
     for position, item in enumerate(data, 1):
         if not isinstance(item, dict) or item.get("type") not in ("ok_video", "video"):
             continue
-        videos.append(normalize_video(item, post_id, author, position))
+        if metadata_only and not item.get("id"):
+            video = {"video_id": None, "kind": item.get("type"), "title": item.get("title"),
+                     "position": position, "duration_sec": None}
+        else:
+            video = normalize_video(item, post_id, author, position)
+        if metadata_only:
+            video.pop("thumbnail_url", None)
+            video.pop("external_url", None)
+            duration = item.get("duration")
+            video["duration_sec"] = duration if isinstance(duration, (int, float)) and not isinstance(duration, bool) and math.isfinite(duration) and duration >= 0 else None
+        videos.append(video)
 
     declared_video_count = int(counters.get("ok_video", 0)) + int(counters.get("video", 0))
     video_count = max(len(videos), declared_video_count)
-    text = extract_text(data)
-    if not text:
+    text = "" if metadata_only else extract_text(data)
+    if not text and not metadata_only:
         text = extract_text(teaser)
-    image_url = first_image_url(data) or first_image_url(teaser)
-    if not image_url and videos:
+    image_url = None if metadata_only else first_image_url(data) or first_image_url(teaser)
+    if not image_url and videos and not metadata_only:
         image_url = videos[0].get("thumbnail_url")
 
     return {
@@ -258,13 +317,21 @@ def normalize_post(raw, author):
         "publish_time": _int_or_none(raw.get("publishTime")),
         "updated_at": _int_or_none(raw.get("updatedAt")),
         "has_access": has_access,
+        # Safe inventory only. A visible filename/counter is NOT a collected
+        # PDF/image/audio original or extracted body. No signed download URL.
+        "assets_metadata": normalize_assets_metadata(data),
+        "auth_mode": "public" if metadata_only else "account",
+        "anonymous_access_state": ("public_access" if has_access is True else
+                                   "locked_for_anonymous" if has_access is False else "unknown")
+                                  if metadata_only else None,
+        "metadata_only": metadata_only,
         "is_deleted": bool(raw.get("isDeleted")),
         "is_blocked": bool(raw.get("isBlocked")),
         "is_published": raw.get("isPublished") is not False,
         "is_waiting_video": bool(raw.get("isWaitingVideo")),
         "is_pinned": bool(raw.get("isPinned")),
         "price": raw.get("price"),
-        "currency_prices": _safe_dict(raw.get("currencyPrices")),
+        "currency_prices": _safe_prices(raw.get("currencyPrices")) if metadata_only else _safe_dict(raw.get("currencyPrices")),
         "subscription_level": _safe_level(raw.get("subscriptionLevel")),
         "tags": [
             {"id": tag.get("id"), "title": tag.get("title")}
@@ -272,11 +339,31 @@ def normalize_post(raw, author):
         ],
         "content_counters": counters,
         "video_count": video_count,
+        "declared_video_count": declared_video_count if isinstance(raw.get("contentCounters"), list) else None,
+        "content_counters_available": isinstance(raw.get("contentCounters"), list),
         "videos": videos,
         "thumbnail_url": image_url,
         "likes": _int_or_none((raw.get("count") or {}).get("likes") if isinstance(raw.get("count"), dict) else None),
         "comments": _int_or_none((raw.get("count") or {}).get("comments") if isinstance(raw.get("count"), dict) else None),
     }
+
+
+def normalize_assets_metadata(data):
+    result = []
+    for position, item in enumerate(data or [], 1):
+        if not isinstance(item, dict) or item.get('type') not in {'file', 'image', 'audio', 'video', 'ok_video', 'link'}:
+            continue
+        raw_id = item.get('id')
+        identifier = str(raw_id) if isinstance(raw_id, (str, int)) and not isinstance(raw_id, bool) and re.fullmatch(r'[\w-]{1,100}', str(raw_id)) else None
+        name = item.get('name') or item.get('fileName') or item.get('filename') or item.get('title')
+        name = name[:1000] if isinstance(name, str) and not re.search(r'https?://|signedQuery|accessToken', name, re.I) else None
+        size = item.get('size')
+        duration = item.get('duration')
+        result.append({'asset_id': identifier, 'kind': item['type'], 'position': position, 'name': name,
+                       'bytes': size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else None,
+                       'duration_sec': duration if isinstance(duration, (int, float)) and not isinstance(duration, bool) and math.isfinite(duration) and duration > 0 else None,
+                       'original_saved': None, 'extracted_text_saved': None, 'coverage': 'not_checked_metadata_snapshot'})
+    return result
 
 
 def normalize_video(item, post_id, author, position=1):
@@ -411,8 +498,20 @@ def _safe_level(value):
         "id": value.get("id"),
         "name": value.get("name"),
         "price": value.get("price"),
-        "currency_prices": _safe_dict(value.get("currencyPrices")),
+        "currency_prices": _safe_prices(value.get("currencyPrices")),
+        "is_archived": value.get("isArchived") if isinstance(value.get("isArchived"), bool) else None,
+        "is_hidden": value.get("isHidden") if isinstance(value.get("isHidden"), bool) else None,
+        "deleted": value.get("deleted") if isinstance(value.get("deleted"), bool) else None,
+        # No monthly-period inference from the resource name or amount.
+        "price_period": value.get("period") if isinstance(value.get("period"), (str, int)) else None,
+        "price_period_provenance": "upstream_period" if isinstance(value.get("period"), (str, int)) else "not_exposed",
     }
+
+
+def _safe_prices(value):
+    return {k: v for k, v in (value.items() if isinstance(value, dict) else [])
+            if isinstance(k, str) and re.fullmatch(r"[A-Z]{3}", k)
+            and isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0}
 
 
 def _safe_dict(value):

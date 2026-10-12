@@ -51,6 +51,7 @@ from yt_single_ndjson import (   # noqa: E402
     fetch_meta,
     silenced,
     write_text_file,
+    download_youtube_audio,
 )
 
 
@@ -138,40 +139,23 @@ def process_one(i, n, vid, url, args, totals):
     except Exception:
         pass
 
-    emit({"type": "transcribe_start", "i": i, "video_id": meta["id"], "engine": args.engine})
+    emit({"type": "audio_download_start", "i": i, "video_id": meta["id"], "engine": args.engine})
+    audio_bytes, error_code, error_message = download_youtube_audio(url, audio_tmp)
+    if error_message:
+        emit({
+            "type": "item_error",
+            "i": i,
+            "video_id": meta["id"],
+            "stage": "downloading_audio",
+            "code": error_code,
+            "message": error_message,
+        })
+        totals["errors"] += 1
+        return
 
-    import subprocess  # local import — only needed for AI path
-    cmd = [
-        "yt-dlp",
-        "--cookies-from-browser", "firefox",
-        "--remote-components", "ejs:github",
-        "-x", "--audio-format", "mp3",
-        "--audio-quality", "9",
-        "--no-warnings",
-        "--ignore-errors",
-        "-o", audio_tmp,
-        url,
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, check=True, timeout=600)
-    except subprocess.TimeoutExpired:
-        emit({"type": "item_error", "i": i, "video_id": meta["id"],
-              "message": "yt-dlp timeout (>10m)"})
-        totals["errors"] += 1
-        return
-    except subprocess.CalledProcessError as ex:
-        tail = ex.stderr or b""
-        if isinstance(tail, bytes):
-            tail = tail.decode(errors="ignore")
-        emit({"type": "item_error", "i": i, "video_id": meta["id"],
-              "message": f"yt-dlp failed: {tail[-300:].strip()}"})
-        totals["errors"] += 1
-        return
-    if not os.path.exists(audio_tmp):
-        emit({"type": "item_error", "i": i, "video_id": meta["id"],
-              "message": "audio file missing after download"})
-        totals["errors"] += 1
-        return
+    emit({"type": "audio_download_done", "i": i, "video_id": meta["id"],
+          "engine": args.engine, "bytes": audio_bytes})
+    emit({"type": "transcribe_start", "i": i, "video_id": meta["id"], "engine": args.engine})
 
     text2, err, cost = None, None, 0.0
     try:

@@ -99,10 +99,13 @@ export function RequestJobRow({ job, active, onClose = closeActivity }) {
   const [cancelError, setCancelError] = useState(null)
   const cancelling = job.status === 'cancelling'
   const cleanHandle = String(job.target || '').replace(/^@/, '')
+  const isIndex = job.type === 'tg_index' || job.type === 'yt_index'
   // Match strategy: tg by handle, YouTube types by source_id when available.
   // yt_transcribe (single) is sourceless so it stays unlinked.
   const matchedSource = (
-    (job.type === 'tg_fetch' || job.type === 'tg_preview')
+    isIndex && job.source_id
+      ? sources.find(s => Number(s.id) === Number(job.source_id))
+    : (job.type === 'tg_fetch' || job.type === 'tg_preview')
       ? (job.source_id
           ? sources.find(s => s.id === job.source_id)
           : sources.find(s => s.platform === 'telegram' && s.handle === cleanHandle))
@@ -115,6 +118,11 @@ export function RequestJobRow({ job, active, onClose = closeActivity }) {
         ? sources.find(s => s.id === job.source_id)
     : null
   )
+  const sourceTitle = job.entity_title || (isIndex
+    ? matchedSource?.display_name || matchedSource?.handle || (job.source_id ? `источник #${job.source_id}` : job.target)
+    : job.target)
+  const showFragmentProgress = isIndex && job.unit === 'messages' &&
+    Number(job.fragments_total || 0) > Math.max(1, Number(job.messages_selected || job.items_total || 0))
   const pct = job.items_total ? Math.min(100, Math.round((job.items_done / job.items_total) * 100)) : null
   const ago = active ? '' : humanAgo(Math.floor(Date.now() / 1000) - (job.finished_at || job.started_at || 0))
 
@@ -150,7 +158,7 @@ export function RequestJobRow({ job, active, onClose = closeActivity }) {
         <>
           <div className="text-zinc-500 mt-1 flex items-center gap-2" style={{ fontSize: '14px' }}>
             <span className="truncate flex-1">
-              {job.entity_title || job.target}
+              {sourceTitle}
             </span>
             {matchedSource && (
               <button
@@ -164,6 +172,14 @@ export function RequestJobRow({ job, active, onClose = closeActivity }) {
               media phase. Hides itself when there's nothing to show. */}
           {job.type !== 'yt_transcribe' && job.type !== 'rutube_transcribe' && job.type !== 'tk_transcribe' && job.type !== 'boosty_transcribe' && (
             <JobProgress job={job} variant="compact" />
+          )}
+          {isIndex && active && job.phase === 'starting' && (
+            <div className="text-zinc-500 mt-1" style={{ fontSize: '14px' }}>Подготавливаю индекс…</div>
+          )}
+          {showFragmentProgress && (
+            <div data-index-fragments-progress className="text-zinc-500 mt-1 tabular-nums" style={{ fontSize: '14px' }}>
+              Фрагменты: {Number(job.fragments_embedded || 0).toLocaleString('ru-RU')} / {Number(job.fragments_total).toLocaleString('ru-RU')}
+            </div>
           )}
         </>
       )}
@@ -309,6 +325,8 @@ function labelFor(type, job) {
     return 'Telegram · автообновление'
   }
   return ({
+    tg_index:             'Telegram · индексация',
+    yt_index:             'YouTube · индексация',
     tg_fetch:             'Telegram · парсинг',
     tg_preview:           'Telegram · анализ',
     tg_folder_fetch:      'Telegram · папка',
@@ -317,6 +335,11 @@ function labelFor(type, job) {
     tg_live_search:       'Telegram · поиск',
     tg_live_context:      'Telegram · контекст',
     tg_live_range:        'Telegram · диапазон',
+    tg_live_attachment:   'Telegram · вложение',
+    tg_live_transcribe:    'Telegram · расшифровка',
+    tg_live_public_search: 'Telegram · публичный поиск',
+    tg_live_join:          'Telegram · вступление',
+    tg_live_leave:         'Telegram · выход',
     sync_source:          'Синхронизация',
     transcribe:           'Транскрипция',
     download_item:        'Загрузка',

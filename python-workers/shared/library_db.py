@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS items (
   transcribe_engine   TEXT,
   transcribe_cost_usd REAL,
   raw_meta_json       TEXT,
+  sender              TEXT,
   has_media           INTEGER NOT NULL DEFAULT 0,
   topic_id            INTEGER,
   topic_title         TEXT,
@@ -98,6 +99,98 @@ CREATE INDEX IF NOT EXISTS idx_items_source_caption_present ON items(source_id)
   WHERE caption IS NOT NULL AND length(trim(caption)) > 0;
 CREATE INDEX IF NOT EXISTS idx_items_status     ON items(download_status, transcribe_status);
 CREATE INDEX IF NOT EXISTS idx_items_type       ON items(source_id, type);
+
+CREATE TABLE IF NOT EXISTS semantic_chunks (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id              INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  source_id            INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  chunk_index          INTEGER NOT NULL,
+  start_char           INTEGER NOT NULL,
+  end_char             INTEGER NOT NULL,
+  start_seconds        REAL,
+  end_seconds          REAL,
+  position_approximate INTEGER NOT NULL DEFAULT 1,
+  text                 TEXT NOT NULL,
+  document_hash        TEXT NOT NULL,
+  indexed_at           INTEGER,
+  created_at           INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(item_id, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS idx_semantic_chunks_source ON semantic_chunks(source_id, item_id, chunk_index);
+CREATE INDEX IF NOT EXISTS idx_semantic_chunks_document ON semantic_chunks(item_id, document_hash);
+
+-- Boosty saved-text publication. Partial embeddings are resumable but never
+-- searchable; active vectors live in the same semantic_chunks/vec corpus.
+CREATE TABLE IF NOT EXISTS boosty_rag_generations (
+  generation_id TEXT PRIMARY KEY,
+  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  document_hash TEXT NOT NULL,
+  index_version TEXT NOT NULL,
+  fragments_total INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('staging', 'active', 'obsolete')),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  published_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_boosty_rag_item ON boosty_rag_generations(item_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_boosty_rag_active ON boosty_rag_generations(item_id) WHERE status = 'active';
+CREATE TABLE IF NOT EXISTS boosty_rag_staging (
+  generation_id TEXT NOT NULL REFERENCES boosty_rag_generations(generation_id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
+  chunk_json TEXT NOT NULL,
+  embedding BLOB,
+  PRIMARY KEY(generation_id, chunk_index)
+);
+
+-- Telegram-only RAG publication ledger. Staging embeddings never enter vec0.
+CREATE TABLE IF NOT EXISTS telegram_rag_source_state (
+  source_id        INTEGER PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+  content_revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS telegram_rag_item_state (
+  item_id               INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+  local_revision        INTEGER NOT NULL DEFAULT 1,
+  stale                 INTEGER NOT NULL DEFAULT 0,
+  migrated              INTEGER NOT NULL DEFAULT 0,
+  active_generation_id  TEXT,
+  desired_generation_id TEXT
+);
+CREATE TABLE IF NOT EXISTS telegram_rag_generations (
+  generation_id      TEXT PRIMARY KEY,
+  item_id            INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  source_id          INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  input_hash         TEXT NOT NULL,
+  index_version      TEXT NOT NULL,
+  target_revision    INTEGER NOT NULL,
+  target_content_hash TEXT NOT NULL,
+  source_revision    INTEGER NOT NULL,
+  context_refs_json  TEXT NOT NULL,
+  status             TEXT NOT NULL CHECK(status IN ('staging', 'active', 'obsolete')),
+  fragments_total    INTEGER NOT NULL,
+  created_at         INTEGER NOT NULL DEFAULT (unixepoch()),
+  published_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_rag_generations_item
+  ON telegram_rag_generations(item_id, status);
+CREATE TABLE IF NOT EXISTS telegram_rag_generation_chunks (
+  generation_id TEXT NOT NULL REFERENCES telegram_rag_generations(generation_id) ON DELETE CASCADE,
+  chunk_index   INTEGER NOT NULL,
+  chunk_json    TEXT NOT NULL,
+  embedding     BLOB,
+  PRIMARY KEY(generation_id, chunk_index)
+);
+CREATE TABLE IF NOT EXISTS telegram_rag_dependencies (
+  generation_id TEXT NOT NULL REFERENCES telegram_rag_generations(generation_id) ON DELETE CASCADE,
+  source_id     INTEGER NOT NULL,
+  external_id   TEXT NOT NULL,
+  item_id       INTEGER,
+  local_revision INTEGER,
+  content_hash  TEXT,
+  role          TEXT NOT NULL,
+  PRIMARY KEY(generation_id, source_id, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_rag_dependencies_external
+  ON telegram_rag_dependencies(source_id, external_id);
 
 CREATE TABLE IF NOT EXISTS jobs (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -233,11 +326,151 @@ CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
   tokenize='unicode61 remove_diacritics 2'
 );
 
+
+CREATE TABLE IF NOT EXISTS research_jobs (
+  job_id TEXT PRIMARY KEY, kind TEXT, provider TEXT, model_id TEXT, mode TEXT,
+  status TEXT, stage TEXT, prompt TEXT, response_text TEXT, url TEXT,
+  response_len INTEGER, link_count INTEGER, result_json TEXT,
+  request_fingerprint TEXT, request_metadata_json TEXT, error TEXT,
+  created_at INTEGER, updated_at INTEGER, done_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_research_jobs_created ON research_jobs(created_at DESC);
+
 CREATE TABLE IF NOT EXISTS schema_version (
   version    INTEGER PRIMARY KEY,
   applied_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 INSERT OR IGNORE INTO schema_version (version) VALUES (1);
+"""
+
+
+TELEGRAM_RAG_TRIGGERS = """
+-- Triggers cover BOTH SQLite writers; they deliberately never touch vec0.
+CREATE TRIGGER IF NOT EXISTS telegram_rag_item_insert AFTER INSERT ON items
+WHEN EXISTS (SELECT 1 FROM sources WHERE id = NEW.source_id AND platform = 'telegram')
+BEGIN
+  INSERT INTO telegram_rag_source_state(source_id) SELECT NEW.source_id
+    WHERE NOT EXISTS (SELECT 1 FROM telegram_rag_source_state WHERE source_id = NEW.source_id);
+  UPDATE telegram_rag_source_state SET content_revision = content_revision + 1 WHERE source_id = NEW.source_id;
+  INSERT INTO telegram_rag_item_state(item_id) SELECT NEW.id
+    WHERE NOT EXISTS (SELECT 1 FROM telegram_rag_item_state WHERE item_id = NEW.id);
+
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE item_id IN (
+     SELECT g.item_id FROM telegram_rag_dependencies d
+     JOIN telegram_rag_generations g ON g.generation_id = d.generation_id
+     WHERE d.source_id = NEW.source_id AND d.external_id = NEW.external_id
+       AND g.status IN ('staging', 'active')
+   );
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE (active_generation_id IS NOT NULL OR desired_generation_id IS NOT NULL)
+     AND item_id IN (
+       SELECT i.id FROM items i WHERE i.source_id = NEW.source_id
+         AND i.id != NEW.id
+         AND COALESCE(i.topic_id, 0) = COALESCE(NEW.topic_id, 0)
+         AND i.published_at BETWEEN NEW.published_at AND NEW.published_at + 86400
+         AND (i.published_at > NEW.published_at
+           OR (i.published_at = NEW.published_at
+             AND CAST(i.external_id AS INTEGER) > CAST(NEW.external_id AS INTEGER)))
+     );
+
+END;
+CREATE TRIGGER IF NOT EXISTS telegram_rag_item_update AFTER UPDATE ON items
+WHEN EXISTS (SELECT 1 FROM sources WHERE id = NEW.source_id AND platform = 'telegram')
+ AND (OLD.caption IS NOT NEW.caption
+  OR OLD.sender IS NOT NEW.sender
+  OR OLD.type IS NOT NEW.type
+  OR OLD.published_at IS NOT NEW.published_at
+  OR OLD.topic_id IS NOT NEW.topic_id
+  OR OLD.topic_title IS NOT NEW.topic_title
+  OR OLD.parent_external_id IS NOT NEW.parent_external_id
+  OR OLD.source_id IS NOT NEW.source_id
+  OR OLD.external_id IS NOT NEW.external_id
+  OR (CASE WHEN json_valid(OLD.raw_meta_json) THEN json_extract(OLD.raw_meta_json, '$.forward') END)
+     IS NOT (CASE WHEN json_valid(NEW.raw_meta_json) THEN json_extract(NEW.raw_meta_json, '$.forward') END)
+  OR (CASE WHEN json_valid(OLD.raw_meta_json) THEN json_extract(OLD.raw_meta_json, '$.telegram_reply') END)
+     IS NOT (CASE WHEN json_valid(NEW.raw_meta_json) THEN json_extract(NEW.raw_meta_json, '$.telegram_reply') END)
+  OR (CASE WHEN json_valid(OLD.raw_meta_json) THEN json_type(OLD.raw_meta_json, '$.telegram_reply') END)
+     IS NOT (CASE WHEN json_valid(NEW.raw_meta_json) THEN json_type(NEW.raw_meta_json, '$.telegram_reply') END)
+  OR (CASE WHEN json_valid(OLD.raw_meta_json) THEN json_extract(OLD.raw_meta_json, '$.external_reply') END)
+     IS NOT (CASE WHEN json_valid(NEW.raw_meta_json) THEN json_extract(NEW.raw_meta_json, '$.external_reply') END)
+  OR (CASE WHEN json_valid(OLD.raw_meta_json) THEN json_type(OLD.raw_meta_json, '$.external_reply') END)
+     IS NOT (CASE WHEN json_valid(NEW.raw_meta_json) THEN json_type(NEW.raw_meta_json, '$.external_reply') END))
+BEGIN
+  INSERT INTO telegram_rag_source_state(source_id) SELECT NEW.source_id
+    WHERE NOT EXISTS (SELECT 1 FROM telegram_rag_source_state WHERE source_id = NEW.source_id);
+  UPDATE telegram_rag_source_state SET content_revision = content_revision + 1
+    WHERE source_id IN (NEW.source_id, OLD.source_id);
+  INSERT INTO telegram_rag_item_state(item_id) SELECT NEW.id
+    WHERE NOT EXISTS (SELECT 1 FROM telegram_rag_item_state WHERE item_id = NEW.id);
+  UPDATE telegram_rag_item_state SET local_revision = local_revision + 1, stale = 1 WHERE item_id = NEW.id;
+
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE item_id IN (
+     SELECT g.item_id FROM telegram_rag_dependencies d
+     JOIN telegram_rag_generations g ON g.generation_id = d.generation_id
+     WHERE d.source_id = NEW.source_id AND d.external_id = NEW.external_id
+       AND g.status IN ('staging', 'active')
+   );
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE (active_generation_id IS NOT NULL OR desired_generation_id IS NOT NULL)
+     AND item_id IN (
+       SELECT i.id FROM items i WHERE i.source_id = NEW.source_id
+         AND i.id != NEW.id
+         AND COALESCE(i.topic_id, 0) = COALESCE(NEW.topic_id, 0)
+         AND i.published_at BETWEEN NEW.published_at AND NEW.published_at + 86400
+         AND (i.published_at > NEW.published_at
+           OR (i.published_at = NEW.published_at
+             AND CAST(i.external_id AS INTEGER) > CAST(NEW.external_id AS INTEGER)))
+     );
+
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE item_id IN (
+     SELECT g.item_id FROM telegram_rag_dependencies d
+     JOIN telegram_rag_generations g ON g.generation_id = d.generation_id
+     WHERE d.source_id = OLD.source_id AND d.external_id = OLD.external_id
+       AND g.status IN ('staging', 'active')
+   );
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE (active_generation_id IS NOT NULL OR desired_generation_id IS NOT NULL)
+     AND item_id IN (
+       SELECT i.id FROM items i WHERE i.source_id = OLD.source_id
+         AND i.id != OLD.id
+         AND COALESCE(i.topic_id, 0) = COALESCE(OLD.topic_id, 0)
+         AND i.published_at BETWEEN OLD.published_at AND OLD.published_at + 86400
+         AND (i.published_at > OLD.published_at
+           OR (i.published_at = OLD.published_at
+             AND CAST(i.external_id AS INTEGER) > CAST(OLD.external_id AS INTEGER)))
+     );
+
+END;
+CREATE TRIGGER IF NOT EXISTS telegram_rag_item_delete AFTER DELETE ON items
+WHEN EXISTS (SELECT 1 FROM sources WHERE id = OLD.source_id AND platform = 'telegram')
+BEGIN
+  INSERT INTO telegram_rag_source_state(source_id) SELECT OLD.source_id
+    WHERE NOT EXISTS (SELECT 1 FROM telegram_rag_source_state WHERE source_id = OLD.source_id);
+  UPDATE telegram_rag_source_state SET content_revision = content_revision + 1 WHERE source_id = OLD.source_id;
+
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE item_id IN (
+     SELECT g.item_id FROM telegram_rag_dependencies d
+     JOIN telegram_rag_generations g ON g.generation_id = d.generation_id
+     WHERE d.source_id = OLD.source_id AND d.external_id = OLD.external_id
+       AND g.status IN ('staging', 'active')
+   );
+  UPDATE telegram_rag_item_state SET stale = 1
+   WHERE (active_generation_id IS NOT NULL OR desired_generation_id IS NOT NULL)
+     AND item_id IN (
+       SELECT i.id FROM items i WHERE i.source_id = OLD.source_id
+         AND i.id != OLD.id
+         AND COALESCE(i.topic_id, 0) = COALESCE(OLD.topic_id, 0)
+         AND i.published_at BETWEEN OLD.published_at AND OLD.published_at + 86400
+         AND (i.published_at > OLD.published_at
+           OR (i.published_at = OLD.published_at
+             AND CAST(i.external_id AS INTEGER) > CAST(OLD.external_id AS INTEGER)))
+     );
+
+END;
 """
 
 
@@ -253,16 +486,32 @@ def open_db() -> sqlite3.Connection:
     # equivalent try/ALTER block in electron/database.js — both writers must
     # agree on the full column set.
     for ddl in (
+        "ALTER TABLE research_jobs ADD COLUMN result_json TEXT",
+        "ALTER TABLE research_jobs ADD COLUMN request_fingerprint TEXT",
+        "ALTER TABLE research_jobs ADD COLUMN request_metadata_json TEXT",
         "ALTER TABLE sources ADD COLUMN tg_session TEXT",
         "ALTER TABLE sources ADD COLUMN tg_session_conflict INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE folders ADD COLUMN tg_session TEXT",
         "ALTER TABLE items ADD COLUMN video_path TEXT",
         "ALTER TABLE items ADD COLUMN has_media INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE items ADD COLUMN sender TEXT",
+        "ALTER TABLE items ADD COLUMN topic_id INTEGER",
+        "ALTER TABLE items ADD COLUMN topic_title TEXT",
+        "ALTER TABLE items ADD COLUMN parent_external_id TEXT",
     ):
         try:
             conn.execute(ddl)
         except sqlite3.OperationalError:
             pass  # column already exists
+    # Keep installed bodies current atomically, including DBs opened by an
+    # earlier worker. No trigger touches sqlite-vec, unavailable in Python.
+    conn.executescript(
+        "BEGIN IMMEDIATE;"
+        "DROP TRIGGER IF EXISTS telegram_rag_item_insert;"
+        "DROP TRIGGER IF EXISTS telegram_rag_item_update;"
+        "DROP TRIGGER IF EXISTS telegram_rag_item_delete;"
+        + TELEGRAM_RAG_TRIGGERS + "COMMIT;"
+    )
     return conn
 
 

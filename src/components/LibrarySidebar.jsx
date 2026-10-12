@@ -45,7 +45,7 @@ export default function LibrarySidebar() {
   const activeSourceId = screen.name === 'source-detail' ? screen.payload?.sourceId : null
   const jobs = useJobsSelector(
     list => list.filter(job => (
-      job?.type === 'tg_index'
+      (job?.type === 'tg_index' || job?.type === 'yt_index')
       && (job.status === 'running' || job.status === 'awaiting_ai' || job.status === 'cancelling')
       && job.source_id != null
     )),

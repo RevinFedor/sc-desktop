@@ -22,17 +22,15 @@ import io
 import re
 import json
 import time
-import uuid
 import argparse
 import contextlib
 import subprocess
-import tempfile
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "shared"))
+
+from soniox_utils import transcribe_file as transcribe_soniox_file
 
 
 _REAL_STDOUT = sys.stdout  # captured before silenced() may replace sys.stdout
@@ -222,176 +220,26 @@ def format_srt(cues):
     return "\n".join(blocks)
 
 
-def read_dotenv_value(path, name):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                m = re.match(rf"\s*{re.escape(name)}\s*=\s*(.*)\s*$", line)
-                if not m:
-                    continue
-                value = m.group(1).strip()
-                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-                    value = value[1:-1]
-                return value.strip() or None
-    except OSError:
-        return None
-    return None
-
-
-def get_soniox_key():
-    key = os.environ.get("SONIOX_API_KEY")
-    if key:
-        return key.strip()
-    try:
-        import settings
-        key = settings.get_api_key("SONIOX_API_KEY")
-        if key:
-            return key.strip()
-    except Exception:
-        pass
-    return read_dotenv_value(Path.home() / ".noted-terminal" / ".env", "SONIOX_API_KEY")
-
-
-def http_json(url, *, key, method="GET", body=None, headers=None, timeout=600):
-    req_headers = {"Authorization": f"Bearer {key}"}
-    if headers:
-        req_headers.update(headers)
-    data = None
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        req_headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"soniox {method} {url} failed {e.code}: {detail}") from e
-
-
-def soniox_upload_file(file_path, key):
-    boundary = "----scdesktop" + uuid.uuid4().hex
-    name = Path(file_path).name
-    with open(file_path, "rb") as f:
-        blob = f.read()
-    head = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'
-        "Content-Type: application/octet-stream\r\n\r\n"
-    ).encode("utf-8")
-    tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.soniox.com/v1/files",
-        data=head + blob + tail,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            return json.loads(resp.read().decode("utf-8"))["id"]
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"soniox upload failed {e.code}: {detail}") from e
-
-
-VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".flv", ".wmv", ".3gp"}
-
-
-def maybe_extract_audio(src):
-    if src.suffix.lower() not in VIDEO_EXTS:
-        return str(src), None
-    tmp = tempfile.TemporaryDirectory(prefix="sc-local-soniox-")
-    out = Path(tmp.name) / f"{safe_slug(src.stem)}.m4a"
-    try:
-        r = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-y", "-i", str(src), "-map", "0:a:0", "-c:a", "copy", str(out)],
-            capture_output=True, text=True, timeout=120,
-        )
-        if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
-            return str(out), tmp
-    except Exception:
-        pass
-    tmp.cleanup()
-    return str(src), None
-
-
 def transcribe_soniox(src, timings=False):
-    key = get_soniox_key()
-    if not key:
-        return None, "SONIOX_API_KEY not configured", {}
+    def progress(stage, **extra):
+        emit({
+            "type": "transcribe_progress",
+            "engine": "soniox",
+            "stage": stage,
+            **extra,
+        })
 
-    upload_path, tmp = maybe_extract_audio(src)
-    file_id = None
-    transcription_id = None
-    try:
-        emit({"type": "transcribe_progress", "engine": "soniox", "stage": "uploading"})
-        file_id = soniox_upload_file(upload_path, key)
-        emit({"type": "transcribe_progress", "engine": "soniox", "stage": "processing", "status": "queued"})
-        create = http_json(
-            "https://api.soniox.com/v1/transcriptions",
-            key=key,
-            method="POST",
-            body={
-                "file_id": file_id,
-                "model": "stt-async-v5",
-                "language_hints": ["ru", "en"],
-                "enable_language_identification": True,
-                "context": {
-                    "terms": [
-                        "Codex", "Claude", "JSONL", "MCP", "Rewind", "Input",
-                        "Timeline", "Answer", "Fast", "effort", "iOS", "PTY",
-                    ]
-                },
-                "client_reference_id": "sc-desktop-local-file",
-            },
-            timeout=120,
-        )
-        transcription_id = create["id"]
-        attempt = 0
-        while True:
-            attempt += 1
-            time.sleep(1 if attempt < 30 else 3)
-            poll = http_json(
-                f"https://api.soniox.com/v1/transcriptions/{transcription_id}",
-                key=key,
-                timeout=120,
-            )
-            status = poll.get("status")
-            emit({"type": "transcribe_progress", "engine": "soniox", "stage": "processing",
-                  "status": status, "attempt": attempt})
-            if status == "completed":
-                break
-            if status == "error":
-                return None, "Soniox error: " + (poll.get("error_message") or "unknown"), {}
-            if attempt > 600:
-                return None, "Soniox poll timeout (>30 min)", {}
-
-        emit({"type": "transcribe_progress", "engine": "soniox", "stage": "fetching"})
-        transcript = http_json(
-            f"https://api.soniox.com/v1/transcriptions/{transcription_id}/transcript",
-            key=key,
-            timeout=120,
-        )
-        tokens = transcript.get("tokens") or []
-        text = clean_space("".join(str(t.get("text") or "") for t in tokens))
-        return text, None, {"tokens": tokens if timings else [], "token_count": len(tokens)}
-    finally:
-        if transcription_id:
-            try:
-                http_json(f"https://api.soniox.com/v1/transcriptions/{transcription_id}", key=key, method="DELETE", timeout=30)
-            except Exception:
-                pass
-        if file_id:
-            try:
-                http_json(f"https://api.soniox.com/v1/files/{file_id}", key=key, method="DELETE", timeout=30)
-            except Exception:
-                pass
-        if tmp:
-            tmp.cleanup()
+    return transcribe_soniox_file(
+        src,
+        timings=timings,
+        language_hints=["ru", "en"],
+        context_terms=[
+            "Codex", "Claude", "JSONL", "MCP", "Rewind", "Input",
+            "Timeline", "Answer", "Fast", "effort", "iOS", "PTY",
+        ],
+        client_reference_id="sc-desktop-local-file",
+        progress_callback=progress,
+    )
 
 
 def main(argv):

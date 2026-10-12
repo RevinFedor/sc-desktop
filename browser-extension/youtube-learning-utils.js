@@ -105,9 +105,8 @@
     return finalizeCues(raw);
   }
 
-  // YouTube automatic captions are emitted as short rolling fragments.
-  // Language Reactor combines adjacent ASR events in pairs; doing the same
-  // keeps a readable phrase on screen instead of replacing it every ~2 sec.
+  // Legacy pairwise assembly remains available to older consumers. The
+  // interactive overlay now packs original timed fragments by measured width.
   function pairAdjacentAsrCues(rawCues) {
     const cues = finalizeCues(rawCues || []);
     const paired = [];
@@ -232,6 +231,54 @@
     if (candidate < 0) return -1;
     const cue = cues[candidate];
     return timeMs <= cue.endMs + 120 ? candidate : -1;
+  }
+
+  // Display lines follow the available width, not the source track's fragment
+  // count. Preserve original cue boundaries in the timing map; only a cut
+  // inside a source cue needs the same kind of estimated timing as splitting.
+  function layoutTimedCuesToFit(rawCues, options = {}) {
+    const source = finalizeCues(rawCues || []);
+    const maxWidth = Math.max(1, Number(options.maxWidth) || 1);
+    const maxGapMs = 20;
+    const runs = [];
+    for (const cue of source) {
+      const run = runs.at(-1);
+      if (run && cue.startMs - run.at(-1).endMs <= maxGapMs) run.push(cue);
+      else runs.push([cue]);
+    }
+    const result = [];
+    for (const run of runs) {
+      let cursor = 0;
+      const spans = run.map(cue => {
+        const start = cursor;
+        cursor += cue.text.replace(/\s/g, '').length;
+        return { cue, start, end: cursor };
+      });
+      const chunks = splitTextToMeasuredWidth(run.map(cue => cue.text).join(' '), maxWidth,
+        options.measureText, options.language || 'en');
+      let from = 0, spanIndex = 0;
+      const mapped = chunks.map(text => {
+        const to = from + text.replace(/\s/g, '').length;
+        while (spanIndex + 1 < spans.length && spans[spanIndex].end <= from) spanIndex++;
+        const first = spans[spanIndex];
+        let lastIndex = spanIndex;
+        while (lastIndex + 1 < spans.length && spans[lastIndex].end < to) lastIndex++;
+        const last = spans[lastIndex];
+        const time = (span, offset) => Math.round(span.cue.startMs
+          + (span.cue.endMs - span.cue.startMs) * (offset - span.start) / (span.end - span.start));
+        const value = { text, startMs: time(first, from), endMs: time(last, to),
+          sourceCueIndex: first.cue.index, sourceCueEndIndex: last.cue.index };
+        from = to;
+        return value;
+      });
+      mapped.forEach((cue, index) => {
+        const next = mapped[index + 1];
+        if (next && next.startMs > cue.startMs) cue.endMs = Math.min(cue.endMs, next.startMs);
+        cue.endMs = Math.max(cue.startMs + 1, cue.endMs);
+        result.push({ ...cue, index: result.length });
+      });
+    }
+    return result;
   }
 
   function normalizeTerm(value) {
@@ -505,6 +552,20 @@
     return selected;
   }
 
+  function pendingSaveWordIndexes(cues, cueIndex, operations, language) {
+    const indexes = new Set();
+    for (const operation of operations || []) {
+      if (!['preparing', 'saving'].includes(operation?.phase)) continue;
+      // Match each operation separately: overlapping simultaneous saves must
+      // keep the union of their components, rather than claim each other's words.
+      const expression = { ...operation, sourceText: operation.term || operation.key };
+      for (const match of expressionMatchesForCue(cues, cueIndex, [expression], language)) {
+        for (const index of match.wordIndexes) indexes.add(index);
+      }
+    }
+    return Array.from(indexes);
+  }
+
   function sentenceSegments(text, language = 'en') {
     const source = cleanCueText(text);
     if (!source) return [];
@@ -535,13 +596,17 @@
     return parts.length === 1 && /[.!?](?:[\"'”’»\)\]]+)?$/.test(parts[0].text);
   }
 
-  function sentenceDetailsForTerm(text, term, language = 'en') {
+  function sentenceDetailsForTerm(text, term, language = 'en', sourceWordIndex) {
     const source = cleanCueText(text);
     const normalized = normalizeTerm(term);
     if (!source || !normalized) return { text: source, ordinal: 0, complete: sentenceIsComplete(source, language) };
     const parts = sentenceSegments(source, language);
-    const ordinal = parts.findIndex(part => segmentWords(part.text, language)
-      .some(word => word.word && word.normalized === normalized));
+    const indexed = Number.isInteger(sourceWordIndex)
+      ? segmentWords(source, language).filter(part => part.word)[sourceWordIndex] : null;
+    const ordinal = indexed?.normalized === normalized
+      ? parts.findIndex(part => part.index <= indexed.index && part.end > indexed.index)
+      : parts.findIndex(part => segmentWords(part.text, language)
+        .some(word => word.word && word.normalized === normalized));
     const selected = ordinal >= 0 ? parts[ordinal].text : source;
     return { text: selected.trim(), ordinal: Math.max(0, ordinal), complete: sentenceIsComplete(selected, language) };
   }
@@ -592,7 +657,7 @@
       .some((part) => part.word && forms.has(part.normalized));
   }
 
-  function sentenceForCueTerm(cues, cueIndex, term, language = 'en') {
+  function sentenceForCueTerm(cues, cueIndex, term, language = 'en', sourceWordIndex) {
     const list = Array.isArray(cues) ? cues : [];
     const selectedIndex = Math.trunc(Number(cueIndex));
     const selectedCue = list[selectedIndex];
@@ -611,7 +676,9 @@
     }
     const joined = chunks.join(' ');
     const selectedText = cleanCueText(selectedCue.text);
-    const localTerm = segmentWords(selectedText, language).find(part => part.word && part.normalized === normalized);
+    const words = segmentWords(selectedText, language).filter(part => part.word);
+    const indexed = Number.isInteger(sourceWordIndex) ? words[sourceWordIndex] : null;
+    const localTerm = indexed?.normalized === normalized ? indexed : words.find(part => part.normalized === normalized);
     const selectedOffset = offsets[selectedIndex];
     if (!joined || !localTerm || !Number.isFinite(selectedOffset)) return sentenceForTerm(selectedText, term, language);
     const absoluteTermIndex = selectedOffset + localTerm.index;
@@ -620,8 +687,8 @@
     return sentence?.text?.trim() || sentenceForTerm(selectedText, term, language);
   }
 
-  function parallelSentenceForTerm(sourceText, targetText, term, sourceLanguage = 'en', targetLanguage = 'ru') {
-    const source = sentenceDetailsForTerm(sourceText, term, sourceLanguage);
+  function parallelSentenceForTerm(sourceText, targetText, term, sourceLanguage = 'en', targetLanguage = 'ru', sourceWordIndex) {
+    const source = sentenceDetailsForTerm(sourceText, term, sourceLanguage, sourceWordIndex);
     const targetParts = sentenceSegments(targetText, targetLanguage);
     const target = targetParts[source.ordinal]?.text || '';
     return {
@@ -683,6 +750,7 @@
       if (!sourceParts.term) continue;
       rows.push({
         pairIndex: index,
+        label: pair.label || '',
         sourceText: selected.source,
         targetText: selected.target,
         sourcePrefix: sourceParts.prefix,
@@ -841,7 +909,49 @@
     const bounded = Number.isFinite(Number(limit))
       ? clusters.slice(0, Math.max(1, Number(limit)))
       : clusters;
-    return bounded.map(({ concepts, ...pair }) => pair);
+    return bounded.map(({ concepts, ...pair }) => ({ ...pair, label: pair.targets.join(' / ') }));
+  }
+
+  function quickWordTranslationRows(payload, fallbacks = [], limit = 3, sourceText = '') {
+    const rows = [];
+    const seen = new Set();
+    const normalizedSource = normalizeTerm(sourceText);
+    let sourceEcho = null;
+    const push = (value, partOfSpeech = '') => {
+      const text = String(value || '').replace(/\s+/g, ' ').trim();
+      const key = text.toLocaleLowerCase('ru-RU');
+      if (!text || seen.has(key)) return;
+      if (normalizedSource && normalizeTerm(text) === normalizedSource) {
+        sourceEcho ||= { value: text, partOfSpeech: String(partOfSpeech || '').trim() };
+        return;
+      }
+      seen.add(key);
+      rows.push({ value: text, partOfSpeech: String(partOfSpeech || '').trim() });
+    };
+    for (const item of Array.isArray(payload?.dictionary?.translations) ? payload.dictionary.translations : []) {
+      push(item?.displayTarget || item?.normalizedTarget, item?.posTag);
+    }
+    push(payload?.fallback_translation, '');
+    for (const fallback of Array.isArray(fallbacks) ? fallbacks : [fallbacks]) {
+      if (fallback && typeof fallback === 'object') {
+        push(fallback.value || fallback.translation, fallback.partOfSpeech || fallback.pos);
+      } else {
+        push(fallback, '');
+      }
+    }
+    if (!rows.length && sourceEcho) rows.push(sourceEcho);
+    return rows.slice(0, Math.max(1, Math.min(3, Math.trunc(Number(limit) || 3))));
+  }
+
+  function quickWordPopoverLeft(input = {}) {
+    const margin = Math.max(0, Number(input.margin) || 0);
+    const viewportWidth = Math.max(1, Number(input.viewportWidth) || 1);
+    const popoverWidth = Math.max(0, Number(input.popoverWidth) || 0);
+    const anchorLeft = Number(input.anchorLeft) || 0;
+    const anchorWidth = Math.max(0, Number(input.anchorWidth) || 0);
+    const centered = anchorLeft + anchorWidth / 2 - popoverWidth / 2;
+    const maxLeft = Math.max(margin, viewportWidth - popoverWidth - margin);
+    return Math.max(margin, Math.min(maxLeft, centered));
   }
 
   function mergeDictionaryMeaningPairs(dictionary, preferredPairs = [], invalidValues = []) {
@@ -856,7 +966,7 @@
       if (!uncovered.length) continue;
       const overlapping = merged.find((pair) => pair.targets.some((target) => fallback.targets.includes(target)));
       if (overlapping) overlapping.targets = Array.from(new Set([...overlapping.targets, ...uncovered]));
-      else merged.push({ ...fallback, targets: uncovered });
+      else merged.push({ ...fallback, label: fallback.label || uncovered.join(' / '), targets: uncovered });
       uncovered.forEach((target) => covered.add(normalizeTerm(target)));
     }
     return merged;
@@ -978,6 +1088,48 @@
     const candidates = [above, below].filter(top => top >= minTop && top <= maxTop);
     if (!candidates.length) return preferred;
     return candidates.sort((left, right) => Math.abs(left - preferred) - Math.abs(right - preferred))[0];
+  }
+
+  function fitFloatingElement(panel, anchor, { margin = 12, gap = 8, heightLimit = 760, preferBelow = false, scroll = true, bottomLimit } = {}) {
+    if (!panel?.isConnected || !anchor?.getBoundingClientRect) return null;
+    const win = panel.ownerDocument.defaultView, viewport = win.visualViewport;
+    const bounds = { left: viewport?.offsetLeft || 0, top: viewport?.offsetTop || 0,
+      right: (viewport?.offsetLeft || 0) + Math.min(win.innerWidth, viewport?.width || win.innerWidth),
+      bottom: (viewport?.offsetTop || 0) + Math.min(win.innerHeight, viewport?.height || win.innerHeight) };
+    if (Number.isFinite(bottomLimit)) bounds.bottom = Math.min(bounds.bottom, bottomLimit);
+    // An inline panel also has to fit ancestors which actually clip its paint.
+    for (let node = panel.parentElement; node && node !== panel.ownerDocument.documentElement; node = node.parentElement) {
+      const style = win.getComputedStyle(node), rect = node.getBoundingClientRect();
+      if (!rect.width || !rect.height) continue;
+      const sx = node.offsetWidth ? rect.width / node.offsetWidth : 1, sy = node.offsetHeight ? rect.height / node.offsetHeight : 1;
+      const left = rect.left + (node.clientLeft || 0) * sx, top = rect.top + (node.clientTop || 0) * sy;
+      if (/hidden|clip|auto|scroll/.test(style.overflowX)) { bounds.left = Math.max(bounds.left, left); bounds.right = Math.min(bounds.right, left + node.clientWidth * sx); }
+      if (/hidden|clip|auto|scroll/.test(style.overflowY)) { bounds.top = Math.max(bounds.top, top); bounds.bottom = Math.min(bounds.bottom, top + node.clientHeight * sy); }
+    }
+    const parent = panel.offsetParent;
+    const parentRect = parent?.getBoundingClientRect();
+    const fixed = win.getComputedStyle(panel).position === 'fixed' && (!parent || parent === panel.ownerDocument.body);
+    const scaleX = !fixed && parent?.offsetWidth ? parentRect.width / parent.offsetWidth : 1;
+    const scaleY = !fixed && parent?.offsetHeight ? parentRect.height / parent.offsetHeight : 1;
+    const inset = Math.max(0, Math.min(margin, (bounds.right - bounds.left - 1) / 2, (bounds.bottom - bounds.top - 1) / 2));
+    panel.style.boxSizing = 'border-box'; panel.style.minHeight = '0';
+    panel.style.maxWidth = `${Math.max(1, (bounds.right - bounds.left - 2 * inset) / (scaleX || 1))}px`;
+    panel.style.maxHeight = `${Math.max(1, Math.min(heightLimit, (bounds.bottom - bounds.top - 2 * inset) / (scaleY || 1)))}px`;
+    if (scroll) { panel.style.overflowY = 'auto'; panel.style.overscrollBehavior = 'contain'; }
+    panel.style.transform = 'none'; panel.style.bottom = 'auto'; panel.style.right = 'auto';
+    const box = panel.getBoundingClientRect(), a = anchor.getBoundingClientRect();
+    if (!box.width || !box.height) return null;
+    const left = Math.max(bounds.left + inset, Math.min(bounds.right - inset - box.width, a.left + a.width / 2 - box.width / 2));
+    const above = a.top - gap - box.height, below = a.bottom + gap;
+    const fits = top => top >= bounds.top + inset && top + box.height <= bounds.bottom - inset;
+    const preferred = preferBelow ? below : above, alternate = preferBelow ? above : below;
+    const desired = fits(preferred) ? preferred : fits(alternate) ? alternate : preferred;
+    const top = Math.max(bounds.top + inset, Math.min(bounds.bottom - inset - box.height, desired));
+    const originX = fixed ? 0 : (parentRect?.left || 0) + (parent?.clientLeft || 0) * scaleX;
+    const originY = fixed ? 0 : (parentRect?.top || 0) + (parent?.clientTop || 0) * scaleY;
+    panel.style.left = `${(left - originX) / (scaleX || 1) + (fixed ? 0 : parent?.scrollLeft || 0)}px`;
+    panel.style.top = `${(top - originY) / (scaleY || 1) + (fixed ? 0 : parent?.scrollTop || 0)}px`;
+    return { left, top, width: box.width, height: box.height, bounds };
   }
 
   function wordPopoverLayout(input = {}) {
@@ -1164,6 +1316,109 @@
     return result;
   }
 
+  function cuePrefetchItems(cues, currentIndex, ahead = 16, behind = 2) {
+    const items = Array.isArray(cues) ? cues : [];
+    const current = Math.trunc(Number(currentIndex));
+    if (!Number.isInteger(current) || current < 0 || current >= items.length) return [];
+    const first = Math.max(0, current - Math.max(0, Math.trunc(Number(behind) || 0)));
+    const last = Math.min(items.length - 1, current + Math.max(0, Math.trunc(Number(ahead) || 0)));
+    const order = [];
+    for (let index = current; index <= last; index += 1) order.push(index);
+    for (let index = current - 1; index >= first; index -= 1) order.push(index);
+    const seen = new Set();
+    const result = [];
+    for (const index of order) {
+      const cue = items[index];
+      const text = String(cue?.text || '').trim();
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      result.push({ cue, index });
+    }
+    return result;
+  }
+
+  function fullSubtitleRevealActive(input = {}) {
+    return input.translationMode === 'never'
+      && input.metaKeyDown === true;
+  }
+
+  function nextTranslationMode(mode) {
+    return mode === 'always' ? 'never' : 'always';
+  }
+
+  function translationBufferSnapshot(input = {}) {
+    const cues = Array.isArray(input.cues) ? input.cues : [];
+    const currentIndex = Math.trunc(Number(input.currentIndex));
+    const ahead = Math.max(0, Math.trunc(Number(input.ahead) || 0));
+    const mode = input.translationMode === 'always' ? 'always' : 'never';
+    const literal = input.translationOrder === 'source' && input.literalNeeded !== false;
+    const naturalReady = input.naturalReady instanceof Set
+      ? input.naturalReady
+      : new Set(Array.isArray(input.naturalReady) ? input.naturalReady : []);
+    const literalReady = input.literalReady instanceof Set
+      ? input.literalReady
+      : new Set(Array.isArray(input.literalReady) ? input.literalReady : []);
+    const naturalPending = input.naturalPending instanceof Set
+      ? input.naturalPending
+      : new Set(Array.isArray(input.naturalPending) ? input.naturalPending : []);
+    const literalPending = input.literalPending instanceof Set
+      ? input.literalPending
+      : new Set(Array.isArray(input.literalPending) ? input.literalPending : []);
+    const validCurrent = Number.isInteger(currentIndex) && currentIndex >= 0 && currentIndex < cues.length;
+    const currentText = validCurrent ? String(cues[currentIndex]?.text || '').trim() : '';
+    const readySet = literal ? literalReady : naturalReady;
+    const currentReady = !!currentText && readySet.has(currentText);
+    const targetAhead = validCurrent ? Math.min(ahead, Math.max(0, cues.length - currentIndex - 1)) : 0;
+    let readyAhead = 0;
+    if (currentReady) {
+      for (let index = currentIndex + 1; index <= currentIndex + targetAhead; index += 1) {
+        const text = String(cues[index]?.text || '').trim();
+        if (!text || !readySet.has(text)) break;
+        readyAhead += 1;
+      }
+    }
+    const window = validCurrent ? cues.slice(currentIndex, currentIndex + targetAhead + 1) : [];
+    const naturalReadyInWindow = window.filter((cue) => naturalReady.has(String(cue?.text || '').trim())).length;
+    const literalReadyInWindow = window.filter((cue) => literalReady.has(String(cue?.text || '').trim())).length;
+    const naturalPendingInWindow = window.filter((cue) => naturalPending.has(String(cue?.text || '').trim())).length;
+    const literalPendingInWindow = window.filter((cue) => literalPending.has(String(cue?.text || '').trim())).length;
+    let stage = 'captions';
+    if (!validCurrent) stage = 'captions';
+    else if (!naturalReady.has(currentText)) stage = 'azure';
+    else if (literal && !literalReady.has(currentText)) stage = 'gemini';
+    else stage = 'ready';
+    return {
+      mode,
+      literal,
+      stage,
+      currentReady,
+      readyAhead,
+      targetAhead,
+      naturalReadyInWindow,
+      literalReadyInWindow,
+      naturalPendingInWindow,
+      literalPendingInWindow,
+    };
+  }
+
+  function subtitleClipboardText(cues) {
+    const lines = [];
+    for (const cue of Array.isArray(cues) ? cues : []) {
+      const text = cleanCueText(cue?.text || '');
+      if (!text || lines[lines.length - 1] === text) continue;
+      lines.push(text);
+    }
+    return lines.join('\n');
+  }
+
+  function externalMediaSpaceAction(input = {}) {
+    if (!input.external || input.code !== 'Space' || input.modifier || input.editable || input.interactive) {
+      return 'ignore';
+    }
+    if (input.repeat || input.interactionOpen) return 'block';
+    return 'toggle';
+  }
+
   function isDesktopChromiumSpeech(userAgent) {
     const value = String(userAgent || '');
     return /(Chrome|Chromium|Edg)\/[\d.]+/i.test(value)
@@ -1203,6 +1458,7 @@
     parseVttCues,
     pairAdjacentAsrCues,
     splitTimedCuesToFit,
+    layoutTimedCuesToFit,
     findCueIndex,
     normalizeTerm,
     segmentWords,
@@ -1212,6 +1468,7 @@
     literalSpacingFromReference,
     examplesForTerm,
     expressionMatchesForCue,
+    pendingSaveWordIndexes,
     sentenceIsComplete,
     sentenceContainsTerm,
     sentenceForTerm,
@@ -1224,6 +1481,8 @@
     annotatedTextSegments,
     cueNavigationDelta,
     dictionaryMeaningPairs,
+    quickWordTranslationRows,
+    quickWordPopoverLeft,
     mergeDictionaryMeaningPairs,
     classifyRepeatedWordClick,
     dismissalPlaybackOwner,
@@ -1235,13 +1494,19 @@
     subtitleCardPlacement,
     subtitleWidthLayout,
     obstacleAvoidingTop,
-    wordPopoverLayout,
+    wordPopoverLayout, fitFloatingElement,
     floatingPopoverScrollState,
     exampleTranslationChoice,
     literalTargetRangesForTerms,
     learningExamplePresentation,
     batchTexts,
     cueLookaheadItems,
+    cuePrefetchItems,
+    fullSubtitleRevealActive,
+    nextTranslationMode,
+    translationBufferSnapshot,
+    subtitleClipboardText,
+    externalMediaSpaceAction,
     isDesktopChromiumSpeech,
     preferredEnglishSpeechVoice,
     shouldAutoplayCard,

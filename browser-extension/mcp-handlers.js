@@ -1,5 +1,5 @@
 // ============ MCP Bridge ============
-// Connects to local MCP bridge (ws://localhost:3457).
+// Connects to local MCP bridge (ws://127.0.0.1:3457).
 // Allows Claude Code to control the browser via MCP tools.
 //
 // Это расширение (SC Browser Parser) полностью dev-only — никакого
@@ -15,7 +15,7 @@
 // connected; останавливается на close, чтобы не жечь ресурсы при
 // мёртвом bridge'е.
 
-const MCP_WS_URL = 'ws://localhost:3457';
+const MCP_WS_URL = 'ws://127.0.0.1:3457';
 const MCP_KEEPALIVE_ALARM = 'sc-mcp-keepalive';
 let mcpWs = null;
 
@@ -83,7 +83,48 @@ async function connectMcpBridge() {
 }
 
 async function handleMcpCommand(command) {
+  if (command.action === 'mcp_evaluate_raw' && command.world === 'MAIN'
+    && (!Number.isInteger(command.tabId) || command.__implicitTabId)) {
+    return { success: false, error: 'MAIN execution requires an explicit tabId' };
+  }
+  const pageActions = new Set([
+    'mcp_evaluate', 'mcp_evaluate_raw', 'mcp_click', 'mcp_fill', 'mcp_act',
+    'mcp_snapshot', 'mcp_inspect', 'mcp_get_text', 'mcp_scroll', 'mcp_scroll_element',
+    'mcp_hover', 'mcp_wait_for_selector', 'mcp_navigate', 'mcp_reload_tab',
+  ]);
+  if (pageActions.has(command.action) && globalThis.scMcpNativeDialogs) {
+    let explicitTabId = command.tabId;
+    if (!Number.isInteger(explicitTabId)) {
+      const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!active) return { success: false, error: 'No active tab' };
+      explicitTabId = active.id;
+    }
+    return globalThis.scMcpNativeDialogs.run(explicitTabId, command.action,
+      () => handleMcpCommandCore({ ...command, tabId: explicitTabId }));
+  }
+  return handleMcpCommandCore(command);
+}
+
+async function handleMcpCommandCore(command) {
   const { action, tabId } = command;
+
+  if (action === 'mcp_native_browser_info') {
+    const ua = navigator.userAgent || '';
+    let browser = /YaBrowser\//.test(ua) ? 'yandex' : /Edg\//.test(ua) ? 'edge' : null;
+    if (!browser && navigator.brave?.isBrave && await navigator.brave.isBrave()) browser = 'brave';
+    if (!browser && /Chrome\//.test(ua)) browser = 'chrome';
+    return { success: true, browser, capabilities: { evaluateRawWorlds: ['USER_SCRIPT', 'MAIN'] } };
+  }
+
+  // Dialog control never falls back to the active tab or page JS: a modal can
+  // block both content-script execution and the response to the original click.
+  if (action === 'mcp_read_dialog' || action === 'mcp_handle_dialog' || action === 'mcp_release_dialog_observer') {
+    if (!Number.isInteger(tabId)) return { success: false, errorCode: 'DIALOG_ARGUMENTS', error: 'Explicit tabId required' };
+    const dialogs = globalThis.scMcpNativeDialogs;
+    if (!dialogs) return { success: false, errorCode: 'DIALOG_OBSERVER_UNAVAILABLE', error: 'Native dialog controller not loaded' };
+    if (action === 'mcp_release_dialog_observer') return dialogs.release(tabId);
+    return action === 'mcp_read_dialog' ? dialogs.read(tabId, command.operationId) : dialogs.handle(command);
+  }
 
   // Window discovery must not depend on whichever window Chrome currently
   // considers "current" for this service worker. OAuth/payment popups are
@@ -94,6 +135,130 @@ async function handleMcpCommand(command) {
       return { success: true, windows: scMcpSerializeWindows(browserWindows) };
     }
     return { success: true, tabs: scMcpFlattenWindows(browserWindows) };
+  }
+
+  // Read the extension-owned fallback exporter log. This is intentionally
+  // separate from page localStorage/sessionStorage: logger.js mirrors the
+  // last 500 structured events here when Native Messaging is unavailable.
+  if (action === 'mcp_exporter_logs') {
+    const raw = await chrome.storage.local.get({ __aise_buffer: [] });
+    const all = Array.isArray(raw.__aise_buffer) ? raw.__aise_buffer : [];
+    const requestedLimit = Number(command.limit);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(500, Math.max(1, Math.trunc(requestedLimit)))
+      : 200;
+    const filtered = command.exportId
+      ? all.filter(evt => evt?.exportId === command.exportId)
+      : all;
+    return {
+      success: true,
+      events: filtered.slice(-limit),
+      totalBuffered: all.length,
+      matched: filtered.length,
+    };
+  }
+
+  // Trigger the exact same per-site export flow as the popup's
+  // "Экспортировать" button, but for an explicit tab. The command only
+  // acknowledges delivery to the page: AI Studio / Perplexity / Claude run
+  // the export asynchronously and report progress in their in-page overlay.
+  // `downloadFile` defaults to true for agent callers so the result is a
+  // durable artefact instead of silently replacing the user's clipboard.
+  if (action === 'mcp_export_conversation') {
+    if (!Number.isInteger(tabId)) {
+      return { success: false, error: 'tabId is required for conversation export' };
+    }
+
+    const tab = await chrome.tabs.get(tabId);
+    const url = String(tab?.url || '');
+    let site = null;
+    try {
+      const parsed = new URL(url);
+      if (parsed.hostname === 'aistudio.google.com' && /^\/(?:u\/\d+\/)?prompts\//.test(parsed.pathname)) {
+        site = 'aistudio';
+      } else if (parsed.hostname === 'www.perplexity.ai' && /^\/(?:search|computer\/tasks)\//.test(parsed.pathname)) {
+        site = 'perplexity';
+      } else if (parsed.hostname === 'claude.ai' && /^\/chat\/[0-9a-f-]+/i.test(parsed.pathname)) {
+        site = 'claude';
+      } else if ((parsed.hostname === 'chatgpt.com' || parsed.hostname === 'www.chatgpt.com') && /^\/c\//.test(parsed.pathname)) {
+        site = 'chatgpt';
+      }
+    } catch (_) {}
+
+    if (!site) {
+      return {
+        success: false,
+        error: 'Conversation export supports AI Studio, Perplexity, Claude, and ChatGPT chat tabs only',
+      };
+    }
+
+    const stored = await new Promise(resolve => chrome.storage.sync.get({
+      __export: { downloadFile: false },
+      __pplx: {},
+      __claude: {},
+      __chatgpt: {},
+    }, resolve));
+    const requested = command.settings && typeof command.settings === 'object' && !Array.isArray(command.settings)
+      ? command.settings
+      : {};
+    const downloadFile = typeof command.downloadFile === 'boolean' ? command.downloadFile : true;
+    const exportSettings = {
+      ...(stored.__export && typeof stored.__export === 'object' ? stored.__export : {}),
+      ...(requested.__export && typeof requested.__export === 'object' ? requested.__export : {}),
+      downloadFile,
+    };
+
+    let settings;
+    if (site === 'perplexity') {
+      settings = {
+        ...(stored.__pplx && typeof stored.__pplx === 'object' ? stored.__pplx : {}),
+        ...requested,
+        __export: exportSettings,
+      };
+    } else if (site === 'claude') {
+      settings = {
+        ...(stored.__claude && typeof stored.__claude === 'object' ? stored.__claude : {}),
+        ...requested,
+        __export: exportSettings,
+      };
+    } else if (site === 'chatgpt') {
+      settings = {
+        ...(stored.__chatgpt && typeof stored.__chatgpt === 'object' ? stored.__chatgpt : {}),
+        ...requested,
+        __export: exportSettings,
+      };
+    } else {
+      // AI Studio's exporter owns its top-level scrape settings in storage;
+      // only this one-shot override is passed inline and never persisted.
+      settings = { ...requested, __export: exportSettings };
+    }
+
+    let response;
+    try {
+      response = await chrome.tabs.sendMessage(tabId, { action: 'export', settings }, { frameId: 0 });
+    } catch (error) {
+      const message = error?.message || String(error);
+      return {
+        success: false,
+        error: /Receiving end does not exist|Could not establish connection/i.test(message)
+          ? 'Export content script is not attached. Reload this tab and retry.'
+          : message,
+      };
+    }
+
+    if (response?.success === false) {
+      return { success: false, error: response.message || 'Export was rejected by the page' };
+    }
+    return {
+      success: true,
+      accepted: response?.accepted === true || response?.success === true,
+      site,
+      tabId,
+      title: tab?.title || '',
+      url,
+      delivery: downloadFile ? 'download' : 'clipboard',
+      note: 'Command accepted by the page; follow the in-page overlay or exporter log for terminal status.',
+    };
   }
 
   if (action === 'mcp_new_window') {
@@ -161,8 +326,10 @@ async function handleMcpCommand(command) {
   // без manual ⟳ в chrome://extensions/). Отправляем ack ДО reload — иначе
   // вызывающая сторона не получит ответа.
   if (action === 'mcp_force_reload') {
-    setTimeout(() => { try { chrome.runtime.reload(); } catch {} }, 50);
-    return { success: true, reloading: true };
+    const gate = globalThis.scResearchReloadGate;
+    if (!gate?.request) return { success: false, error: 'research-aware reload gate unavailable' };
+    const outcome = await gate.request('mcp_force_reload');
+    return { success: true, ...outcome };
   }
 
   if (action === 'mcp_navigate') {
@@ -237,16 +404,36 @@ async function handleMcpCommand(command) {
         active: false,
       });
     }
-    // Durable identity ДО debugger/load awaits. Если SW reload'нется после
-    // tabs.create, повтор команды найдёт тот же tab и не создаст дубль.
-    if (researchId && typeof scRememberResearchTab === 'function') {
-      await scRememberResearchTab(chrome, researchId, tab);
+    // Lifecycle ownership becomes visible synchronously, before any
+    // debugger/storage/load await. A main-frame failure can happen between
+    // tabs.create() resolution and the first durable storage write; the
+    // navigation coordinator can still recover the id from the URL.
+    let startupTracking = Promise.resolve(null);
+    try {
+      if (typeof beginResearchTabTracking === 'function') {
+        startupTracking = beginResearchTabTracking(RESEARCH_TABS, globalThis.scResearchStartup, {
+          researchId,
+          tab: { ...tab, reused },
+          targetUrl: target,
+        });
+      } else {
+        RESEARCH_TABS.add(tab.id);
+      }
+    } catch (_) {
+      try { RESEARCH_TABS.add(tab.id); } catch {}
     }
     // Set autoDiscardable=false ASAP — до load complete, чтобы Yandex
     // ни секунды не считал её never-active кандидатом на discard.
     try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (e) {
       console.log('[mcp_open_research_tab] autoDiscardable set failed:', e?.message);
     }
+    // Durable identity ДО debugger/load awaits. Если SW reload'нется после
+    // tabs.create, повтор команды найдёт тот же tab и не создаст дубль.
+    const durableWrites = [startupTracking];
+    if (researchId && typeof scRememberResearchTab === 'function') {
+      durableWrites.push(scRememberResearchTab(chrome, researchId, tab));
+    }
+    await Promise.all(durableWrites);
     // Focus-emulation через chrome.debugger — тот же фикс что у aistudio
     // (background.js::attachFocusEmulation). autoDiscardable:false спасает
     // только от discard, НЕ от render-freeze: при долгой деактивации ВСЕГО
@@ -296,12 +483,6 @@ async function handleMcpCommand(command) {
     // Visually distinguish MCP-tab: extension's icon as favicon (sites cannot
     // be put into a specific Yandex tab group programmatically, see research).
     try { await markTabAsMcpVisually(tab.id); } catch {}
-    // В lifecycle-трекинг (background.js::RESEARCH_TABS — общий SW-scope,
-    // mcp-handlers.js подключён через importScripts) — СРАЗУ при открытии,
-    // не дожидаясь keepalive-порта CS. Иначе зомби-вкладка (CS не стартовал:
-    // LNA, расширение протухло) не даёт sw.tab.onRemoved при ручном закрытии,
-    // и bridge не может перевести вечно-queued job в error (tab-closed fallback).
-    try { RESEARCH_TABS.add(tab.id); } catch {}
     return { success: true, tabId: tab.id, url: tab.url || target, researchId, reused };
   }
 
@@ -825,7 +1006,7 @@ async function handleMcpCommand(command) {
     }
   }
 
-  // ── evaluate_raw via chrome.userScripts (USER_SCRIPT world, bypasses CSP) ──
+  // evaluate_raw defaults to USER_SCRIPT; MAIN is explicit and shares page globals.
   // chrome.scripting.executeScript runs in isolated world but is still bound by
   // the page's CSP — `unsafe-eval` is denied on aistudio.google.com / banks /
   // many SPAs, so `new Function(code)` throws.
@@ -833,6 +1014,11 @@ async function handleMcpCommand(command) {
   // explicitly exempt from page CSP and allows eval — exactly what we need.
   // Requires Chrome 135+ and the "Allow user scripts" toggle in chrome://extensions.
   if (action === 'mcp_evaluate_raw') {
+    const world = command.world === undefined ? 'USER_SCRIPT' : command.world;
+    if (!['USER_SCRIPT', 'MAIN'].includes(world)) return { success: false, error: 'Unsupported execution world' };
+    if (world === 'MAIN' && !Number.isInteger(command.tabId)) {
+      return { success: false, error: 'MAIN execution requires an explicit tabId' };
+    }
     if (!chrome.userScripts) {
       return { success: false, error: 'chrome.userScripts unavailable. Need Chrome 135+ and "Allow user scripts" toggle enabled in chrome://extensions for this extension.' };
     }
@@ -898,7 +1084,7 @@ async function handleMcpCommand(command) {
       const results = await chrome.userScripts.execute({
         target: { tabId: targetTabId },
         js: [{ code: wrapped }],
-        world: 'USER_SCRIPT',
+        world,
       });
       const first = results && results[0];
       if (!first) return { success: false, error: 'userScripts.execute returned no frames' };
@@ -906,7 +1092,7 @@ async function handleMcpCommand(command) {
       const r = first.result;
       if (!r) return { success: false, error: 'no result from page' };
       if (!r.ok) return { success: false, error: r.error };
-      return { success: true, result: r.value };
+      return { success: true, result: r.value, executionWorld: world, documentId: first.documentId };
     } catch (e) {
       const msg = e && e.message || String(e);
       // Detect the specific "toggle disabled" symptom.

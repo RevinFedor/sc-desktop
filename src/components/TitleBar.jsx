@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { Settings, Activity, History, Plus } from 'lucide-react'
 import { useStore, pushScreen, toggleScreen, openSettings, toggleActivity, closeActivity } from '../lib/store'
 import { SETTINGS_SECTIONS } from '../lib/settingsSections'
@@ -31,6 +31,26 @@ export default function TitleBar({
   const [requestsPopoverOpen, setRequestsPopoverOpen] = useState(false)
   const fallbackRequestsBtnRef = useRef(null)
   const requestsBtnRef = toggleRef || fallbackRequestsBtnRef
+  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false)
+  const settingsMenuCloseTimer = useRef(null)
+
+  function openSettingsMenu() {
+    if (settingsMenuCloseTimer.current) clearTimeout(settingsMenuCloseTimer.current)
+    settingsMenuCloseTimer.current = null
+    setSettingsMenuOpen(true)
+  }
+
+  function scheduleSettingsMenuClose() {
+    if (settingsMenuCloseTimer.current) clearTimeout(settingsMenuCloseTimer.current)
+    settingsMenuCloseTimer.current = setTimeout(() => {
+      settingsMenuCloseTimer.current = null
+      setSettingsMenuOpen(false)
+    }, 220)
+  }
+
+  useEffect(() => () => {
+    if (settingsMenuCloseTimer.current) clearTimeout(settingsMenuCloseTimer.current)
+  }, [])
 
   // Правые поверхности (MCP-popover, История MCP, панель Запросов) —
   // взаимоисключающие: открытие любой закрывает остальные, иначе панели
@@ -161,7 +181,13 @@ export default function TitleBar({
           </button>
         </div>
 
-        <div className="no-drag relative group flex h-full items-center">
+        <div
+          className="no-drag relative flex h-full items-center"
+          onPointerEnter={openSettingsMenu}
+          onPointerLeave={scheduleSettingsMenuClose}
+          onFocusCapture={openSettingsMenu}
+          onBlurCapture={scheduleSettingsMenuClose}
+        >
           <button
             type="button"
             onClick={() => {
@@ -177,7 +203,15 @@ export default function TitleBar({
             <Settings size={14} />
           </button>
 
-          <div className="absolute right-0 top-full z-50 pt-1 invisible opacity-0 pointer-events-none group-hover:visible group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity">
+          <div
+            data-settings-hover-menu
+            aria-hidden={!settingsMenuOpen}
+            className={`absolute right-0 top-[calc(100%-3px)] z-50 pt-2 transition-opacity ${
+              settingsMenuOpen
+                ? 'visible opacity-100 pointer-events-auto'
+                : 'invisible opacity-0 pointer-events-none'
+            }`}
+          >
             <div
               className="flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-950 p-1 shadow-xl"
               role="menu"

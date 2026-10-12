@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ChevronDown, ChevronUp, Copy, ExternalLink, FileText, FolderOpen, Image as ImageIcon, X } from 'lucide-react'
 import { useAistudioJobs, clearAistudioJob, refreshAistudioJobs } from '../lib/aistudioJobs'
 import McpJobTimer, { hasMcpTimer } from '../components/McpJobTimer'
@@ -6,13 +6,40 @@ import McpJobTimer, { hasMcpTimer } from '../components/McpJobTimer'
 export default function AistudioJobScreen({ payload }) {
   const jobId = payload?.jobId
   const jobs = useAistudioJobs()
-  const job = jobs.find(j => j.jobId === jobId) || null
+  const [detailFallback, setDetailFallback] = useState(null)
+  const [detailLoadedFor, setDetailLoadedFor] = useState(null)
+  const job = jobs.find(j => j.jobId === jobId) || (detailFallback?.jobId === jobId ? detailFallback : null)
+  const acknowledged = useRef(null)
   const [copyToast, setCopyToast] = useState('')
 
   // Navbar/history receive compact summaries. Pull full answers only when the
   // user opens one detail screen; this preserves the complete postmortem UI
   // without moving ~4.4 MB through a loopback poll every 1.5 seconds.
-  useEffect(() => { refreshAistudioJobs({ full: true }) }, [jobId])
+  useEffect(() => {
+    let alive = true
+    setDetailFallback(null)
+    setDetailLoadedFor(null)
+    ;(async () => {
+      const result = await refreshAistudioJobs({ full: true })
+      if (!alive) return
+      if (result?.jobs?.some(job => job.jobId === jobId)) { setDetailLoadedFor(jobId); return }
+      const exact = await window.api?.aistudioListJobs?.({ full: true, jobId })
+      const selected = exact?.jobs?.find(job => job.jobId === jobId)
+      if (alive && selected) { setDetailFallback(selected); setDetailLoadedFor(jobId) }
+      else if (alive && payload?.navigationRequestId) {
+        await window.api?.researchOpenAck?.({ requestId: payload.navigationRequestId, jobId, success: false,
+          error: exact?.error || 'research_job_not_found' })
+      }
+    })().catch(error => console.error('[ResearchNavigation] detail read failed', error))
+    return () => { alive = false }
+  }, [jobId])
+  useLayoutEffect(() => {
+    const requestId = payload?.navigationRequestId
+    if (!job || detailLoadedFor !== jobId || !requestId || acknowledged.current === requestId) return
+    acknowledged.current = requestId
+    window.api?.researchOpenAck?.({ requestId, jobId, success: true })
+      .catch(error => console.error('[ResearchNavigation] ACK failed', error))
+  }, [job, jobId, detailLoadedFor, payload?.navigationRequestId])
 
   // Full refresh above hydrates responseText/sources for this screen. Compact
   // push updates merge over that object without dropping its heavy fields.
@@ -74,7 +101,7 @@ export default function AistudioJobScreen({ payload }) {
   const chatTurns = buildChatTurns(jobs, job)
 
   return (
-    <div className="h-full overflow-auto p-6 space-y-4" style={{ scrollbarGutter: 'stable' }}>
+    <div data-research-job-id={jobId} className="h-full overflow-auto p-6 space-y-4" style={{ scrollbarGutter: 'stable' }}>
       <div className="flex items-center gap-3">
         <Dot status={job.status} />
         <h1 className="text-xl text-zinc-200">{providerTitle(job)}</h1>
@@ -88,7 +115,7 @@ export default function AistudioJobScreen({ payload }) {
             ><ExternalLink size={14} /> В браузере</button>
           )}
           <button
-            onClick={() => clearAistudioJob({ id: job.jobId })}
+            onClick={async () => { await clearAistudioJob({ id: job.jobId }); setDetailFallback(null) }}
             className="text-sm px-2 py-1 rounded text-zinc-400 hover:text-red-400 inline-flex items-center gap-1"
             title="Снять с трекинга"
           ><X size={14} /> Удалить</button>
@@ -427,6 +454,9 @@ function normalizeJobFiles(files) {
         lineStart: Number.isFinite(file?.lineStart) ? file.lineStart : (Number.isFinite(file?.line_start) ? file.line_start : null),
         lineEnd: Number.isFinite(file?.lineEnd) ? file.lineEnd : (Number.isFinite(file?.line_end) ? file.line_end : null),
         bundledCount: Number.isFinite(file?.bundledCount) ? file.bundledCount : (Number.isFinite(file?.bundled_count) ? file.bundled_count : null),
+        bundleIndex: Number.isFinite(file?.bundleIndex) ? file.bundleIndex : (Number.isFinite(file?.bundle_index) ? file.bundle_index : null),
+        bundleCount: Number.isFinite(file?.bundleCount) ? file.bundleCount : (Number.isFinite(file?.bundle_count) ? file.bundle_count : null),
+        sourceTotalCount: Number.isFinite(file?.sourceTotalCount) ? file.sourceTotalCount : (Number.isFinite(file?.source_total_count) ? file.source_total_count : null),
       }
     })
     .filter((file) => file.filePath)
@@ -444,7 +474,12 @@ function InputFileList({ files, onCopyPath, compact = false }) {
           const range = file.lineStart
             ? `строки ${file.lineStart}–${file.lineEnd || 'конец'}`
             : ''
-          const bundle = file.bundledCount ? `объединено ${file.bundledCount}` : ''
+          const bundle = file.bundledCount
+            ? [
+                file.bundleIndex && file.bundleCount ? `пакет ${file.bundleIndex}/${file.bundleCount}` : 'пакет',
+                `${file.bundledCount}${file.sourceTotalCount ? `/${file.sourceTotalCount}` : ''} исходников`,
+              ].join(' · ')
+            : ''
           return (
             <div key={`${file.filePath}-${i}`} className="flex min-w-0 items-center gap-2 text-xs text-zinc-300">
               <FileText size={14} className="shrink-0 text-zinc-500" />

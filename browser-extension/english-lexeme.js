@@ -148,6 +148,7 @@
     const raw = [
       options?.partOfSpeech,
       options?.posTag,
+      ...(Array.isArray(options?.partsOfSpeech) ? options.partsOfSpeech : []),
       ...(Array.isArray(options?.posCandidates) ? options.posCandidates : []),
     ];
     return Array.from(new Set(raw.map(normalizePartOfSpeech).filter((value) => value !== 'unknown')));
@@ -307,15 +308,21 @@
     }
     const providedLemma = normalizeWord(options.lemma);
     const providedPos = normalizePartOfSpeech(options.partOfSpeech || options.posTag);
+    const candidates = explicitParts(options);
     if (providedLemma) {
+      const derived = providedLemma === normalizedSurface
+        && normalizedSurface.endsWith('ing')
+        && !NON_INFLECTED_ING.has(normalizedSurface)
+        && candidates.includes('verb')
+        ? lemmatizeVerb(normalizedSurface)
+        : null;
+      const resolvedLemma = derived?.lemma || providedLemma;
       const confidence = normalizeConfidence(options.analysisConfidence, providedPos === 'unknown' ? 'medium' : 'high');
       return {
-        surface: normalizeText(surface, 500), normalizedSurface, lemma: providedLemma, suggestedLemma: providedLemma,
-        partOfSpeech: providedPos, confidence, provisional: confidence !== 'high', reason: 'provided',
+        surface: normalizeText(surface, 500), normalizedSurface, lemma: resolvedLemma, suggestedLemma: resolvedLemma,
+        partOfSpeech: providedPos, confidence, provisional: confidence !== 'high', reason: derived ? 'provided-derived-ing' : 'provided',
       };
     }
-
-    const candidates = explicitParts(options);
     const inferred = providedPos !== 'unknown'
       ? { partOfSpeech: providedPos, confidence: 'high', reason: 'provided-pos' }
       : inferPartOfSpeech(normalizedSurface, options.context || options.sourceText || '', candidates);
@@ -362,6 +369,7 @@
       ...analyzeWord(surface, {
         lemma: input.lemma,
         partOfSpeech: input.partOfSpeech,
+        partsOfSpeech: input.partsOfSpeech,
         posTag: input.posTag,
         posCandidates: input.posCandidates,
         analysisConfidence: input.analysisConfidence,

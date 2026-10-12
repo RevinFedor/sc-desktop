@@ -1,13 +1,21 @@
 'use strict'
 
 const util = require('node:util')
+const fs = require('node:fs')
 const { parentPort, workerData } = require('node:worker_threads')
+const { chunkTranscript } = require('./youtube-semantic')
+const {
+  INDEX_VERSION,
+  prepareTelegramIndex,
+  telegramIndexPage,
+  publishReadyTelegramGenerations,
+  saveTelegramIndexBatch,
+  telegramFragmentIndexStatus,
+} = require('./telegram-rag-index')
 
 const {
   BATCH_SIZE,
-  CONTEXT_NEIGHBORS,
   RPM_TARGET,
-  buildEmbeddingText,
   errorMessage,
   rpmWindowState,
 } = require('./index-worker-protocol')
@@ -95,81 +103,6 @@ async function sleepUnlessCancelled(ms) {
   throwIfCancelled()
 }
 
-function prepareSelection(sourceId, limit) {
-  const handle = db.getDb()
-  handle.exec('DROP TABLE IF EXISTS temp.index_job_selection')
-  handle.exec(`
-    CREATE TEMP TABLE index_job_selection (
-      seq INTEGER PRIMARY KEY AUTOINCREMENT,
-      item_id INTEGER NOT NULL UNIQUE
-    )
-  `)
-
-  const limitSql = limit ? 'LIMIT ?' : ''
-  const statement = handle.prepare(`
-    INSERT INTO index_job_selection(item_id)
-    SELECT i.id
-      FROM items i
-     WHERE i.source_id = ?
-       AND i.caption IS NOT NULL AND length(trim(i.caption)) > 0
-       AND i.id NOT IN (SELECT item_id FROM items_vec)
-     ORDER BY i.published_at DESC, i.id DESC
-     ${limitSql}
-  `)
-  if (limit) statement.run(sourceId, limit)
-  else statement.run(sourceId)
-
-  return handle.prepare('SELECT COUNT(*) AS n FROM index_job_selection').get()?.n || 0
-}
-
-function selectionPage(afterSeq, limit) {
-  return db.getDb().prepare(`
-    SELECT selected.seq, i.id, i.published_at, i.sender, i.caption, i.type
-      FROM index_job_selection selected
-      JOIN items i ON i.id = selected.item_id
-     WHERE selected.seq > ?
-     ORDER BY selected.seq ASC
-     LIMIT ?
-  `).all(afterSeq, limit)
-}
-
-function buildContextMap(sourceId, batchRows) {
-  const map = new Map()
-  if (!batchRows.length) return map
-
-  // Preserve the old batch-level one-day candidate boundary while keeping
-  // memory bounded: each target performs a LIMIT 5 lookup instead of loading
-  // every caption in a dense day into JavaScript.
-  const minTimestamp = batchRows.reduce(
-    (minimum, row) => Math.min(minimum, Number(row.published_at) || 0),
-    Infinity,
-  )
-  const lowerBound = Math.max(0, (Number.isFinite(minTimestamp) ? minTimestamp : 0) - 86_400)
-  const priorStatement = db.getDb().prepare(`
-    SELECT id, published_at, sender, caption
-      FROM items
-     WHERE source_id = ?
-       AND published_at IS NOT NULL
-       AND published_at < ?
-       AND published_at >= ?
-       AND caption IS NOT NULL AND length(trim(caption)) > 0
-     ORDER BY published_at DESC, id DESC
-     LIMIT ?
-  `)
-
-  for (const row of batchRows) {
-    if (row.published_at == null) {
-      map.set(row.id, [])
-      continue
-    }
-    const priors = priorStatement
-      .all(sourceId, row.published_at, lowerBound, CONTEXT_NEIGHBORS)
-      .reverse()
-    map.set(row.id, priors)
-  }
-  return map
-}
-
 function resetOrphan(sourceId) {
   try {
     const orphan = db.findRunningJobForSource('tg_index', sourceId)
@@ -178,6 +111,186 @@ function resetOrphan(sourceId) {
     console.log(`[IndexJob] reset orphan running row #${orphan.id} on source #${sourceId} → interrupted`)
   } catch (error) {
     console.warn(`[IndexJob] orphan guard failed on source #${sourceId}: ${errorMessage(error)}`)
+  }
+}
+
+function resetYoutubeOrphan(sourceId) {
+  try {
+    const orphan = db.findRunningJobForSource('yt_index', sourceId)
+    if (!orphan) return
+    db.updateJob(orphan.id, { status: 'interrupted' })
+    console.log(`[YouTubeIndex] reset orphan running row #${orphan.id} on source #${sourceId} → interrupted`)
+  } catch (error) {
+    console.warn(`[YouTubeIndex] orphan guard failed on source #${sourceId}: ${errorMessage(error)}`)
+  }
+}
+
+function ensureYoutubeChunks(sourceId) {
+  const source = db.getSource(sourceId)
+  if (!source || source.platform !== 'youtube') throw new Error(`YouTube source #${sourceId} not found`)
+  const rows = db.listYoutubeTranscriptItemsForIndex(sourceId)
+  const validItemIds = []
+  let changedVideos = 0
+  let chunks = 0
+  for (const row of rows) {
+    throwIfCancelled()
+    let raw = ''
+    try { raw = fs.readFileSync(row.transcript_path, 'utf8') } catch {
+      db.replaceSemanticChunksForItem({
+        itemId: row.id,
+        sourceId,
+        documentHash: 'missing',
+        chunks: [],
+      })
+      continue
+    }
+    const result = chunkTranscript(raw, { durationSeconds: row.duration_seconds })
+    if (!result.documentHash || !result.chunks.length) {
+      db.replaceSemanticChunksForItem({
+        itemId: row.id,
+        sourceId,
+        documentHash: 'empty',
+        chunks: [],
+      })
+      continue
+    }
+    const replaced = db.replaceSemanticChunksForItem({
+      itemId: row.id,
+      sourceId,
+      documentHash: result.documentHash,
+      chunks: result.chunks,
+    })
+    validItemIds.push(row.id)
+    chunks += result.chunks.length
+    if (replaced.changed) changedVideos += 1
+  }
+  console.log(`[YouTubeIndex] prepared source #${sourceId} videos=${validItemIds.length} chunks=${chunks} changed=${changedVideos}`)
+  return { source, rows, validItemIds, chunks, changedVideos }
+}
+
+function youtubeChunkEmbeddingText(row) {
+  const channel = row.source_title || row.source_handle || ''
+  const title = row.title || row.external_id || 'YouTube video'
+  return `Channel: ${channel}\nVideo: ${title}\nFragment ${Number(row.chunk_index) + 1}:\n${String(row.text || '').slice(0, 5000)}`
+}
+
+async function runYoutubeIndexJob(data) {
+  const sourceId = data.sourceId
+  const limit = data.limit || null
+  const origin = data.origin || 'unknown'
+  const liveId = data.jobId
+  const setupStarted = Date.now()
+
+  throwIfCancelled()
+  resetYoutubeOrphan(sourceId)
+  const prepared = ensureYoutubeChunks(sourceId)
+  throwIfCancelled()
+
+  const selectedItems = limit ? prepared.rows.slice(0, limit) : prepared.rows
+  const selectedIds = selectedItems.map(row => row.id)
+  const missing = db.listUnindexedSemanticChunks(sourceId, selectedIds)
+  const initial = db.semanticChunkIndexStatus(sourceId)
+  const itemsTotal = missing.length
+  console.log(`[YouTubeIndex] start source #${sourceId} origin=${origin} limit=${limit || 'full'} ` +
+    `selection chunks=${itemsTotal} existing=${initial.done}/${initial.total}`)
+  if (!itemsTotal) return { type: 'noop', reason: 'already-indexed' }
+
+  const startedAt = Math.floor(Date.now() / 1000)
+  let dbRowId = null
+  try {
+    dbRowId = db.recordJob({
+      type: 'yt_index',
+      source_id: sourceId,
+      status: 'running',
+      items_total: itemsTotal,
+      params: { limit, origin, unit: 'fragments' },
+      started_at: startedAt,
+    })
+  } catch (error) {
+    console.error('[YouTubeIndex] recordJob failed', errorMessage(error))
+  }
+
+  post({
+    type: 'started',
+    dbRowId,
+    itemsTotal,
+    initialIndexed: initial.done,
+    startedAt,
+  })
+
+  let itemsDone = 0
+  let status = 'running'
+  let failure = null
+  let requestLog = []
+  try {
+    for (let offset = 0; offset < missing.length; offset += BATCH_SIZE) {
+      throwIfCancelled()
+      const batch = missing.slice(offset, offset + BATCH_SIZE)
+      while (true) {
+        throwIfCancelled()
+        const window = rpmWindowState(requestLog, batch.length)
+        requestLog = window.entries
+        if (!window.waitMs) break
+        console.log(`[YouTubeIndex] #${liveId} RPM throttle: ${window.units} in window, ` +
+          `+${batch.length} would exceed ${RPM_TARGET}, sleeping ${window.waitMs}ms`)
+        await sleepUnlessCancelled(window.waitMs)
+      }
+
+      const embedStarted = Date.now()
+      const vectors = await waitForOrCancel(embedBatch(batch.map(youtubeChunkEmbeddingText), 'RETRIEVAL_DOCUMENT'))
+      requestLog.push({ ts: embedStarted, units: batch.length })
+      throwIfCancelled()
+      db.bulkUpsertSemanticChunkVectors(batch.map((row, index) => ({
+        chunk_id: row.id,
+        source_id: sourceId,
+        embedding: vectors[index],
+      })))
+      itemsDone += batch.length
+      if (dbRowId) {
+        try { db.updateJob(dbRowId, { items_done: itemsDone }) } catch (error) {
+          console.error('[YouTubeIndex] mid-run updateJob failed', errorMessage(error))
+        }
+      }
+      console.log(`[YouTubeIndex] #${liveId} batch ${Math.floor(offset / BATCH_SIZE) + 1}/${Math.ceil(missing.length / BATCH_SIZE)} ` +
+        `chunks=${batch.length} embed_ms=${Date.now() - embedStarted} → ${itemsDone}/${itemsTotal}`)
+      post({ type: 'progress', itemsDone, itemsTotal })
+    }
+    status = 'done'
+  } catch (error) {
+    if (error?.code === 'INDEX_CANCELLED' || errorMessage(error) === 'cancelled' || isCancelled()) {
+      status = 'cancelled'
+      failure = null
+      console.log(`[YouTubeIndex] #${liveId} cancelled at ${itemsDone}/${itemsTotal}`)
+    } else {
+      status = 'error'
+      failure = errorMessage(error)
+      console.error(`[YouTubeIndex] #${liveId} failed: ${failure}`)
+    }
+  } finally {
+    const finishedAt = Math.floor(Date.now() / 1000)
+    if (dbRowId) {
+      try {
+        db.updateJob(dbRowId, {
+          status,
+          items_done: itemsDone,
+          error: failure,
+          finished_at: finishedAt,
+        })
+      } catch (error) {
+        console.error('[YouTubeIndex] updateJob failed', errorMessage(error))
+      }
+    }
+    console.log(`[YouTubeIndex] end source #${sourceId} status=${status} ` +
+      `chunks=${itemsDone}/${itemsTotal} total_ms=${Date.now() - setupStarted}`)
+    return {
+      type: 'terminal',
+      status,
+      itemsDone,
+      itemsTotal,
+      error: failure,
+      finishedAt,
+      dbRowId,
+    }
   }
 }
 
@@ -191,19 +304,26 @@ async function runIndexJob(data) {
   throwIfCancelled()
   resetOrphan(sourceId)
   throwIfCancelled()
+  if (process.env.SC_INDEX_WORKER_FIXTURE === '1') {
+    const delay = Math.max(0, Number(process.env.SC_INDEX_WORKER_FIXTURE_PREPARE_DELAY_MS) || 0)
+    if (delay) await sleepUnlessCancelled(delay)
+  }
 
   const selectStarted = Date.now()
-  const itemsTotal = prepareSelection(sourceId, limit)
+  const prepared = prepareTelegramIndex(db, sourceId, limit, { throwIfCancelled, itemIds: data.itemIds })
+  const itemsTotal = prepared.messagesPending
   console.log(`[IndexJob] start source #${sourceId} origin=${origin} limit=${limit || 'full'} ` +
-    `selection rows=${itemsTotal} took ${Date.now() - selectStarted}ms`)
+    `selection messages=${prepared.messagesSelected} fragments=${prepared.fragmentsSelected} ` +
+    `pending_messages=${itemsTotal} pending_fragments=${prepared.fragmentsPending} ` +
+    `changed=${prepared.changedMessages} took ${Date.now() - selectStarted}ms`)
   if (!itemsTotal) {
     return { type: 'noop', reason: 'already-indexed' }
   }
 
   throwIfCancelled()
-  const countStarted = Date.now()
-  const initialIndexed = db.vectorCountForSource(sourceId)
-  console.log(`[IndexJob] start source #${sourceId} vectorCount=${initialIndexed} took ${Date.now() - countStarted}ms`)
+  // Count messages only after complete atomic publication. Staged fragment
+  // vectors are resumable work, not searchable coverage.
+  const initialIndexed = prepared.messagesSelected - prepared.messagesPending
 
   const startedAt = Math.floor(Date.now() / 1000)
   let dbRowId = null
@@ -213,7 +333,12 @@ async function runIndexJob(data) {
       source_id: sourceId,
       status: 'running',
       items_total: itemsTotal,
-      params: { limit, origin },
+      params: {
+        limit, origin, unit: 'messages', messages_selected: prepared.messagesSelected,
+        fragments_total: prepared.fragmentsPending, fragments_selected: prepared.fragmentsSelected,
+        index_version: INDEX_VERSION,
+        ...(data.itemIds != null ? { item_ids: data.itemIds } : {}),
+      },
       started_at: startedAt,
     })
   } catch (error) {
@@ -226,6 +351,10 @@ async function runIndexJob(data) {
     itemsTotal,
     initialIndexed,
     startedAt,
+    unit: 'messages',
+    messagesSelected: prepared.messagesSelected,
+    fragmentsTotal: prepared.fragmentsPending,
+    indexVersion: INDEX_VERSION,
   })
   console.log(`[IndexJob] start source #${sourceId} origin=${origin} live #${liveId} setup took ${Date.now() - setupStarted}ms`)
 
@@ -237,27 +366,21 @@ async function runIndexJob(data) {
   }
   let requestLog = []
   let afterSeq = 0
+  let fragmentsEmbedded = 0
 
   try {
+    job.itemsDone += publishReadyTelegramGenerations(db)
     while (job.itemsDone < job.itemsTotal) {
       throwIfCancelled()
-      const pageSize = Math.min(BATCH_SIZE, job.itemsTotal - job.itemsDone)
-      const batch = selectionPage(afterSeq, pageSize)
+      const batch = telegramIndexPage(db, afterSeq, BATCH_SIZE)
       if (!batch.length) {
-        throw new Error(`index selection changed: ${job.itemsDone}/${job.itemsTotal} rows remained available`)
+        throw new Error(`index selection changed: ${job.itemsDone}/${job.itemsTotal} messages published without remaining fragments`)
       }
       afterSeq = batch[batch.length - 1].seq
 
-      const contextStarted = Date.now()
-      const contextMap = buildContextMap(sourceId, batch)
-      const contextMs = Date.now() - contextStarted
-      const batchNumber = Math.floor(job.itemsDone / BATCH_SIZE) + 1
-      const batchCount = Math.ceil(job.itemsTotal / BATCH_SIZE)
-      if (contextMs >= 100) {
-        console.log(`[IndexJob] #${liveId} slow context batch ${batchNumber}/${batchCount} ` +
-          `source #${sourceId} origin=${origin} rows=${batch.length} ctx_ms=${contextMs}`)
-      }
-      const texts = batch.map(row => buildEmbeddingText(row, contextMap.get(row.id) || []))
+      const batchNumber = Math.floor(fragmentsEmbedded / BATCH_SIZE) + 1
+      const batchCount = Math.ceil(prepared.fragmentsPending / BATCH_SIZE)
+      const texts = batch.map(row => row.embedding_text)
 
       while (true) {
         throwIfCancelled()
@@ -275,16 +398,15 @@ async function runIndexJob(data) {
       requestLog.push({ ts: embedStarted, units: batch.length })
 
       throwIfCancelled()
-      const vectorRows = batch.map((row, index) => ({ item_id: row.id, embedding: vectors[index] }))
       const writeStarted = Date.now()
-      db.bulkUpsertVectors(vectorRows)
+      job.itemsDone += saveTelegramIndexBatch(db, batch, vectors)
+      fragmentsEmbedded += batch.length
       const writeMs = Date.now() - writeStarted
       if (writeMs >= 100) {
-        console.log(`[IndexJob] #${liveId} slow bulkUpsert batch ${batchNumber}/${batchCount} ` +
-          `source #${sourceId} origin=${origin} rows=${vectorRows.length} bulk_ms=${writeMs}`)
+        console.log(`[IndexJob] #${liveId} slow stage/publish batch ${batchNumber}/${batchCount} ` +
+          `source #${sourceId} origin=${origin} fragments=${batch.length} write_ms=${writeMs}`)
       }
 
-      job.itemsDone += batch.length
       if (dbRowId) {
         try {
           const updateStarted = Date.now()
@@ -301,9 +423,9 @@ async function runIndexJob(data) {
       const window = rpmWindowState(requestLog, 0)
       requestLog = window.entries
       console.log(`[IndexJob] #${liveId} batch ${batchNumber}/${batchCount} ` +
-        `(${batch.length} msgs, total=${Date.now() - embedStarted}ms embed=${embedMs}ms ` +
-        `bulk=${writeMs}ms ctx=${contextMs}ms, ${window.units} RPM in window) → ${job.itemsDone}/${job.itemsTotal}`)
-      post({ type: 'progress', itemsDone: job.itemsDone, itemsTotal: job.itemsTotal })
+        `(${batch.length} fragments, total=${Date.now() - embedStarted}ms embed=${embedMs}ms ` +
+        `write=${writeMs}ms, ${window.units} RPM in window) → ${job.itemsDone}/${job.itemsTotal} messages published`)
+      post({ type: 'progress', itemsDone: job.itemsDone, itemsTotal: job.itemsTotal, fragmentsEmbedded })
     }
     job.status = 'done'
   } catch (error) {
@@ -343,10 +465,12 @@ async function runIndexJob(data) {
 }
 
 function statusForSource(sourceId) {
-  const handle = db.getDb()
-  const total = handle.prepare('SELECT COUNT(*) AS n FROM items WHERE source_id = ?').get(sourceId)?.n || 0
-  const indexed = db.vectorCountForSource(sourceId)
-  return { state: 'idle', done: indexed, total }
+  return telegramFragmentIndexStatus(db, sourceId)
+}
+
+function statusForYoutubeSource(sourceId) {
+  ensureYoutubeChunks(sourceId)
+  return db.semanticChunkIndexStatus(sourceId)
 }
 
 function recoverJob(data) {
@@ -361,7 +485,7 @@ function recoverJob(data) {
 }
 
 function recoverSourceJob(data) {
-  const row = db.findRunningJobForSource('tg_index', data.sourceId)
+  const row = db.findRunningJobForSource(data.mode === 'boosty' ? 'boosty_index' : data.mode === 'youtube' ? 'yt_index' : 'tg_index', data.sourceId)
   if (!row) return { updated: false }
   db.updateJob(row.id, {
     status: data.status,
@@ -375,10 +499,22 @@ function recoverSourceJob(data) {
 async function run() {
   const operation = workerData?.operation
   if (operation === 'index') {
-    return runIndexJob(workerData)
+    if (workerData?.mode === 'boosty') return require('./boosty-rag-index').runBoostyIndex(db, workerData, {
+      post, embedBatch, throwIfCancelled, waitForOrCancel, sleepUnlessCancelled, isCancelled,
+    })
+    return workerData?.mode === 'youtube'
+      ? runYoutubeIndexJob(workerData)
+      : runIndexJob(workerData)
   }
   if (operation === 'status') {
-    return { type: 'result', result: statusForSource(workerData.sourceId) }
+    return {
+      type: 'result',
+      result: workerData?.mode === 'boosty'
+        ? require('./boosty-rag').indexStatus(db, { source_id: workerData.sourceId })
+        : workerData?.mode === 'youtube'
+        ? statusForYoutubeSource(workerData.sourceId)
+        : statusForSource(workerData.sourceId),
+    }
   }
   if (operation === 'recover') {
     return { type: 'result', result: recoverJob(workerData) }

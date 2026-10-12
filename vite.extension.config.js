@@ -11,7 +11,9 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: path.join(rootDir, 'browser-extension', 'study'),
-    emptyOutDir: true,
+    // This directory is a live unpacked extension. Direct Vite builds must
+    // never remove its manifest-referenced options page before emitting it.
+    emptyOutDir: false,
     sourcemap: false,
     rollupOptions: {
       output: {

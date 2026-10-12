@@ -553,14 +553,19 @@ function AwaitingAiPanel({ yt, engine, setEngine, onConfirm, busy }) {
 
 function TranscribingPanel({ job }) {
   const eng = job?.yt?.engine || 'AI'
+  const downloadingAudio = job?.yt?.stage === 'downloading_audio'
   return (
     <div className="rounded-md border border-zinc-800 bg-zinc-900 px-4 py-3 mb-3">
       <div className="flex items-center gap-2 mb-1">
         <Spinner />
-        <span className="text-zinc-200">Транскрибация ({eng})…</span>
+        <span className="text-zinc-200">
+          {downloadingAudio ? 'Скачиваем аудио с YouTube…' : `Расшифровываем через ${eng}…`}
+        </span>
       </div>
       <div className="text-zinc-500" style={{ fontSize: '14px' }}>
-        Скачиваю аудио → отправляю в API. Может занять несколько минут.
+        {downloadingAudio
+          ? 'Нейросеть ещё не запущена. Для речи видео не скачивается в высоком качестве.'
+          : 'Аудио уже получено и отправлено в AI. Может занять несколько минут.'}
       </div>
     </div>
   )

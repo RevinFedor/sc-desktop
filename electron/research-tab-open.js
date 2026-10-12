@@ -30,13 +30,25 @@ function jobHasStarted(snapshot) {
   if (!snapshot || typeof snapshot !== 'object') return false
   if (Number.isInteger(snapshot.tabId)) return true
   if (snapshot.status && snapshot.status !== 'queued') return true
-  return !!(snapshot.stage && snapshot.stage !== 'queued')
+  return !!(snapshot.stage && !['queued', 'prepared', 'opening'].includes(snapshot.stage))
 }
 
-async function reconcileResearchTabOpen({ openTab, findTab, getSnapshot, delay }) {
+async function reconcileResearchTabOpen({ openTab, findTab, getSnapshot, delay, retryAfterMissing = true }) {
   try {
     const response = await openTab()
-    return { tabId: tabIdFromResponse(response), openState: 'opened', attempts: 1, response }
+    if (response?.success === false || response?.result?.success === false) {
+      return { tabId: null, openState: 'failed', attempts: 1,
+        openError: errorText(response.error || response.result?.error || 'extension rejected browser open'), response }
+    }
+    const tabId = tabIdFromResponse(response)
+    if (tabId == null) {
+      const snapshot = typeof getSnapshot === 'function' ? getSnapshot() : null
+      return { tabId: null,
+        openState: jobHasStarted(snapshot) ? 'started_without_tab_ack' : 'delivery_unknown',
+        attempts: 1, response,
+        openWarning: 'The extension returned no browser tab identity' }
+    }
+    return { tabId, openState: 'opened', attempts: 1, response }
   } catch (firstError) {
     if (!isAmbiguousDeliveryError(firstError)) {
       return { tabId: null, openState: 'failed', attempts: 1, openError: errorText(firstError) }
@@ -53,6 +65,13 @@ async function reconcileResearchTabOpen({ openTab, findTab, getSnapshot, delay }
           attempts: 2,
           openWarning: errorText(firstError),
           response: found,
+        }
+      }
+
+      if (!retryAfterMissing) {
+        return {
+          tabId: null, openState: 'delivery_unknown', attempts: 2,
+          openWarning: errorText(firstError),
         }
       }
 

@@ -33,6 +33,8 @@ from pathlib import Path
 _REAL_STDOUT = sys.stdout
 _ACTIVE_TEMP_DIR = None
 _ACTIVE_PROCESS = None
+_STRICT_CONFIG = None
+_RECEIPT_DIR = None
 
 
 def emit(event):
@@ -41,7 +43,19 @@ def emit(event):
 
 
 def emit_item(event, context=None):
+    if _STRICT_CONFIG and event.get("type") in {"download_progress", "download_processing", "download_done", "transcribe_start", "transcribe_progress"}:
+        try:
+            from shared.boosty_storage import inspect_storage
+            inspect_storage(_STRICT_CONFIG, external_mount=_STRICT_CONFIG["external_mount"],
+                            expected_volume_uuid=_STRICT_CONFIG["volume_uuid"], reserve_bytes=_STRICT_CONFIG["reserve_bytes"])
+        except Exception:
+            process = _ACTIVE_PROCESS
+            if process and process.poll() is None:
+                process.terminate()
+            raise RuntimeError("Внешний storage proof изменился; медиа/ASR остановлены") from None
     payload = dict(event)
+    if _STRICT_CONFIG:
+        payload.pop("thumbnail", None)
     if context:
         payload.update(context)
     emit(payload)
@@ -183,7 +197,7 @@ def yt_dlp_binary():
     return executable
 
 
-def load_metadata(canonical_url, cookie_path):
+def load_metadata(canonical_url, cookie_path, *, allow_empty_formats=False):
     result = subprocess.run(
         [
             yt_dlp_binary(),
@@ -192,6 +206,7 @@ def load_metadata(canonical_url, cookie_path):
             "--skip-download",
             "--no-warnings",
             "--no-color",
+            *(["--ignore-no-formats-error"] if allow_empty_formats else []),
             canonical_url,
         ],
         capture_output=True,
@@ -383,6 +398,8 @@ def download_audio(
         "--progress-template", progress_template,
         "--print", "after_move:__SC_FILE__%(filepath)s",
     ]
+    if _STRICT_CONFIG:
+        command.extend(["--no-cache-dir", "--paths", "temp:" + str(work_dir)])
     if save_video:
         command.extend([
             "--format", (
@@ -453,6 +470,16 @@ def download_audio(
             stderr_text = process.stderr.read()
         code = process.wait()
     finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
+            except Exception:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
         _ACTIVE_PROCESS = None
     if code != 0:
         raise RuntimeError(redact_error(stderr_text.strip() or f"yt-dlp exited {code}"))
@@ -526,6 +553,12 @@ def transcribe_assemblyai(audio_path, item_context=None):
     aai.settings.polling_interval = 5.0
     config = aai.TranscriptionConfig(language_detection=True)
     config.speech_models = ["universal-2"]
+    if _STRICT_CONFIG:
+        approved = _STRICT_CONFIG.get("asr_profile") or {}
+        if approved.get("approved_by_user") is not True or approved.get("engine") != "assemblyai" or approved.get("language_detection") is not True or approved.get("speaker_labels") is not True or not approved.get("speech_models"):
+            raise RuntimeError("Explicit user model+cost release and diarization required; no paid fallback")
+        config = aai.TranscriptionConfig(language_detection=True, speaker_labels=True,
+                                       speech_models=approved["speech_models"])
     transcriber = aai.Transcriber()
 
     emit_item({"type": "transcribe_start", "engine": "assemblyai"}, item_context)
@@ -533,7 +566,22 @@ def transcribe_assemblyai(audio_path, item_context=None):
         {"type": "transcribe_progress", "engine": "assemblyai", "stage": "uploading"},
         item_context,
     )
-    transcript = transcriber.submit(str(audio_path), config=config)
+    receipt = None
+    if _RECEIPT_DIR:
+        from shared.boosty_asr_receipt import Receipt
+        video_id = str((item_context or {}).get("video_id") or "")
+        if not re.fullmatch(r"[\w-]{1,100}", video_id):
+            raise RuntimeError("Exact child ID is required for paid receipt")
+        receipt = Receipt(Path(_RECEIPT_DIR) / (video_id + ".json"), {"source_id": _STRICT_CONFIG["source_id"], "video_id": video_id,
+            "workflow_id": _STRICT_CONFIG["owner_workflow_id"], "engine": "assemblyai", "speech_models": config.speech_models,
+            "language_detection": True, "speaker_labels": True})
+        client = aai.Client.get_default()
+        def get_existing(transcript_id):
+            response = aai_api.get_transcript(client=client.http_client, transcript_id=transcript_id)
+            return aai.Transcript.from_response(client=client, response=response)
+        transcript = receipt.get_or_submit(audio_path, lambda: transcriber.submit(str(audio_path), config=config), get_existing)
+    else:
+        transcript = transcriber.submit(str(audio_path), config=config)
     audio_duration_sec = None
     try:
         if transcript.audio_duration:
@@ -588,6 +636,18 @@ def transcribe_assemblyai(audio_path, item_context=None):
         srt = transcript.export_subtitles_srt()
     except Exception:
         srt = None
+    if receipt:
+        if not srt or not srt.strip():
+            raise RuntimeError("ASR completed, but SRT is missing; retain media and recover this receipt")
+        utterances = []
+        for utterance in transcript.utterances or []:
+            utterances.append({'speaker_label': utterance.speaker, 'start_ms': utterance.start, 'end_ms': utterance.end,
+                               'text': utterance.text, 'role': None})
+        if not utterances:
+            raise RuntimeError('Requested diarization output missing; retain media and recover the exact provider ID')
+        receipt.completed(transcript.id, {'speaker_labels': 'provider_assigned_not_verified_identity',
+                                         'utterances': utterances, 'speech_models_requested': config.speech_models,
+                                         'language_detection_requested': True, 'mixed_RU_EN_quality_verified': False})
     emit_item(
         {"type": "transcribe_done", "engine": "assemblyai", "chars": len(text), "cost_usd": 0},
         item_context,
@@ -642,11 +702,18 @@ def write_results(transcript_root, canonical, media, text, srt):
         "source: boosty",
         "transcription: assemblyai",
     ]
-    text_path.write_text("\n".join(header) + "\n\n" + text, encoding="utf-8")
+    def publish(path, content):
+        temporary = path.with_suffix(path.suffix + ".part")
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    publish(text_path, "\n".join(header) + "\n\n" + text)
     srt_path = None
     if srt:
         srt_path = expected_srt_path
-        srt_path.write_text(srt, encoding="utf-8")
+        publish(srt_path, srt)
     return text_path, srt_path
 
 
@@ -713,7 +780,7 @@ def select_requested_videos(info, requests):
                     match, match_index = entry, index
                     break
         position = request.get("position")
-        if match is None and position and 1 <= int(position) <= len(entries):
+        if match is None and position and not _STRICT_CONFIG and 1 <= int(position) <= len(entries):
             match_index = int(position)
             match = entries[match_index - 1]
         if match is None:
@@ -743,7 +810,31 @@ def main(argv):
     parser.add_argument("--video-dir", help=argparse.SUPPRESS)
     parser.add_argument("--force-download", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--metadata-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--strict-storage-plan", help=argparse.SUPPRESS)
+    parser.add_argument("--asr-receipt-dir", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    global _STRICT_CONFIG, _RECEIPT_DIR
+    if args.strict_storage_plan:
+        workers_root = str(Path(__file__).resolve().parents[1])
+        if workers_root not in sys.path:
+            sys.path.insert(0, workers_root)
+        from shared.boosty_storage import inspect_storage
+        _STRICT_CONFIG = json.loads(Path(args.strict_storage_plan).read_text(encoding="utf-8"))
+        profile = _STRICT_CONFIG.get('asr_profile') or {}
+        if profile.get('approved_by_user') is not True or profile.get('engine') != 'assemblyai' or profile.get('language_detection') is not True or profile.get('speaker_labels') is not True or not profile.get('speech_models'):
+            raise RuntimeError('Model+cost release is required before any media/ASR')
+        if args.force_download or args.save_video or args.download_only:
+            raise RuntimeError('Strict catchup cannot force/replay or archive video')
+        if str(Path(args.media_dir).resolve()) != _STRICT_CONFIG["audio_dir"] or str(Path(args.work_dir).resolve()) != _STRICT_CONFIG["work_dir"] or str(Path(args.transcript_dir).resolve()) != _STRICT_CONFIG["transcript_dir"]:
+            raise RuntimeError("Worker paths differ from the admitted storage proof")
+        inspect_storage(_STRICT_CONFIG, external_mount=_STRICT_CONFIG["external_mount"],
+                        expected_volume_uuid=_STRICT_CONFIG["volume_uuid"], reserve_bytes=_STRICT_CONFIG["reserve_bytes"])
+        tempfile.tempdir = args.work_dir
+        _RECEIPT_DIR = args.asr_receipt_dir
+        if not _RECEIPT_DIR or not Path(_RECEIPT_DIR).resolve().is_relative_to(Path(_STRICT_CONFIG["library_root"]).resolve()):
+            raise RuntimeError("Paid receipt must remain on Mac in Library")
+    else:
+        _STRICT_CONFIG = _RECEIPT_DIR = None
 
     if args.save_video and not args.video_dir:
         raise ValueError("Для сохранения видео нужна --video-dir")
@@ -766,7 +857,11 @@ def main(argv):
 
     expiration = os.environ.get("SC_BOOSTY_AUTH_EXPIRES")
     Path(args.work_dir).mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="boosty-", dir=args.work_dir) as temp_dir:
+    # Strict catchup retains unknown/failed media. Only verified own-media
+    # cleanup in the app may remove it; a Python context manager must not.
+    workspace = contextlib.nullcontext(str(Path(args.work_dir) / "worker")) if _STRICT_CONFIG else tempfile.TemporaryDirectory(prefix="boosty-", dir=args.work_dir)
+    with workspace as temp_dir:
+        Path(temp_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
         global _ACTIVE_TEMP_DIR
         _ACTIVE_TEMP_DIR = temp_dir
         cookie_path = write_cookie_file(temp_dir, cookie, expiration)
@@ -1005,6 +1100,11 @@ def main(argv):
                         text,
                         srt,
                     )
+                    if _RECEIPT_DIR:
+                        receipt_path = Path(_RECEIPT_DIR) / (descriptor['video_id'] + '.json')
+                        from shared.boosty_asr_receipt import Receipt
+                        paid = json.loads(receipt_path.read_text(encoding='utf-8'))
+                        Receipt(receipt_path, paid['identity']).bind_saved_pair(text_path, srt_path)
                     saved = {
                         "file_path": str(text_path),
                         "srt_path": str(srt_path) if srt_path else None,
@@ -1072,6 +1172,11 @@ def main(argv):
             emit({"type": "error", "code": code, "message": message})
             return 4
         finally:
+            if _STRICT_CONFIG:
+                try:
+                    cookie_path.unlink()
+                except OSError:
+                    pass
             _ACTIVE_TEMP_DIR = None
 
 

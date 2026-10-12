@@ -107,6 +107,33 @@ def _resolve_channel_from_video(video_url):
         return None
 
 
+def build_channel_command(url, limit=200, reverse=False):
+    cmd = [
+        "yt-dlp",
+        "--cookies-from-browser", "firefox",
+        "--remote-components", "ejs:github",
+        "--dump-single-json",
+        "--flat-playlist",
+        "--extractor-args", "youtubetab:approximate_date",
+    ]
+    if limit > 0:
+        cmd.extend(["--playlist-end", str(limit)])
+    cmd.extend(["--ignore-errors", "--no-warnings", url])
+    if reverse:
+        cmd.append("--playlist-reverse")
+    return cmd
+
+
+def catalog_coverage(total, requested_limit, reported_total=None):
+    complete = requested_limit <= 0 or total < requested_limit
+    known_total = total if complete else (
+        int(reported_total)
+        if isinstance(reported_total, (int, float)) and reported_total >= total
+        else None
+    )
+    return {"complete": complete, "total": known_total}
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("target")
@@ -124,24 +151,10 @@ def main():
     started = time.monotonic()
     emit({"type": "info", "message": f"Querying yt-dlp for {url} (limit={args.limit})"})
 
-    cmd = [
-        "yt-dlp",
-        "--cookies-from-browser", "firefox",
-        "--remote-components", "ejs:github",
-        "--dump-single-json",
-        "--flat-playlist",
-        # Approximate upload-date is normally NOT extracted on tab pages
-        # (yt-dlp default — too many requests for big channels). With this
-        # flag the relative "N days ago" string is parsed into a timestamp
-        # at day-precision. Good enough for sorting + date-range UI.
-        "--extractor-args", "youtubetab:approximate_date",
-        "--playlist-end", str(args.limit),
-        "--ignore-errors",
-        "--no-warnings",
-        url,
-    ]
-    if args.reverse:
-        cmd.append("--playlist-reverse")
+    # Approximate dates keep a complete catalog cheap: no per-video detail
+    # requests. build_channel_command deliberately omits --playlist-end when
+    # limit=0, which is the public "whole channel" contract.
+    cmd = build_channel_command(url, args.limit, args.reverse)
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -241,16 +254,30 @@ def main():
         if total % 50 == 0:
             emit({"type": "page", "loaded": total, "limit": args.limit})
 
+    coverage = catalog_coverage(total, args.limit, data.get("playlist_count"))
+    catalog_complete = coverage["complete"]
+    catalog_total = coverage["total"]
+
     emit({
         "type": "preview_summary",
         "items_total":        total,
+        "loaded_count":       total,
+        "catalog_total":      catalog_total,
+        "catalog_complete":   catalog_complete,
+        "requested_limit":    args.limit,
         "total_duration_sec": total_duration,
         "date_min":           date_min,
         "date_max":           date_max,
     })
 
     elapsed = round(time.monotonic() - started, 2)
-    emit({"type": "done", "items_total": total, "duration_sec": elapsed})
+    emit({
+        "type": "done",
+        "items_total": total,
+        "catalog_total": catalog_total,
+        "catalog_complete": catalog_complete,
+        "duration_sec": elapsed,
+    })
 
 
 def _from_first_entry(data, key):

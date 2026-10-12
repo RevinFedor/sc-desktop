@@ -328,10 +328,7 @@ function boostyBatchPlan(sourceId, videoIds, mode, saveVideo, storage = {}) {
 
 function semanticIndexStatus(sourceId) {
   const id = Number(sourceId)
-  const handle = db.getDb()
-  const total = handle.prepare('SELECT COUNT(*) AS n FROM items WHERE source_id = ?').get(id)?.n || 0
-  const indexed = db.vectorCountForSource(id)
-  return { state: 'idle', done: indexed, total }
+  return require('./telegram-rag-index').telegramFragmentIndexStatus(db, id)
 }
 
 function activityHistoryRows() {
@@ -346,7 +343,12 @@ function activityHistoryRows() {
     telegramSingle: db.listSourcelessJobs({ type: 'tg_fetch', limit: 150 }),
     telegramLive: handle.prepare(
       `SELECT * FROM jobs
-        WHERE type IN ('tg_live_search', 'tg_live_context', 'tg_live_range')
+        WHERE type IN ('tg_live_search', 'tg_live_public_search', 'tg_live_context',
+                       'tg_live_range', 'tg_live_attachment', 'tg_live_transcribe',
+                       'tg_live_join', 'tg_live_leave', 'tg_live_bot_info', 'tg_live_bot_messages',
+                       'tg_live_bot_action', 'tg_live_bot_action_status', 'tg_live_membership_info',
+                       'tg_live_folder_read', 'tg_live_folder_merge', 'tg_live_folder_merge_status',
+                       'tg_live_bot_join', 'tg_live_bot_join_status')
         ORDER BY started_at DESC LIMIT 150`
     ).all(),
     youtubeBatch: db.listSourcelessJobs({ type: 'yt_batch_transcribe', limit: 150 }),
@@ -603,6 +605,8 @@ async function selectedTranscriptsAssembly(payload = {}) {
 }
 
 const methods = {
+  boostyCatalog: (action, args = {}) => require('./boosty-catalog-store').performRead(db, action, args),
+  boostyRag: (action, args = {}) => require('./boosty-rag').performRead(db, action, args),
   listSources: platform => db.listSources(platform || null),
   getSource: id => db.getSource(id),
   findTelegramSourceByTarget: target => db.findTelegramSourceByTarget(target),
@@ -642,6 +646,10 @@ const methods = {
   youtubeBatchAssembly,
   selectedTranscriptsAssembly,
   hybridSearch: params => db.hybridSearch(params || {}),
+  telegramRagSearch: params => require('./telegram-rag-search').searchTelegramRag(db, params || {}),
+  telegramRagGuardCandidates: params => require('./telegram-rag-index').detectTelegramExcludedReplyGuards(db, params || {}),
+  semanticChunkSearch: params => db.semanticChunkSearch(params || {}),
+  semanticChunkContext: params => db.semanticChunkContext(params || {}),
   sourceStorage,
   socialOverview,
 }

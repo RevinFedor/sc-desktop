@@ -22,6 +22,17 @@ test('Work research uses a normal chat because temporary chat has no Work space'
   assert.equal(url.searchParams.get('sc-research'), 'r-work')
 })
 
+test('Main setting can open a new Chat research as a normal persistent chat', () => {
+  const url = new URL(chatgptResearchEntryUrl({
+    id: 'r-persistent-chat',
+    mode: 'chat',
+    temporaryChat: false,
+  }))
+
+  assert.equal(url.searchParams.has('temporary-chat'), false)
+  assert.equal(url.searchParams.get('sc-research'), 'r-persistent-chat')
+})
+
 test('continuing an explicit conversation preserves whether that conversation is temporary', () => {
   const permanent = new URL(chatgptResearchEntryUrl({
     id: 'r-followup',

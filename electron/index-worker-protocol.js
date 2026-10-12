@@ -25,11 +25,27 @@ function normalizeOrigin(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : 'unknown'
 }
 
-function normalizeStartRequest({ sourceId, limit, origin } = {}) {
+function normalizeItemIds(value) {
+  if (value == null) return null
+  if (!Array.isArray(value) || value.length > 5000) throw new Error('itemIds must be an array of at most 5000 local item IDs')
+  const ids = value.map(id => {
+    const number = Number(id)
+    if (!['string', 'number'].includes(typeof id) || !Number.isSafeInteger(number) || number <= 0) {
+      throw new Error('itemIds must contain positive local item IDs')
+    }
+    return number
+  })
+  return [...new Set(ids)].sort((a, b) => a - b)
+}
+
+function normalizeStartRequest({ sourceId, limit, origin, itemIds, requestId } = {}) {
+  const selected = normalizeItemIds(itemIds)
   return {
     sourceId: normalizeSourceId(sourceId),
     limit: normalizeLimit(limit),
     origin: normalizeOrigin(origin),
+    ...(selected != null ? { itemIds: selected } : {}),
+    ...(requestId != null ? { requestId } : {}),
   }
 }
 
@@ -43,11 +59,12 @@ function nullablePositiveInt(value) {
   return Number.isSafeInteger(number) && number > 0 ? number : null
 }
 
-function createStartingState({ id, sourceId, startedAt = null }) {
+function createStartingState({ id, sourceId, mode = 'telegram', startedAt = null }) {
   return {
     id,
     dbRowId: null,
     source_id: sourceId,
+    mode: ['youtube', 'boosty'].includes(mode) ? mode : 'telegram',
     phase: 'starting',
     status: 'running',
     items_done: 0,
@@ -76,6 +93,14 @@ function applyWorkerMessage(state, message) {
       items_total: nonNegativeInt(message.itemsTotal),
       initial_indexed: nonNegativeInt(message.initialIndexed),
       started_at: nonNegativeInt(message.startedAt, state.started_at || 0) || state.started_at,
+      ...(typeof message.target === 'string' ? { target: message.target } : {}),
+      ...(['messages', 'fragments'].includes(message.unit) ? {
+        unit: message.unit,
+        messages_selected: nonNegativeInt(message.messagesSelected),
+        fragments_total: nonNegativeInt(message.fragmentsTotal),
+        fragments_embedded: 0,
+        index_version: typeof message.indexVersion === 'string' ? message.indexVersion : null,
+      } : {}),
     }
   }
 
@@ -83,11 +108,14 @@ function applyWorkerMessage(state, message) {
     if (state.phase !== 'running') throw new Error(`unexpected progress message in ${state.phase}`)
     const total = Math.max(state.items_total, nonNegativeInt(message.itemsTotal, state.items_total))
     const done = Math.min(total, Math.max(state.items_done, nonNegativeInt(message.itemsDone)))
-    return { ...state, items_done: done, items_total: total }
+    return {
+      ...state, items_done: done, items_total: total,
+      ...(state.unit ? { fragments_embedded: Math.max(state.fragments_embedded || 0, nonNegativeInt(message.fragmentsEmbedded)) } : {}),
+    }
   }
 
   if (message.type === 'terminal') {
-    if (state.phase !== 'running') throw new Error(`unexpected terminal message in ${state.phase}`)
+    if (!['starting', 'running'].includes(state.phase)) throw new Error(`unexpected terminal message in ${state.phase}`)
     const status = TERMINAL_STATUSES.has(message.status) ? message.status : 'error'
     const total = Math.max(state.items_total, nonNegativeInt(message.itemsTotal, state.items_total))
     const done = Math.min(total, Math.max(state.items_done, nonNegativeInt(message.itemsDone)))
@@ -115,15 +143,24 @@ function snapshot(state) {
     id: `index-${state.id}`,
     live_id: state.id,
     db_id: state.dbRowId || null,
-    type: 'tg_index',
+    type: state.mode === 'boosty' ? 'boosty_index' : state.mode === 'youtube' ? 'yt_index' : 'tg_index',
     source_id: state.source_id,
     status: state.status,
+    phase: state.phase,
     items_done: base + (state.items_done || 0),
     items_total: base + (state.items_total || 0),
     error: state.error || null,
     started_at: state.started_at,
     finished_at: state.finished_at || null,
     target: state.target || null,
+    ...(state.noop ? { noop: true, reason: state.reason || 'already-indexed' } : {}),
+    ...(state.unit ? {
+      unit: state.unit,
+      messages_selected: state.messages_selected || 0,
+      fragments_total: state.fragments_total || 0,
+      fragments_embedded: state.fragments_embedded || 0,
+      index_version: state.index_version || null,
+    } : {}),
   }
 }
 
@@ -135,6 +172,13 @@ function runningStatus(state) {
     total: current.items_total,
     jobId: current.id,
     dbId: state.dbRowId || null,
+    ...(state.unit ? {
+      unit: state.unit,
+      messages_selected: state.messages_selected || 0,
+      fragments_total: state.fragments_total || 0,
+      fragments_embedded: state.fragments_embedded || 0,
+      index_version: state.index_version || null,
+    } : {}),
   }
 }
 
@@ -182,6 +226,7 @@ module.exports = {
   normalizeSourceId,
   normalizeLimit,
   normalizeStartRequest,
+  normalizeItemIds,
   createStartingState,
   applyWorkerMessage,
   snapshot,

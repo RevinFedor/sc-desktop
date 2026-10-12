@@ -467,10 +467,10 @@ function Detection({
           {isVideo && (
             <SplitChip
               platform="youtube"
-              leftLabel="видео"
+              leftLabel="текст видео"
               rightLabel="+ comm"
-              leftTitle="YouTube · видео · Enter"
-              rightTitle="YouTube · видео + комментарии"
+              leftTitle="Получить текст одного YouTube-видео · Enter"
+              rightTitle="Получить текст видео и комментарии"
               onLeft={() => onPickYtKind('video')}
               onRight={() => onPickYtKind('video', { withComments: true })}
             />
@@ -479,12 +479,12 @@ function Detection({
             <button
               key={k}
               onClick={() => onPickYtKind(k)}
-              title={`YouTube · ${k === 'channel' ? 'канал' : k}`}
+              title={k === 'channel' ? 'Открыть каталог канала' : `YouTube · ${k}`}
               className="h-7 px-2 rounded-md flex items-center gap-1.5 bg-zinc-900 border border-zinc-800 hover:border-zinc-500 hover:bg-zinc-800 whitespace-nowrap"
             >
               <PlatformLogo platform="youtube" size={16} />
               <span className="text-zinc-300" style={{ fontSize: '14px' }}>
-                [{k === 'channel' ? 'канал' : k === 'video' ? 'видео' : k}]
+                [{k === 'channel' ? 'каталог канала' : k === 'video' ? 'текст видео' : k}]
               </span>
             </button>
           ))}
@@ -589,7 +589,9 @@ function Detection({
  * is "default Enter" — same pattern as PlatformChips.
  */
 function PlatformKindChips({ platform, availableKinds, defaultKind, onPick }) {
-  const LABELS = { video: 'видео', channel: 'канал', comments: 'комментарии' }
+  const LABELS = platform === 'youtube'
+    ? { video: 'текст видео', channel: 'каталог канала', comments: 'комментарии' }
+    : { video: 'видео', channel: 'канал', comments: 'комментарии' }
   const platformLabel = PLATFORMS[platform]?.label || platform
   return (
     <div className="ml-auto flex items-center gap-1.5">

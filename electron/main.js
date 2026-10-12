@@ -34,6 +34,8 @@ const {
   stopTelegramFinalizer,
 } = require('./telegram-finalizer-client')
 const { embedQuery } = require('./embedder')
+const { normalizeRagScope, searchTelegramRag } = require('./telegram-rag-search')
+const { createTelegramRagPreparation } = require('./telegram-rag-preparation')
 const { assembleText } = require('./assemble')
 const {
   startTelegramAutoScheduler,
@@ -49,6 +51,21 @@ const {
   startServer: startBrowserBridge,
   listExternalJobsForUi,
 } = require('./browser-bridge')
+const { createResearchNavigation } = require('./research-navigation')
+const researchNavigation = createResearchNavigation({
+  readJob: jobId => listExternalJobsForUi({ jobId, summary: true }).find(job => job.jobId === jobId),
+  getWindow: () => {
+    let window = BrowserWindow.getAllWindows().find(candidate => !candidate.isDestroyed())
+    if (!window) {
+      createWindow()
+      window = BrowserWindow.getAllWindows().find(candidate => !candidate.isDestroyed())
+    }
+    return window
+  },
+})
+ipcMain.handle('research:open-job-ready', event => researchNavigation.ready(event.sender.id))
+ipcMain.handle('research:open-job-ack', (event, body) => researchNavigation.acknowledge(event.sender.id, body))
+app.on('before-quit', () => researchNavigation.dispose())
 const {
   publicAppSettings,
   patchAppSettings,
@@ -68,6 +85,11 @@ async function readDb(method, args, fallback) {
     return fallback()
   }
 }
+
+if (!isE2E) indexJob.setTelegramPreparation(createTelegramRagPreparation({
+  jobRunner,
+  readDb: (method, args) => readDb(method, args, () => db[method](...args)),
+}))
 
 const isPrimaryInstance = isDev || app.requestSingleInstanceLock()
 if (!isPrimaryInstance) {
@@ -170,7 +192,13 @@ function createWindow() {
 
 ipcMain.handle('jobs:list', async () => {
   const historyRows = await readDb('activityHistoryRows', [], () => null)
-  return jobRunner.listJobs(historyRows)
+  const indices = indexJob.listActiveSnapshots()
+  const rows = jobRunner.listJobs(historyRows).filter(row => !indices.some(index => (
+    row.id === index.id || (index.db_id != null && (
+      row.db_id === index.db_id || row.id === `db-${index.db_id}`
+    ))
+  )))
+  return [...rows, ...indices].sort((a, b) => (b.started_at || 0) - (a.started_at || 0))
 })
 ipcMain.handle('jobs:setLiveSource', (event, sourceId) => {
   const id = Number(sourceId)
@@ -196,16 +224,17 @@ ipcMain.handle('jobs:setLiveSource', (event, sourceId) => {
 // Полные ответы запрашиваются только при открытии JobDetail.
 // Имя IPC-канала оставлено aistudio:* для обратной совместимости с renderer-
 // store (исторически), но содержимое теперь — все external-research jobs.
-async function fetchAistudioJobs({ full = false } = {}) {
+async function fetchAistudioJobs({ full = false, jobId = null } = {}) {
   if (isE2E) return { jobs: [] }
   try {
-    return { jobs: listExternalJobsForUi({ summary: !full }) }
+    return { jobs: listExternalJobsForUi({ summary: !full, jobId }) }
   } catch (e) {
     return { jobs: [], error: String(e?.message || e) }
   }
 }
 ipcMain.handle('aistudio:listJobs', (_evt, options) => fetchAistudioJobs({
   full: options?.full === true,
+  jobId: typeof options?.jobId === 'string' ? options.jobId : null,
 }))
 ipcMain.handle('aistudio:clearJob', async (_evt, payload) => {
   try {
@@ -866,50 +895,11 @@ ipcMain.handle('tg:index', async (_evt, { sourceId, limit }) => {
     const sid = Number(sourceId)
     const t0 = Date.now()
     console.log(`[tg:index] request source #${sid} limit=${limit || 'full'}`)
-    const result = await indexJob.start({ sourceId, limit: limit || null, origin: 'manual-ipc' })
-    if (result && typeof result === 'object' && result.noop) {
-      console.log(`[tg:index] source #${sid} noop reason=${result.reason} total_ms=${Date.now() - t0}`)
-      return { ok: true, noop: true, reason: result.reason }
-    }
-    console.log(`[tg:index] source #${sid} started job=${result} total_ms=${Date.now() - t0}`)
-
-    // Reply-graph backfill improves MCP `telegram_reply_thread`, but it must
-    // not sit in the click's synchronous IPC path. Run it after returning the
-    // index job id, and only when an index job actually started. If semantic
-    // index is already complete (`noop`), a hidden Telethon job on every
-    // "Index" click is just lag with no user-visible indexing work.
-    if (!isE2E) setImmediate(async () => {
-      try {
-        const pendingStarted = Date.now()
-        const pending = await readDb(
-          'listItemsMissingParent', [sid, 1],
-          () => db.listItemsMissingParent(sid, 1),
-        )
-        console.log(`[tg:index] reply-backfill pending-check source #${sid} rows=${pending.length} took ${Date.now() - pendingStarted}ms`)
-        if (!pending.length) return
-        const sourceStarted = Date.now()
-        const s = await readDb('getSource', [sid], () => db.getSource(sid))
-        console.log(`[tg:index] reply-backfill source-read source #${sid} took ${Date.now() - sourceStarted}ms`)
-        if (s && s.platform === 'telegram' && s.handle) {
-          try {
-            jobRunner.startTelegramReplyBackfill({
-              source_id: sid,
-              target: s.handle,
-              limit: 5000,
-              _runtime_source: s,
-            })
-          } catch (err) {
-            // Expected when a tg_fetch is already running for this source.
-            // The index job itself runs over local DB rows and doesn't need
-            // a Telethon session, so just skip backfill this time.
-            console.log(`[tg:index] reply-backfill deferred: ${err.message || err}`)
-          }
-        }
-      } catch (err) {
-        console.error('[tg:index] reply-backfill kickoff failed', err)
-      }
-    })
-    return { ok: true, jobId: result }
+    // The shared coordinator publishes the preparing job immediately and
+    // owns reply preparation BEFORE taking the embedding snapshot.
+    const job = indexJob.startTracked({ sourceId, limit: limit || null, origin: 'manual-ipc' })
+    console.log(`[tg:index] source #${sid} preparing job=${job.id} total_ms=${Date.now() - t0}`)
+    return { ok: true, jobId: job.id, job }
   } catch (err) {
     console.error('[tg:index] failed', err)
     return { ok: false, error: String(err && err.message || err) }
@@ -929,18 +919,19 @@ ipcMain.handle('tg:indexCancel', (_evt, sourceId) => {
   return { ok: indexJob.cancel(sourceId) }
 })
 
-// Hybrid search — server-side wrapper for the renderer + future MCP tool.
-// Embeds the query, runs RRF over FTS5 + items_vec, returns up to `limit`
-// items annotated with their fusion score.
-ipcMain.handle('tg:search', async (_evt, { sourceId, query, limit }) => {
+// Same per-message RAG ranking as MCP; all corpus reads/ranking run in the
+// persistent DB worker. UI retrieves low-score rows for its local slider.
+ipcMain.handle('tg:search', async (_evt, { sourceId, query, limit,
+                                         min_cos = -1, date_from, date_to, topic_id } = {}) => {
   try {
-    if (!query || !query.trim()) return { results: [] }
+    if (typeof query !== 'string' || !query.trim()) return { results: [] }
+    const scope = normalizeRagScope({ source_id: sourceId, limit: limit || 10,
+      min_cos, date_from, date_to, topic_id })
     const q = await embedQuery(query)
-    const params = {
-      query, query_embedding: q, source_id: sourceId, limit: limit || 10,
-    }
-    const results = await readDb('hybridSearch', [params], () => db.hybridSearch(params))
-    return { results }
+    const params = { ...scope, query_embedding: q }
+    const result = await readDb('telegramRagSearch', [params], () => searchTelegramRag(db, params))
+    return { results: result.rows, diagnostics: result.diagnostics,
+      coverage: result.coverage, scope: result.scope }
   } catch (err) {
     console.error('[tg:search] failed', err)
     return { results: [], error: String(err && err.message || err) }
@@ -1555,6 +1546,83 @@ ipcMain.handle('yt:channelLookup', (_evt, payload) => jobRunner.lookupYoutubeCha
 ipcMain.handle('yt:channelFetch',  (_evt, params)  => jobRunner.startYoutubeChannelFetch(params))
 ipcMain.handle('yt:batchTranscribe', (_evt, params) => jobRunner.startYoutubeBatchTranscribe(params))
 
+ipcMain.handle('yt:index', async (_evt, { sourceId, limit } = {}) => {
+  try {
+    const sid = Number(sourceId)
+    const source = await readDb('getSource', [sid], () => db.getSource(sid))
+    if (!source || source.platform !== 'youtube') return { ok: false, error: 'YouTube source not found' }
+    console.log(`[yt:index] request source #${sid} limit=${limit || 'full'}`)
+    const result = await indexJob.start({
+      sourceId: sid,
+      limit: limit || null,
+      origin: 'manual-ipc',
+      mode: 'youtube',
+    })
+    if (result && typeof result === 'object' && result.noop) {
+      return { ok: true, noop: true, reason: result.reason }
+    }
+    return { ok: true, jobId: result }
+  } catch (err) {
+    console.error('[yt:index] failed', err)
+    return { ok: false, error: String(err?.message || err) }
+  }
+})
+
+ipcMain.handle('yt:indexStatus', async (_evt, sourceId) => {
+  try {
+    return await indexJob.statusForSource(sourceId, 'youtube')
+  } catch (err) {
+    console.error('[yt:indexStatus] failed', err)
+    return { state: 'idle', done: 0, total: 0, error: String(err?.message || err) }
+  }
+})
+
+ipcMain.handle('yt:indexCancel', (_evt, sourceId) => ({
+  ok: indexJob.cancel(sourceId, 'youtube'),
+}))
+
+ipcMain.handle('yt:semanticSearch', async (_evt, { sourceId, query, limit } = {}) => {
+  try {
+    if (!String(query || '').trim()) return { results: [] }
+    const sid = Number(sourceId)
+    const queryEmbedding = await embedQuery(String(query).trim())
+    const rows = await readDb(
+      'semanticChunkSearch',
+      [{ query_embedding: queryEmbedding, source_id: sid, limit: limit || 20 }],
+      () => db.semanticChunkSearch({ query_embedding: queryEmbedding, source_id: sid, limit: limit || 20 }),
+    )
+    return {
+      results: rows.map(row => ({
+        ...row,
+        id: `yt-chunk-${row.id}`,
+        item_id: row.item_id,
+        type: 'video',
+        caption: row.text,
+        semantic_chunk: {
+          chunk_id: row.id,
+          chunk_index: row.chunk_index,
+          start_seconds: row.start_seconds,
+          end_seconds: row.end_seconds,
+          position_approximate: !!row.position_approximate,
+        },
+      })),
+    }
+  } catch (err) {
+    console.error('[yt:semanticSearch] failed', err)
+    return { results: [], error: String(err?.message || err) }
+  }
+})
+
+ipcMain.handle('yt:semanticContext', async (_evt, payload = {}) => {
+  try {
+    const rows = await readDb('semanticChunkContext', [payload], () => db.semanticChunkContext(payload))
+    return { results: rows }
+  } catch (err) {
+    console.error('[yt:semanticContext] failed', err)
+    return { results: [], error: String(err?.message || err) }
+  }
+})
+
 // ─── TikTok ───────────────────────────────────────────────────────
 ipcMain.handle('tk:lookupCache', (_evt, videoId) => {
   const row = jobRunner.lookupTiktokCache(videoId)
@@ -1594,6 +1662,7 @@ ipcMain.handle('boosty:channelLookup', (_evt, payload = {}) => (
   jobRunner.lookupBoostyChannel(payload)
 ))
 ipcMain.handle('boosty:channelFetch', async (_evt, params = {}) => {
+  if (params.auth_mode === 'public') return jobRunner.startBoostyChannelFetch(params)
   const { requestBoostyAuthCookie } = require('./browser-bridge')
   const auth = await requestBoostyAuthCookie()
   return jobRunner.startBoostyChannelFetch({
@@ -2264,6 +2333,10 @@ ipcMain.handle('jobs:listForSourcePage', async (_e, payload = {}) => {
 
 ipcMain.handle('jobs:cancel', (_evt, payload) => {
   const request = payload && typeof payload === 'object' ? payload : { id: payload }
+  const dbMatch = /^db-(\d+)$/.exec(String(request.id))
+  const dbId = dbMatch ? Number(dbMatch[1]) : request.identity === 'db' ? Number(request.id) : null
+  const index = dbId != null && indexJob.listActiveSnapshots().find(job => job.db_id === dbId)
+  if (index) return indexJob.cancelById(index.id)
   // Historic ids are not cancellable — they're already finished.
   if (typeof request.id === 'string' && request.id.startsWith('db-')) return false
   return jobRunner.cancelJob(request.id, {
@@ -2274,6 +2347,14 @@ ipcMain.handle('jobs:cancel', (_evt, payload) => {
 
 ipcMain.handle('jobs:detail', (_evt, payload) => {
   const request = payload && typeof payload === 'object' ? payload : { id: payload }
+  if (typeof request.id === 'string' && /^index-\d+$/.test(request.id)) {
+    const live = indexJob.getActiveSnapshot(request.id)
+    if (live) return live
+  }
+  const dbMatch = /^db-(\d+)$/.exec(String(request.id))
+  const dbId = dbMatch ? Number(dbMatch[1]) : request.identity === 'db' ? Number(request.id) : null
+  const index = dbId != null && indexJob.listActiveSnapshots().find(job => job.db_id === dbId)
+  if (index) return index
   return jobRunner.getJobDetail(request.id, { identity: request.identity || null })
 })
 
@@ -2712,6 +2793,7 @@ app.whenReady().then(() => {
     try {
       startBrowserBridge({
         jobRunner,
+        researchNavigation,
         notificationService: telegramNotificationService,
         settingsAccess: { readScSettings: readScSettingsStrict, writeScSettings },
       })

@@ -203,6 +203,84 @@ continues here
   assert.equal(__test.parseByteRange('bytes=1000-', 1000).invalid, true)
 })
 
+test('learning media language detector distinguishes English, Russian, and mixed subtitles', () => {
+  assert.equal(__test.subtitleLanguageFromText('This interview is entirely in English. '.repeat(8)).code, 'en')
+  assert.equal(__test.subtitleLanguageFromText('Это собеседование полностью проходит на русском языке. '.repeat(8)).code, 'ru')
+  assert.equal(__test.subtitleLanguageFromText(`${'English sentence. '.repeat(8)}${'Русское предложение. '.repeat(8)}`).code, 'mixed')
+})
+
+test('Boosty outcome parser keeps explicit offer, rejection, and candidate refusal distinct', () => {
+  assert.equal(__test.interviewOutcomeFromDescription('<p>В итоге получил оффер на 8 000$.</p>').code, 'offer')
+  assert.equal(__test.interviewOutcomeFromDescription('✅ Прошел').code, 'passed')
+  assert.equal(__test.interviewOutcomeFromDescription('✅ Пройдено').code, 'passed')
+  assert.equal(__test.interviewOutcomeFromDescription('Компания отказала после финального этапа.').code, 'rejected')
+  assert.equal(__test.interviewOutcomeFromDescription('😔 Не пройдено').code, 'rejected')
+  assert.equal(__test.interviewOutcomeFromDescription('❌ Отказ').code, 'rejected')
+  assert.equal(__test.interviewOutcomeFromDescription('Провалено ❌').code, 'rejected')
+  assert.equal(__test.interviewOutcomeFromDescription('Получил оффер, но отказался от оффера сам.').code, 'candidate_declined')
+  assert.equal(__test.interviewOutcomeFromDescription('Разбор технического интервью и вопросы команды.').code, 'unknown')
+  assert.equal(__test.interviewOutcomeFromDescription('Разобрал свой пройденный System Design.').code, 'unknown')
+})
+
+test('Boosty interview details separate chips from non-duplicated notes', () => {
+  assert.deepEqual(__test.boostyInterviewDetails(`
+🏢 Inworld AI
+💵 30,000$
+😔 Не прошел ❌
+⚠ Principal Engineer
+До этого был созвон с командой.
+HR — прошел
+  `), {
+    company: 'Inworld AI',
+    compensation: '30,000$',
+    role: 'Principal Engineer',
+    notes: 'До этого был созвон с командой.\nHR — прошел',
+    outcome: {
+      code: 'rejected',
+      label: 'Отказ',
+      evidence: '😔 Не прошел ❌',
+      explicit: true,
+    },
+  })
+})
+
+test('learning media library groups child videos by the real Boosty parent and preserves stage order', () => {
+  const source = { id: 7, display_name: 'Про гринд в АйТи' }
+  const parent = {
+    external_id: 'post:order-capital',
+    title: 'Order Capital 8,000$',
+    caption: '<p>Три этапа. В итоге получил оффер.</p>',
+    url: 'https://boosty.test/post',
+    published_at: 100,
+  }
+  const row = (id, externalId, position) => ({
+    source,
+    parent,
+    videoMeta: { position },
+    item: {
+      id,
+      source_id: 7,
+      external_id: externalId,
+      parent_external_id: parent.external_id,
+      title: `Stage ${position}`,
+      url: parent.url,
+      duration_seconds: 60,
+      published_at: 100,
+      download_status: 'done',
+      transcribe_status: 'done',
+    },
+    video: id === 2 ? { stat: { size: 123 } } : null,
+    subtitles: null,
+    audio: null,
+  })
+  const result = __test.publicLearningMediaLibrary([row(1, 'v1', 2), row(2, 'v2', 1)], 'token')
+  assert.equal(result.groups.length, 1)
+  assert.deepEqual(result.groups[0].videoIds, [2, 1])
+  assert.equal(result.groups[0].downloadedCount, 1)
+  assert.equal(result.groups[0].outcome.code, 'offer')
+  assert.equal(result.groups[0].description, 'Три этапа. В итоге получил оффер.')
+})
+
 test('vocabulary sync payload keeps the offline learning contract', () => {
   assert.equal(__test.normalizeVocabularyTerm('  That’s   Fine  '), 'that’s fine')
   assert.deepEqual(__test.vocabularySyncPayload({
@@ -237,12 +315,26 @@ test('vocabulary sync payload keeps the offline learning contract', () => {
     contexts: [{ sourceText: "That's fine." }],
   })
   assert.equal(__test.vocabularySyncPayload({ sourceText: 'skip', state: '' }).state, 'none')
+  assert.equal(__test.vocabularySyncPayload({ sourceText: 'later', state: 'archived' }).state, 'archived')
   assert.equal(__test.vocabularySyncPayload({ sourceText: 'replace', state: 'saved', replaceContexts: true }).replaceContexts, true)
+})
+
+test('Voice discovery prefers the installed vocabulary server over a newer isolated runtime', () => {
+  assert.deepEqual(__test.orderVoiceServerCandidates([
+    { port: 7995, updatedAt: 300 },
+    { port: 7888, updatedAt: 100 },
+    { port: 7889, updatedAt: 200 },
+  ]).map(candidate => candidate.port), [7888, 7995, 7889])
+  assert.deepEqual(__test.orderVoiceServerCandidates([
+    { port: 7995, updatedAt: 300 },
+    { port: 7889, updatedAt: 200 },
+  ]).map(candidate => candidate.port), [7995, 7889])
 })
 
 test('practice request keeps a bounded bilingual history and vocabulary identity', () => {
   const request = __test.normalizeVocabularyPracticeRequest({
     action: 'turn',
+    theme: 'technical_interview',
     answer: '  This   is reliable. ',
     vocabulary: [
       { key: 'word|en|ru|reliable', sourceText: ' reliable ', translation: 'надёжный', partOfSpeech: 'adjective' },
@@ -251,7 +343,8 @@ test('practice request keeps a bounded bilingual history and vocabulary identity
     history: Array.from({ length: 20 }, (_, index) => ({ role: index % 2 ? 'user' : 'assistant', english: ` line ${index} ` })),
   })
   assert.equal(request.action, 'turn')
-  assert.equal(request.answer, 'This is reliable.')
+  assert.equal(request.theme, 'technical_interview')
+  assert.equal(request.answer, 'This   is reliable.')
   assert.equal(request.vocabulary.length, 1)
   assert.deepEqual(request.vocabulary[0], {
     id: 'word|en|ru|reliable',
@@ -261,4 +354,22 @@ test('practice request keeps a bounded bilingual history and vocabulary identity
   })
   assert.equal(request.history.length, 16)
   assert.equal(request.history[0].english, 'line 4')
+  assert.equal(__test.normalizeVocabularyPracticeRequest({
+    action: 'start',
+    theme: 'unsupported',
+    vocabulary: [{ id: 'word|en|ru|safe', term: 'safe' }],
+  }).theme, 'general')
+})
+
+test('practice relay preserves a long bilingual thought process and all explicit questions', () => {
+  const answer = 'Так, I like work. I love to work.\n'.repeat(160) + 'Thanks to this or because of this?'
+  const payload = { action: 'turn', requestId: 'same-attempt', answer,
+    vocabulary: [{ id: 'word|en|ru|work', term: 'work' }],
+    history: [{ role: 'assistant', english: 'What helped?', feedbackRussian: 'Первое пояснение.\n\nВторое пояснение.' }],
+  }
+  const result = __test.normalizeVocabularyPracticeRequest(payload)
+  assert.equal(result.answer, answer)
+  assert.equal(result.requestId, 'same-attempt')
+  assert.equal(result.history[0].feedbackRussian, payload.history[0].feedbackRussian)
+  assert.throws(() => __test.normalizeVocabularyPracticeRequest({ ...payload, answer: 'x'.repeat(24001) }), /too long/)
 })

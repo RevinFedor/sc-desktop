@@ -6,8 +6,12 @@ const path = require('node:path')
 
 const {
   MAX_ATTACHMENT_COUNT,
+  MAX_ATTACHMENT_SPECS,
+  MAX_BUNDLE_BYTES,
   normalizeResearchAttachments,
   materializeResearchAttachments,
+  researchAttachmentPackingSummary,
+  publicAttachmentMeta,
   researchResultForPersist,
 } = require('./research-attachments')
 
@@ -15,6 +19,27 @@ function tempDir(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sc-research-attachments-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   return dir
+}
+
+function textSpecs(root, count, ext = '.txt') {
+  return Array.from({ length: count }, (_, i) => {
+    const file = path.join(root, `part-${String(i + 1).padStart(4, '0')}${ext}`)
+    fs.writeFileSync(file, `value-${i + 1}\n`)
+    return file
+  })
+}
+
+function bundledSourceIndexes(files, expectedTotal) {
+  const found = []
+  for (const file of files) {
+    if (!file.bundled_count) continue
+    const text = fs.readFileSync(file.path, 'utf8')
+    for (const match of text.matchAll(/===== FILE (\d+)\/(\d+):/g)) {
+      assert.equal(Number(match[2]), expectedTotal)
+      found.push(Number(match[1]))
+    }
+  }
+  return found.sort((a, b) => a - b)
 }
 
 test('materializes only the requested one-based line range', (t) => {
@@ -43,22 +68,103 @@ test('accepts compact lines syntax and clamps an open range to EOF', (t) => {
   assert.equal(attachment.source_line_count, 4)
 })
 
-test('more than twenty text inputs become one bounded bundle', (t) => {
+test('more than twenty text inputs become several bounded, complete bundles', (t) => {
+  const root = tempDir(t)
+  const specs = textSpecs(root, MAX_ATTACHMENT_COUNT + 1)
+  const normalized = normalizeResearchAttachments(specs)
+  const bundles = materializeResearchAttachments({ libRoot: root, id: 'bundle-job', attachments: normalized })
+  const summary = researchAttachmentPackingSummary(bundles)
+
+  assert.equal(bundles.length, 3)
+  assert.equal(summary.sourceFileCount, 21)
+  assert.equal(summary.packedSourceFileCount, 21)
+  assert.equal(summary.bundleCount, 3)
+  assert.equal(summary.packingComplete, true)
+  assert.deepEqual(
+    publicAttachmentMeta(bundles[0]),
+    {
+      index: 0,
+      name: bundles[0].name,
+      mime: 'text/plain',
+      size: bundles[0].size,
+      kind: 'file',
+      line_start: null,
+      line_end: null,
+      bundled_count: bundles[0].bundled_count,
+      bundle_index: 1,
+      bundle_count: 3,
+      source_total_count: 21,
+    },
+  )
+  assert.deepEqual(bundledSourceIndexes(bundles, 21), Array.from({ length: 21 }, (_, i) => i + 1))
+  assert.ok(bundles.every(bundle => bundle.mime === 'text/plain' && bundle.size <= MAX_BUNDLE_BYTES))
+})
+
+test('one hundred thirty small paths become thirteen uploads without caller bundling', (t) => {
+  const root = tempDir(t)
+  const normalized = normalizeResearchAttachments(textSpecs(root, 130))
+  const bundles = materializeResearchAttachments({ libRoot: root, id: 'bundle-130', attachments: normalized })
+
+  assert.equal(bundles.length, 13)
+  assert.deepEqual(bundledSourceIndexes(bundles, 130), Array.from({ length: 130 }, (_, i) => i + 1))
+  assert.deepEqual(researchAttachmentPackingSummary(bundles), {
+    sourceFileCount: 130,
+    packedSourceFileCount: 130,
+    uploadFileCount: 13,
+    bundleCount: 13,
+    individualFileCount: 0,
+    packingComplete: true,
+  })
+})
+
+test('six hundred twenty eight paths cap at twenty uploads with no missing source index', (t) => {
+  const root = tempDir(t)
+  const normalized = normalizeResearchAttachments(textSpecs(root, 628, '.mts'))
+  const bundles = materializeResearchAttachments({ libRoot: root, id: 'bundle-628', attachments: normalized })
+
+  assert.equal(bundles.length, MAX_ATTACHMENT_COUNT)
+  assert.deepEqual(bundledSourceIndexes(bundles, 628), Array.from({ length: 628 }, (_, i) => i + 1))
+  assert.equal(researchAttachmentPackingSummary(bundles).packingComplete, true)
+})
+
+test('known binary files stay individual while remaining text is bundled into free slots', (t) => {
+  const root = tempDir(t)
+  const binary = path.join(root, 'reference.pdf')
+  fs.writeFileSync(binary, Buffer.from([0, 1, 2, 3]))
+  const normalized = normalizeResearchAttachments([binary, ...textSpecs(root, 25, '.b64')])
+  const packed = materializeResearchAttachments({ libRoot: root, id: 'mixed', attachments: normalized })
+  const summary = researchAttachmentPackingSummary(packed)
+
+  assert.equal(summary.sourceFileCount, 26)
+  assert.equal(summary.uploadFileCount, 4)
+  assert.equal(summary.bundleCount, 3)
+  assert.equal(summary.individualFileCount, 1)
+  assert.equal(summary.packingComplete, true)
+  assert.equal(packed.filter(file => file.mime === 'application/pdf').length, 1)
+})
+
+test('more than twenty unbundleable files fail before any browser upload', (t) => {
   const root = tempDir(t)
   const specs = Array.from({ length: MAX_ATTACHMENT_COUNT + 1 }, (_, i) => {
-    const file = path.join(root, `part-${i + 1}.txt`)
-    fs.writeFileSync(file, `value-${i + 1}`)
+    const file = path.join(root, `binary-${i + 1}.pdf`)
+    fs.writeFileSync(file, Buffer.from([0, i, 2, 3]))
     return file
   })
   const normalized = normalizeResearchAttachments(specs)
-  const [bundle] = materializeResearchAttachments({ libRoot: root, id: 'bundle-job', attachments: normalized })
-  const text = fs.readFileSync(bundle.path, 'utf8')
 
-  assert.equal(bundle.bundled_count, 21)
-  assert.equal(bundle.mime, 'text/plain')
-  assert.match(text, /FILE 1\/21: part-1\.txt/)
-  assert.match(text, /FILE 21\/21: part-21\.txt/)
-  assert.match(text, /value-21/)
+  assert.throws(
+    () => materializeResearchAttachments({ libRoot: root, id: 'too-many-binary', attachments: normalized }),
+    /21 inputs cannot be text-bundled/,
+  )
+  assert.equal(fs.existsSync(path.join(root, 'research-artifacts', 'too-many-binary', 'input')), false)
+})
+
+test('input path ceiling permits the 628-file audit but remains bounded', () => {
+  assert.ok(MAX_ATTACHMENT_SPECS >= 628)
+  assert.throws(
+    () => normalizeResearchAttachments(Array.from({ length: MAX_ATTACHMENT_SPECS + 1 }, () => '/not/read')),
+    new RegExp(`maximum input list is ${MAX_ATTACHMENT_SPECS}`),
+  )
 })
 
 test('rejects relative paths and binary line ranges', (t) => {

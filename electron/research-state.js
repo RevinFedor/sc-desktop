@@ -22,6 +22,7 @@
 const { EventEmitter } = require('node:events')
 const path = require('node:path')
 const os = require('node:os')
+const { chatgptConversationIdentity } = require('./chatgpt-url')
 
 const jobs = new Map() // requestId → job snapshot
 const events = new EventEmitter()
@@ -39,14 +40,17 @@ function newRequestId() {
 
 // Job-шейп держим плоским и сериализуемым (отдаём наружу как JSON).
 // Каждый POST /research-state мерджит свои поля через update().
-function create({ provider, prompt, options, attachments }) {
-  const id = newRequestId()
+function create({ id: requestedId, provider, prompt, options, attachments, requestFingerprint, conversationModeProof }) {
+  const id = requestedId || newRequestId()
+  if (jobs.has(id)) throw new Error(`research job already exists: ${id}`)
   const job = {
     id,
     provider,        // 'claude' | 'perplexity'
     prompt,          // raw prompt (не показываем наружу через MCP — это input)
     options: options || {},
     attachments: Array.isArray(attachments) ? attachments : [],
+    requestFingerprint: requestFingerprint || null,
+    conversationModeProof: conversationModeProof || null,
     status: 'queued', // queued|running|done|error
     stage: null,      // 'opening'|'configuring'|'submitting'|'running'|'extracting'|null
     url: null,        // claude.ai/chat/<uuid> или perplexity.ai/search/<uuid>
@@ -92,7 +96,7 @@ function findByTabId(tabId) {
 // /research-state. Без re-create CS получает 404 и теряет связь, хотя
 // research живёт в браузерной вкладке. Stub'ом ставим минимум данных:
 // provider от CS, prompt пустой (orig потерян), status='running'.
-function recreate({ id, provider, options }) {
+function recreate({ id, provider, options, requestFingerprint }) {
   if (jobs.has(id)) return jobs.get(id)
   const job = {
     id,
@@ -100,6 +104,7 @@ function recreate({ id, provider, options }) {
     prompt: '',                // оригинал потерян, CS уже отработал submit
     options: options || {},
     attachments: [],
+    requestFingerprint: requestFingerprint || null,
     status: 'running',
     stage: 'recovered',
     url: null,
@@ -140,6 +145,8 @@ function subscribe(fn) {
 // Снапшот для MCP-ответа: prompt и options не отдаём (это input).
 function publicSnapshot(job) {
   if (!job) return null
+  const conversation = job.provider === 'chatgpt'
+    ? chatgptConversationIdentity(job.result?.url || job.url) : null
   return {
     id: job.id,
     provider: job.provider,
@@ -153,6 +160,8 @@ function publicSnapshot(job) {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     doneAt: job.doneAt,
+    ...(conversation || {}),
+    ...(job.dispatchState === 'delivery_unknown' ? { deliveryUnknown: true } : {}),
   }
 }
 
@@ -285,6 +294,9 @@ function normalizeInputFilesFromAttachments(attachments) {
       lineEnd: Number.isFinite(a?.line_end) ? a.line_end : null,
       sourceLineCount: Number.isFinite(a?.source_line_count) ? a.source_line_count : null,
       bundledCount: Number.isFinite(a?.bundled_count) ? a.bundled_count : null,
+      bundleIndex: Number.isFinite(a?.bundle_index) ? a.bundle_index : null,
+      bundleCount: Number.isFinite(a?.bundle_count) ? a.bundle_count : null,
+      sourceTotalCount: Number.isFinite(a?.source_total_count) ? a.source_total_count : null,
     }))
 }
 
@@ -366,6 +378,16 @@ function claudeModelLabel(options) {
 function chatgptModelLabel(options) {
   const model = String(options?.model || '5.6-sol')
   const labels = {
+    '6': 'GPT-6',
+    'gpt-6': 'GPT-6',
+    '6-astra': 'GPT-6 Astra',
+    'gpt-6-astra': 'GPT-6 Astra',
+    '6.1-sol': 'GPT-6.1 Sol',
+    'gpt-6.1-sol': 'GPT-6.1 Sol',
+    '6-sol': 'GPT-6 Sol',
+    'gpt-6-sol': 'GPT-6 Sol',
+    '6-luna': 'GPT-6 Luna',
+    'gpt-6-luna': 'GPT-6 Luna',
     '5.5': 'GPT-5.5 Instant',
     '5.6': 'GPT-5.6 Sol',
     '5.6-sol': 'GPT-5.6 Sol',
@@ -374,7 +396,7 @@ function chatgptModelLabel(options) {
     'o3': 'o3',
   }
   const modelLabel = labels[model] || (/^\d/.test(model) ? `GPT-${model}` : model)
-  const parts = [modelLabel, options?.effort || (model === 'o3' ? 'medium' : 'xhigh')]
+  const parts = [modelLabel, options?.effort || (options?.mode !== 'work' && (model === '6-astra' || model === 'gpt-6-astra') ? 'pro' : model === 'o3' ? 'medium' : 'xhigh')]
   if (options?.mode === 'work') parts.push(options?.speed === 'fast' ? 'fast' : 'standard')
   return parts.join(' · ')
 }

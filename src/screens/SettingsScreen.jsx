@@ -72,21 +72,49 @@ function MainSettings() {
     return <div className="text-zinc-500 italic text-sm py-4">Загрузка общих настроек…</div>
   }
   const autoClose = state.value?.external_research_auto_close === true
+  const researchTemporary = state.value?.external_research_temporary_chat !== false
+  const youtubeTemporary = state.value?.youtube_ai_temporary_chat !== false
 
   return (
     <section>
       <h2 className="text-zinc-200 font-medium mb-3">Внешние AI-вкладки</h2>
-      <div className="rounded-md border border-zinc-800 bg-zinc-950 px-4 py-4">
-        <Checkbox
-          checked={autoClose}
-          disabled={state.saving}
-          onChange={value => state.patch({ external_research_auto_close: value })}
-          label="Автоматически закрывать вкладки после успешного завершения"
-        />
-        <div className="text-zinc-500 text-xs mt-2 ml-7">
-          {autoClose
-            ? 'Включено: успешные AI-вкладки закрываются после сохранения результата. Ошибки остаются для диагностики.'
-            : 'Выключено: вкладка с результатом external research останется открытой.'}
+      <div className="rounded-md border border-zinc-800 bg-zinc-950 px-4 py-4 space-y-4">
+        <div>
+          <Checkbox
+            checked={researchTemporary}
+            disabled={state.saving}
+            onChange={value => state.patch({ external_research_temporary_chat: value })}
+            label="External Research — открывать ChatGPT во временном чате"
+          />
+          <div className="text-zinc-500 text-xs mt-2 ml-7">
+            Отдельная настройка для запросов через MCP. Действует только в Chat; Work всегда открывается обычным чатом.
+          </div>
+        </div>
+
+        <div className="border-t border-zinc-900 pt-4">
+          <Checkbox
+            checked={youtubeTemporary}
+            disabled={state.saving}
+            onChange={value => state.patch({ youtube_ai_temporary_chat: value })}
+            label="YouTube AI — открывать пересказ во временном чате"
+          />
+          <div className="text-zinc-500 text-xs mt-2 ml-7">
+            Отдельная настройка для кнопки AI на YouTube. Действует только в Chat; Work всегда открывается обычным чатом.
+          </div>
+        </div>
+
+        <div className="border-t border-zinc-900 pt-4">
+          <Checkbox
+            checked={autoClose}
+            disabled={state.saving}
+            onChange={value => state.patch({ external_research_auto_close: value })}
+            label="Автоматически закрывать вкладки после успешного завершения"
+          />
+          <div className="text-zinc-500 text-xs mt-2 ml-7">
+            {autoClose
+              ? 'Включено: успешные AI-вкладки закрываются после сохранения результата. Ошибки остаются для диагностики.'
+              : 'Выключено: вкладка с результатом External Research останется открытой.'}
+          </div>
         </div>
         {(state.saving || state.error) && (
           <div className={`text-sm mt-3 ${state.error ? 'text-red-300' : 'text-zinc-500'}`}>

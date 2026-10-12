@@ -55,6 +55,7 @@ except RuntimeError as ex:
 
 try:
     from telethon import TelegramClient
+    from tg_concurrent_session import telegram_session
     from telethon.tl.functions.messages import GetDialogFiltersRequest
     from telethon.tl.types import (
         User, Chat, Channel,
@@ -226,14 +227,25 @@ async def _peer_to_handle(client, peer):
     }
 
 
+def _explicit_filter_peers(f):
+    from telethon import utils
+    result, seen = [], set()
+    for peer in list(getattr(f, "pinned_peers", []) or []) + list(getattr(f, "include_peers", []) or []):
+        key = utils.get_peer_id(peer)
+        if key not in seen:
+            seen.add(key)
+            result.append(peer)
+    return result
+
+
 async def _expand_filter(client, f):
-    """Walk a DialogFilter's include_peers and emit one `folder` event with
+    """Walk both pinned and included peers and emit one `folder` event with
     the resolved chats. Same shape regardless of how the caller targeted it
     (by name, by filter_id, or via --all sweep)."""
     fid = _filter_id(f)
     ftitle = _filter_title(f)
     chats = []
-    for peer in list(getattr(f, "include_peers", []) or []):
+    for peer in _explicit_filter_peers(f):
         row = await _peer_to_handle(client, peer)
         if row is not None:
             chats.append(row)
@@ -249,7 +261,7 @@ async def main(name, filter_id_hint, sweep_all):
               "message": f"Session file '{SESSION_PATH.name}' not found — open Telegram settings and pick or create a session."})
         return 4
 
-    client = TelegramClient(str(SESSION_PATH).replace(".session", ""),
+    client = TelegramClient(telegram_session(str(SESSION_PATH).replace(".session", "")),
                             TELEGRAM_API_ID, TELEGRAM_API_HASH)
     _bump_session_busy_timeout(client)
     ok, err, code = await connect_authorized(client, session_name=SESSION_PATH.stem)
@@ -279,7 +291,7 @@ async def main(name, filter_id_hint, sweep_all):
             ftitle = _filter_title(f)
             if not ftitle:
                 continue   # default / unsorted bucket
-            include_count = len(getattr(f, "include_peers", []) or [])
+            include_count = len(_explicit_filter_peers(f))
             candidates.append((f, fid, ftitle, include_count))
             emit({"type": "folder_candidate",
                   "filter_id":     fid,

@@ -177,9 +177,15 @@ export default function JobDetail({ payload }) {
   const isTgFolderRefresh = job.type === 'tg_folder_refresh'
   const isTgReplyBackfill = job.type === 'tg_reply_backfill'
   const isTgIndex        = job.type === 'tg_index'
+  const isYoutubeIndex   = job.type === 'yt_index'
   const isTgLive         = job.type === 'tg_live_search'
                         || job.type === 'tg_live_context'
                         || job.type === 'tg_live_range'
+                        || job.type === 'tg_live_attachment'
+                        || job.type === 'tg_live_transcribe'
+                        || job.type === 'tg_live_public_search'
+                        || job.type === 'tg_live_join'
+                        || job.type === 'tg_live_leave'
   const isTgSave         = job.type === 'tg_fetch' && job.params?.mode === 'id_list'
   const isLocal          = job.type === 'local_transcribe'
   const isBoostySingle   = job.type === 'boosty_transcribe'
@@ -202,10 +208,16 @@ export default function JobDetail({ payload }) {
                          : isTgFolderRefresh ? 'Telegram · обновление папок'
                          : isTgReplyBackfill ? 'Telegram · reply backfill'
                          : isTgIndex        ? 'Семантический индекс'
+                         : isYoutubeIndex   ? 'YouTube · смысловой поиск'
                          : isTgSave         ? 'Telegram · сохранение найденного'
                          : job.type === 'tg_live_search' ? 'Telegram · поиск'
                          : job.type === 'tg_live_context' ? 'Telegram · контекст'
                          : job.type === 'tg_live_range' ? 'Telegram · диапазон'
+                         : job.type === 'tg_live_attachment' ? 'Telegram · вложение'
+                         : job.type === 'tg_live_transcribe' ? 'Telegram · расшифровка'
+                         : job.type === 'tg_live_public_search' ? 'Telegram · публичный поиск'
+                         : job.type === 'tg_live_join' ? 'Telegram · вступление'
+                         : job.type === 'tg_live_leave' ? 'Telegram · выход'
                          : isBoostyChannel  ? 'Boosty · каталог'
                          : isBoostyBatch    ? 'Boosty · пакетная обработка'
                          : isBoostySingle   ? 'Boosty · видео'
@@ -376,14 +388,14 @@ export default function JobDetail({ payload }) {
           {isTgPreview      && <TelegramPreviewBody job={job} />}
           {isTgFolderFetch  && <TelegramFolderFetchBody job={job} />}
           {isTgFolderRefresh && <TelegramFolderRefreshBody job={job} />}
-          {isTgIndex        && <TelegramIndexBody job={job} />}
+          {(isTgIndex || isYoutubeIndex) && <TelegramIndexBody job={job} />}
           {isTgReplyBackfill && <TelegramReplyBackfillBody job={job} />}
           {isTgLive          && <TelegramLiveBody job={job} />}
           {isBoostySingle  && <BoostyBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
           {isBoostyChannel && <BoostyChannelBody job={job} />}
           {isBoostyBatch   && <BoostyBatchBody job={job} />}
           {isLocal          && <LocalBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
-          {!isYoutube && !isRutube && !isTiktok && !isInstagram && !isTgPreview && !isTgFolderFetch && !isTgFolderRefresh && !isTgIndex && !isTgReplyBackfill && !isTgLive && !isBoosty && !isLocal && <TelegramBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
+          {!isYoutube && !isYoutubeIndex && !isRutube && !isTiktok && !isInstagram && !isTgPreview && !isTgFolderFetch && !isTgFolderRefresh && !isTgIndex && !isTgReplyBackfill && !isTgLive && !isBoosty && !isLocal && <TelegramBody job={job} busy={busy} toast={toast} copyFile={copyFile} copyFlash={copyFlash} openIn={openIn} reveal={reveal} />}
 
           {window.api && (
             <div className="mt-12 pt-6 border-t border-zinc-900">
@@ -497,20 +509,94 @@ function TelegramLiveBody({ job }) {
     search: 'Поиск по серверу Telegram',
     context: 'Контекст сообщения',
     range: 'Диапазон сообщений',
+    attachment: 'Чтение вложения',
+    transcribe: 'Расшифровка выбранного медиа',
+    public_search: 'Поиск публичных групп и каналов',
+    join: 'Вступление в чат',
+    leave: 'Выход из чата',
   }[live.operation] || live.operation || 'Live-запрос'
+  const stage = {
+    starting: 'Запускаем',
+    running: 'Подключаемся к Telegram',
+    resolving_transcription: 'Проверяем сообщение',
+    downloading_attachment: 'Скачиваем выбранное медиа',
+    uploading_soniox: 'Передаём аудио в Soniox',
+    transcribing_soniox: 'Soniox расшифровывает',
+    fetching_transcript: 'Получаем расшифровку',
+    reading_transcript: 'Сохраняем текст',
+    searching_public_chats: 'Ищем публичные чаты',
+    resolving_membership: 'Проверяем участие',
+    updating_membership: 'Telegram применяет изменение',
+    membership_updated: 'Обновляем участие',
+    done: 'Готово',
+    cancelling: 'Отменяем',
+    cancelled: 'Отменено',
+    error: 'Ошибка',
+  }[live.stage] || live.stage || job.status || '—'
   const queryCount = Array.isArray(job.params?.searches) ? job.params.searches.length : null
+  const attachment = job.tg_live_attachment || job.params?._tg_live_attachment || null
+  const transcription = job.tg_live_transcription || job.params?._tg_live_transcription || null
+  const membership = job.tg_live_membership || job.params?._tg_live_membership || null
   return (
     <>
       <EntityCard platform="telegram" target={job.target} title={job.entity_title} kind={job.entity_kind} />
       <Section title="Live-запрос">
         <KV k="Операция" v={operation} />
-        <KV k="Этап" v={live.stage || job.status || '—'} />
+        <KV k="Этап" v={stage} />
         {queryCount != null && <KV k="Поисковых формулировок" v={queryCount} />}
         <KV k="Найдено" v={(live.unique_hits || 0).toLocaleString('ru-RU')} />
         {live.truncated && <KV k="Результат" v="ограничен заданным лимитом" />}
-        <KV k="Медиа" v="не скачивались" />
-        <KV k="Хранение" v={live.result_available ? 'временно, до перезапуска приложения' : 'результат не сохранялся'} />
+        {live.operation === 'join' || live.operation === 'leave' ? (
+          <>
+            <KV k="Результат" v={membership?.status || job.status || '—'} />
+            {membership?.chat?.title && <KV k="Чат" v={membership.chat.title} />}
+            {membership?.chat?.username && <KV k="Username" v={`@${membership.chat.username}`} />}
+            {membership?.chat?.type && <KV k="Тип" v={membership.chat.type} />}
+            {membership?.chat?.participants_count != null && (
+              <KV k="Участников" v={Number(membership.chat.participants_count).toLocaleString('ru-RU')} />
+            )}
+            {membership?.chat?.has_discussion != null && (
+              <KV k="Обсуждение" v={membership.chat.has_discussion ? 'подключено' : 'нет'} />
+            )}
+            {membership?.request_sent && <KV k="Доступ" v="заявка отправлена, ждём одобрения" />}
+            {membership?.source_id != null && <KV k="Источник" v={`#${membership.source_id}`} />}
+            {membership?.source_registration_error && (
+              <KV k="Регистрация источника" v={<span className="text-red-400">{membership.source_registration_error}</span>} />
+            )}
+            <KV k="Готов к парсингу" v={membership?.ready_for_fetch ? 'да' : 'нет'} />
+            <KV k="Хранение" v={membership?.source_registered ? 'источник зарегистрирован в SC Desktop' : 'локальный источник не изменён'} />
+          </>
+        ) : live.operation === 'attachment' || live.operation === 'transcribe' ? (
+          <>
+            <KV k="Медиа" v={attachment?.file_path ? 'выбранное вложение скачано' : 'файл не скачан'} />
+            {attachment?.file_name && <KV k="Файл" v={attachment.file_name} />}
+            {attachment?.content_type && <KV k="Тип" v={attachment.content_type} />}
+            {attachment?.bytes != null && <KV k="Размер" v={fmtBytes(attachment.bytes)} />}
+            {attachment?.extraction?.status && <KV k="Чтение" v={attachment.extraction.status} />}
+            {attachment?.limitation && <KV k="Ограничение" v={attachment.limitation} />}
+            {live.operation === 'transcribe' && (
+              <>
+                <KV k="Распознавание" v={transcription?.engine || live.provider || 'Soniox'} />
+                {transcription?.model && <KV k="Модель" v={transcription.model} />}
+                {transcription?.status && <KV k="Статус текста" v={transcription.status} />}
+                {transcription?.chars != null && <KV k="Символов" v={Number(transcription.chars).toLocaleString('ru-RU')} />}
+                {transcription?.transcript_path && <KV k="Транскрипт" v={transcription.transcript_path} />}
+                {transcription?.limitation && <KV k="Ограничение текста" v={transcription.limitation} />}
+              </>
+            )}
+            <KV k="Хранение" v={attachment?.file_path ? 'локальный кэш SC Desktop' : 'файл отсутствует'} />
+          </>
+        ) : (
+          <>
+            <KV k="Медиа" v="не скачивались" />
+            <KV k="Хранение" v={live.result_available ? 'временно, до перезапуска приложения' : 'результат не сохранялся'} />
+          </>
+        )}
+        {live.retry_after_seconds != null && (
+          <KV k="Повторить через" v={`${Number(live.retry_after_seconds).toLocaleString('ru-RU')} сек`} />
+        )}
         {live.duration_ms != null && <KV k="Время" v={`${(live.duration_ms / 1000).toFixed(2)}s`} />}
+        {job.warning?.message && <KV k="Важно" v={<span className="text-amber-300">{job.warning.message}</span>} />}
         {job.error && <KV k="Ошибка" v={<span className="text-red-400">{job.error}</span>} />}
       </Section>
     </>

@@ -8,6 +8,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const readline = require('node:readline')
 const { randomUUID } = require('node:crypto')
+const crypto = require('node:crypto')
 let electronApp = null
 try {
   electronApp = require('electron').app || null
@@ -28,6 +29,7 @@ const {
 } = require('./telegram-finalizer-client')
 const { resolveTelegramProcessOutcome } = require('./telegram-lifecycle')
 const { boundedTail } = require('./job-snapshot-policy')
+const { shouldAutoCopy } = require('./clipboard-policy')
 const {
   normalizeTelegramLiveRequest,
   telegramLiveJobType,
@@ -35,6 +37,10 @@ const {
   createTelegramLiveState,
   applyTelegramLiveEvent,
   publicTelegramLiveState,
+  telegramMembershipSourcePayload,
+  telegramMembershipMutationInFlight,
+  telegramBotMutationInFlight,
+  telegramFolderMutationInFlight,
 } = require('./telegram-live')
 const {
   TELEGRAM_SOURCE_UNAVAILABLE,
@@ -211,6 +217,20 @@ function workerEnv() {
 // СПАВНА job'а (job.tg_session): уже-запущенный fetch продолжает работать со
 // своей сессией, даже если юзер переключил активную (fact-telegram-sessions).
 // Привязка чат↔сессия в sources.tg_session пишется из этого снимка.
+function telegramFetchCapabilities() {
+  const env = workerEnv()
+  return {
+    engines: { soniox: { configured: !!env.SONIOX_API_KEY }, assemblyai: { configured: !!env.ASSEMBLYAI_API_KEY }, gemini: { configured: !!env.GEMINI_API_KEY } },
+    policy_version: 1, voice_types: ['voice', 'audio', 'video'], duration_guard_before_download: true,
+    per_job_media_cache: true, durable_asr_checkpoints: true, durable_request_ids: true,
+    full_history_snapshot_report: true, storage_check_async: true,
+    transcript_reuse: 'any_complete_when_requested',
+    request_status_route: '/telegram-rag/fetch/status', resume_route: '/telegram-rag/fetch/resume',
+    asr_checkpoint_probe_route: '/telegram-rag/fetch/asr-state',
+    asr_adopt_existing_file_route: '/telegram-rag/fetch/asr-adopt-file', partial_asr_resume: true,
+  }
+}
+
 function activeTgSession() {
   try {
     const n = (readScSettings().telegram || {}).session
@@ -495,6 +515,10 @@ function hasUnsafeTelegramBackfillNeed(sourceId, params = {}) {
 }
 
 function telegramCoveragePlannerAllowed(params = {}) {
+  // A durable fetch identity belongs to one exact worker scope. Keep the
+  // existing range planner for legacy callers, but do not substitute a noop
+  // or a split parent behind a newly reserved request row.
+  if (params.request_id) return false
   if (params._range_plan_child || params._coverage_planner_disabled) return false
   if ((params.mode || '') !== 'from_date') return false
   if (!params.date) return false
@@ -856,14 +880,18 @@ if (process.env.SC_DESKTOP_MCP !== '1') {
     const n = db.markStuckRunningAsInterrupted({
       types: [
         'yt_batch_transcribe', 'tk_batch_transcribe', 'ig_batch_transcribe',
-        'tg_index', 'tg_fetch', 'tg_preview',
+        'tg_index', 'yt_index', 'boosty_index', 'tg_fetch', 'tg_preview',
         'tg_folder_fetch', 'tg_folder_refresh', 'tg_reply_backfill',
-        'tg_catchup', 'tg_live_search', 'tg_live_context', 'tg_live_range',
+        'tg_catchup', 'tg_live_search', 'tg_live_public_search', 'tg_live_context',
+        'tg_live_range', 'tg_live_attachment', 'tg_live_transcribe', 'tg_live_join', 'tg_live_leave',
+        'tg_live_bot_info', 'tg_live_bot_messages', 'tg_live_bot_action', 'tg_live_bot_action_status',
+        'tg_live_membership_info', 'tg_live_folder_read', 'tg_live_folder_merge', 'tg_live_folder_merge_status',
+        'tg_live_bot_join', 'tg_live_bot_join_status',
         'yt_transcribe', 'yt_comments', 'yt_batch_comments',
         'rutube_transcribe',
         'yt_channel_fetch', 'tk_transcribe', 'tk_channel_fetch',
         'ig_profile_fetch', 'local_transcribe', 'boosty_transcribe',
-        'boosty_channel_fetch', 'boosty_batch_transcribe',
+        'boosty_channel_fetch', 'boosty_batch_transcribe', 'boosty_account_preflight', 'boosty_catchup',
       ],
     })
     if (n > 0) console.log(`[Jobs] reset ${n} zombie running job row(s) → interrupted`)
@@ -935,6 +963,7 @@ function snapshot(j, { includeLiveItems = false } = {}) {
     // Set by tg_fetch's empty-result path (personal account has no feed, 0 new
     // messages, filters excluded all). Rendered amber, doesn't block `done`.
     warning: j.warning || null,
+    fetch_report: j.fetch_report || j.params?._fetch_report || null,
     tg_progress: publicTelegramProgress(j.tg_progress)
                  || j.params?._tg_progress
                  || null,
@@ -983,26 +1012,33 @@ function snapshot(j, { includeLiveItems = false } = {}) {
     // sidecar .txt path written on close — TelegramSingleMessageForm reads
     // it to enable the «📋 Комменты» button. Null for non-tg_fetch / non-
     // single fetches.
-    tg_voice:    j.tg_voice    || null,
-    tg_comments: j.tg_comments || null,
+    tg_voice:      j.tg_voice      || null,
+    tg_attachment: j.tg_attachment || j.params?._tg_attachment || null,
+    tg_forward:    j.tg_forward    || j.params?._tg_forward || null,
+    tg_comments:   j.tg_comments   || null,
     file_path_comments: j.file_path_comments || null,
     has_discussion: j.has_discussion === true ? true
                   : j.has_discussion === false ? false
                   : null,
     tg_live_items: includeLiveItems ? publicTelegramLiveItems(j) : null,
     tg_current_item: publicTelegramLiveItem(j.tg_current_item, j),
-    // Read-only Telegram server request started by MCP. The potentially large
-    // message result stays in process memory and is returned only through the
+    // Telegram live request started by MCP (read-only retrieval or an explicit
+    // confirmed membership mutation). Potentially large result bodies stay in
+    // process memory and are returned only through the
     // explicit bridge status endpoint; renderer snapshots carry this compact
     // progress summary so background polling never recreates the old traffic
     // amplification bug.
     tg_live: publicTelegramLiveState(j.tg_live),
+    tg_live_attachment: j.tg_live_attachment || j.params?._tg_live_attachment || null,
+    tg_live_transcription: j.tg_live_transcription || j.params?._tg_live_transcription || null,
+    tg_live_membership: j.tg_live_membership || j.params?._tg_live_membership || null,
   }
 }
 
 function publicTelegramLiveItem(it, j) {
   if (!it || !j) return null
   const published = it.date ? Math.floor(new Date(it.date).getTime() / 1000) : null
+  const rawMeta = telegramRawMetaFromItem(it)
   return {
     id: `live:${j.id}:${it.id}`,
     source_id: j.source_id || null,
@@ -1021,7 +1057,7 @@ function publicTelegramLiveItem(it, j) {
     thumbnail_path: null,
     sender: it.sender || null,
     has_media: !!it.has_media,
-    raw_meta_json: null,
+    raw_meta_json: rawMeta ? JSON.stringify(rawMeta) : null,
     topic_id: it.topic_id != null ? it.topic_id : null,
     topic_title: it.topic_title || null,
     parent_external_id: it.parent_external_id || null,
@@ -1029,6 +1065,15 @@ function publicTelegramLiveItem(it, j) {
     __live: true,
     __live_job_id: j.id,
   }
+}
+
+function telegramRawMetaFromItem(item) {
+  const out = {}
+  if (Array.isArray(item?.media) && item.media.length) out.media = item.media
+  if (item?.forward && typeof item.forward === 'object') out.forward = item.forward
+  if (item?.telegram_reply && typeof item.telegram_reply === 'object') out.telegram_reply = item.telegram_reply
+  if (Object.prototype.hasOwnProperty.call(item || {}, 'external_reply')) out.external_reply = item.external_reply
+  return Object.keys(out).length ? out : null
 }
 
 function publicTelegramLiveItems(j) {
@@ -1150,7 +1195,12 @@ function listJobs(historyRows = null) {
       ? (workerHistory.telegramLive || [])
       : db.getDb().prepare(
           `SELECT * FROM jobs
-            WHERE type IN ('tg_live_search', 'tg_live_context', 'tg_live_range')
+            WHERE type IN ('tg_live_search', 'tg_live_public_search', 'tg_live_context',
+                           'tg_live_range', 'tg_live_attachment', 'tg_live_transcribe',
+                           'tg_live_join', 'tg_live_leave', 'tg_live_bot_info', 'tg_live_bot_messages',
+                           'tg_live_bot_action', 'tg_live_bot_action_status', 'tg_live_membership_info',
+                           'tg_live_folder_read', 'tg_live_folder_merge', 'tg_live_folder_merge_status',
+                           'tg_live_bot_join', 'tg_live_bot_join_status')
             ORDER BY started_at DESC LIMIT 150`
         ).all()
     historicTgLive = rows
@@ -1439,6 +1489,8 @@ function rowToTgSingleSnapshot(row) {
     // Restore per-kind error / skipped logs so «Видео ⚠14» in JobDetail
     // can still expand into the per-msg failure list after Electron restart.
     media_phase:    p?._media_phase || null,
+    tg_attachment:  p?._tg_attachment || null,
+    tg_forward:     p?._tg_forward || null,
   }
 }
 
@@ -1894,22 +1946,32 @@ async function bulkUpsertItemsYielding(rows, { jobId = '-', sourceId = '-', chun
  * params: { target, mode, limit?, date?, url? }
  */
 function startTelegramFetch(params) {
-  params = { ...(params || {}) }
-  const coveragePlan = prepareTelegramCoveragePlan(params)
+  try {
+    params = require('./telegram-fetch-policy').validateTelegramFetchPolicy(params || {})
+    // Never perform potentially blocking external-volume I/O on Electron main.
+    // The explicit public preflight uses a bounded storage worker; the real
+    // Python job independently fences mount/space before download/provider work.
+  } catch (error) { error.pre_spawn = true; throw error }
+  let coveragePlan
+  try { coveragePlan = prepareTelegramCoveragePlan(params) }
+  catch (error) { error.pre_spawn = true; throw error }
   if (coveragePlan?.kind === 'noop') return startTelegramNoopFetch(params, coveragePlan)
   if (coveragePlan?.kind === 'multi') return startTelegramRangePlan(params, coveragePlan)
   if (coveragePlan?.kind === 'single' && coveragePlan.params) params = coveragePlan.params
 
   const startStartedMs = Date.now()
   const id = nextId++
-  const telegramSource = telegramSourceForFetchParams(params)
-  const workerTarget = telegramWorkerTarget(params, telegramSource)
-  const usesStableTelegramTarget = !!telegramStableTarget(telegramSource)
+  let telegramSource, workerTarget, usesStableTelegramTarget, tgSession
+  try {
+    telegramSource = telegramSourceForFetchParams(params)
+    workerTarget = telegramWorkerTarget(params, telegramSource)
+    usesStableTelegramTarget = !!telegramStableTarget(telegramSource)
+    tgSession = telegramSessionForFetchParams(params, telegramSource)
+  } catch (error) { error.pre_spawn = true; throw error }
   // Снимок активной сессии ДО построения args: он же уходит Python'у явным
   // --session (иначе Python перечитал бы settings.json сам — окно гонки, в
   // котором переключение сессии в UI ретаргетит уже-спавнящийся fetch, и
   // job.tg_session разошёлся бы с реально использованной сессией).
-  const tgSession = telegramSessionForFetchParams(params, telegramSource)
   const args = [
     path.join(WORKERS_ROOT, 'telegram', 'tg_fetch_json.py'),
     workerTarget,
@@ -1940,6 +2002,7 @@ function startTelegramFetch(params) {
   if (params.process_photo) args.push('--process-photo')
   if (params.process_docs)  args.push('--process-docs')
   if (params.process_polls) args.push('--process-polls')
+  args.push(...require('./telegram-fetch-worker-options').telegramFetchWorkerOptions(params, { jobsDir: JOBS_DIR, session: tgSession }))
   // Forum topic filter (multi). Each id maps to a top_msg_id; Python loops
   // over them with iter_messages(reply_to=tid). Empty / undefined → omit.
   if (Array.isArray(params.topic_ids) && params.topic_ids.length > 0) {
@@ -1988,6 +2051,9 @@ function startTelegramFetch(params) {
         if (existing?.type !== 'tg_fetch') continue
         if (Number(existing.source_id) !== Number(knownSourceId)) continue
         if (existing.status !== 'running' && existing.status !== 'awaiting_ai' && existing.status !== 'cancelling') continue
+        if (params.request_id && existing.params?.request_id !== params.request_id) {
+          throw Object.assign(new Error('Another Telegram fetch already owns this source'), { code: 'FETCH_SOURCE_BUSY', pre_spawn: true, existing_job_id: `desktop:${existing.id}` })
+        }
         console.warn(`[Jobs] tg_fetch duplicate source #${knownSourceId} → reuse live #${existing.id} db #${existing.dbRowId || '-'}`)
         return existing.id
       }
@@ -2020,7 +2086,7 @@ function startTelegramFetch(params) {
                        // Building a skip-set would no-op the whole request.
                        || isMediaOnly
   let skipFilePath = null // legacy cleanup field; new runs do not create one
-  if (wantsAi && !allowReprocess && !isEphemeral) {
+  if (wantsAi && !allowReprocess && (!isEphemeral || params.reuse_transcripts)) {
     if (telegramSource?.id) {
       args.push('--skip-processed-source-id', String(telegramSource.id))
     }
@@ -2087,6 +2153,7 @@ function startTelegramFetch(params) {
   }
   job._closePromise = new Promise(resolve => { job._resolveClose = resolve })
   if (job.tg_progress) job.params = persistTelegramProgressParams(job)
+  if (params._reserved_job_row_id) job.dbRowId = Number(params._reserved_job_row_id)
   if (job.tg_progress) markTelegramEtaPoint(job)
   // SourceDetail fetches already know their source_id before Python resolves
   // the Telegram entity. Seed it now and insert the running History row before
@@ -2095,7 +2162,7 @@ function startTelegramFetch(params) {
   if (knownSourceId && Number.isFinite(knownSourceId) && knownSourceId > 0) {
     job.source_id = knownSourceId
     try {
-      job.dbRowId = db.recordJob({
+      job.dbRowId = job.dbRowId || db.recordJob({
         type: job.type, source_id: job.source_id, status: 'running',
         items_total: null, items_done: 0,
         params: job.params, started_at: job.started_at,
@@ -2238,6 +2305,8 @@ function startTelegramFetch(params) {
     }
 
     let finalizeFailure = null
+    let persistedRows = finalizerResult ? Number(finalizerResult.rows || 0) : null
+    let persistedMedia = finalizerResult ? Number(finalizerResult.mediaApplied || 0) : null
 
     // 1. Persist all items into SQLite (idempotent UPSERT — re-fetches don't dup).
     try {
@@ -2257,7 +2326,7 @@ function startTelegramFetch(params) {
           comments:         null,
           sender:           it.sender || null,
           has_media:        !!it.has_media,
-          raw_meta:         null,
+          raw_meta:         telegramRawMetaFromItem(it),
           topic_id:         it.topic_id != null ? it.topic_id : null,
           topic_title:      it.topic_title || null,
           parent_external_id: it.parent_external_id || null,
@@ -2282,6 +2351,7 @@ function startTelegramFetch(params) {
             emit(job)
           },
         })
+        persistedRows = rows.length
         console.log(`[Jobs] close #${id} bulkUpsertItems rows=${rows.length} source #${job.source_id} took ${Date.now() - dbStartedMs}ms`)
       }
 
@@ -2313,6 +2383,7 @@ function startTelegramFetch(params) {
           }
         }
         console.log(`[Jobs] close #${id} applied ${applied}/${stash.length} media results to items took ${Date.now() - mediaStartedMs}ms`)
+        persistedMedia = applied
       }
     } catch (err) {
       console.error('[Jobs] DB write failed', err)
@@ -2459,6 +2530,8 @@ function startTelegramFetch(params) {
           file_path_comments: job.file_path_comments || null,
           tg_comments: job.tg_comments || null,
           has_discussion: job.has_discussion === true,
+          _tg_attachment: job.tg_attachment || null,
+          _tg_forward: job.tg_forward || null,
         }
       }
       // media_phase + type_breakdown live in-memory only; reaping the job
@@ -2477,6 +2550,7 @@ function startTelegramFetch(params) {
         // Persist the empty-result warning so a historic JobDetail (rebuilt
         // from the DB row after restart) still explains why 0 items landed.
         if (job.warning) next._warning = job.warning
+        if (job.error_code) next._error_code = job.error_code
         finishTelegramProgress(job)
         if (job.tg_progress) next._tg_progress = publicTelegramProgress(job.tg_progress)
         job.params = next
@@ -2499,6 +2573,18 @@ function startTelegramFetch(params) {
     job.finished_at = Math.floor(Date.now() / 1000)
     finishTelegramProgress(job)
     job.params = persistTelegramProgressParams(job)
+    if (job.error_code) job.params._error_code = job.error_code
+    if (job.params?.request_id || job.params?.full_history) {
+      job.fetch_report = { ...(job.fetch_report || {}), persistence: {
+        metadata_rows_received: closeItemCount,
+        metadata_rows_upserted: persistedRows ?? (closeItemCount === 0 ? 0 : null),
+        media_results_received: Array.isArray(job.tg_media_results) ? job.tg_media_results.length : 0,
+        media_results_applied: persistedMedia ?? (job.tg_media_results?.length ? null : 0),
+        count_semantics: 'upserted_input_rows_not_new_insert_count',
+        finalization_succeeded: !finalizeFailure,
+      } }
+      job.params._fetch_report = job.fetch_report
+    }
 
     // Finalise the jobs row (started as status='running' on entity-resolve).
     // Single UPDATE — same id throughout the job lifecycle.
@@ -2670,6 +2756,7 @@ function _recordMediaProgress(job, kind, evt) {
     aai_status:         evt.aai_status || null,
     elapsed_sec:        evt.elapsed_sec ?? null,
     audio_duration_sec: evt.audio_duration_sec ?? prevDur ?? null,
+    file_name:          evt.file_name ?? (sameMsg ? prev?.file_name : null) ?? null,
   }
 }
 
@@ -2816,6 +2903,7 @@ function handleEvent(job, evt) {
         // while the fetch is still in progress. Finalised in the close handler
         // via db.updateJob(...) — no second INSERT, same row id.
         try {
+          if (job.source_id && job.dbRowId && job.params?.request_id) db.updateJob(job.dbRowId, { source_id: job.source_id })
           if (job.source_id && !job.dbRowId) {
             const pendingStartedMs = Date.now()
             job.dbRowId = db.recordJob({
@@ -2838,6 +2926,10 @@ function handleEvent(job, evt) {
       updateTelegramDateProgress(job, evt.data)
       const t = (evt.data && evt.data.type) || 'other'
       job.type_breakdown[t] = (job.type_breakdown[t] || 0) + 1
+      if (job.params?.mode === 'single') {
+        job.tg_attachment = Array.isArray(evt.data?.media) ? (evt.data.media[0] || null) : null
+        job.tg_forward = evt.data?.forward || null
+      }
 
       // Track date range for coverage record
       const ts = evt.data && evt.data.date ? Math.floor(new Date(evt.data.date).getTime() / 1000) : null
@@ -2924,6 +3016,19 @@ function handleEvent(job, evt) {
     case 'comment_error':
       // Per-post failure — keep going, just count it. Surfaced in 'done' totals.
       console.warn(`[Jobs] tg comment_error post=${evt.post_id}: ${evt.message}`)
+      break
+    case 'speech-summary':
+      job.fetch_report = { ...(job.fetch_report || {}), speech: evt.stats || evt.summary || {} }
+      job.params._fetch_report = job.fetch_report
+      if (job.dbRowId) { try { db.updateJob(job.dbRowId, { params: job.params }) } catch (error) { console.error('[Jobs] speech summary checkpoint failed', error.message) } }
+      emit(job)
+      break
+    case 'flood-wait':
+    case 'traversal':
+      job.fetch_report = { ...(job.fetch_report || {}), ...evt }
+      job.params._fetch_report = job.fetch_report
+      if (job.dbRowId) { try { db.updateJob(job.dbRowId, { params: job.params }) } catch (error) { console.error('[Jobs] traversal checkpoint failed', error.message) } }
+      emit(job)
       break
     case 'done':
       // Protocol done is not durable completion. Python still has to close and
@@ -3286,7 +3391,15 @@ function rowToHistoricSnapshot(row) {
       synced:        0,
       removed:       0,
     }
-  } else if (type === 'tg_live_search' || type === 'tg_live_context' || type === 'tg_live_range') {
+  } else if (type === 'tg_live_search' || type === 'tg_live_public_search'
+    || type === 'tg_live_context' || type === 'tg_live_range'
+    || type === 'tg_live_attachment' || type === 'tg_live_transcribe'
+    || type === 'tg_live_join' || type === 'tg_live_leave'
+    || type === 'tg_live_bot_info' || type === 'tg_live_bot_messages'
+    || type === 'tg_live_bot_action' || type === 'tg_live_bot_action_status'
+    || type === 'tg_live_membership_info' || type === 'tg_live_folder_read'
+    || type === 'tg_live_folder_merge' || type === 'tg_live_folder_merge_status'
+    || type === 'tg_live_bot_join' || type === 'tg_live_bot_join_status') {
     base.entity_kind = 'telegram_live'
     base.tg_live = params?._tg_live || {
       operation: type.replace('tg_live_', ''),
@@ -3312,16 +3425,16 @@ function cancelJob(id, { identity = null, type = null } = {}) {
     try {
       const indexJob = require('./index-job')
       if (indexJob && typeof indexJob.cancelById === 'function' && indexJob.cancelById(requestedId)) {
-        console.log(`[Jobs] cancel id=${id} handled by tg_index`)
+        console.log(`[Jobs] cancel id=${id} handled by semantic index`)
         return true
       }
     } catch (err) {
-      console.error('[Jobs] cancel tg_index route failed', err && err.message || err)
+      console.error('[Jobs] cancel semantic-index route failed', err && err.message || err)
     }
     return false
   }
   if ((typeof requestedId === 'string' && requestedId.startsWith('index-'))
-      || (identity === 'db' && type === 'tg_index')) {
+      || (identity === 'db' && (type === 'tg_index' || type === 'yt_index' || type === 'boosty_index'))) {
     return cancelIndex()
   }
 
@@ -3348,13 +3461,39 @@ function cancelJob(id, { identity = null, type = null } = {}) {
     return false
   }
   console.log(`[Jobs] cancel id=${id} matched live #${j.id} db #${j.dbRowId || '-'} type=${j.type} source #${j.source_id || '-'}`)
+  if (telegramMembershipMutationInFlight(j)) {
+    j.warning = {
+      code: 'telegram_membership_commit_in_flight',
+      message: 'Запрос на изменение участия уже передан Telegram; ждём подтверждение результата.',
+    }
+    console.warn(`[Jobs] cancel id=${id} refused: ${j.type} membership RPC already in flight`)
+    emit(j)
+    return false
+  }
+  if (telegramBotMutationInFlight(j)) {
+    j.warning = { code: 'telegram_bot_commit_in_flight', message: 'Запрос боту уже отправляется; ждём квитанцию исходного request_id.' }
+    console.warn(`[Jobs] cancel id=${id} refused: bot RPC already in flight`)
+    emit(j)
+    return false
+  }
+  if (telegramFolderMutationInFlight(j)) {
+    j.warning = { code: 'telegram_folder_commit_in_flight', message: 'Изменение папки уже отправляется; проверяем исходный request_id, без повторной записи.' }
+    console.warn(`[Jobs] cancel id=${id} refused: folder RPC already in flight`)
+    emit(j)
+    return false
+  }
   // Telegram cancellation remains non-terminal until the subprocess closes
   // and all received rows have been durably finalized. This prevents folder
   // umbrellas from starting the next child over a still-running Telethon
   // process or an in-flight SQLite commit.
   const deferTerminalUntilClose = new Set([
     'tg_fetch', 'tg_reply_backfill', 'tg_folder_refresh',
-    'tg_live_search', 'tg_live_context', 'tg_live_range',
+    'tg_live_search', 'tg_live_public_search', 'tg_live_context', 'tg_live_range',
+    'tg_live_attachment', 'tg_live_transcribe', 'tg_live_join', 'tg_live_leave', 'tg_live_asr_recovery',
+    'tg_live_bot_info', 'tg_live_bot_messages', 'tg_live_bot_action', 'tg_live_bot_action_status',
+    'tg_live_membership_info',
+    'tg_live_folder_read', 'tg_live_folder_merge', 'tg_live_folder_merge_status',
+    'tg_live_bot_join', 'tg_live_bot_join_status',
     'yt_channel_fetch', 'yt_batch_transcribe',
     'tk_channel_fetch', 'tk_batch_transcribe',
     'ig_profile_fetch', 'ig_batch_transcribe',
@@ -3368,7 +3507,10 @@ function cancelJob(id, { identity = null, type = null } = {}) {
     try { j.child.kill('SIGTERM') }
     catch (err) { console.error('[Jobs] child SIGTERM failed', err) }
     j._cancelEscalationTimer = setTimeout(() => {
-      if (!j.child || j.child.exitCode != null) return
+      // A signal-terminated child keeps exitCode=null and records signalCode.
+      // Treat either as terminal; otherwise a clean SIGTERM misleadingly
+      // schedules a second SIGKILL against an already-closed process.
+      if (!j.child || j.child.exitCode != null || j.child.signalCode != null) return
       console.warn(`[Jobs] cancel escalate live #${j.id} pid=${j.child.pid || '-'} → SIGKILL`)
       try { j.child.kill('SIGKILL') } catch {}
     }, 5000)
@@ -3923,6 +4065,7 @@ function startTelegramReplyBackfill(params) {
           external_id: evt.external_id,
           parent_external_id: evt.parent_external_id || null,
         }
+        if (evt.raw_meta_patch && typeof evt.raw_meta_patch === 'object') upd.raw_meta_patch = evt.raw_meta_patch
         if (Object.prototype.hasOwnProperty.call(evt, 'reactions')) {
           upd.reactions = evt.reactions   // null | [] | [...]
           job.reaction_checked += 1
@@ -4491,6 +4634,44 @@ const TG_LIVE_RESULT_TTL_MS = 30 * 60 * 1000
 const TG_LIVE_RESULT_MAX_BYTES = 32 * 1024 * 1024
 const TG_LIVE_RESULT_MAX_JOBS = 50
 
+function applyTelegramMembershipResult(job, result) {
+  if (!result || !['join', 'leave'].includes(result.operation)) return
+  const chat = result.chat && typeof result.chat === 'object' ? result.chat : null
+  if (!chat?.id) return
+  try {
+    if (result.operation === 'join' && result.ready_for_fetch === true) {
+      const payload = telegramMembershipSourcePayload(result, job.tg_session)
+      if (!payload) throw new Error('Telegram join returned incomplete source identity')
+      const sourceId = db.upsertSource(payload)
+      job.source_id = sourceId
+      result.source_id = sourceId
+      result.source_registered = true
+      if (typeof chat.has_discussion === 'boolean') {
+        db.setSourceHasDiscussion(sourceId, chat.has_discussion)
+      }
+      clearTelegramUnavailableAfterLiveResolve(sourceId, `tg_live_join #${job.id}`)
+      return
+    }
+    if (result.operation === 'leave') {
+      const lookup = chat.username || String(chat.id)
+      const existing = db.findTelegramSourceByTarget(lookup)
+        || db.findTelegramSourceByTarget(String(chat.id))
+      if (!existing) return
+      const payload = telegramMembershipSourcePayload(result, job.tg_session, existing)
+      if (!payload) return
+      const sourceId = db.upsertSource(payload)
+      job.source_id = sourceId
+      result.source_id = sourceId
+      result.source_registered = true
+    }
+  } catch (error) {
+    result.source_registered = false
+    result.source_registration_error = String(error?.message || error)
+    result.ready_for_fetch = false
+    console.error(`[Jobs] tg_live_${result.operation} #${job.id} source registration failed`, error)
+  }
+}
+
 function pruneTelegramLiveResults({ keepId = null } = {}) {
   const now = Date.now()
   const candidates = [...jobs.values()]
@@ -4515,7 +4696,9 @@ function pruneTelegramLiveResults({ keepId = null } = {}) {
 }
 
 /**
- * Start a read-only Telegram server request on behalf of MCP. The MCP process
+ * Start a Telegram server request on behalf of MCP. Read operations and
+ * explicit confirmed membership mutations share this one visible job path.
+ * The MCP process
  * calls the loopback bridge, so this is the main-process job Map the renderer
  * already watches — no invisible second job-runner exists for this flow.
  *
@@ -4531,7 +4714,9 @@ function startTelegramLive(rawRequest = {}) {
   const tgSession = telegramSessionForFetchParams({ session: request.session }) || 'session2'
   request.session = tgSession
   const args = [TG_LIVE_SCRIPT, '--session', tgSession]
-  console.log(`[Jobs] start ${type} #${id} target=${target} session=${tgSession}${request.operation === 'search' ? ` searches=${request.searches.length}` : ''}`)
+  const diagnosticTarget = /^https?:\/\/(?:t|telegram)\.me\/(?:\+|joinchat\/)/i.test(target)
+    ? `private-invite:${crypto.createHash('sha256').update(target).digest('hex').slice(0,12)}` : target
+  console.log(`[Jobs] start ${type} #${id} target=${diagnosticTarget} session=${tgSession}${request.operation === 'search' ? ` searches=${request.searches.length}` : ''}`)
 
   const child = spawn(WORKER_PYTHON, args, {
     cwd: WORKERS_ROOT,
@@ -4546,7 +4731,7 @@ function startTelegramLive(rawRequest = {}) {
     items_done: 0,
     items_total: request.operation === 'search' ? request.searches.length : null,
     started_at: Math.floor(Date.now() / 1000),
-    params: request,
+    params: { ...request, origin: rawRequest.origin, autoCopy: rawRequest.autoCopy },
     source_id: null,
     tg_session: tgSession,
     tg_live: createTelegramLiveState(request),
@@ -4563,6 +4748,9 @@ function startTelegramLive(rawRequest = {}) {
     try { event = JSON.parse(line) } catch {
       console.warn(`[Jobs] ${type} #${id} ignored non-JSON worker line`)
       return
+    }
+    if (event.type === 'result' && event.result) {
+      applyTelegramMembershipResult(job, event.result)
     }
     emitEvent(job, event)
     const shouldEmit = applyTelegramLiveEvent(job, event)
@@ -4610,7 +4798,7 @@ function startTelegramLive(rawRequest = {}) {
     try {
       job.dbRowId = db.recordJob({
         type: job.type,
-        source_id: null,
+        source_id: job.source_id || null,
         status: job.status,
         items_total: job.tg_live?.unique_hits || job.items_total || 0,
         items_done: job.tg_live?.unique_hits || job.items_done || 0,
@@ -4619,12 +4807,16 @@ function startTelegramLive(rawRequest = {}) {
         params: {
           ...job.params,
           _tg_live: publicTelegramLiveState(job.tg_live),
+          _tg_live_attachment: job.tg_live_attachment || null,
+          _tg_live_transcription: job.tg_live_transcription || null,
+          _tg_live_membership: job.tg_live_membership || null,
           entity_title: job.entity_title || null,
           target: job.target,
         },
         error: job.error,
         started_at: job.started_at,
         finished_at: job.finished_at,
+        file_path: job.file_path || null,
       })
     } catch (error) {
       console.error(`[Jobs] ${type} #${id} recordJob failed`, error)
@@ -4893,6 +5085,10 @@ function startYoutubeComments(params) {
     '--limit', String(limit),
   ]
   if (wReply) args.push('--with-replies')
+  if (params._comments_archive_path) {
+    args.push('--archive-json', params._comments_archive_path,
+      '--expected-channel-id', params._comments_expected_channel_id)
+  }
 
   console.log(`[Jobs] start yt_comments #${id} url=${params.url} sort=${sort} limit=${limit}${wReply ? ' +replies' : ''}`)
 
@@ -4904,7 +5100,9 @@ function startYoutubeComments(params) {
     items_done: 0,
     items_total: null,
     started_at: Math.floor(Date.now() / 1000),
-    params: { url: params.url, sort, limit, includeReplies: wReply },
+    params: { ...params, url: params.url, sort, limit, includeReplies: wReply },
+    source_id: params._comments_source_id || null,
+    dbRowId: params._comments_db_row_id || null,
     yt_comments: {
       stage:    'fetching',
       video_id: null,
@@ -4971,14 +5169,15 @@ function attachYoutubeCommentsStreams(job, child) {
     // and so cache-lookup can find this entry next time.
     if (job.status !== 'running') {
       try {
-        db.recordJob({
+        const record = {
           type:        'yt_comments',
-          source_id:   null,
+          source_id:   job.source_id || null,
           status:      job.status,
-          items_total: null,
-          items_done:  0,
+          items_total: job.yt_comments?.archive_report ? Number(job.yt_comments.archive_report.unique_count || 0) : null,
+          items_done:  job.yt_comments?.archive_report ? Number(job.yt_comments.archive_report.unique_count || 0) : 0,
           cost_usd:    0,
           params: {
+            ...job.params,
             url:             job.target,
             video_id:        job.yt_comments?.video_id,
             title:           job.yt_comments?.title,
@@ -4989,12 +5188,19 @@ function attachYoutubeCommentsStreams(job, child) {
             count_total:     job.yt_comments?.count_total,
             count_top:       job.yt_comments?.count_top,
             count_replies:   job.yt_comments?.count_replies,
+            ...(job.yt_comments?.archive_path ? {
+              _comments_archive_path: job.yt_comments.archive_path,
+              _comments_archive_sha256: job.yt_comments.archive_sha256,
+              _comments_archive_report: job.yt_comments.archive_report,
+            } : {}),
           },
           error:       job.error,
           started_at:  job.started_at,
           finished_at: job.finished_at,
           file_path:   job.file_path || null,
-        })
+        }
+        if (job.dbRowId) db.updateJob(job.dbRowId, record)
+        else job.dbRowId = db.recordJob(record)
       } catch (err) {
         console.error('[Jobs] yt_comments DB write failed', err)
       }
@@ -5047,6 +5253,8 @@ function handleYoutubeCommentsEvent(job, evt) {
         count_total:   evt.count_total,
         count_top:     evt.count_top,
         count_replies: evt.count_replies,
+        ...(evt.archive_path ? { archive_path: evt.archive_path,
+          archive_sha256: evt.archive_sha256, archive_report: evt.archive_report } : {}),
       }
       scheduleAutoCopy(job, evt.file_path, result => {
         job.yt_comments.copied_bytes = result.bytes
@@ -5061,13 +5269,21 @@ function handleYoutubeCommentsEvent(job, evt) {
       break
     case 'error':
       job.error = evt.message
+      job.error_code = evt.code || null
+      job.yt = {
+        ...(job.yt || {}),
+        stage: 'error',
+        failure_stage: evt.stage || job.yt?.stage || null,
+      }
       break
   }
 }
 
-async function copyFileToClipboard(filePath) {
+async function copyFileToClipboard(filePath, { silent = false } = {}) {
   // Used by both fresh and cached YouTube flow.
   // Resolves to { ok, bytes? | error }; file I/O stays in the read worker.
+  // This is the clipboard primitive. Automatic delivery is separately guarded
+  // by scheduleAutoCopy; explicit human Copy remains available for any result.
   const { clipboard } = require('electron')
   try {
     let result
@@ -5080,15 +5296,22 @@ async function copyFileToClipboard(filePath) {
     }
     if (!result?.parts) return { ok: false, error: 'File not found' }
     clipboard.writeText(result.text)
-    playClipboardSound()
+    if (!silent) playClipboardSound()
     return { ok: true, bytes: result.bytes }
   } catch (err) {
     return { ok: false, error: String(err) }
   }
 }
 
+// Every provider uses this shared gate. MCP gets its saved result through the
+// API, never the person's clipboard; manual paste-flow/extension keeps copying.
 function scheduleAutoCopy(job, filePath, onCopied) {
-  void copyFileToClipboard(filePath).then(result => {
+  if (!shouldAutoCopy(job?.params)) {
+    console.log(`[Jobs] auto-copy suppressed #${job?.id} type=${job?.type || 'unknown'} reason=clipboard_policy`)
+    return
+  }
+  const silent = !!job?.params?.silentAutoCopy
+  void copyFileToClipboard(filePath, { silent }).then(result => {
     if (!result?.ok) return
     try { onCopied?.(result) } catch {}
     emit(job)
@@ -5100,6 +5323,7 @@ function scheduleAutoCopy(job, filePath, onCopied) {
 // Plays macOS system "Blow.aiff" — fire-and-forget. Used after every auto-copy
 // to clipboard so the user knows the transcript landed without looking at UI.
 // Manual Copy buttons in JobDetail/etc. don't call this — only auto-fires.
+// MCP jobs skip the whole automatic copy, including its sound.
 function playClipboardSound() {
   if (process.platform !== 'darwin') return
   try {
@@ -5854,14 +6078,16 @@ function lookupYoutubeChannel({ handle, channel_id }) {
  */
 function startYoutubeChannelFetch(params) {
   const id = nextId++
+  const rawLimit = Number(params?.limit)
+  const requestedLimit = Number.isFinite(rawLimit) ? Math.max(0, Math.floor(rawLimit)) : 200
   const args = [
     YT_CHANNEL_SCRIPT,
     params.target,
-    '--limit', String(params.limit || 200),
+    '--limit', String(requestedLimit),
   ]
   if (params.reverse) args.push('--reverse')
 
-  console.log(`[Jobs] start yt_channel_fetch #${id} target=${params.target} limit=${params.limit || 200}`)
+  console.log(`[Jobs] start yt_channel_fetch #${id} target=${params.target} limit=${requestedLimit || 'full'}`)
 
   const child = spawn(WORKER_PYTHON, args, {
     cwd: WORKERS_ROOT,
@@ -5877,7 +6103,7 @@ function startYoutubeChannelFetch(params) {
     items_done: 0,
     items_total: null,
     started_at: Math.floor(Date.now() / 1000),
-    params: { ...params },
+    params: { ...params, limit: requestedLimit },
     items: [],            // accumulated → bulkUpsert on close
     yt_channel: {},       // entity payload mirrored here
     child,
@@ -5977,6 +6203,31 @@ function startYoutubeChannelFetch(params) {
     // history. The channel's last_synced_at on `sources` covers "when did
     // we last update the list".  Only batch transcribes / TG fetches stay.
 
+    if (job.status === 'done' && job.source_id && job.yt_channel?.channel_id) {
+      try {
+        db.upsertYoutubeChannel({
+          channel_id: job.yt_channel.channel_id,
+          handle: job.yt_channel.handle,
+          display_name: job.yt_channel.title,
+          avatar_url: job.yt_channel.avatar_url,
+          meta: {
+            subs_count: job.yt_channel.subs_count,
+            channel_url: job.yt_channel.url,
+            catalog_last_fetch_count: job.yt_channel.loaded_count ?? job.items_done ?? 0,
+            catalog_total: job.yt_channel.catalog_complete
+              ? (job.yt_channel.catalog_total ?? job.items_done ?? 0)
+              : null,
+            catalog_complete: !!job.yt_channel.catalog_complete,
+            catalog_requested_limit: requestedLimit,
+            catalog_updated_at: job.finished_at,
+          },
+          is_explicit: true,
+        })
+      } catch (err) {
+        console.error('[Jobs] YouTube catalog coverage meta write failed', err)
+      }
+    }
+
     delete job.items
     job.phase = 'terminal'
     const dur = job.finished_at - job.started_at
@@ -6047,6 +6298,10 @@ function handleChannelEvent(job, evt) {
       job.yt_channel = {
         ...job.yt_channel,
         items_total:        evt.items_total,
+        loaded_count:       evt.loaded_count ?? evt.items_total,
+        catalog_total:      evt.catalog_total ?? null,
+        catalog_complete:   !!evt.catalog_complete,
+        requested_limit:    evt.requested_limit,
         total_duration_sec: evt.total_duration_sec,
         date_min:           evt.date_min || job.yt_channel.date_min,
         date_max:           evt.date_max || job.yt_channel.date_max,
@@ -6366,6 +6621,14 @@ function handleBatchEvent(job, evt) {
     case 'subs_missing':
       if (b.current) b.current.stage = 'awaiting_ai'
       break
+    case 'audio_download_start':
+      if (b.current) { b.current.stage = 'downloading_audio'; b.current.engine = evt.engine }
+      emit(job)
+      break
+    case 'audio_download_done':
+      if (b.current) { b.current.stage = 'audio_ready'; b.current.bytes = evt.bytes || null }
+      emit(job)
+      break
     case 'transcribe_start':
       if (b.current) { b.current.stage = 'transcribing'; b.current.engine = evt.engine }
       break
@@ -6403,7 +6666,7 @@ function handleBatchEvent(job, evt) {
     case 'item_error':
       b.errors += 1
       job.items_done = (b.saved + b.skipped + b.errors)
-      b.log.push({ video_id: evt.video_id, kind: 'error', message: evt.message })
+      b.log.push({ video_id: evt.video_id, kind: 'error', code: evt.code || null, stage: evt.stage || null, message: evt.message })
       emit(job)
       break
     case 'done':
@@ -8046,23 +8309,33 @@ function handleRedditEvent(job, evt) {
 
 const TG_SESSIONS_SCRIPT = path.join(WORKERS_ROOT, 'telegram', 'tg_sessions_ndjson.py')
 const TG_SEND_SAVED_SCRIPT = path.join(WORKERS_ROOT, 'telegram', 'tg_send_saved_ndjson.py')
+const TG_SEND_TEXT_SCRIPT = path.join(WORKERS_ROOT, 'telegram', 'tg_send_text_ndjson.py')
 const IG_SESSIONS_SCRIPT = path.join(WORKERS_ROOT, 'instagram', 'ig_sessions_ndjson.py')
 const IG_LOGIN_SCRIPT = path.join(WORKERS_ROOT, 'instagram', 'ig_login_ndjson.py')
 
-function runOneShotNdjson(scriptPath, argv, { onEvent, extraEnv } = {}) {
+function runOneShotNdjson(scriptPath, argv, { onEvent, onSpawn, extraEnv, input, timeoutMs = null, timeoutCode = 'worker_deadline' } = {}) {
   return new Promise((resolve, reject) => {
     const env = workerEnv()
     if (extraEnv && typeof extraEnv === 'object') Object.assign(env, extraEnv)
     const child = spawn(WORKER_PYTHON, [scriptPath, ...argv], {
       cwd: WORKERS_ROOT,
       env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     })
+    onSpawn?.(child)
     // Drop secrets from our mutable copy once spawn has cloned the env.
     if (extraEnv) {
       for (const key of Object.keys(extraEnv)) delete env[key]
     }
+    if (input != null) {
+      child.stdin.on('error', () => {}) // close/result determines outcome, never resend
+      child.stdin.end(input)
+    }
     const events = []
+    const deadline = require('./ndjson-worker-deadline').ndjsonWorkerDeadline(child, {
+      timeoutMs, onTimeout: () => events.push({ type: 'error', code: timeoutCode,
+        message: 'Worker deadline: исход неизвестен, отсутствие аккаунта не доказано.' }),
+    })
     let stderrTail = ''
     const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity })
     rl.on('line', line => {
@@ -8075,6 +8348,8 @@ function runOneShotNdjson(scriptPath, argv, { onEvent, extraEnv } = {}) {
     })
     child.stderr.on('data', chunk => { stderrTail = (stderrTail + chunk.toString()).slice(-2000) })
     child.on('close', code => {
+      deadline.clear()
+      if (deadline.expired()) { resolve(events.filter(event => event.type !== 'done')); return }
       if (code !== 0 && events.length === 0) {
         reject(new Error(stderrTail.slice(-300) || `python exited ${code}`))
       } else {
@@ -8086,30 +8361,88 @@ function runOneShotNdjson(scriptPath, argv, { onEvent, extraEnv } = {}) {
 }
 
 function runTgSessionsCommand(argv) {
-  return runOneShotNdjson(TG_SESSIONS_SCRIPT, argv)
+  return runOneShotNdjson(TG_SESSIONS_SCRIPT, argv, argv[0] === 'list'
+    ? { timeoutMs: 30000, timeoutCode: 'session_inventory_timeout' } : {})
 }
 
-async function sendTelegramSavedMessage({ text = '', images = [], files = [], session = null, silent = false } = {}) {
+async function runTelegramAsrCheckpointCommand(request, params) {
+  const session = params._tg_session_override || params.session
+  if (!session || !Number.isSafeInteger(params.expected_peer_id) || !Number.isSafeInteger(params.expected_account_id)) {
+    throw Object.assign(new Error('ASR recovery requires the original explicit session/account/peer'), { code: 'ASR_RECOVERY_SCOPE_REQUIRED' })
+  }
+  const namespace = crypto.createHash('sha256').update(session).digest('hex').slice(0,32)
+  const id = nextId++, now = Math.floor(Date.now()/1000)
+  const job = { id, type:'tg_live_asr_recovery', target:request.original_request_id,
+    source_id:params.source_id_hint || params._source_id || null, tg_session:session,
+    status:'running', items_done:0, items_total:request.message_ids.length, started_at:now,
+    params:{ operation:request.action || 'inspect', original_request_id:request.original_request_id,
+      expected_account_id:params.expected_account_id, expected_peer_id:params.expected_peer_id } }
+  job.dbRowId = db.recordJob({type:job.type,source_id:job.source_id,status:'running',started_at:now,params:job.params})
+  jobs.set(id,job);emit(job)
+  try {
+    const events = await runOneShotNdjson(path.join(WORKERS_ROOT,'telegram','tg_asr_recovery_ndjson.py'),[],{
+      input:JSON.stringify({...request,state_dir:path.join(JOBS_DIR,'telegram-asr-state',namespace),expected_peer_id:params.expected_peer_id}),
+      timeoutMs:60000,timeoutCode:'asr_checkpoint_deadline',onSpawn:child=>{job.child=child},
+    })
+    const error = events.find(e=>e.type==='error')
+    const result = events.find(e=>e.type==='result')?.result
+    if(job._cancelRequested)throw Object.assign(new Error('ASR checkpoint operation was cancelled; inspect before any recovery'),{code:'ASR_RECOVERY_CANCELLED'})
+    if (error || !result) throw Object.assign(new Error(error?.message || 'ASR checkpoint result unavailable'),{code:error?.code || 'ASR_RECOVERY_UNKNOWN'})
+    job.status = 'done';job.items_done=request.message_ids.length;job.params.result=result
+    return {...result,desktop_job_id:id,db_job_id:job.dbRowId}
+  } catch(error) {
+    job.status=job._cancelRequested?'cancelled':'error';job.error=error.message;job.error_code=error.code
+    throw error
+  } finally {
+    job.child=null;job.finished_at=Math.floor(Date.now()/1000)
+    db.updateJob(job.dbRowId,{status:job.status,items_done:job.items_done,items_total:job.items_total,finished_at:job.finished_at,error:job.error||null,params:job.params})
+    emit(job)
+  }
+}
+
+async function runTelegramTextCommand(request) {
+  // Same owned one-shot worker contour as Saved Messages. Bodies travel only
+  // through stdin, never process argv, logs, library items or job history.
+  console.log(`[Jobs] tg_text operation=${request.operation} request_id=${request.request_id || '-'}`)
+  try {
+    const events = await runOneShotNdjson(TG_SEND_TEXT_SCRIPT, [], { input: JSON.stringify(request) })
+    const result = events.find(event => event.type === 'result')?.result
+    if (result) return result
+  } catch {
+    // An exit/error is not proof the external effect did not happen. The
+    // durable worker receipt, not stderr text, decides a later reconciliation.
+  }
+  return {
+    ok: false, delivered: false, state: 'unknown', code: 'worker_result_missing',
+    request_id: request.request_id || null,
+    error: 'No receipt returned. Use telegram_send_text_status with the original request_id; never resend under a new key.',
+  }
+}
+
+async function sendTelegramSavedMessage({ text = '', images = [], files = [], album = null, session = null, silent = false } = {}) {
   const message = String(text == null ? '' : text)
   const argv = ['--text', message]
   for (const image of images || []) argv.push('--image', String(image))
   for (const file of files || []) argv.push('--file', String(file))
+  if (album) argv.push('--album-json', JSON.stringify(album))
   if (session) argv.push('--session', String(session))
   if (silent) argv.push('--silent')
 
-  console.log(`[Jobs] tg_send_saved session=${session || activeTgSession() || '-'} chars=${message.length} images=${(images || []).length} files=${(files || []).length}`)
+  console.log(`[Jobs] tg_send_saved session=${session || activeTgSession() || '-'} chars=${message.length} images=${(images || []).length} files=${(files || []).length} album=${album?.mode || '-'} album_files=${album?.paths?.length || 0}`)
   const events = await runOneShotNdjson(TG_SEND_SAVED_SCRIPT, argv)
   const sent = events.filter(e => e.type === 'sent')
   const done = events.find(e => e.type === 'done') || null
   const errors = events.filter(e => e.type === 'error')
-  if (errors.length && sent.length === 0) {
-    throw new Error(errors[0].message || 'Telegram saved message send failed')
+  if (!done && !errors.length) {
+    errors.push({ code: 'delivery_unknown', message: 'Worker stopped without a delivery receipt. Inspect Saved Messages before retrying.' })
   }
   return {
-    ok: errors.length === 0,
+    ok: !!done && errors.length === 0,
     target: 'saved_messages',
     session: done?.session || sent[0]?.session || session || null,
     sent,
+    albums: events.filter(e => e.type === 'album_verified'),
+    preflight: events.find(e => e.type === 'preflight') || null,
     done,
     errors,
   }
@@ -8231,6 +8564,15 @@ async function runYoutubeSearch({ query, limit = 20, offset = 0 }) {
 // signed player URLs.
 
 const BOOSTY_CATALOG_SCRIPT = path.join(WORKERS_ROOT, 'web', 'boosty_catalog_ndjson.py')
+
+let boostyWorkflow
+function getBoostyWorkflow() {
+  return boostyWorkflow ||= require('./boosty-workflow').createBoostyWorkflow({
+    db, jobs, allocateId: () => nextId++, emit, markJobClosed, spawn, workerEnv,
+    python: WORKER_PYTHON, workersRoot: WORKERS_ROOT, libraryRoot: LIB_ROOT,
+    authProvider: () => require('./browser-bridge').requestBoostyAuthCookie(), indexJob: require('./index-job'),
+  })
+}
 const BOOSTY_THUMBNAIL_SCRIPT = path.join(WORKERS_ROOT, 'web', 'boosty_thumbnail_cache_ndjson.py')
 const boostyThumbnailProcesses = new Map()
 
@@ -8433,6 +8775,12 @@ function lookupBoostyChannel(payload = {}) {
 }
 
 function startBoostyChannelFetch(params = {}) {
+  if (params.auth_mode === 'public') {
+    const { createPublicCatalogRunner } = require('./boosty-catalog-runner')
+    return createPublicCatalogRunner({ db, jobs, allocateId: () => nextId++, spawn, workerEnv,
+      python: WORKER_PYTHON, script: BOOSTY_CATALOG_SCRIPT, cwd: WORKERS_ROOT,
+      emit, emitEvent, markJobClosed, finalizeCatalog: finalizeCatalogJob }).start(params)
+  }
   const target = String(params.target || params.url || '').trim()
   const authCookie = String(params.authCookie || '').trim()
   if (!target) throw new Error('startBoostyChannelFetch: target required')
@@ -9793,6 +10141,8 @@ function handleLocalEvent(job, evt) {
 }
 
 module.exports = {
+  runTelegramAsrCheckpointCommand,
+  telegramFetchCapabilities,
   startTelegramLive,
   getTelegramLiveResult,
   startTelegramFetch,
@@ -9824,6 +10174,7 @@ module.exports = {
   startTiktokBatchTranscribe,
   runTgSessionsCommand,
   sendTelegramSavedMessage,
+  runTelegramTextCommand,
   runIgSessionsCommand,
   runIgLogin,
   startInstagramProfileFetch,
@@ -9834,6 +10185,7 @@ module.exports = {
   startBoostyChannelFetch,
   previewBoostyPost,
   startBoostyBatchTranscribe,
+  getBoostyWorkflow,
   startBoostySingle,
   startLocalTranscribe,
   runYoutubeSearch,

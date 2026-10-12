@@ -24,16 +24,20 @@ const PROVIDERS = [
   { id: 'chatgpt',    label: 'ChatGPT' },
 ]
 
-// ChatGPT — модели (зеркало chatgpt-research.js::MODELS). Default GPT-5.5.
+// ChatGPT — модели (зеркало chatgpt-research.js::MODELS). Default GPT-5.6 Sol.
 const CHATGPT_MODES = [
   { id: 'chat', label: 'Chat' },
   { id: 'work', label: 'Work' },
 ]
 
 const CHATGPT_MODELS = [
-  { id: '5.5',       label: 'GPT-5.5 Instant', modes: ['chat'] },
+  { id: '6',         label: 'GPT-6', modes: ['chat'] },
+  { id: '6-astra',   label: 'GPT-6 Astra', modes: ['chat', 'work'] },
+  { id: '6.1-sol',   label: 'GPT-6.1 Sol', modes: ['work'] },
+  { id: '6-sol',     label: 'GPT-6 Sol', modes: ['work'] },
+  { id: '6-luna',    label: 'GPT-6 Luna', modes: ['work'] },
   { id: '5.6-sol',   label: 'GPT-5.6 Sol',     modes: ['chat', 'work'] },
-  { id: 'o3',        label: 'o3 · до 26 августа', modes: ['chat'] },
+  { id: '5.5',       label: 'GPT-5.5 · до 14 октября', modes: ['chat', 'work'] },
   { id: '5.6-terra', label: 'GPT-5.6 Terra',   modes: ['work'] },
   { id: '5.6-luna',  label: 'GPT-5.6 Luna',    modes: ['work'] },
 ]
@@ -44,7 +48,7 @@ const CHATGPT_WORK_SPEEDS = [
 ]
 
 // ChatGPT — уровни интеллекта (зеркало chatgpt-research.js::EFFORTS).
-// «Очень высокий» = xhigh. В обычном Chat уровни выше Instant используют Sol;
+// «Очень высокий» = xhigh. В Chat уровни относятся к выбранной GPT-6 или Sol;
 // Work предлагает Low..Ultra отдельно для Sol, Terra и Luna.
 const CHATGPT_EFFORTS = [
   { id: 'low',          label: 'Low' },
@@ -60,16 +64,18 @@ const CHATGPT_EFFORTS = [
 function chatgptEffortOptions(mode, model) {
   const byId = Object.fromEntries(CHATGPT_EFFORTS.map(x => [x.id, x]))
   if (mode === 'work') {
+    if (model === '5.5') return ['low', 'medium', 'high', 'xhigh'].map(id => byId[id])
+    if (model === '6-luna' || model === '5.6-luna') return ['low', 'medium', 'high', 'xhigh', 'max'].map(id => byId[id])
     return ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(id => byId[id])
   }
+  if (model === '6-astra') return [byId.pro]
   if (model === '5.5') return [byId.instant]
-  if (model === 'o3') return [byId.medium]
   return ['instant', 'medium', 'high', 'xhigh', 'pro'].map(id => byId[id])
 }
 
 function defaultChatgptEffort(mode, model) {
+  if (mode === 'chat' && model === '6-astra') return 'pro'
   if (mode === 'chat' && model === '5.5') return 'instant'
-  if (mode === 'chat' && model === 'o3') return 'medium'
   return 'xhigh'
 }
 
@@ -147,9 +153,9 @@ export default function NewResearchScreen() {
     { id: 'sonnet', label: 'Claude Sonnet 4.6' },
     { id: 'kimi',   label: 'Kimi K2.6' },
   ]
-  // В обычном Chat доступны 5.5 Instant и 5.6 Sol. Work предлагает три
-  // независимых tier'а 5.6: Sol, Terra и Luna. Скрытый старый state никогда
-  // не отправляем.
+  // В Chat доступны GPT-6 (Instant..Pro), Astra (только Pro), Sol и 5.5 Instant.
+  // Work также предлагает новые 6/6.1; предел effort зависит от модели.
+  // Скрытый старый state никогда не отправляем.
   const gptModelOptions = CHATGPT_MODELS.filter(x => x.modes.includes(gptMode))
   const gptModelValue = gptModelOptions.some(x => x.id === gptModel)
     ? gptModel
@@ -189,7 +195,7 @@ export default function NewResearchScreen() {
       // и disabled — но state clResearch при этом остаётся true с прошлой
       // модели, и отправка сырого state давала «opus-3 не поддерживает
       // Research mode» при визуально выключенной галке. Disabled-контрол
-      // не отправляет скрытое значение (см. переносимый-дизайн.md).
+      // не отправляет скрытое значение (см. дизайн-принципы.md).
       body.options = { research: clModel === 'opus-3' ? false : clResearch }
       if (clModel !== 'auto' && m) {
         body.options.model = clModel

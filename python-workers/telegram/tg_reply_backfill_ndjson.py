@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
 from credentials import telegram_credentials
 from library_db import open_db, pending_reply_external_ids
+from tg_message_payload import reply_metadata
 
 try:
     TELEGRAM_API_ID, TELEGRAM_API_HASH = telegram_credentials()
@@ -55,6 +56,7 @@ except RuntimeError as ex:
 
 try:
     from telethon import TelegramClient
+    from tg_concurrent_session import telegram_session
     from telethon.tl.types import (
         User, Chat, Channel,
         ReactionEmoji, ReactionCustomEmoji,
@@ -148,16 +150,8 @@ def _reactions(msg):
 def _reply_target(msg):
     """Same rule as tg_fetch_json._reply_to_for: forum topic-marker
     (reply_to_msg_id == reply_to_top_id) is NOT a real reply."""
-    rt = getattr(msg, "reply_to", None)
-    if not rt:
-        return None
-    rid = getattr(rt, "reply_to_msg_id", None)
-    top = getattr(rt, "reply_to_top_id", None)
-    if not rid:
-        return None
-    if top and rid == top:
-        return None
-    return rid
+    parent = reply_metadata(msg)["parent_external_id"]
+    return int(parent) if parent is not None else None
 
 
 async def run(target, ids):
@@ -167,7 +161,7 @@ async def run(target, ids):
               "message": f"Session file '{SESSION_PATH.name}' not found"})
         return 4
 
-    client = TelegramClient(str(SESSION_PATH).replace(".session", ""),
+    client = TelegramClient(telegram_session(str(SESSION_PATH).replace(".session", "")),
                             TELEGRAM_API_ID, TELEGRAM_API_HASH)
     _bump_session_busy_timeout(client)
     ok, err, code = await connect_authorized(client, session_name=SESSION_PATH.stem)
@@ -241,12 +235,16 @@ async def run(target, ids):
                         return 5
                     await asyncio.sleep(wait + 1)
             for asked_id, msg in zip(chunk, msgs):
-                parent = _reply_target(msg) if msg else None
+                reply_data = reply_metadata(msg)
                 rx = _reactions(msg) if msg else None
                 emit({
                     "type": "item-update",
                     "external_id": str(asked_id),
-                    "parent_external_id": str(parent) if parent else None,
+                    "parent_external_id": reply_data["parent_external_id"],
+                    "raw_meta_patch": {
+                        "telegram_reply": reply_data["telegram_reply"],
+                        "external_reply": reply_data["external_reply"],
+                    },
                     # rx semantics:
                     #   None  → concrete message checked, but Telethon exposed
                     #           no reaction list; caller marks resolved with

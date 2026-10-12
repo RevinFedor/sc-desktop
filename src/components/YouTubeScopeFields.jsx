@@ -1,5 +1,4 @@
 import React from 'react'
-import { ArrowLeftRight } from 'lucide-react'
 
 // Minimal scope-fields for YouTube channel fetches. Mirrors the visual
 // language of <TelegramScopeFields> (RowLabel + h-9 inputs) but only
@@ -23,7 +22,7 @@ export default function YouTubeScopeFields({ range, onRangeChange, children }) {
   function patch(p) { onRangeChange({ ...range, ...p }) }
   return (
     <div className="space-y-3">
-      <RowLabel label="Сколько">
+      <RowLabel label="Каталог">
         <div className="flex items-center gap-2 min-h-[34px]">
           <input
             type="number"
@@ -35,10 +34,11 @@ export default function YouTubeScopeFields({ range, onRangeChange, children }) {
             style={{ fontSize: '14px' }}
             placeholder="50"
           />
-          <DirectionToggle value={range.direction} onChange={v => patch({ direction: v })} />
           <span className="text-zinc-500" style={{ fontSize: '13px' }}>
-            видео · 0 = весь канал
+            видео
           </span>
+          <DirectionToggle value={range.direction} onChange={v => patch({ direction: v })} />
+          <span className="text-zinc-500" style={{ fontSize: '13px' }}>0 = весь канал</span>
           <div className="ml-auto flex items-center gap-1.5">{children}</div>
         </div>
       </RowLabel>
@@ -63,24 +63,20 @@ function RowLabel({ label, children }) {
 // styling tokens that aren't yet stable enough to spec.
 function DirectionToggle({ value, onChange }) {
   const isOldest = value === 'oldest'
-  const next = isOldest ? 'newest' : 'oldest'
-  const title = isOldest
-    ? 'Берём N самых старых видео (от первого видео канала). Клик → переключить на «с конца».'
-    : 'Берём N самых свежих видео (от последнего загруженного). Клик → переключить на «с начала».'
   return (
-    <button
-      type="button"
-      onClick={() => onChange(next)}
-      title={title}
-      aria-label={isOldest ? 'Сейчас: с начала' : 'Сейчас: с конца'}
-      aria-pressed={isOldest}
-      className={`inline-flex items-center justify-center h-[34px] w-[34px] rounded-md border transition-colors ${
-        isOldest
-          ? 'bg-zinc-100 text-zinc-900 border-zinc-100 hover:bg-white'
-          : 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:border-zinc-500 hover:text-zinc-100'
-      }`}
-    >
-      <ArrowLeftRight size={14} className="shrink-0" />
-    </button>
+    <div className="h-[34px] inline-flex rounded-md border border-zinc-700 overflow-hidden" aria-label="Какие видео загружать">
+      <button
+        type="button"
+        onClick={() => onChange('newest')}
+        aria-pressed={!isOldest}
+        className={`px-3 transition-colors ${!isOldest ? 'bg-zinc-100 text-zinc-900' : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100'}`}
+      >Новые</button>
+      <button
+        type="button"
+        onClick={() => onChange('oldest')}
+        aria-pressed={isOldest}
+        className={`px-3 border-l border-zinc-700 transition-colors ${isOldest ? 'bg-zinc-100 text-zinc-900' : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100'}`}
+      >Старые</button>
+    </div>
   )
 }

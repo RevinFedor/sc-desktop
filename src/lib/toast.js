@@ -4,7 +4,7 @@
 // custom-terminal toast contract but in this project's useSyncExternalStore
 // idiom (no zustand here).
 //
-// Design rule (methodology/переносимый-дизайн.md::Единая форма для уведомлений
+// Design rule (methodology/дизайн-принципы.md::Единая форма для уведомлений
 // одного домена): one component, one geometry — only icon + border-color vary
 // by `type`. Don't fork a second "card" variant for longer text; truncate.
 //

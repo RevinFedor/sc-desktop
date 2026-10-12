@@ -6,7 +6,10 @@
 const fs = require('fs');
 const path = require('path');
 
-const LOG_DIR = path.resolve(__dirname, '..', 'logs');
+const os = require('node:os');
+const LOG_DIR = process.env.SC_BROWSER_DATA_DIR
+  ? path.resolve(process.env.SC_BROWSER_DATA_DIR)
+  : path.join(os.homedir(), 'Library', 'Application Support', 'sc-desktop', 'browser-mcp');
 try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch (_) {}
 
 function logFilePath() {

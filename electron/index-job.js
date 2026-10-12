@@ -101,10 +101,12 @@ function createCoordinator({
   controlTask = null,
   statusTask = null,
   logger = console,
+  idSeed = 1,
 } = {}) {
-  let nextId = 1
+  let nextId = idSeed
   const activeJobs = new Map()
   const listeners = new Set()
+  let telegramPreparation = null
   const runControlTask = controlTask || createControlTask(workerFactory, logger)
   const readIdleStatus = statusTask || (sourceId => runControlTask('status', { sourceId }))
 
@@ -121,8 +123,9 @@ function createCoordinator({
   }
 
   function removeIfCurrent(job) {
-    if (activeJobs.get(job.state.source_id) === job) {
-      activeJobs.delete(job.state.source_id)
+    const key = `${job.state.mode || 'telegram'}:${job.state.source_id}`
+    if (activeJobs.get(key) === job) {
+      activeJobs.delete(key)
     }
   }
 
@@ -152,6 +155,7 @@ function createCoordinator({
       try {
         await runControlTask('recover-source', {
           sourceId: job.state.source_id,
+          mode: job.state.mode,
           status,
           itemsDone: 0,
           error: status === 'error' ? message : null,
@@ -162,7 +166,12 @@ function createCoordinator({
       }
       job.lifecycleSettled = true
       removeIfCurrent(job)
+      job.state = applyWorkerMessage(job.state, {
+        type: 'terminal', status, itemsDone: 0, itemsTotal: 0,
+        error: status === 'error' ? message : null, finishedAt,
+      })
       rejectStartup(job, failure instanceof Error ? failure : new Error(message))
+      if (job.tracked) emit(job.state)
       terminateQuietly(job.worker)
       return
     }
@@ -218,6 +227,17 @@ function createCoordinator({
         job.lifecycleSettled = true
         removeIfCurrent(job)
         resolveStartup(job, { noop: true, reason: message.reason || 'already-indexed' })
+        if (job.tracked) {
+          job.state = {
+            ...applyWorkerMessage(job.state, {
+              type: 'terminal', status: 'done', itemsDone: 0, itemsTotal: 0,
+              finishedAt: Math.floor(Date.now() / 1000),
+            }),
+            noop: true,
+            reason: message.reason || 'already-indexed',
+          }
+          emit(job.state)
+        }
         terminateQuietly(worker)
         return
       }
@@ -270,14 +290,32 @@ function createCoordinator({
    * proved the request is a no-op ({noop:true}). Concurrent calls for the same
    * source share that result and never spawn a second worker.
    */
-  async function start(rawRequest) {
+  function jobForRequest(rawRequest, tracked = false) {
     const request = normalizeStartRequest(rawRequest)
-    const existing = activeJobs.get(request.sourceId)
-    if (existing) return existing.startPromise
+    const mode = ['youtube', 'boosty'].includes(rawRequest?.mode) ? rawRequest.mode : 'telegram'
+    if (mode === 'youtube' && request.itemIds != null) throw new Error('itemIds selection is only supported for Telegram indexing')
+    const key = `${mode}:${request.sourceId}`
+    const existing = activeJobs.get(key)
+    if (existing) {
+      if (tracked && (request.limit !== existing.request.limit ||
+          JSON.stringify(request.itemIds ?? null) !== JSON.stringify(existing.request.itemIds ?? null))) {
+        const error = new Error(`source already has an index job with another selection: ${snapshot(existing.state).id}`)
+        error.code = 'INDEX_ALREADY_RUNNING_DIFFERENT_SCOPE'
+        error.jobId = snapshot(existing.state).id
+        throw error
+      }
+      if (tracked && !existing.tracked) {
+        existing.tracked = true
+        if (existing.state.phase === 'starting') emit(existing.state)
+      }
+      return existing
+    }
 
     const cancelBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)
     const job = {
-      state: createStartingState({ id: nextId++, sourceId: request.sourceId }),
+      state: createStartingState({ id: nextId++, sourceId: request.sourceId, mode, startedAt: Math.floor(Date.now() / 1000) }),
+      request,
+      tracked,
       worker: null,
       cancelBuffer,
       cancelView: new Int32Array(cancelBuffer),
@@ -293,54 +331,104 @@ function createCoordinator({
       job.resolveStart = resolve
       job.rejectStart = reject
     })
-    activeJobs.set(request.sourceId, job)
+    // A tracked caller receives its live id before preparation and does not
+    // await this promise. Retain rejection for .start() callers while ensuring
+    // a later preparation failure cannot become an unhandled rejection.
+    job.startPromise.catch(() => {})
+    activeJobs.set(key, job)
+    if (tracked) emit(job.state)
 
-    try {
+    const launchWorker = () => {
+      if (job.cancelled) throw new Error('index cancelled during preparation')
       job.worker = workerFactory({
         operation: 'index',
         jobId: job.state.id,
         sourceId: request.sourceId,
+        mode,
         limit: request.limit,
         origin: request.origin,
+        ...(request.itemIds != null ? { itemIds: request.itemIds } : {}),
+        ...(request.requestId != null ? { requestId: request.requestId } : {}),
         cancelBuffer,
       })
       attachWorker(job)
-    } catch (error) {
-      job.lifecycleSettled = true
-      removeIfCurrent(job)
-      rejectStartup(job, error)
+    }
+    if (mode === 'telegram' && telegramPreparation) {
+      // The owned preparation (reply metadata) finishes BEFORE the worker
+      // snapshots embedding inputs. The public job already exists and Cancel
+      // reaches its child instead of leaving hidden Telethon work running.
+      Promise.resolve().then(() => telegramPreparation(request, {
+        isCancelled: () => job.cancelled,
+        onCancel: callback => {
+          job.cancelPreparation = callback
+          if (job.cancelled) callback()
+        },
+      })).then(launchWorker).catch(error => { void failJob(job, error) })
+    } else {
+      try { launchWorker() } catch (error) { void failJob(job, error) }
     }
 
-    return job.startPromise
+    return job
   }
 
-  async function statusForSource(value) {
+  async function start(rawRequest) {
+    return jobForRequest(rawRequest).startPromise
+  }
+
+  function startTracked(rawRequest) {
+    return snapshot(jobForRequest(rawRequest, true).state)
+  }
+
+  function currentSnapshot(value, requestedMode = 'telegram') {
     const sourceId = normalizeSourceId(value)
-    const pending = activeJobs.get(sourceId)
+    const mode = ['youtube', 'boosty'].includes(requestedMode) ? requestedMode : 'telegram'
+    const job = activeJobs.get(`${mode}:${sourceId}`)
+    return job ? snapshot(job.state) : null
+  }
+
+  function getActiveSnapshot(value) {
+    for (const job of activeJobs.values()) {
+      if (matchesJobId(job.state, value)) return snapshot(job.state)
+    }
+    return null
+  }
+
+  function listActiveSnapshots() {
+    return [...activeJobs.values()].map(job => snapshot(job.state))
+  }
+
+  async function statusForSource(value, requestedMode = 'telegram') {
+    const sourceId = normalizeSourceId(value)
+    const mode = ['youtube', 'boosty'].includes(requestedMode) ? requestedMode : 'telegram'
+    const key = `${mode}:${sourceId}`
+    const pending = activeJobs.get(key)
     if (pending) {
       if (pending.state.phase === 'starting') {
-        try { await pending.startPromise } catch {}
+        return { ...runningStatus(pending.state), phase: 'starting',
+          unit: pending.state.mode === 'youtube' ? 'fragments' : 'messages' }
       }
-      const live = activeJobs.get(sourceId)
+      const live = activeJobs.get(key)
       if (live?.state.phase === 'running') return runningStatus(live.state)
     }
-    return readIdleStatus(sourceId)
+    return readIdleStatus(sourceId, mode)
   }
 
   function signalCancellation(job, label) {
     if (!job || job.lifecycleSettled) return false
     job.cancelled = true
     Atomics.store(job.cancelView, 0, 1)
+    try { job.cancelPreparation?.() } catch {}
     try { job.worker?.postMessage({ type: 'cancel' }) } catch {}
     logger.log?.(`[IndexJob] cancel requested ${label} matched live #${job.state.id} ` +
       `db #${job.state.dbRowId || '-'} source #${job.state.source_id}`)
     return true
   }
 
-  function cancel(value) {
+  function cancel(value, requestedMode = 'telegram') {
     let sourceId
     try { sourceId = normalizeSourceId(value) } catch { return false }
-    const job = activeJobs.get(sourceId)
+    const mode = ['youtube', 'boosty'].includes(requestedMode) ? requestedMode : 'telegram'
+    const job = activeJobs.get(`${mode}:${sourceId}`)
     return signalCancellation(job, `source #${sourceId}`)
   }
 
@@ -356,7 +444,12 @@ function createCoordinator({
   }
 
   return {
+    setTelegramPreparation: callback => { telegramPreparation = typeof callback === 'function' ? callback : null },
     start,
+    startTracked,
+    currentSnapshot,
+    getActiveSnapshot,
+    listActiveSnapshots,
     cancel,
     cancelById,
     statusForSource,
@@ -368,13 +461,25 @@ function createCoordinator({
 }
 
 const coordinator = createCoordinator({
+  // Public IDs from a previous app run must never alias a newly started job
+  // (especially for Cancel). Native fixtures keep their deterministic IDs.
+  idSeed: process.env.SC_INDEX_WORKER_FIXTURE === '1' ? 1 : Date.now() * 1000,
   // Idle status is a pair of SQLite counts. Reuse the persistent read worker
   // instead of booting the much heavier embedding worker on every mount.
-  statusTask: sourceId => dbRead.request('semanticIndexStatus', sourceId),
+  statusTask: (sourceId, mode) => mode === 'boosty'
+    ? dbRead.request('boostyRag', 'status', { source_id: sourceId })
+    : mode === 'youtube'
+    ? createControlTask(defaultWorkerFactory, console)('status', { sourceId, mode })
+    : dbRead.request('semanticIndexStatus', sourceId),
 })
 
 module.exports = {
+  setTelegramPreparation: coordinator.setTelegramPreparation,
   start: coordinator.start,
+  startTracked: coordinator.startTracked,
+  currentSnapshot: coordinator.currentSnapshot,
+  getActiveSnapshot: coordinator.getActiveSnapshot,
+  listActiveSnapshots: coordinator.listActiveSnapshots,
   cancel: coordinator.cancel,
   cancelById: coordinator.cancelById,
   statusForSource: coordinator.statusForSource,

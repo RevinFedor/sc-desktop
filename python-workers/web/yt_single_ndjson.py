@@ -352,6 +352,73 @@ def write_text_file(out_dir, video_id, title, channel, video_url, body,
 
 # ─── stages ──────────────────────────────────────────────────────────────
 
+AUDIO_DOWNLOAD_TIMEOUT_SEC = 600
+
+
+def build_audio_download_command(url, audio_path):
+    """Build the yt-dlp command used before an AI transcript.
+
+    Speech recognition needs the sound, not a high-resolution picture. Most
+    regular YouTube videos expose a separate audio-only stream, so we keep its
+    normal quality. Some archived livestreams expose only combined HLS streams;
+    in that case the old implicit ``best`` choice downloaded 1080p video just
+    to discard it afterwards. ``worst`` is the intentional fallback: it keeps
+    the audio, while avoiding gigabytes of unnecessary video data.
+    """
+    return [
+        "yt-dlp",
+        "--cookies-from-browser", "firefox",
+        "--remote-components", "ejs:github",
+        "--format", "bestaudio/worst",
+        "--concurrent-fragments", "4",
+        "--retries", "3",
+        "--fragment-retries", "3",
+        "--socket-timeout", "30",
+        "--no-playlist",
+        "-x", "--audio-format", "mp3",
+        "--audio-quality", "9",
+        "--no-warnings",
+        "-o", audio_path,
+        url,
+    ]
+
+
+def download_youtube_audio(url, audio_path, timeout=AUDIO_DOWNLOAD_TIMEOUT_SEC):
+    """Download an AI-ready audio file without attributing YouTube failures to AI.
+
+    Returns ``(bytes, code, message)``. ``bytes`` is set only when the audio
+    exists and is ready for the selected AI provider. This makes the boundary
+    visible to both the single-video and channel-batch flows.
+    """
+    try:
+        subprocess.run(
+            build_audio_download_command(url, audio_path),
+            capture_output=True,
+            check=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "youtube_audio_timeout", (
+            "YouTube не отдал аудио за 10 минут; AssemblyAI ещё не запускался. "
+            "Повторите попытку."
+        )
+    except subprocess.CalledProcessError as ex:
+        tail = ex.stderr or b""
+        if isinstance(tail, bytes):
+            tail = tail.decode(errors="ignore")
+        detail = " ".join(tail.strip().split())[-300:]
+        suffix = f" Техническая причина: {detail}" if detail else ""
+        return None, "youtube_audio_download_failed", (
+            "Не удалось скачать аудио с YouTube; AssemblyAI ещё не запускался." + suffix
+        )
+
+    if not os.path.exists(audio_path):
+        return None, "youtube_audio_missing", (
+            "YouTube завершил загрузку без аудиофайла; AssemblyAI ещё не запускался."
+        )
+
+    return os.path.getsize(audio_path), None, None
+
 def stage_subs(url, lang, with_ts, out_dir, meta):
     emit({"type": "subs_racing"})
     text = None
@@ -381,35 +448,17 @@ def stage_ai(url, engine, out_dir, meta):
 
     emit({"type": "audio_download_start", "engine": engine})
 
-    cmd = [
-        "yt-dlp",
-        "--cookies-from-browser", "firefox",
-        "--remote-components", "ejs:github",
-        "-x", "--audio-format", "mp3",
-        "--audio-quality", "9",
-        "--no-warnings",
-        "--ignore-errors",
-        "-o", audio_tmp,
-        url,
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, check=True, timeout=600)
-    except subprocess.TimeoutExpired:
-        emit({"type": "error", "message": "yt-dlp timeout (>10m)"})
-        return None
-    except subprocess.CalledProcessError as ex:
-        tail = ex.stderr or b""
-        if isinstance(tail, bytes):
-            tail = tail.decode(errors="ignore")
-        emit({"type": "error", "message": f"yt-dlp failed: {tail[-300:].strip()}"})
+    audio_bytes, error_code, error_message = download_youtube_audio(url, audio_tmp)
+    if error_message:
+        emit({
+            "type": "error",
+            "stage": "downloading_audio",
+            "code": error_code,
+            "message": error_message,
+        })
         return None
 
-    if not os.path.exists(audio_tmp):
-        emit({"type": "error", "message": "audio file missing after download"})
-        return None
-
-    emit({"type": "audio_download_done", "engine": engine,
-          "bytes": os.path.getsize(audio_tmp)})
+    emit({"type": "audio_download_done", "engine": engine, "bytes": audio_bytes})
     emit({"type": "transcribe_start", "engine": engine})
     text, err, cost = None, None, 0.0
     try:

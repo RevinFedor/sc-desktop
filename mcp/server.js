@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// SC Desktop — MCP server for semantic search over Telegram archives.
+// SC Desktop — one MCP entry point for semantic search over saved archives,
+// live social/source tools and direct API integrations such as YouGile.
 //
 // Architecture: Claude Code spawns this script (via the wrapper that sets
 // ELECTRON_RUN_AS_NODE=1, see ./run.sh). The script opens the same library.db
@@ -18,9 +19,10 @@
 //                                   (chat + message_id) to one item
 //
 // All paths are absolute. The server has no CLI args; configuration goes
-// through env (GEMINI_API_KEY, SC_DESKTOP_DB) inherited from .mcp.json.
+// through env or shared ~/.config/sc/settings.json.
 
 const path = require('node:path')
+const { pathToFileURL } = require('node:url')
 const { spawn } = require('node:child_process')
 const crypto = require('node:crypto')
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js')
@@ -49,11 +51,28 @@ const {
   scrapeTwitterThread,
 } = require(path.join(projectRoot, 'mcp', 'twitter-browser.js'))
 const { createTelegramLiveClient } = require('./telegram-live-client')
+const { telegramArchiveMediaTools, callTelegramArchiveMediaTool } = require('./telegram-archive-media-tools')
+const { createTelegramRagClient } = require('./telegram-rag-client')
+const { telegramSendSavedMessageTool: savedMessageTool, normalizeSavedMessageInput } = require('./telegram-saved-message')
+const { telegramTextTools, toolOperations: telegramTextOperations, callTelegramTextTool } = require('./telegram-text-tools')
+const { telegramBotTools, botOperations, callTelegramBotTool } = require('./telegram-bot-tools')
+const { telegramFolderTools, callTelegramFolderTool } = require('./telegram-folder-tools')
+const { createTelegramRagReaders, serializeTelegramItem, readTelegramCaptionSpan, annotateSemanticContextRefs } = require('./telegram-rag-readers')
+const { telegramRagTools, captionProperties: ragCaptionProperties, ragErrorResult } = require('./telegram-rag-tools')
+const { boostyRagTools, boostyRagOperations, callBoostyRagTool } = require('./boosty-rag-tools')
+const { boostyCatalogTools, boostyCatalogOperations, callBoostyCatalogTool } = require('./boosty-catalog-tools')
+const { boostyWorkflowTools, boostyWorkflowOperations, callBoostyWorkflowTool } = require('./boosty-workflow-tools')
+const { accountTools, inventoryResult: telegramAccountInventory, selectAccount: selectTelegramAccount, loginCommand: telegramLoginCommand } = require('./telegram-account-tools')
+const { telegramForwardProvenance } = require('./telegram-forward-provenance')
+const { searchTelegramRag, normalizeRagScope } = require('../electron/telegram-rag-search')
+const { loadYougileToolBridge } = require('./yougile-tools')
 
 let _jobRunner = null
 let _indexJob = null
 let _youtubeSubtitlesClient = null
 let _telegramLiveClient = null
+let _telegramRagClient = null
+let yougileToolBridge = null
 function jobRunner() {
   if (!_jobRunner) {
     _jobRunner = require(path.join(projectRoot, 'electron', 'job-runner.js'))
@@ -76,6 +95,10 @@ function youtubeSubtitlesClient() {
 function telegramLiveClient() {
   if (!_telegramLiveClient) _telegramLiveClient = createTelegramLiveClient()
   return _telegramLiveClient
+}
+function telegramRagClient() {
+  if (!_telegramRagClient) _telegramRagClient = createTelegramRagClient()
+  return _telegramRagClient
 }
 
 // ===== GT EDITOR INTEGRATION =====
@@ -117,6 +140,10 @@ function getGtDb() {
 }
 
 const TOOLS = [
+  ...telegramBotTools,
+  ...telegramFolderTools,
+  ...telegramRagTools,
+  ...accountTools,
   {
     name: 'list_telegram_chats',
     description:
@@ -128,11 +155,15 @@ const TOOLS = [
   {
     name: 'telegram_semantic_search',
     description:
-      'Vector search inside one indexed Telegram chat. Returns the top N ' +
-      'messages ranked by Gemini-embedding cosine similarity. Long natural-' +
-      'language queries (a sentence or paragraph) work better than single ' +
-      'keywords. Each result includes the cosine score (0..1) — values >= ' +
-      '0.70 are strong matches, 0.55-0.70 weak, < 0.55 likely noise.',
+      'Semantic RAG search scoped to ONE saved Telegram source before nearest-neighbor ranking. ' +
+      'Searches full-text fragments for migrated messages and preserves legacy message vectors ' +
+      'for the remaining corpus. Returns original-message identities, matched spans, provenance, ' +
+      'coverage/freshness and explicit search_budget_exhausted. Dates/topics apply before top-k. ' +
+      'Cosine is a ranking score, NOT a probability or proof of a statement. Use several distinct ' +
+      'semantic angles, then telegram_context and telegram_message_read for chosen hits; do not ' +
+      'treat repeated snippets or forwarded copies as independent evidence. Unindexed/stale ' +
+      'corpus and a budget-truncated empty result are not proof a topic was never discussed.',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     inputSchema: {
       type: 'object',
       properties: {
@@ -152,7 +183,7 @@ const TOOLS = [
           type: 'integer',
           default: 10,
           minimum: 1,
-          maximum: 50,
+          maximum: 100,
           description: 'Number of results. Default 10.',
         },
         min_cos: {
@@ -161,9 +192,12 @@ const TOOLS = [
           minimum: 0,
           maximum: 1,
           description:
-            'Drop results with cosine below this. Tighten to 0.65+ to keep ' +
-            'only confident hits.',
+            'Ranking threshold, not confidence. Inspect context; distributions differ for legacy vs fragment indexes.',
         },
+        date_from: { oneOf: [{ type: 'string' }, { type: 'integer', minimum: 0 }], description: 'Inclusive lower publication bound: Unix seconds or ISO date/time. A plain YYYY-MM-DD means UTC midnight.' },
+        date_to: { oneOf: [{ type: 'string' }, { type: 'integer', minimum: 0 }], description: 'Inclusive upper bound; plain YYYY-MM-DD includes the entire UTC day.' },
+        topic_id: { type: 'integer', minimum: 0, description: 'Topic eligibility before ranking. Omit for every topic; 0 selects null/zero (unknown or non-topic) metadata. General is normally topic 1, not 0.' },
+        caption_chars: { ...ragCaptionProperties.caption_chars, default: 1200 },
       },
       required: ['source_id', 'query'],
       additionalProperties: false,
@@ -174,9 +208,8 @@ const TOOLS = [
     description:
       'Fetch the messages immediately preceding and following an item by ' +
       'published_at within the same chat. Use this after a search hit to ' +
-      'reconstruct the conversation context that produced the embedding ' +
-      "(Late Chunking — the vector remembers the neighbours but the DB only " +
-      'stores the single message). Best for dense bursts where one topic ' +
+      'inspect chronological context. An adjacent message is not proof of belonging ' +
+      'to the same conversation. Best for dense bursts where one topic ' +
       "is discussed back-to-back. For replies that span hours/days call " +
       'telegram_reply_thread instead — the two tools are complementary.',
     inputSchema: {
@@ -185,6 +218,8 @@ const TOOLS = [
         item_id: { type: 'integer', description: 'Numeric item id.' },
         before:  { type: 'integer', default: 5, minimum: 0, maximum: 30 },
         after:   { type: 'integer', default: 5, minimum: 0, maximum: 30 },
+        same_topic: { type: 'boolean', default: false },
+        ...ragCaptionProperties,
       },
       required: ['item_id'],
       additionalProperties: false,
@@ -221,6 +256,7 @@ const TOOLS = [
             'Telegram message_id inside the chat (last numeric segment of a ' +
             't.me URL). Required unless `chat` is a full t.me URL.',
         },
+        ...ragCaptionProperties,
       },
       required: ['chat'],
       additionalProperties: false,
@@ -229,15 +265,17 @@ const TOOLS = [
   {
     name: 'telegram_reply_thread',
     description:
-      'Walk the Telegram reply graph around an item: ancestors (the chain ' +
-      'this message replies to, transitively up) and descendants (every ' +
-      'message replying to this one, transitively down). Use when a hit ' +
+      'Walk the saved Telegram reply graph around an item, with checked same-peer ' +
+      'edges separate from unverified legacy parent candidates. Known external-peer ' +
+      'quotes never become local edges; topic anchors are not ordinary replies. ' +
+      'Use when a hit ' +
       'sits in a reply chain that is spread across hours or days — ' +
       'telegram_neighbors would return unrelated messages by time. Returns ' +
       'empty arrays for items that neither reply to nor are replied to. ' +
-      'Reply edges are populated only for messages fetched after this ' +
-      'feature shipped; older items may have parent_external_id = NULL ' +
-      'until backfilled.',
+      'Missing parents, bounded traversal and provenance quality are explicit; ' +
+      'an empty local graph does not prove a conversation has no context. ' +
+      'Read saved-caption processing flags before attributing text to the author.',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       type: 'object',
       properties: {
@@ -254,6 +292,7 @@ const TOOLS = [
             'Cap on how many descendant messages to return. Wide threads ' +
             'with hundreds of replies get truncated; ancestors are never capped.',
         },
+        ...ragCaptionProperties,
       },
       required: ['item_id'],
       additionalProperties: false,
@@ -293,7 +332,8 @@ const TOOLS = [
       'Return detailed local state for one Telegram source: source row, saved ' +
       'message counts, semantic-index coverage, date range, max message id, ' +
       'stored comments, coverage rows, recent jobs, and type breakdown. Accepts ' +
-      'source_id, handle/title/internal id, or t.me URL.',
+      'source_id, handle/title/internal id, or t.me URL. Coverage history is explicitly ' +
+      'paged; continue coverage_next_offset rather than assuming the first page is all syncs.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -305,6 +345,8 @@ const TOOLS = [
             'source_id is omitted.',
         },
         jobs_limit: { type: 'integer', default: 10, minimum: 0, maximum: 50 },
+        coverage_offset: { type: 'integer', default: 0, minimum: 0 },
+        coverage_limit: { type: 'integer', default: 200, minimum: 1, maximum: 1000 },
       },
       additionalProperties: false,
     },
@@ -479,13 +521,100 @@ const TOOLS = [
     },
   },
   {
+    name: 'telegram_search_public_chats',
+    description:
+      'Search Telegram globally for public groups, supergroups, and channels by ' +
+      'name or username through the selected user session. This is read-only and ' +
+      'does not join anything. Returns public candidates and whether the account is ' +
+      'already a member. The request is visible and cancellable in SC Desktop Requests.',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', minLength: 1, maxLength: 200 },
+        limit: { type: 'integer', default: 20, minimum: 1, maximum: 50 },
+        session: { type: 'string', description: 'Telegram session name or account alias.' },
+        profile: { type: 'string', description: 'Alias for session.' },
+        wait_ms: { type: 'integer', default: 30000, minimum: 0, maximum: 30000 },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'telegram_join_chat',
+    description:
+      'Join one Telegram public group/channel by @username or t.me link, or use a ' +
+      'private invite link (t.me/+... or t.me/joinchat/...). This changes the live ' +
+      'Telegram account and therefore requires confirm=true. Already-member is a ' +
+      'successful idempotent result. A successful membership is registered as an ' +
+      'explicit SC Desktop source ready for telegram_fetch/telegram_index. FloodWait ' +
+      'errors include retry_after_seconds. The operation is visible in SC Desktop ' +
+      'Requests and cancellable until the membership RPC has been sent; after that ' +
+      'SC Desktop waits for Telegram\'s authoritative result instead of claiming rollback.',
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', minLength: 1, maxLength: 2000, description: '@username, t.me public link, t.me/+... or t.me/joinchat/... invite.' },
+        session: { type: 'string', description: 'Telegram session name or account alias.' },
+        profile: { type: 'string', description: 'Alias for session.' },
+        confirm: { type: 'boolean', const: true, description: 'Must be true: joining is a visible action by the user account.' },
+        wait_ms: { type: 'integer', default: 30000, minimum: 0, maximum: 30000 },
+      },
+      required: ['target', 'confirm'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'telegram_leave_chat',
+    description:
+      'Leave one Telegram group/channel by @username, public t.me link, or invite ' +
+      'link. This changes the live Telegram account and may remove access to private ' +
+      'history, so confirm=true is mandatory. Already-left is an idempotent success. ' +
+      'Local SC Desktop messages/source data are preserved. FloodWait errors include ' +
+      'retry_after_seconds. The operation is visible in Requests and cancellable until ' +
+      'the membership RPC has been sent; an in-flight external mutation is allowed to ' +
+      'finish so the result cannot be misreported as rolled back.',
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', minLength: 1, maxLength: 2000, description: '@username, t.me public link, or invite link.' },
+        session: { type: 'string', description: 'Telegram session name or account alias.' },
+        profile: { type: 'string', description: 'Alias for session.' },
+        confirm: { type: 'boolean', const: true, description: 'Must be true: leaving is a visible and potentially access-removing action.' },
+        wait_ms: { type: 'integer', default: 30000, minimum: 0, maximum: 30000 },
+      },
+      required: ['target', 'confirm'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'telegram_live_search',
     description:
       'Search one Telegram chat directly on Telegram servers without fetching ' +
       'or indexing the whole chat. Returns matching message text/metadata and ' +
       'a pagination offset. This is lexical Telegram search, not semantic RAG. ' +
+      'Forward provenance and attachment name/type/size are included when present. ' +
       'The request runs as a visible, cancellable SC Desktop job; no media bytes ' +
-      'or messages are saved locally. Use telegram_live_context on selected hits.',
+      'or messages are saved locally. Use telegram_live_context on selected hits; ' +
+      'if a selected hit is voice/audio/video, use telegram_live_transcribe to read it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -519,7 +648,8 @@ const TOOLS = [
       'wide-search wave: provide several literal/synonym queries, then inspect ' +
       'deduplicated candidates and expand only strong hits with ' +
       'telegram_live_context. SC Desktop limits Telegram concurrency (default 3), ' +
-      'shows one umbrella job in Requests, and provides Cancel.',
+      'shows one umbrella job in Requests, and provides Cancel. Selected voice/audio/' +
+      'video hits can be read with telegram_live_transcribe.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -556,7 +686,9 @@ const TOOLS = [
       'reply ancestor chain, reply descendants, and chronological messages ' +
       'before/after are fetched together and deduplicated. Accepts a t.me URL ' +
       'or chat + message_id. Use this for every live hit you cite or analyse; ' +
-      'reply links alone miss ordinary follow-up messages.',
+      'reply links alone miss ordinary follow-up messages. Forward and attachment ' +
+      'metadata are returned without downloading the attachment bytes. For a selected ' +
+      'voice/audio/video message, call telegram_live_transcribe with its URL.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -579,9 +711,11 @@ const TOOLS = [
     name: 'telegram_live_range',
     description:
       'Read an inclusive Telegram message-id range without saving the chat or ' +
-      'downloading media. Pass two t.me URLs from the same chat, or chat + ' +
+      'downloading media; attachment name/type/size and forward origin are still ' +
+      'returned. Pass two t.me URLs from the same chat, or chat + ' +
       'from_id + to_id. Missing/deleted ids are reported explicitly. This is ' +
-      'the deterministic tool for requests like “read messages 5299 through 5318”.',
+      'the deterministic tool for requests like “read messages 5299 through 5318”. ' +
+      'Use telegram_live_transcribe for any selected voice/audio/video row.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -595,6 +729,72 @@ const TOOLS = [
         max_messages: { type: 'integer', default: 1000, minimum: 1, maximum: 5000 },
         caption_chars: { type: 'integer', default: 8000, minimum: 100, maximum: 8000 },
         wait_ms: { type: 'integer', default: 20000, minimum: 0, maximum: 30000 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'telegram_live_attachment',
+    description:
+      'Download and read exactly one attachment from one Telegram message without ' +
+      'fetching or materialising the chat. Accepts a t.me message URL or chat + ' +
+      'message_id. The operation runs in SC Desktop as a visible cancellable job. ' +
+      'Returns a local cached file and metadata; supported images are additionally ' +
+      'returned as real MCP image content, text/code and text PDFs as text content. ' +
+      'Voice/audio/video are returned as the original file; use ' +
+      'telegram_live_transcribe when the user wants their spoken contents. ' +
+      'Unsupported binary formats return the original file plus an explicit limitation. ' +
+      'If a large download is still running, call this tool again with job_id.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'Existing desktop:<id> from an earlier attachment call; resumes result delivery without starting another download.' },
+        url: { type: 'string', description: 'Full t.me message URL.' },
+        chat: { oneOf: [{ type: 'string' }, { type: 'integer' }], description: 'Chat title, handle, source id, or Telegram internal id.' },
+        message_id: { type: 'integer', minimum: 1 },
+        session: { type: 'string', description: 'Telegram session name or account alias.' },
+        profile: { type: 'string', description: 'Alias for session.' },
+        max_bytes: { type: 'integer', default: 104857600, minimum: 1, maximum: 2147483648, description: 'Explicit safety cap for this one download; raise it when a known larger file is intended.' },
+        max_text_chars: { type: 'integer', default: 200000, minimum: 1, maximum: 1000000 },
+        caption_chars: { type: 'integer', default: 8000, minimum: 100, maximum: 8000 },
+        wait_ms: { type: 'integer', default: 30000, minimum: 0, maximum: 30000 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'telegram_live_transcribe',
+    description:
+      'Transcribe exactly one selected Telegram voice, audio, video note, or video ' +
+      'without fetching or saving the surrounding chat. Use this when the user asks ' +
+      'to read, listen to, understand, or transcribe a Telegram voice/media message. ' +
+      'Soniox stt-async-v5 is the default and currently supported engine. SC Desktop ' +
+      'shows one visible cancellable job, downloads only that attachment into its ' +
+      'bounded cache, and returns transcript text plus links to the transcript and ' +
+      'original media. If the job is still running, call again with job_id.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'Existing desktop:<id> from an earlier transcription call; resumes result delivery without starting another job.' },
+        url: { type: 'string', description: 'Full t.me URL of the voice/audio/video message.' },
+        chat: { oneOf: [{ type: 'string' }, { type: 'integer' }], description: 'Chat title, handle, source id, or Telegram internal id.' },
+        message_id: { type: 'integer', minimum: 1 },
+        session: { type: 'string', description: 'Telegram session name or account alias.' },
+        profile: { type: 'string', description: 'Alias for session.' },
+        engine: { type: 'string', enum: ['soniox'], default: 'soniox' },
+        language_hints: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 5,
+          default: ['ru', 'en'],
+          items: { type: 'string', minLength: 2, maxLength: 16 },
+          description: 'Expected spoken languages; hints improve recognition but do not forbid other languages.',
+        },
+        context: { type: 'string', maxLength: 8000, description: 'Optional topic, names, or domain terms that should guide recognition.' },
+        max_bytes: { type: 'integer', default: 104857600, minimum: 1, maximum: 2147483648, description: 'Safety cap for downloading this one selected media file.' },
+        max_text_chars: { type: 'integer', default: 200000, minimum: 1, maximum: 1000000, description: 'Maximum transcript characters returned inline; the full text remains in transcript_path.' },
+        caption_chars: { type: 'integer', default: 8000, minimum: 100, maximum: 8000 },
+        wait_ms: { type: 'integer', default: 30000, minimum: 0, maximum: 30000 },
       },
       additionalProperties: false,
     },
@@ -615,7 +815,7 @@ const TOOLS = [
         profile: { type: 'string' },
         process_voice: { type: 'boolean', default: false },
         process_photo: { type: 'boolean', default: false },
-        process_docs: { type: 'boolean', default: false },
+        process_docs: { type: 'boolean', default: false, description: 'Read text/code attachments locally or extract PDFs with Gemini.' },
         process_polls: { type: 'boolean', default: true },
         transcribe_engine: { type: 'string', enum: ['assemblyai', 'gemini'] },
         transcribe_lang: { type: 'string', default: 'ru' },
@@ -669,7 +869,12 @@ const TOOLS = [
       'the app UI. Saves messages into library.db, can pull comments, process ' +
       'voice/audio/video, describe photos, extract PDFs, save polls/reactions, ' +
       'and record coverage. Returns immediately with job id; poll ' +
-      'telegram_job_status and run telegram_index after completion.',
+      'telegram_job_status and run telegram_index after persisted completion. ' +
+      'For a bounded speech pass use mode id_list + message_ids. voice_types and ' +
+      'voice_max_duration_sec are checked before any download/STT. full_history ' +
+      'requires mode all without limit/date/since/topic narrowing. With request_id, ' +
+      'recover an unknown acknowledgement through fetch:<request_id>, never a new key.',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     inputSchema: {
       type: 'object',
       properties: {
@@ -688,7 +893,7 @@ const TOOLS = [
         profile: { type: 'string', description: 'Alias for session.' },
         mode: {
           type: 'string',
-          enum: ['last_n', 'all', 'from_date', 'date_range', 'sync_new', 'single', 'media_only'],
+          enum: ['last_n', 'all', 'from_date', 'date_range', 'sync_new', 'single', 'media_only', 'id_list'],
           default: 'last_n',
         },
         limit: { type: 'integer', default: 500, minimum: 1, maximum: 100000 },
@@ -707,7 +912,8 @@ const TOOLS = [
         },
         process_voice: { type: 'boolean', description: 'Transcribe voice/audio/video.' },
         process_photo: { type: 'boolean', description: 'Describe photos with Gemini Vision.' },
-        process_docs: { type: 'boolean', description: 'Extract PDF/document text with Gemini.' },
+        process_docs: { type: 'boolean', description: 'Read text/code files locally and extract PDFs with Gemini.' },
+        download_profile_photo: { type: 'boolean', description: 'Optional avatar download. Set false for strictly metadata/allowed-speech-only collection; omit to keep legacy avatars.' },
         process_polls: { type: 'boolean', description: 'Render poll/quiz body into caption. Default true.' },
         include_comments: { type: 'boolean', description: 'Fetch linked discussion comments for posts.' },
         comments_limit: { type: 'integer', default: 0, minimum: 0, description: 'Max comments per post; 0 = all.' },
@@ -716,9 +922,19 @@ const TOOLS = [
           items: { type: 'integer' },
           description: 'Forum topic top_msg_ids. Omit for all topics.',
         },
-        transcribe_engine: { type: 'string', enum: ['assemblyai', 'gemini'], default: 'assemblyai' },
+        transcribe_engine: { type: 'string', enum: ['assemblyai', 'gemini', 'soniox'], default: 'assemblyai' },
         transcribe_lang: { type: 'string', default: 'ru' },
         redo_processed: { type: 'boolean', default: false, description: 'Re-run AI media processing even if done.' },
+        request_id: { type: 'string', description: 'Optional durable idempotency key. Same payload reuses original fetch:<key>; changed payload under that key is rejected.' },
+        expected_account_id: { type: 'integer', minimum: 1, description: 'Optional exact Telegram account fence before history/download; does not switch the global session.' },
+        expected_peer_id: { type: 'integer', description: 'Optional exact signed Telegram peer fence before history/download, e.g. -1002369738868 for itgrind.' },
+        full_history: { type: 'boolean', default: false, description: 'Full snapshot: mode all, no limit/date/since/topic filter. Reports EOF/head/oldest/gaps; not a remote-delete audit.' },
+        voice_types: { type: 'array', minItems: 1, items: { type: 'string', enum: ['voice', 'audio', 'video'] }, description: 'Speech allowlist before download/STT; omit to preserve all three types.' },
+        voice_max_duration_sec: { type: 'number', exclusiveMinimum: 0, description: 'Inclusive duration cap before download; unknown/invalid duration is skipped.' },
+        media_cache_dir: { type: 'string', description: 'Absolute job-local download directory; unmounted/unwritable/low-space cache fails, no silent fallback.' },
+        media_min_free_bytes: { type: 'integer', minimum: 1048576 },
+        reuse_transcripts: { type: 'boolean', default: false, description: 'Reuse any complete transcript, also for selected-message passes; do not repeat paid work.' },
+        message_ids: { type: 'array', minItems: 1, maxItems: 5000, items: { type: 'integer', minimum: 1 }, description: 'Exact Telegram IDs for a bounded persisted speech pass.' },
       },
       additionalProperties: false,
     },
@@ -753,10 +969,12 @@ const TOOLS = [
   {
     name: 'telegram_index',
     description:
-      'Start semantic indexing for one Telegram source. Runs over saved local ' +
-      'items that have non-empty captions and no vector yet. Returns immediately; ' +
-      'poll telegram_index_status or telegram_job_status. Also starts reply-' +
-      'graph backfill when needed, matching the desktop UI behavior.',
+      'Start/resume full-caption fragment indexing for one saved Telegram source in the ' +
+      'running SC Desktop app. One visible cancellable Requests job; a message becomes ready ' +
+      'only after every current fragment is published atomically. Old vectors remain for ' +
+      'unmigrated messages. Returns immediately, including preparation; poll index/job status. ' +
+      'item_ids are LOCAL item_id values, never Telegram message_id. No hidden MCP worker fallback.',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     inputSchema: {
       type: 'object',
       properties: {
@@ -765,7 +983,8 @@ const TOOLS = [
           oneOf: [{ type: 'string' }, { type: 'integer' }],
           description: 'Handle/title/internal id/t.me URL when source_id is omitted.',
         },
-        limit: { type: 'integer', minimum: 1, maximum: 200000, description: 'Newest unindexed rows to index. Omit for all.' },
+        limit: { type: 'integer', minimum: 1, maximum: 200000, description: 'Newest local indexable messages to consider. Omit for all.' },
+        item_ids: { type: 'array', minItems: 1, maxItems: 5000, items: { type: 'integer', minimum: 1 }, description: 'Optional exact local item_id subset within this source, for local-only targeted migration/guard repair. Does not start source-wide network metadata backfill.' },
       },
       additionalProperties: false,
     },
@@ -773,8 +992,10 @@ const TOOLS = [
   {
     name: 'telegram_index_status',
     description:
-      'Return semantic-index coverage for one Telegram source: idle/running, ' +
-      'indexed count, total local items, and active job ids when any.',
+      'Return current Telegram index coverage by saved source: ready-current messages, ' +
+      'legacy-unverified, stale, partial and pending, with fragment progress separate. ' +
+      'An accepted index job is not ready coverage; inspect its exact index-<id> status.',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       type: 'object',
       properties: {
@@ -789,13 +1010,16 @@ const TOOLS = [
     description:
       'List recent Telegram jobs from SC Desktop jobs table, plus live MCP jobs ' +
       'known to this server process. Filter by source_id/chat when investigating ' +
-      'a specific channel.',
+      'a specific channel. active_only reads every nonterminal durable row without a recent-history limit. ' +
+      'all_types with active_only is a read-only application drain check; live MCP rows are not the main app inventory.',
     inputSchema: {
       type: 'object',
       properties: {
         source_id: { type: 'integer' },
         chat: { oneOf: [{ type: 'string' }, { type: 'integer' }] },
         limit: { type: 'integer', default: 30, minimum: 1, maximum: 200 },
+        active_only: { type: 'boolean', default: false },
+        all_types: { type: 'boolean', default: false, description: 'Only with active_only: include other application job types for safe restart preflight; does not fetch their data.' },
       },
       additionalProperties: false,
     },
@@ -806,7 +1030,8 @@ const TOOLS = [
       'Get one job snapshot/detail by in-memory id or DB id. For index status ' +
       'by source, pass source_id/chat. Use after telegram_fetch, ' +
       'telegram_preview_fetch, telegram_comments_catchup, telegram_index, or ' +
-      'a telegram_live_* tool. desktop:<id> jobs are read from the running app ' +
+      'a telegram_live_* / telegram_join_chat / telegram_leave_chat tool. ' +
+      'desktop:<id> jobs are read from the running app ' +
       'and include the ephemeral live result while the app remains open.',
     inputSchema: {
       type: 'object',
@@ -821,8 +1046,8 @@ const TOOLS = [
   {
     name: 'telegram_cancel_job',
     description:
-      'Cancel a running Telegram fetch/preview/comments/index job by in-memory ' +
-      'id or DB id. For desktop:<id> returned by telegram_live_* this routes ' +
+      'Cancel a running Telegram fetch/preview/comments/index/membership job by ' +
+      'in-memory id or DB id. For desktop:<id> returned by live/join/leave tools this routes ' +
       'to the running SC Desktop app, so the same cancellation is reflected in Requests.',
     inputSchema: {
       type: 'object',
@@ -853,66 +1078,140 @@ const TOOLS = [
   {
     name: 'telegram_list_sessions',
     description:
-      'List Telegram session files known to SC Desktop and whether each is ' +
-      'authorized. Read-only inventory; login/revoke remains in the app UI.',
+      'Bounded fresh Telegram inventory: account IDs, assigned labels, masked phones. ' +
+      'authorized:null/unknown means network/DNS/deadline, NOT absence. ' +
+      'Use telegram_account_login_command for ONE user-run local hidden-input login; ' +
+      'never ask for phone/code/2FA in AI. After ready use telegram_resolve_account ' +
+      'and an explicit session per call. Global active is unchanged.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
+  savedMessageTool,
+  ...telegramTextTools,
+  ...boostyRagTools,
+  ...boostyCatalogTools,
+  ...boostyWorkflowTools,
+
+  // ========== YOUTUBE SEARCH + SUBTITLES ==========
   {
-    name: 'telegram_send_saved_message',
+    name: 'youtube_list_channels',
     description:
-      'Send text and/or local attachments to Telegram Saved Messages / Избранное. ' +
-      'This tool intentionally has no chat/target argument and cannot send to ' +
-      'other chats. Images are sent as photos; files are sent as documents. ' +
-      'For long text, split it into multiple calls; one Telegram text message ' +
-      'is limited to 4096 characters.',
+      'List YouTube channels saved in SC Desktop with catalog, transcript, and RAG-index coverage. ' +
+      'Use this first to resolve a source_id before channel-specific semantic research.',
     inputSchema: {
       type: 'object',
       properties: {
-        text: {
-          type: 'string',
-          maxLength: 4096,
-          description:
-            'Optional plain text to send exactly as-is. Markdown/HTML parsing is disabled. ' +
-            'When attachments are also present, text is sent as a separate message first.',
-        },
-        images: {
-          type: 'array',
-          maxItems: 50,
-          description:
-            'Local image file paths to send as Telegram photos, e.g. PNG/JPEG/WebP.',
-          items: { type: 'string' },
-        },
-        files: {
-          type: 'array',
-          maxItems: 50,
-          description:
-            'Local file paths to send as Telegram documents. Use this for PDFs, ZIPs, ' +
-            'or images that should be preserved as files instead of photos.',
-          items: { type: 'string' },
-        },
-        session: {
-          type: 'string',
-          description:
-            'Optional Telegram session/account. Accepts a session name or an ' +
-            'account alias from telegram_list_sessions (username/phone, e.g. f9922).',
-        },
-        profile: { type: 'string', description: 'Alias for session.' },
-        silent: {
-          type: 'boolean',
-          default: false,
-          description: 'Send without notification when Telegram supports it.',
-        },
+        query: { type: 'string', description: 'Optional channel title, handle, or channel-id substring.' },
+        indexed_only: { type: 'boolean', default: false },
+        limit: { type: 'integer', minimum: 1, maximum: 500, default: 100 },
       },
-      anyOf: [
-        { required: ['text'] },
-        { required: ['images'] },
-        { required: ['files'] },
-      ],
       additionalProperties: false,
     },
   },
-
-  // ========== YOUTUBE SUBTITLES ==========
+  {
+    name: 'youtube_channel_index',
+    description:
+      'Start or resume a chunk-level RAG index for saved transcripts in one YouTube channel. ' +
+      'The operation embeds bounded transcript passages, not whole videos. Poll ' +
+      'youtube_channel_index_status or telegram_job_status with the returned job_id.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source_id: { type: 'integer', minimum: 1 },
+        channel: { type: 'string', description: 'Channel title, @handle, channel id, or URL when source_id is unknown.' },
+        limit: { type: 'integer', minimum: 1, maximum: 20000, description: 'Newest transcribed videos to index. Omit for all.' },
+      },
+      anyOf: [{ required: ['source_id'] }, { required: ['channel'] }],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'youtube_channel_index_status',
+    description:
+      'Return RAG coverage for a saved YouTube channel: indexed transcript fragments, total ' +
+      'fragments, and indexed/available videos.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source_id: { type: 'integer', minimum: 1 },
+        channel: { type: 'string' },
+      },
+      anyOf: [{ required: ['source_id'] }, { required: ['channel'] }],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'youtube_channel_semantic_search',
+    description:
+      'Semantic RAG search inside one indexed YouTube channel. Returns matching transcript ' +
+      'passages with video URL, title, score, and exact or approximate position. For a selected ' +
+      'hit call youtube_channel_context before making detailed claims or reconstructing a scheme.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source_id: { type: 'integer', minimum: 1 },
+        channel: { type: 'string' },
+        query: { type: 'string', maxLength: 10000 },
+        limit: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+        min_cos: { type: 'number', minimum: -1, maximum: 1, default: 0.5 },
+      },
+      required: ['query'],
+      anyOf: [{ required: ['source_id'] }, { required: ['channel'] }],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'youtube_channel_context',
+    description:
+      'Read neighboring transcript passages around a YouTube semantic-search hit. Pass item_id ' +
+      'and chunk_index from youtube_channel_semantic_search; this is the evidence-expansion step ' +
+      'before asking another model to explain a mechanism, workflow, or scheme.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'integer', minimum: 1 },
+        chunk_index: { type: 'integer', minimum: 0 },
+        before: { type: 'integer', minimum: 0, maximum: 10, default: 2 },
+        after: { type: 'integer', minimum: 0, maximum: 10, default: 2 },
+      },
+      required: ['item_id', 'chunk_index'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'youtube_search',
+    description:
+      'Search YouTube through the running SC Desktop app using the same yt-dlp ranked-search ' +
+      'flow as the in-app picker. A plain query returns YouTube relevance order. A full ' +
+      'youtube.com/results URL preserves its native sp filters and sort. Results are ephemeral ' +
+      'and are not written to the Library; pass selected URLs to youtube_get_subtitles.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          maxLength: 4096,
+          description:
+            'Plain search text, or a YouTube results URL containing search_query and optional sp filters.',
+        },
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 100,
+          default: 20,
+          description: 'Number of ranked results to return in this window.',
+        },
+        offset: {
+          type: 'integer',
+          minimum: 0,
+          maximum: 1000,
+          default: 0,
+          description: 'Start offset within the ranked result window.',
+        },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+  },
   {
     name: 'youtube_get_subtitles',
     description:
@@ -1657,44 +1956,60 @@ const TOOLS = [
 ]
 
 const server = new Server(
-  { name: 'sc-desktop-tg-search', version: '0.1.0' },
+  { name: 'sc-desktop', version: '0.2.0' },
   { capabilities: { tools: {} } },
 )
+
+TOOLS.push(...telegramArchiveMediaTools)
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params
   try {
+    if (telegramArchiveMediaTools.some(tool => tool.name === name)) return await callTelegramArchiveMediaTool(name, args)
+    if (botOperations[name]) return await callTelegramBotTool(name, args, telegramLiveClient())
+    if (telegramFolderTools.some(tool => tool.name === name)) return await callTelegramFolderTool(name, args, telegramLiveClient())
+    if (boostyRagOperations[name]) return await callBoostyRagTool(name, args)
+    if (boostyCatalogOperations[name]) return await callBoostyCatalogTool(name, args)
+    if (boostyWorkflowOperations[name]) return await callBoostyWorkflowTool(name, args)
+    if (yougileToolBridge?.has(name)) {
+      return await yougileToolBridge.call(name, args)
+    }
     if (name === 'list_telegram_chats') {
       return { content: [{ type: 'text', text: JSON.stringify(listChats(), null, 2) }] }
     }
     if (name === 'telegram_semantic_search') {
-      const { source_id, query, limit = 10, min_cos = 0.55 } = args
-      if (!source_id) throw new Error('source_id is required')
-      if (!query || !query.trim()) throw new Error('query is required')
-      const out = await searchChat({ source_id, query, limit, min_cos })
+      if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('query is required')
+      const out = await searchChat(args)
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'telegram_message_read' || name === 'telegram_context') {
+      try {
+        const readers = createTelegramRagReaders(db.getDb())
+        const out = name === 'telegram_message_read' ? readers.readItem(args) : readers.context(args)
+        return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+      } catch (error) { return ragErrorResult(error) }
     }
     if (name === 'telegram_neighbors') {
       const { item_id, before = 5, after = 5 } = args
       if (!item_id) throw new Error('item_id is required')
       return {
-        content: [{ type: 'text', text: JSON.stringify(neighbors(item_id, before, after), null, 2) }],
+        content: [{ type: 'text', text: JSON.stringify(createTelegramRagReaders(db.getDb()).neighbors(args), null, 2) }],
       }
     }
     if (name === 'telegram_reply_thread') {
       const { item_id, max_depth = 10, max_descendants = 100 } = args
       if (!item_id) throw new Error('item_id is required')
       return {
-        content: [{ type: 'text', text: JSON.stringify(replyThread(item_id, max_depth, max_descendants), null, 2) }],
+        content: [{ type: 'text', text: JSON.stringify(createTelegramRagReaders(db.getDb()).replyThread(args), null, 2) }],
       }
     }
     if (name === 'telegram_get_by_external_id') {
       const { chat, external_id } = args
       if (chat == null || chat === '') throw new Error('chat is required')
       return {
-        content: [{ type: 'text', text: JSON.stringify(getByExternalId(chat, external_id), null, 2) }],
+        content: [{ type: 'text', text: JSON.stringify(getByExternalId(chat, external_id, args), null, 2) }],
       }
     }
     if (name === 'telegram_list_sources') {
@@ -1710,7 +2025,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const source = resolveSourceOrThrow(args)
       const { jobs_limit = 10 } = args
       return {
-        content: [{ type: 'text', text: JSON.stringify(sourceState(source.id, jobs_limit), null, 2) }],
+        content: [{ type: 'text', text: JSON.stringify(sourceState(source.id, jobs_limit, args), null, 2) }],
       }
     }
     if (name === 'telegram_list_folders') {
@@ -1740,6 +2055,18 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       })
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
+    if (name === 'telegram_search_public_chats') {
+      const request = await buildTelegramPublicSearchRequest(args)
+      const out = await telegramLiveClient().start(request, args.wait_ms ?? 30000)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'telegram_join_chat' || name === 'telegram_leave_chat') {
+      if (args.confirm !== true) throw new Error(`${name} requires confirm=true`)
+      const operation = name === 'telegram_join_chat' ? 'join' : 'leave'
+      const request = await buildTelegramMembershipRequest(args, operation)
+      const out = await telegramLiveClient().start(request, args.wait_ms ?? 30000)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
     if (name === 'telegram_live_search') {
       const request = await buildTelegramLiveSearchRequest(args)
       const out = await telegramLiveClient().start(request, args.wait_ms ?? 15000)
@@ -1759,6 +2086,24 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const request = await buildTelegramLiveRangeRequest(args)
       const out = await telegramLiveClient().start(request, args.wait_ms ?? 20000)
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'telegram_live_attachment') {
+      const out = args.job_id
+        ? await telegramLiveClient().status(args.job_id, args.wait_ms ?? 30000)
+        : await telegramLiveClient().start(
+            await buildTelegramLiveAttachmentRequest(args),
+            args.wait_ms ?? 30000,
+          )
+      return telegramLiveAttachmentToolResult(out)
+    }
+    if (name === 'telegram_live_transcribe') {
+      const out = args.job_id
+        ? await telegramLiveClient().status(args.job_id, args.wait_ms ?? 30000)
+        : await telegramLiveClient().start(
+            await buildTelegramLiveTranscriptionRequest(args),
+            args.wait_ms ?? 30000,
+          )
+      return telegramLiveTranscriptionToolResult(out)
     }
     if (name === 'telegram_live_save') {
       const resolved = liveChatTarget(args.chat)
@@ -1783,8 +2128,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     if (name === 'telegram_fetch') {
       const params = await buildTelegramJobParams(args)
-      const id = jobRunner().startTelegramFetch(params)
-      return { content: [{ type: 'text', text: JSON.stringify(jobStartResult(id), null, 2) }] }
+      const out = await telegramRagClient().startFetch(params)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
     if (name === 'telegram_comments_catchup') {
       const out = startCommentsCatchup(args)
@@ -1792,26 +2137,38 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     if (name === 'telegram_index') {
       const source = resolveSourceOrThrow(args)
+      if (args.limit != null && (typeof args.limit !== 'number' || !Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 200000)) {
+        throw Object.assign(new Error('Explicit index limit must be an integer from 1 to 200000; omit it for full index'), { code: 'INVALID_INDEX_LIMIT' })
+      }
       const limit = coercePositiveInt(args.limit, null)
-      const out = startTelegramIndex(source, limit)
+      const out = await telegramRagClient().startIndex({ source_id: source.id, limit, item_ids: args.item_ids })
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
     if (name === 'telegram_index_status') {
       const source = resolveSourceOrThrow(args)
-      const out = {
-        source: sourceRef(source),
-        index: indexJob().statusForSource(source.id),
-      }
+      const out = { source: sourceRef(source), ...(await telegramRagClient().indexStatus({ source_id: source.id })) }
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
     if (name === 'telegram_list_jobs') {
       const out = listTelegramJobs(args)
+      try {
+        const indices = await telegramRagClient().listIndices({ source_id: out.source?.source_id })
+        out.live.push(...indices.jobs)
+      } catch (error) {
+        out.application_index_status = { available: false, error: error.message }
+      }
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
     if (name === 'telegram_job_status') {
       const out = typeof args.job_id === 'string' && args.job_id.startsWith('desktop:')
         ? await telegramLiveClient().status(args.job_id, 0)
-        : telegramJobStatus(args)
+        : typeof args.job_id === 'string' && args.job_id.startsWith('fetch:')
+          ? await telegramRagClient().fetchStatus({ request_id: args.job_id.slice(6) })
+        : typeof args.job_id === 'string' && args.job_id.startsWith('index-')
+          ? await telegramRagClient().indexStatus({ id: args.job_id, source_id: args.source_id })
+          : args.job_id == null && (args.source_id != null || args.chat != null)
+            ? await telegramRagClient().indexStatus({ source_id: resolveSourceOrThrow(args).id })
+          : telegramJobStatus(args)
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
     if (name === 'telegram_cancel_job') {
@@ -1819,6 +2176,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (job_id == null || job_id === '') throw new Error('job_id is required')
       if (typeof job_id === 'string' && job_id.startsWith('desktop:')) {
         const out = await telegramLiveClient().cancel(job_id)
+        return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+      }
+      if (typeof job_id === 'string' && job_id.startsWith('index-')) {
+        const out = await telegramRagClient().cancelIndex({ job_id })
+        return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+      }
+      if (typeof job_id === 'string' && job_id.startsWith('fetch:')) {
+        const out = await telegramRagClient().cancelFetch({ request_id: job_id.slice(6) })
         return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
       }
       const ok = jobRunner().cancelJob(job_id)
@@ -1837,12 +2202,47 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const out = await listTelegramSessions()
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
-    if (name === 'telegram_send_saved_message') {
-      const out = await telegramSendSavedMessageTool(args)
+    if (name === 'telegram_account_login_command') {
+      return { content: [{ type: 'text', text: JSON.stringify(telegramLoginCommand(args), null, 2) }] }
+    }
+    if (name === 'telegram_resolve_account') {
+      const out = selectTelegramAccount(await listTelegramSessions(), args)
+      if (['missing', 'unauthorized'].includes(out.state)) out.login = telegramLoginCommand({ label: args.name, expected_account_id: args.account_id || out.account_id || undefined })
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
     }
+    if (name === 'telegram_send_saved_message') {
+      const out = await telegramSendSavedMessageTool(args)
+      return { ...(out.ok === false ? { isError: true } : {}), content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (Object.hasOwn(telegramTextOperations, name)) {
+      return await callTelegramTextTool(name, args, request => jobRunner().runTelegramTextCommand(request))
+    }
 
-    // ===== YouTube subtitle tools =====
+    // ===== YouTube channel RAG + search + subtitle tools =====
+    if (name === 'youtube_list_channels') {
+      const out = listYoutubeChannelsTool(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'youtube_channel_index') {
+      const out = await youtubeChannelIndexTool(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'youtube_channel_index_status') {
+      const out = await youtubeChannelIndexStatusTool(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'youtube_channel_semantic_search') {
+      const out = await youtubeChannelSemanticSearchTool(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'youtube_channel_context') {
+      const out = youtubeChannelContextTool(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
+    if (name === 'youtube_search') {
+      const out = await youtubeSubtitlesClient().search(args)
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+    }
     if (name === 'youtube_get_subtitles') {
       const out = await youtubeSubtitlesClient().start(args)
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
@@ -1974,6 +2374,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     throw new Error(`unknown tool: ${name}`)
   } catch (err) {
+    if (name.startsWith('telegram_') && err?.code) return ragErrorResult(err)
     return {
       isError: true,
       content: [{ type: 'text', text: `Error: ${err && err.message || err}` }],
@@ -1982,23 +2383,231 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 })
 
 function listChats() {
-  const handle = db.getDb()
-  const rows = handle.prepare(`
-    SELECT s.id, s.handle, s.display_name,
-           (SELECT COUNT(*) FROM items i WHERE i.source_id = s.id) AS items_total,
-           (SELECT COUNT(*) FROM items_vec v JOIN items i ON i.id = v.item_id
-             WHERE i.source_id = s.id) AS items_indexed
-      FROM sources s
-     WHERE s.platform = 'telegram'
-     ORDER BY items_indexed DESC
-  `).all()
-  return rows.filter(r => r.items_indexed > 0).map(r => ({
+  const rows = db.listSources('telegram')
+  return rows.filter(r => r.semantic_indexed_count > 0)
+    .sort((a, b) => b.semantic_indexed_count - a.semantic_indexed_count).map(r => ({
     source_id: r.id,
     handle: r.handle,
     title: r.display_name || r.handle,
-    indexed: r.items_indexed,
-    total: r.items_total,
+    indexed: r.semantic_indexed_count,
+    indexed_current: r.semantic_current_count,
+    indexed_legacy_unverified: r.semantic_legacy_count,
+    stale: r.semantic_stale_count,
+    total: r.items_count,
+    indexable: r.semantic_indexable_count,
   }))
+}
+
+function youtubeUrlAt(rawUrl, seconds) {
+  const value = String(rawUrl || '')
+  const offset = Math.max(0, Math.round(Number(seconds) || 0))
+  if (!value || !offset) return value || null
+  try {
+    const url = new URL(value)
+    url.searchParams.set('t', `${offset}s`)
+    return url.toString()
+  } catch {
+    return value
+  }
+}
+
+function youtubeSourceSummary(row) {
+  const meta = parseMaybeJson(row.meta_json, {}) || {}
+  const saved = Number(row.items_total || 0)
+  const total = meta.catalog_total == null ? null : Number(meta.catalog_total)
+  const complete = meta.catalog_complete === true
+  const transcripts = Number(row.transcribed_videos || 0)
+  const fragmentsTotal = Number(row.fragments_total || 0)
+  const fragmentsIndexed = Number(row.fragments_indexed || 0)
+  const videosIndexed = Number(row.videos_indexed || 0)
+  const indexComplete = fragmentsTotal > 0 && fragmentsIndexed >= fragmentsTotal
+  const transcriptCoverageComplete = complete && saved > 0 && transcripts >= saved
+  return {
+    source_id: Number(row.id),
+    handle: row.handle,
+    title: row.display_name || row.handle,
+    channel_id: row.external_id || null,
+    catalog: {
+      saved,
+      total,
+      complete,
+      remaining: total == null ? null : Math.max(0, total - saved),
+      updated_at: meta.catalog_updated_at || row.last_synced_at || null,
+    },
+    transcripts: {
+      videos: transcripts,
+      missing: Math.max(0, saved - transcripts),
+      channel_coverage_complete: transcriptCoverageComplete,
+    },
+    rag: {
+      fragments_indexed: fragmentsIndexed,
+      fragments_total: fragmentsTotal,
+      videos_indexed: videosIndexed,
+      index_complete_for_transcripts: indexComplete,
+      channel_coverage_complete: transcriptCoverageComplete && indexComplete,
+    },
+  }
+}
+
+function youtubeSourceRows() {
+  return require('./youtube-source-inventory').youtubeSourceRows(db.getDb())
+}
+
+function resolveYoutubeSourceTool(args = {}) {
+  const sourceId = Number(args.source_id)
+  const rows = youtubeSourceRows()
+  if (Number.isSafeInteger(sourceId) && sourceId > 0) {
+    const row = rows.find(candidate => Number(candidate.id) === sourceId)
+    if (!row) throw new Error(`YouTube source #${sourceId} not found`)
+    return row
+  }
+  const query = normaliseText(args.channel).replace(/^@/, '')
+  if (!query) throw new Error('source_id or channel is required')
+  const exact = rows.filter(row => [row.handle, row.display_name, row.external_id]
+    .some(value => normaliseText(value).replace(/^@/, '') === query))
+  const matches = exact.length ? exact : rows.filter(row => [row.handle, row.display_name, row.external_id]
+    .some(value => normaliseText(value).replace(/^@/, '').includes(query)))
+  if (!matches.length) throw new Error(`YouTube channel not found in Library: ${args.channel}`)
+  if (matches.length > 1) {
+    const candidates = matches.slice(0, 10).map(row => ({
+      source_id: row.id,
+      handle: row.handle,
+      title: row.display_name || row.handle,
+    }))
+    throw new Error(`YouTube channel is ambiguous; pass source_id. Candidates: ${JSON.stringify(candidates)}`)
+  }
+  return matches[0]
+}
+
+function listYoutubeChannelsTool(args = {}) {
+  const query = normaliseText(args.query).replace(/^@/, '')
+  const limit = Math.min(500, coercePositiveInt(args.limit, 100))
+  const rows = youtubeSourceRows()
+    .filter(row => !query || [row.handle, row.display_name, row.external_id]
+      .some(value => normaliseText(value).replace(/^@/, '').includes(query)))
+    .filter(row => args.indexed_only !== true || Number(row.fragments_indexed || 0) > 0)
+  const channels = rows.slice(0, limit).map(youtubeSourceSummary)
+  return {
+    returned: channels.length,
+    total_matching: rows.length,
+    complete: channels.length === rows.length,
+    filters: { query: args.query || null, indexed_only: args.indexed_only === true },
+    channels,
+  }
+}
+
+async function youtubeChannelIndexTool(args = {}) {
+  const source = resolveYoutubeSourceTool(args)
+  const result = await indexJob().start({
+    sourceId: source.id,
+    limit: args.limit || null,
+    origin: 'mcp',
+    mode: 'youtube',
+  })
+  if (result && typeof result === 'object' && result.noop) {
+    return {
+      ok: true,
+      noop: true,
+      reason: result.reason,
+      source: youtubeSourceSummary(source),
+      index: await indexJob().statusForSource(source.id, 'youtube'),
+    }
+  }
+  return {
+    ok: true,
+    job_id: result,
+    source: youtubeSourceSummary(source),
+    next: 'Poll youtube_channel_index_status for coverage or telegram_job_status with this job_id.',
+  }
+}
+
+async function youtubeChannelIndexStatusTool(args = {}) {
+  const source = resolveYoutubeSourceTool(args)
+  return {
+    source: youtubeSourceSummary(source),
+    index: await indexJob().statusForSource(source.id, 'youtube'),
+  }
+}
+
+async function youtubeChannelSemanticSearchTool(args = {}) {
+  const source = resolveYoutubeSourceTool(args)
+  const query = String(args.query || '').trim()
+  if (!query) throw new Error('query is required')
+  const limit = Math.min(100, coercePositiveInt(args.limit, 20))
+  const minCos = Number.isFinite(Number(args.min_cos)) ? Number(args.min_cos) : 0.5
+  const embedding = await embedQuery(query)
+  const rows = db.semanticChunkSearch({
+    query_embedding: embedding,
+    source_id: source.id,
+    limit: Math.min(200, limit * 2),
+  })
+  const results = rows
+    .filter(row => Number(row._cos || 0) >= minCos)
+    .slice(0, limit)
+    .map(row => ({
+      chunk_id: Number(row.id),
+      item_id: Number(row.item_id),
+      chunk_index: Number(row.chunk_index),
+      score: Number(Number(row._cos || 0).toFixed(3)),
+      video_id: row.external_id,
+      title: row.title,
+      url: row.url,
+      url_at_position: youtubeUrlAt(row.url, row.start_seconds),
+      position: {
+        start_seconds: row.start_seconds,
+        end_seconds: row.end_seconds,
+        approximate: !!row.position_approximate,
+      },
+      text: row.text,
+    }))
+  const status = db.semanticChunkIndexStatus(source.id)
+  const sourceSummary = youtubeSourceSummary(source)
+  const indexComplete = status.total > 0 && status.done >= status.total
+  const channelCoverageComplete = sourceSummary.transcripts.channel_coverage_complete && indexComplete
+  return {
+    source: sourceSummary,
+    query,
+    threshold: minCos,
+    returned: results.length,
+    index: status,
+    index_complete_for_transcripts: indexComplete,
+    channel_coverage_complete: channelCoverageComplete,
+    results,
+    next: results.length
+      ? 'Call youtube_channel_context with item_id and chunk_index for the hits used in the answer.'
+      : 'Lower min_cos, broaden the query, or run youtube_channel_index if index coverage is incomplete.',
+  }
+}
+
+function youtubeChannelContextTool(args = {}) {
+  const rows = db.semanticChunkContext({
+    item_id: args.item_id,
+    chunk_index: args.chunk_index,
+    before: Math.min(10, Math.max(0, Number(args.before ?? 2))),
+    after: Math.min(10, Math.max(0, Number(args.after ?? 2))),
+  })
+  if (!rows.length) return { error: 'chunk_not_found', results: [] }
+  const first = rows[0]
+  return {
+    video: {
+      item_id: Number(first.item_id),
+      video_id: first.external_id,
+      title: first.title,
+      channel: first.source_title || first.source_handle,
+      url: first.url,
+    },
+    center_chunk_index: Number(args.chunk_index),
+    returned: rows.length,
+    results: rows.map(row => ({
+      chunk_id: Number(row.id),
+      chunk_index: Number(row.chunk_index),
+      url_at_position: youtubeUrlAt(row.url, row.start_seconds),
+      start_seconds: row.start_seconds,
+      end_seconds: row.end_seconds,
+      position_approximate: !!row.position_approximate,
+      text: row.text,
+    })),
+  }
 }
 
 function coercePositiveInt(value, fallback) {
@@ -2055,12 +2664,13 @@ function resolveSourceOrThrow(args = {}) {
   return row
 }
 
-function sourceSummary(row, { includeBreakdown = true } = {}) {
+function sourceSummary(row, { includeBreakdown = true, indexStatus = null } = {}) {
   const sourceId = Number(row.id)
   const itemsTotal = row.items_total != null
     ? Number(row.items_total)
     : (db.getDb().prepare('SELECT COUNT(*) AS n FROM items WHERE source_id = ?').get(sourceId)?.n || 0)
-  const indexed = row.items_indexed != null ? Number(row.items_indexed) : db.vectorCountForSource(sourceId)
+  const index = indexStatus || require('../electron/telegram-rag-index').telegramFragmentIndexStatus(db, sourceId)
+  const indexed = index.searchable_messages
   const commentsTotal = row.comments_total != null ? Number(row.comments_total) : db.countCommentsBySource(sourceId)
   const range = (row.min_at != null || row.max_at != null)
     ? { min_at: row.min_at || null, max_at: row.max_at || null }
@@ -2075,7 +2685,10 @@ function sourceSummary(row, { includeBreakdown = true } = {}) {
     external_id: row.external_id || null,
     items_total: itemsTotal,
     items_indexed: indexed,
-    index_missing: Math.max(0, itemsTotal - indexed),
+    items_indexable: index.messages_total,
+    items_indexed_current: index.messages_complete,
+    items_indexed_legacy_unverified: index.legacy_only_messages,
+    index_missing: Math.max(0, index.messages_total - indexed),
     comments_total: commentsTotal,
     date_range: range,
     max_external_id: maxExternalId || null,
@@ -2124,6 +2737,9 @@ function compactTelegramSource(row) {
     items_total: itemsTotal,
     items_indexable: indexable,
     items_indexed: indexed,
+    items_indexed_current: Number(row.semantic_current_count || 0),
+    items_indexed_legacy_unverified: Number(row.semantic_legacy_count || 0),
+    stale_messages: Number(row.semantic_stale_count || 0),
     index_missing: Math.max(0, indexable - indexed),
     last_item_at: row.last_item_at || row.max_at || null,
     last_synced_at: row.last_synced_at || null,
@@ -2288,25 +2904,13 @@ async function telegramFolderStateTool(args = {}) {
 }
 
 function listTelegramSources({ indexed_only = false, explicit_only = false, limit = 200 } = {}) {
-  const h = db.getDb()
-  const where = [`s.platform = 'telegram'`]
-  if (explicit_only) where.push('COALESCE(s.is_explicit, 0) = 1')
-  const rows = h.prepare(`
-    SELECT s.*,
-           (SELECT COUNT(*) FROM items i WHERE i.source_id = s.id) AS items_total,
-           (SELECT COUNT(*) FROM items_vec v JOIN items i ON i.id = v.item_id
-             WHERE i.source_id = s.id) AS items_indexed,
-           (SELECT COUNT(*) FROM post_comments c WHERE c.source_id = s.id) AS comments_total,
-           (SELECT MIN(published_at) FROM items i WHERE i.source_id = s.id) AS min_at,
-           (SELECT MAX(published_at) FROM items i WHERE i.source_id = s.id) AS max_at,
-           (SELECT MAX(CAST(external_id AS INTEGER)) FROM items i WHERE i.source_id = s.id) AS max_external_id
-      FROM sources s
-     WHERE ${where.join(' AND ')}
-     ORDER BY items_total DESC, items_indexed DESC, s.last_synced_at DESC
-     LIMIT ?
-  `).all(coercePositiveInt(limit, 200))
+  const rows = db.listSources('telegram')
+    .filter(row => !explicit_only || !!row.is_explicit)
+    .sort((a, b) => b.items_count - a.items_count || b.semantic_indexed_count - a.semantic_indexed_count)
+    .slice(0, coercePositiveInt(limit, 200))
   const sources = rows
-    .filter(r => !indexed_only || Number(r.items_indexed || 0) > 0)
+    .filter(r => !indexed_only || Number(r.semantic_indexed_count || 0) > 0)
+    .map(r => ({ ...r, items_total: r.items_count, items_indexed: r.semantic_indexed_count }))
     .map(r => sourceSummary(r))
   return {
     returned: sources.length,
@@ -2315,13 +2919,11 @@ function listTelegramSources({ indexed_only = false, explicit_only = false, limi
   }
 }
 
-function sourceState(sourceId, jobsLimit = 10) {
+function sourceState(sourceId, jobsLimit = 10, { coverage_offset = 0, coverage_limit = 200 } = {}) {
   const h = db.getDb()
   const row = h.prepare(`
     SELECT s.*,
            (SELECT COUNT(*) FROM items i WHERE i.source_id = s.id) AS items_total,
-           (SELECT COUNT(*) FROM items_vec v JOIN items i ON i.id = v.item_id
-             WHERE i.source_id = s.id) AS items_indexed,
            (SELECT COUNT(*) FROM post_comments c WHERE c.source_id = s.id) AS comments_total,
            (SELECT MIN(published_at) FROM items i WHERE i.source_id = s.id) AS min_at,
            (SELECT MAX(published_at) FROM items i WHERE i.source_id = s.id) AS max_at,
@@ -2330,15 +2932,24 @@ function sourceState(sourceId, jobsLimit = 10) {
      WHERE s.platform = 'telegram' AND s.id = ?
   `).get(sourceId)
   if (!row) return { error: 'source not found', source_id: sourceId }
-  const summary = sourceSummary(row)
-  const coverage = db.listCoverage(sourceId)
-  const recentJobs = db.listJobsForSource(sourceId, coercePositiveInt(jobsLimit, 10))
+  const index = require('../electron/telegram-rag-index').telegramFragmentIndexStatus(db, sourceId)
+  const summary = sourceSummary(row, { indexStatus: index })
+  const allCoverage = db.listCoverage(sourceId)
+  const offset = Math.max(0, Math.floor(Number(coverage_offset) || 0))
+  const pageSize = Math.max(1, Math.min(1000, Math.floor(Number(coverage_limit) || 200)))
+  const coverage = allCoverage.slice(offset, offset + pageSize)
+  const jobsCount = Number.isInteger(Number(jobsLimit)) && Number(jobsLimit) >= 0
+    ? Math.min(50, Number(jobsLimit)) : 10
+  const recentJobs = db.listJobsForSource(sourceId, jobsCount)
     .filter(j => String(j.type || '').startsWith('tg_'))
     .map(formatJobRow)
   return {
     source: summary,
-    index: indexJob().statusForSource(sourceId),
+    index,
     coverage,
+    coverage_offset: offset, coverage_total: allCoverage.length,
+    coverage_has_more: offset + coverage.length < allCoverage.length,
+    coverage_next_offset: offset + coverage.length < allCoverage.length ? offset + coverage.length : null,
     recent_jobs: recentJobs,
   }
 }
@@ -2458,6 +3069,31 @@ async function liveSessionForArgs(args = {}, resolvedChats = []) {
   return sessions[0] || null
 }
 
+async function buildTelegramPublicSearchRequest(args = {}) {
+  const query = String(args.query || '').trim()
+  if (!query) throw new Error('query is required')
+  return {
+    operation: 'public_search',
+    session: await liveSessionForArgs(args, []),
+    query,
+    limit: args.limit,
+  }
+}
+
+async function buildTelegramMembershipRequest(args = {}, operation) {
+  const target = String(args.target || '').trim()
+  if (!target) throw new Error('target is required')
+  if (!['join', 'leave'].includes(operation)) throw new Error('invalid membership operation')
+  if (args.confirm !== true) throw new Error(`${operation} requires confirm=true`)
+  const resolved = liveChatTarget(target)
+  return {
+    operation,
+    session: await liveSessionForArgs(args, [resolved]),
+    target,
+    confirm: true,
+  }
+}
+
 async function buildTelegramLiveSearchRequest(args = {}, { batch = false } = {}) {
   const chatValues = batch ? args.chats : [args.chat]
   const queryValues = batch ? args.queries : [args.query]
@@ -2528,37 +3164,236 @@ async function buildTelegramLiveRangeRequest(args = {}) {
   }
 }
 
+async function buildTelegramLiveAttachmentRequest(args = {}) {
+  if (!args.url && (args.chat == null || args.message_id == null)) {
+    throw new Error('url or chat + message_id is required')
+  }
+  const resolved = args.chat == null ? null : liveChatTarget(args.chat)
+  return {
+    operation: 'attachment',
+    session: await liveSessionForArgs(args, resolved ? [resolved] : []),
+    chat: resolved?.target || null,
+    url: args.url || null,
+    message_id: args.message_id || null,
+    max_bytes: args.max_bytes,
+    max_text_chars: args.max_text_chars,
+    caption_chars: args.caption_chars,
+  }
+}
+
+async function buildTelegramLiveTranscriptionRequest(args = {}) {
+  if (!args.url && (args.chat == null || args.message_id == null)) {
+    throw new Error('url or chat + message_id is required')
+  }
+  const resolved = args.chat == null ? null : liveChatTarget(args.chat)
+  return {
+    operation: 'transcribe',
+    session: await liveSessionForArgs(args, resolved ? [resolved] : []),
+    chat: resolved?.target || null,
+    url: args.url || null,
+    message_id: args.message_id || null,
+    engine: args.engine || 'soniox',
+    language_hints: args.language_hints,
+    context: args.context,
+    max_bytes: args.max_bytes,
+    max_text_chars: args.max_text_chars,
+    caption_chars: args.caption_chars,
+  }
+}
+
+function telegramAttachmentFileInfo(filePath) {
+  if (!filePath || typeof filePath !== 'string') return null
+  const cacheRoot = path.resolve(db.LIB_ROOT, 'cache', 'telegram-live-attachments')
+  const absolute = path.resolve(filePath)
+  if (!fs.existsSync(absolute)) throw new Error(`Telegram attachment cache file is missing: ${absolute}`)
+  const realRoot = fs.realpathSync(cacheRoot)
+  const realPath = fs.realpathSync(absolute)
+  const relative = path.relative(realRoot, realPath)
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error('Telegram attachment result points outside the SC Desktop cache')
+  }
+  const stat = fs.statSync(realPath)
+  if (!stat.isFile()) throw new Error('Telegram attachment result is not a file')
+  return { path: realPath, stat }
+}
+
+function telegramLiveAttachmentToolResult(out) {
+  const result = out?.result
+  if (!result || result.operation !== 'attachment') {
+    return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+  }
+
+  const rawAttachment = result.attachment && typeof result.attachment === 'object'
+    ? result.attachment
+    : null
+  const extractedText = typeof rawAttachment?.extracted_text === 'string'
+    ? rawAttachment.extracted_text
+    : ''
+  const attachment = rawAttachment ? { ...rawAttachment } : null
+  if (attachment) delete attachment.extracted_text
+
+  const file = telegramAttachmentFileInfo(result.file_path || rawAttachment?.file_path)
+  const contentType = String(attachment?.content_type || 'application/octet-stream').toLowerCase()
+  const inlineImageTypes = new Set([
+    'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp', 'image/svg+xml',
+  ])
+  const inlineImageLimit = 20 * 1024 * 1024
+  const imageIncluded = !!file
+    && inlineImageTypes.has(contentType)
+    && file.stat.size <= inlineImageLimit
+
+  const publicResult = {
+    ...result,
+    file_path: file?.path || result.file_path || null,
+    attachment: attachment ? {
+      ...attachment,
+      file_path: file?.path || attachment.file_path || null,
+    } : null,
+    delivery: {
+      resource_link_included: !!file,
+      image_content_included: imageIncluded,
+      extracted_text_included: !!extractedText,
+      image_inline_limit_bytes: inlineImageLimit,
+      limitation: file && contentType.startsWith('image/') && !imageIncluded
+        ? `image is available at file_path but cannot be inlined as MCP image content (${contentType}, ${file.stat.size} bytes)`
+        : null,
+    },
+  }
+  const content = [{
+    type: 'text',
+    text: JSON.stringify({ ...out, result: publicResult }, null, 2),
+  }]
+
+  if (file) {
+    content.push({
+      type: 'resource_link',
+      uri: pathToFileURL(file.path).href,
+      name: path.basename(file.path),
+      title: `Telegram attachment #${result.message?.message_id || 'unknown'} · ${attachment?.file_name || path.basename(file.path)}`,
+      description: result.message?.text || 'Telegram message attachment cached by SC Desktop',
+      mimeType: contentType,
+      size: file.stat.size,
+    })
+  }
+  if (imageIncluded) {
+    content.push({
+      type: 'image',
+      data: fs.readFileSync(file.path).toString('base64'),
+      mimeType: contentType,
+    })
+  }
+  if (extractedText) {
+    content.push({
+      type: 'text',
+      text: `===== TELEGRAM ATTACHMENT: ${attachment?.file_name || path.basename(file?.path || 'attachment')} =====\n${extractedText}`,
+    })
+  }
+  return { content }
+}
+
+function telegramLiveTranscriptionToolResult(out) {
+  const result = out?.result
+  if (!result || result.operation !== 'transcribe') {
+    return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] }
+  }
+
+  const rawTranscription = result.transcription && typeof result.transcription === 'object'
+    ? result.transcription
+    : null
+  const transcriptText = typeof rawTranscription?.text === 'string'
+    ? rawTranscription.text
+    : ''
+  const transcription = rawTranscription ? { ...rawTranscription } : null
+  if (transcription) delete transcription.text
+
+  const rawAttachment = result.attachment && typeof result.attachment === 'object'
+    ? result.attachment
+    : null
+  const attachment = rawAttachment ? { ...rawAttachment } : null
+  if (attachment) delete attachment.extracted_text
+  const mediaFile = telegramAttachmentFileInfo(result.file_path || rawAttachment?.file_path)
+  const transcriptFile = telegramAttachmentFileInfo(result.transcript_path)
+  const contentType = String(attachment?.content_type || 'application/octet-stream').toLowerCase()
+
+  const publicResult = {
+    ...result,
+    file_path: mediaFile?.path || result.file_path || null,
+    transcript_path: transcriptFile?.path || result.transcript_path || null,
+    attachment: attachment ? {
+      ...attachment,
+      file_path: mediaFile?.path || attachment.file_path || null,
+    } : null,
+    transcription,
+    delivery: {
+      media_resource_link_included: !!mediaFile,
+      transcript_resource_link_included: !!transcriptFile,
+      transcript_text_included: !!transcriptText,
+    },
+  }
+  const content = [{
+    type: 'text',
+    text: JSON.stringify({ ...out, result: publicResult }, null, 2),
+  }]
+  const messageId = result.message?.message_id || 'unknown'
+  if (mediaFile) {
+    content.push({
+      type: 'resource_link',
+      uri: pathToFileURL(mediaFile.path).href,
+      name: path.basename(mediaFile.path),
+      title: `Telegram media #${messageId}`,
+      description: 'Original Telegram voice/audio/video cached by SC Desktop',
+      mimeType: contentType,
+      size: mediaFile.stat.size,
+    })
+  }
+  if (transcriptFile) {
+    content.push({
+      type: 'resource_link',
+      uri: pathToFileURL(transcriptFile.path).href,
+      name: path.basename(transcriptFile.path),
+      title: `Telegram transcript #${messageId} · ${transcription?.engine || 'soniox'}`,
+      description: 'Transcript of one selected Telegram media message',
+      mimeType: 'text/plain',
+      size: transcriptFile.stat.size,
+    })
+  }
+  if (transcriptText) {
+    content.push({
+      type: 'text',
+      text: `===== TELEGRAM TRANSCRIPT #${messageId} · ${transcription?.engine || 'soniox'} =====\n${transcriptText}`,
+    })
+  }
+  return { content }
+}
+
 async function resolveTelegramSessionName(args = {}) {
   const raw = args.session || args.profile || args.account || args.tg_session
   if (raw == null || String(raw).trim() === '') return null
   const wanted = String(raw).trim()
-  const q = wanted.casefold ? wanted.casefold() : wanted.toLowerCase()
-  const events = await jobRunner().runTgSessionsCommand(['list'])
-  const sessions = events.filter(e => e.type === 'session')
-  const norm = (v) => String(v == null ? '' : v).trim().toLowerCase()
-  const fields = (s) => {
-    const me = s.me || s.me_cached || {}
-    return [
-      s.name,
-      me.username,
-      me.phone,
-      me.id,
-      [me.first_name, me.last_name].filter(Boolean).join(' '),
-    ].map(norm).filter(Boolean)
+  // An exact session name needs no all-account network inventory. The selected
+  // worker still checks authorization; account aliases use the normal resolver.
+  if (!/^\d+$/.test(wanted) && /^[A-Za-z0-9_-]+$/.test(wanted) && [
+    path.join(projectRoot, 'python-workers', 'telegram', `${wanted}.session`),
+    path.join(db.LIB_ROOT, 'sessions', 'telegram', `${wanted}.session`),
+  ].some(candidate => fs.existsSync(candidate))) return wanted
+  // Preserve explicit +phone aliases without exposing them in public output.
+  // Digit-only selectors are exact IDs, not an ordinal/phone fallback.
+  if (/^\+[0-9 ()-]+$/.test(wanted)) {
+    const raw = await jobRunner().runTgSessionsCommand(['list'])
+    const privateInventory = telegramAccountInventory(raw, activeTelegramSessionName())
+    const digits = wanted.replace(/\D/g, '')
+    const matches = raw.filter(s => s.type === 'session' && String((s.me || s.me_cached)?.phone || '').replace(/\D/g, '') === digits)
+    const ids = [...new Set(matches.map(s => (s.me || s.me_cached)?.id).filter(Boolean))]
+    if (ids.length !== 1) throw Object.assign(new Error('Phone alias отсутствует или неоднозначен; используй account ID/session.'), { code: 'TELEGRAM_ACCOUNT_AMBIGUOUS' })
+    const resolved = selectTelegramAccount(privateInventory, { account_id: Number(ids[0]) })
+    if (!resolved.ok) throw Object.assign(new Error(resolved.error), { code: resolved.code })
+    return resolved.session
   }
-  let match = sessions.find(s => fields(s).some(v => v === q))
-  if (!match) match = sessions.find(s => fields(s).some(v => v.includes(q)))
-  if (!match) {
-    const available = sessions.map(s => {
-      const me = s.me || s.me_cached || {}
-      return `${s.name}${me.username ? ' (@' + me.username + ')' : ''}${me.phone ? ' +' + me.phone : ''}`
-    }).join(', ')
-    throw new Error(`Telegram session/profile not found: ${wanted}. Available: ${available || 'none'}`)
-  }
-  if (match.authorized === false) {
-    throw new Error(`Telegram session is not authorized: ${match.name}`)
-  }
-  return match.name
+  const inventory = await listTelegramSessions()
+  const selected = selectTelegramAccount(inventory, /^\d+$/.test(wanted)
+    ? { account_id: Number(wanted) } : { name: wanted, allowSubstring: true })
+  if (!selected.ok) throw Object.assign(new Error(selected.error), { code: selected.code })
+  return selected.session
 }
 
 async function buildTelegramJobParams(args = {}, { preview = false } = {}) {
@@ -2619,9 +3454,12 @@ async function buildTelegramJobParams(args = {}, { preview = false } = {}) {
       params.transcribe_lang = args.transcribe_lang || 'ru'
     }
     if (args.redo_processed) params.redo_processed = true
+    for (const key of ['request_id', 'expected_account_id', 'expected_peer_id', 'download_profile_photo', 'full_history', 'voice_types', 'voice_max_duration_sec', 'media_cache_dir', 'media_min_free_bytes', 'reuse_transcripts', 'message_ids']) {
+      if (args[key] != null) params[key] = args[key]
+    }
   }
 
-  return params
+  return require('../electron/telegram-fetch-policy').validateTelegramFetchPolicy(params)
 }
 
 function jobStartResult(id) {
@@ -2704,34 +3542,6 @@ function startCommentsCatchup(args = {}) {
   }
 }
 
-function startTelegramIndex(source, limit) {
-  const result = indexJob().start({ sourceId: source.id, limit: limit || null })
-  if (!(result && typeof result === 'object' && result.noop)) {
-    setImmediate(() => maybeStartReplyBackfill(source))
-  }
-  return {
-    ok: true,
-    source: sourceRef(source),
-    result,
-    index: indexJob().statusForSource(source.id),
-  }
-}
-
-function maybeStartReplyBackfill(source) {
-  try {
-    const pending = db.listItemsMissingParent(source.id, 1)
-    if (!pending.length) return
-    const target = source.handle || source.external_id
-    if (!target) return
-    jobRunner().startTelegramReplyBackfill({
-      source_id: source.id,
-      target,
-    })
-  } catch (err) {
-    console.error('[MCP] reply-backfill kickoff failed', err && err.message || err)
-  }
-}
-
 function formatJobRow(row) {
   const params = parseMaybeJson(row.parameters_json, null)
   return {
@@ -2758,6 +3568,16 @@ function listTelegramJobs(args = {}) {
     throw err
   }
   const limit = coercePositiveInt(args.limit, 30)
+  if (args.active_only === true) {
+    const rows = db.getDb().prepare(`SELECT * FROM jobs
+      WHERE status IN ('pending','running','cancelling','awaiting_ai')
+        ${args.all_types === true ? '' : "AND type LIKE 'tg_%'"}
+        ${source ? 'AND source_id = ?' : ''}
+      ORDER BY id`).all(...(source ? [source.id] : []))
+    return { source: sourceRef(source), live_scope: 'mcp_process_only',
+      durable_scope: args.all_types === true ? 'all_application_job_types' : 'telegram',
+      active_only: true, enumeration_complete: true, live: [], historic: rows.map(formatJobRow) }
+  }
   const live = jobRunner().listJobs()
     .filter(j => String(j.type || '').startsWith('tg_'))
     .filter(j => !source || Number(j.source_id) === Number(source.id))
@@ -2789,7 +3609,7 @@ function telegramJobStatus(args = {}) {
   if (args.source_id != null || args.chat != null) {
     const source = resolveSourceOrThrow(args)
     out.source = sourceRef(source)
-    out.index = indexJob().statusForSource(source.id)
+    out.index = require('../electron/telegram-rag-index').telegramFragmentIndexStatus(db, source.id)
     out.source_state = sourceState(source.id, 5)
   }
   if (!('job' in out) && !out.source) {
@@ -2825,39 +3645,16 @@ function getStoredTelegramComments({ source, post_external_id, limit }) {
 }
 
 async function listTelegramSessions() {
-  const events = await jobRunner().runTgSessionsCommand(['list'])
-  return {
-    active: activeTelegramSessionName(),
-    sessions: events.filter(e => e.type === 'session'),
-    done: events.find(e => e.type === 'done') || null,
-    errors: events.filter(e => e.type === 'error'),
-  }
+  const events = await jobRunner().runTgSessionsCommand(['list', '--redact'])
+  return telegramAccountInventory(events, activeTelegramSessionName())
 }
 
 async function telegramSendSavedMessageTool(args = {}) {
-  const text = String(args.text == null ? '' : args.text)
-  const images = Array.isArray(args.images)
-    ? args.images.map(v => String(v || '').trim()).filter(Boolean)
-    : []
-  const files = Array.isArray(args.files)
-    ? args.files.map(v => String(v || '').trim()).filter(Boolean)
-    : []
-  if (!text.trim() && images.length === 0 && files.length === 0) {
-    throw new Error('text, images, or files are required')
-  }
-  const textToSend = text.trim() ? text : ''
-  if (textToSend.length > 4096) {
-    throw new Error(`Telegram message is too long: ${textToSend.length} characters, maximum is 4096`)
-  }
-  if (images.length > 50) throw new Error('Too many images: maximum is 50')
-  if (files.length > 50) throw new Error('Too many files: maximum is 50')
+  const input = normalizeSavedMessageInput(args)
   const session = await resolveTelegramSessionName(args)
   const out = await jobRunner().sendTelegramSavedMessage({
-    text: textToSend,
-    images,
-    files,
+    ...input,
     session: session || null,
-    silent: args.silent === true,
   })
   return {
     ...out,
@@ -4298,28 +5095,53 @@ function summariseReactions(raw) {
   return { total, top: arr.slice(0, 6) }
 }
 
-async function searchChat({ source_id, query, limit, min_cos }) {
-  const q = await embedQuery(query)
-  const rows = db.hybridSearch({
-    query, query_embedding: q, source_id, limit: Math.min(50, limit * 2),
-  })
-  const filtered = rows
-    .filter(r => (r._cos ?? 0) >= min_cos)
-    .slice(0, limit)
-    .map(r => ({
-      item_id: r.id,
-      cos: Number((r._cos || 0).toFixed(3)),
-      published_at: r.published_at,
-      sender: r.sender,
-      external_id: r.external_id,
-      caption: (r.caption || '').slice(0, 800),
-      reactions: summariseReactions(r.reactions),
-    }))
+function telegramMessageMetadata(row) {
+  const raw = parseMaybeJson(row?.raw_meta_json, {}) || {}
   return {
-    source_id,
+    has_media: !!row?.has_media,
+    media: Array.isArray(raw.media) ? raw.media : [],
+    forward: raw.forward && typeof raw.forward === 'object' ? raw.forward : null,
+  }
+}
+
+async function searchChat(args) {
+  const { query } = args
+  const scope = normalizeRagScope(args)
+  const q = await embedQuery(query)
+  const out = searchTelegramRag(db, { ...scope, query_embedding: q }, {
+    annotateContextRefs: (row, refs) => annotateSemanticContextRefs(db.getDb(), row, refs),
+  })
+  const filtered = out.rows.map(row => {
+    const item = serializeTelegramItem(row, out.source, { caption_chars: args.caption_chars ?? 1200 })
+    const matches = (row._matched_chunks || []).map(chunk => ({
+      chunk_id: chunk.chunk_id, chunk_index: chunk.chunk_index,
+      document_hash: chunk.document_hash, cos: Number(chunk.cos.toFixed(3)),
+      index_revision: chunk.index_revision, content_hash: chunk.content_hash,
+      index_version: chunk.index_version, context_refs: chunk.context_refs,
+      ...readTelegramCaptionSpan(row.caption || '', {
+        start: chunk.start_char, end: chunk.end_char, offset_unit: 'utf16_code_units',
+        expected_caption_hash: item.caption_hash,
+      }),
+    }))
+    const origin = telegramForwardProvenance(item.forward)
+    return {
+      ...item, cos: Number(row._cos.toFixed(3)),
+      index_mode: row._index_mode, index_freshness: row._freshness,
+      matches,
+      forward_origin_key: origin.key,
+      forward_origin_basis: origin.basis,
+    }
+  })
+  const chronology = out.chronology
+  return {
+    source_id: scope.source_id,
     query,
+    query_embedding_sha256: crypto.createHash('sha256').update(Buffer.from(q.buffer, q.byteOffset, q.byteLength)).digest('hex'),
     returned: filtered.length,
-    threshold: min_cos,
+    threshold: scope.min_cos,
+    scope: { ...scope, date_timezone: 'UTC_for_date_only', date_bounds: 'inclusive' },
+    corpus: { ...chronology, last_synced_at: out.source.last_synced_at || null, index: out.coverage },
+    ...out.diagnostics,
     results: filtered,
   }
 }
@@ -4331,7 +5153,8 @@ function neighbors(item_id, before, after) {
   ).get(item_id)
   if (!center) return { error: 'item not found' }
   const beforeRows = handle.prepare(`
-    SELECT id, published_at, sender, type, caption, reactions
+    SELECT id, external_id, published_at, sender, type, caption, reactions,
+           has_media, raw_meta_json
       FROM items
      WHERE source_id = ? AND published_at IS NOT NULL
        AND (published_at < ? OR (published_at = ? AND id < ?))
@@ -4339,7 +5162,8 @@ function neighbors(item_id, before, after) {
      LIMIT ?
   `).all(center.source_id, center.published_at, center.published_at, center.id, before).reverse()
   const afterRows = handle.prepare(`
-    SELECT id, published_at, sender, type, caption, reactions
+    SELECT id, external_id, published_at, sender, type, caption, reactions,
+           has_media, raw_meta_json
       FROM items
      WHERE source_id = ? AND published_at IS NOT NULL
        AND (published_at > ? OR (published_at = ? AND id > ?))
@@ -4348,14 +5172,17 @@ function neighbors(item_id, before, after) {
   `).all(center.source_id, center.published_at, center.published_at, center.id, after)
   const trim = (r) => ({
     item_id: r.id,
+    external_id: r.external_id,
     published_at: r.published_at,
     sender: r.sender,
     type: r.type,
     caption: (r.caption || '').slice(0, 800),
     reactions: summariseReactions(r.reactions),
+    ...telegramMessageMetadata(r),
   })
   const centerRow = handle.prepare(
-    'SELECT id, published_at, sender, type, caption, reactions FROM items WHERE id = ?'
+    `SELECT id, external_id, published_at, sender, type, caption, reactions,
+            has_media, raw_meta_json FROM items WHERE id = ?`
   ).get(item_id)
   return {
     before: beforeRows.map(trim),
@@ -4427,7 +5254,7 @@ function resolveChat(chat) {
   return { source: row, urlExternalId }
 }
 
-function getByExternalId(chat, externalIdArg) {
+function getByExternalId(chat, externalIdArg, options = {}) {
   const { source, urlExternalId } = resolveChat(chat)
   if (!source) {
     return {
@@ -4451,7 +5278,7 @@ function getByExternalId(chat, externalIdArg) {
   const handle = db.getDb()
   const row = handle.prepare(`
     SELECT id, source_id, external_id, parent_external_id, published_at,
-           sender, type, caption, reactions
+           sender, type, caption, reactions, has_media, raw_meta_json
       FROM items
      WHERE source_id = ? AND external_id = ?
   `).get(source.id, String(externalId))
@@ -4467,23 +5294,7 @@ function getByExternalId(chat, externalIdArg) {
         'point to a discussion-group reply, not the channel).',
     }
   }
-  return {
-    source: {
-      source_id: source.id,
-      handle: source.handle,
-      title: source.display_name || source.handle,
-    },
-    item: {
-      item_id: row.id,
-      external_id: row.external_id,
-      parent_external_id: row.parent_external_id || null,
-      published_at: row.published_at,
-      sender: row.sender,
-      type: row.type,
-      caption: (row.caption || '').slice(0, 800),
-      reactions: summariseReactions(row.reactions),
-    },
-  }
+  return createTelegramRagReaders(handle).readItem({ source_id: source.id, external_id: String(externalId), caption_chars: options.caption_chars ?? 16000 })
 }
 
 // Reply-graph walk. Two recursive CTEs: ancestors climb up via
@@ -4495,21 +5306,23 @@ function replyThread(item_id, max_depth, max_descendants) {
   const handle = db.getDb()
   const center = handle.prepare(`
     SELECT id, source_id, external_id, parent_external_id, published_at,
-           sender, type, caption, reactions
+           sender, type, caption, reactions, has_media, raw_meta_json
       FROM items WHERE id = ?
   `).get(item_id)
   if (!center) return { error: 'item not found' }
 
   const ancestorsSql = `
     WITH RECURSIVE chain(id, external_id, parent_external_id, published_at,
-                         sender, type, caption, reactions, hop) AS (
+                         sender, type, caption, reactions, has_media,
+                         raw_meta_json, hop) AS (
       SELECT id, external_id, parent_external_id, published_at,
-             sender, type, caption, reactions, 0
+             sender, type, caption, reactions, has_media, raw_meta_json, 0
         FROM items
        WHERE source_id = ? AND external_id = ?
       UNION ALL
       SELECT i.id, i.external_id, i.parent_external_id, i.published_at,
-             i.sender, i.type, i.caption, i.reactions, c.hop + 1
+             i.sender, i.type, i.caption, i.reactions, i.has_media,
+             i.raw_meta_json, c.hop + 1
         FROM items i
         JOIN chain c ON i.source_id = ? AND i.external_id = c.parent_external_id
        WHERE c.parent_external_id IS NOT NULL AND c.hop < ?
@@ -4524,14 +5337,16 @@ function replyThread(item_id, max_depth, max_descendants) {
 
   const descendantsSql = `
     WITH RECURSIVE tree(id, external_id, parent_external_id, published_at,
-                       sender, type, caption, reactions, hop) AS (
+                       sender, type, caption, reactions, has_media,
+                       raw_meta_json, hop) AS (
       SELECT id, external_id, parent_external_id, published_at,
-             sender, type, caption, reactions, 1
+             sender, type, caption, reactions, has_media, raw_meta_json, 1
         FROM items
        WHERE source_id = ? AND parent_external_id = ?
       UNION ALL
       SELECT i.id, i.external_id, i.parent_external_id, i.published_at,
-             i.sender, i.type, i.caption, i.reactions, t.hop + 1
+             i.sender, i.type, i.caption, i.reactions, i.has_media,
+             i.raw_meta_json, t.hop + 1
         FROM items i
         JOIN tree t ON i.source_id = ? AND i.parent_external_id = t.external_id
        WHERE t.hop < ?
@@ -4554,6 +5369,7 @@ function replyThread(item_id, max_depth, max_descendants) {
     type: r.type,
     caption: (r.caption || '').slice(0, 800),
     reactions: summariseReactions(r.reactions),
+    ...telegramMessageMetadata(r),
   })
 
   // Detect when ancestors hit the climb limit without finding the root —
@@ -4575,6 +5391,7 @@ function replyThread(item_id, max_depth, max_descendants) {
       type: center.type,
       caption: (center.caption || '').slice(0, 800),
       reactions: summariseReactions(center.reactions),
+      ...telegramMessageMetadata(center),
     },
     ancestors: ancestors.map(trim),
     descendants: descendants.map(trim),
@@ -5225,7 +6042,18 @@ function gtSetTextBackgrounds(args) {
 // Long-running stdio transport. Errors after init shouldn't kill the process —
 // MCP clients reuse the same connection across many tool calls.
 const transport = new StdioServerTransport()
-server.connect(transport).catch((err) => {
-  console.error('[sc-mcp] transport failed:', err)
-  process.exit(1)
-})
+loadYougileToolBridge()
+  .then((bridge) => {
+    yougileToolBridge = bridge
+    const existing = new Set(TOOLS.map(tool => tool.name))
+    const collisions = bridge.tools.filter(tool => existing.has(tool.name))
+    if (collisions.length) {
+      throw new Error(`YouGile tool collision: ${collisions.map(tool => tool.name).join(', ')}`)
+    }
+    TOOLS.push(...bridge.tools)
+    return server.connect(transport)
+  })
+  .catch((err) => {
+    console.error('[sc-mcp] transport failed:', err)
+    process.exit(1)
+  })

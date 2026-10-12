@@ -24,6 +24,9 @@ import PlatformLogo from './PlatformLogo'
 
 const PLATFORM_BY_TYPE = {
   tg_fetch: 'telegram', tg_preview: 'telegram',
+  tg_live_search: 'telegram', tg_live_context: 'telegram',
+  tg_live_range: 'telegram', tg_live_attachment: 'telegram', tg_live_transcribe: 'telegram',
+  tg_live_public_search: 'telegram', tg_live_join: 'telegram', tg_live_leave: 'telegram',
   yt_transcribe: 'youtube', yt_comments: 'youtube', yt_batch_comments: 'youtube',
   yt_channel_fetch: 'youtube', yt_batch_transcribe: 'youtube',
   rutube_transcribe: 'rutube',
@@ -37,6 +40,14 @@ const PLATFORM_BY_TYPE = {
 const TYPE_LABEL = {
   tg_fetch:             'Telegram',
   tg_preview:           'Telegram',
+  tg_live_search:       'Telegram поиск',
+  tg_live_context:      'Telegram контекст',
+  tg_live_range:        'Telegram диапазон',
+  tg_live_attachment:   'Telegram вложение',
+  tg_live_transcribe:    'Telegram голосовое',
+  tg_live_public_search: 'Telegram каталог',
+  tg_live_join:          'Telegram вступление',
+  tg_live_leave:         'Telegram выход',
   yt_transcribe:        'YouTube видео',
   yt_comments:          'YouTube комменты',
   yt_batch_comments:    'YouTube комменты · batch',

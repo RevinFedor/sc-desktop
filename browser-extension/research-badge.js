@@ -10,9 +10,30 @@
 // (aistudio-mcp / perplexity-research / claude-research) — так же как
 // aistudio-core.js отдаёт window.scAistudio для aistudio-mcp.js.
 //
-// Плашка не блокирует страницу (контейнер pointer-events:none; интерактивна
-// только мини-кнопка сворачивания). Сворачивание persist'ится в localStorage
+// Плашка не блокирует страницу вне карточки: контейнер pointer-events:none,
+// текстовые поля доступны обычному выделению, кнопки остаются интерактивными.
+// Сворачивание persist'ится в localStorage
 // (per-origin — каждый провайдер помнит своё состояние).
+(function installResearchContentPing() {
+  try {
+    if (window.__scResearchContentPingInstalled) return;
+    window.__scResearchContentPingInstalled = true;
+    const hostname = String(location.hostname || '').toLowerCase();
+    const provider = hostname === 'chatgpt.com' || hostname === 'www.chatgpt.com'
+      ? 'chatgpt'
+      : hostname === 'claude.ai' || hostname.endsWith('.claude.ai')
+        ? 'claude'
+        : hostname === 'perplexity.ai' || hostname.endsWith('.perplexity.ai')
+          ? 'perplexity'
+          : hostname.includes('aistudio.google.com') ? 'aistudio' : null;
+    chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+      if (request?.__sc_research_content_ping !== true) return undefined;
+      sendResponse({ ok: true, provider });
+      return false;
+    });
+  } catch (_) {}
+})();
+
 (function () {
   const BADGE_ID = 'sc-mcp-badge';
   const STYLE_ID = 'sc-mcp-badge-style';
@@ -52,8 +73,19 @@
         padding:14px 16px;
         max-width:320px;
       }
+      #${BADGE_ID} .sc-mcp-body,
+      #${BADGE_ID} .sc-mcp-selectable{
+        pointer-events:auto;
+        user-select:text!important;
+        -webkit-user-select:text!important;
+        cursor:text;
+      }
+      #${BADGE_ID} .sc-mcp-meta-value{overflow-wrap:anywhere;}
       #${BADGE_ID} .sc-mcp-prompt-text{
         pointer-events:auto;
+        user-select:text!important;
+        -webkit-user-select:text!important;
+        cursor:text;
         color:#cbd5e1;
         font-size:11px;
         line-height:1.45;
@@ -146,7 +178,7 @@
       el.innerHTML = `
         <div class="sc-mcp-header">
           <div style="width:8px;height:8px;border-radius:50%;background:#22c55e;animation:scMcpPulse 1.4s ease-in-out infinite;flex-shrink:0;"></div>
-          <div style="font-weight:600;letter-spacing:0.3px;color:#fff;font-size:11px;text-transform:uppercase;flex:1;">MCP · ${safe(providerLabel || 'Research')}</div>
+          <div class="sc-mcp-selectable" style="font-weight:600;letter-spacing:0.3px;color:#fff;font-size:11px;text-transform:uppercase;flex:1;">MCP · ${safe(providerLabel || 'Research')}</div>
           <button class="sc-mcp-mini-btn" data-sc-mcp-toggle="1" title="Свернуть/развернуть">
             <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg" data-sc-mcp-chevron="1">
               <path data-sc-mcp-chevron-path="1" d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -155,9 +187,9 @@
         </div>
         <div class="sc-mcp-body">
           <div style="color:#9ca3af;font-size:11px;margin-bottom:4px;">Job</div>
-          <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#cbd5e1;margin-bottom:10px;">${safe(jobId)}</div>
+          <div class="sc-mcp-selectable sc-mcp-meta-value" data-sc-mcp-job="1" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#cbd5e1;margin-bottom:10px;">${safe(jobId)}</div>
           <div style="color:#9ca3af;font-size:11px;margin-bottom:4px;">Модель</div>
-          <div style="color:#e9ecef;font-size:12px;margin-bottom:10px;">${safe(modelTitle)}</div>
+          <div class="sc-mcp-selectable sc-mcp-meta-value" data-sc-mcp-model="1" style="color:#e9ecef;font-size:12px;margin-bottom:10px;">${safe(modelTitle)}</div>
           <div style="color:#9ca3af;font-size:11px;margin-bottom:4px;">Промпт</div>
           <div class="sc-mcp-prompt-text" data-sc-mcp-prompt="1">${safe(fullPrompt)}</div>
           ${hasLongPrompt ? '<button class="sc-mcp-more-btn" data-sc-mcp-prompt-more="1" type="button">Показать ещё</button>' : ''}

@@ -14,7 +14,14 @@ import { Brain, ChevronLeft, ChevronRight } from 'lucide-react'
  * Keeps row height stable: input slides INTO the same flex row from the left
  * (no absolute positioning, no margin tricks).
  */
-export default function IndexButton({ sourceId, status, onStart }) {
+export default function IndexButton({
+  sourceId, status, onStart,
+  idleVerb = 'Проиндексировать',
+  completeLabel = 'Индекс готов',
+  inputPlaceholder = 'N сообщ.',
+  inputTitle = 'Количество последних сообщений (от новых). Пусто = все.',
+  actionTitle = 'Создать семантический индекс по сообщениям (Gemini embeddings)',
+}) {
   const [open, setOpen] = useState(false)
   const [limitStr, setLimitStr] = useState('')
   const inputRef = useRef(null)
@@ -30,7 +37,9 @@ export default function IndexButton({ sourceId, status, onStart }) {
   const labelLimit = limit ? limit.toLocaleString() : 'full'
 
   const indexing = status?.state === 'running'
+  const preparing = indexing && status?.phase === 'starting'
   const complete = !indexing
+    && !status?.needs_reindex
     && Number(status?.total || 0) > 0
     && Number(status?.done || 0) >= Number(status?.total || 0)
   const pct = indexing && status?.total
@@ -38,10 +47,11 @@ export default function IndexButton({ sourceId, status, onStart }) {
     : null
 
   const mainLabel = indexing
-    ? `Индексирую… ${status?.done?.toLocaleString() ?? 0} / ${status?.total?.toLocaleString() ?? '?'}${pct != null ? ` (${pct}%)` : ''}`
+    ? preparing ? 'Подготавливаю индекс…'
+      : `Индексирую… ${status?.done?.toLocaleString() ?? 0} / ${status?.total?.toLocaleString() ?? '?'}${pct != null ? ` (${pct}%)` : ''}`
     : complete
-      ? 'Индекс готов'
-    : `Проиндексировать (${labelLimit})`
+      ? completeLabel
+    : `${idleVerb} (${labelLimit})`
 
   return (
     <div className="ml-auto flex items-center gap-1">
@@ -53,11 +63,11 @@ export default function IndexButton({ sourceId, status, onStart }) {
           type="number"
           min="1"
           step="100"
-          placeholder="N сообщ."
+          placeholder={inputPlaceholder}
           value={limitStr}
           onChange={(e) => setLimitStr(e.target.value.replace(/\D+/g, ''))}
           className="w-32 h-9 px-3 rounded-md bg-zinc-900 border border-zinc-700 text-zinc-100 text-sm focus:outline-none focus:border-zinc-500"
-          title="Количество последних сообщений (от новых). Пусто = все."
+          title={inputTitle}
         />
       )}
 
@@ -91,7 +101,7 @@ export default function IndexButton({ sourceId, status, onStart }) {
             ? 'Индексация уже идёт'
             : complete
               ? 'Все сообщения уже проиндексированы'
-            : 'Создать семантический индекс по сообщениям (Gemini embeddings)'
+            : actionTitle
         }
       >
         <Brain size={16} className="shrink-0" /> {mainLabel}

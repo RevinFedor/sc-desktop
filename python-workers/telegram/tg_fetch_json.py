@@ -29,6 +29,7 @@ import os
 import json
 import asyncio
 import time
+import math
 import argparse
 import platform
 import subprocess
@@ -55,6 +56,39 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
 from credentials import telegram_credentials
 from library_db import open_db, missing_comment_post_ids, processed_external_ids_by_kind
+from tg_voice_policy import (VoicePolicy, MediaStorageError, UnknownMediaDelivery, FetchTraversalCache,
+                             checked_directory, media_directory_fence, verify_media_directory_fence, fatal_media_error)
+
+_VOICE_POLICY = VoicePolicy()
+_VOICE_LANGUAGE_HINTS = ["ru", "en"]
+_FULL_HISTORY_REPORT = False
+_TRAVERSAL_STATE_DIR = None
+_TRAVERSAL_REQUEST_ID = None
+_EXPECTED_ACCOUNT_ID = None
+_EXPECTED_PEER_ID = None
+_SKIP_PROFILE_PHOTO = False
+
+
+def _speech_stats():
+    return {name: 0 for name in ("seen", "eligible", "transcribed", "no_speech", "reused_transcripts",
+        "skipped_type", "skipped_unknown_duration", "skipped_duration", "failed", "blocked_unknown", "blocked_storage", "resumed_provider_jobs")}
+
+
+_SPEECH_STATS = _speech_stats()
+
+
+def _emit_speech_summary():
+    emit({"type": "speech-summary", "stats": dict(_SPEECH_STATS)})
+from tg_message_payload import (
+    TEXT_DOCUMENT_MAX_BYTES,
+    attachment_metadata,
+    forward_metadata,
+    is_pdf_attachment,
+    is_text_attachment,
+    message_media,
+    reply_metadata,
+    read_text_attachment,
+)
 
 try:
     TELEGRAM_API_ID, TELEGRAM_API_HASH = telegram_credentials()
@@ -80,6 +114,7 @@ def _avatar_path_for(entity_id):
 
 try:
     from telethon import TelegramClient
+    from tg_concurrent_session import telegram_session
     from telethon.tl.types import (
         User, Chat, Channel,
         MessageMediaDocument, MessageMediaPhoto, MessageMediaPoll,
@@ -517,18 +552,51 @@ async def process_media(msg, msg_type, *,
     is_audio = msg_type in ("voice", "audio")
     is_video = msg_type == "video"
     if process_voice and transcribe_engine and (is_audio or is_video):
-        if _should_skip_processed(_SKIP_VOICE, msg.id, transcribe_engine):
+        _SPEECH_STATS["seen"] += 1
+        reason, tg_duration = _VOICE_POLICY.decision(msg, msg_type)
+        if reason:
+            _SPEECH_STATS[{"type_not_allowed": "skipped_type", "unknown_duration": "skipped_unknown_duration", "duration_limit": "skipped_duration"}[reason]] += 1
+            emit({"type": "media-skipped", "kind": "voice", "msg_id": msg.id,
+                  "reason": reason, "reason_code": reason, "media_type": msg_type,
+                  "audio_duration_sec": tg_duration})
+            return
+        _SPEECH_STATS["eligible"] += 1
+        if (_should_skip_processed(_SKIP_VOICE, msg.id, transcribe_engine) or
+                (_VOICE_POLICY.reuse_existing and str(msg.id) in _SKIP_VOICE)):
             _emit_media_skipped(kind="voice", msg_id=msg.id,
                                 reason=f"уже обработано · {transcribe_engine}")
+            _SPEECH_STATS["reused_transcripts"] += 1
             return
         tmp_path = None
         try:
+            cache = _VOICE_POLICY.cache(msg, transcribe_engine)
+            cached = cache.completed() if cache and _VOICE_POLICY.reuse_existing else None
+            if cached is not None:
+                _SPEECH_STATS["reused_transcripts"] += 1
+                if not str(cached.get("text") or "").strip():
+                    _SPEECH_STATS["no_speech"] += 1
+                    emit({"type": "media-skipped", "kind": "voice", "msg_id": msg.id,
+                          "reason": "no_speech", "reason_code": "no_speech", "reused": True})
+                    return
+                emit({"type": "transcript", "msg_id": msg.id, "engine": cached.get("engine", transcribe_engine),
+                      "text": cached.get("text", ""), "reused": True, "checkpoint_path": str(cache.path)})
+                return
+            resume_state = cache.load() if cache else {}
+            if resume_state.get("state") == "external_processing" or (resume_state and resume_state.get("state") != "completed" and resume_state.get("engine") not in (None, transcribe_engine)):
+                raise UnknownMediaDelivery("original ASR engine attempt is pending; automatic paid redo is not allowed")
+            known_provider = transcribe_engine == "soniox" and bool(resume_state.get("transcription_id") or resume_state.get("file_id"))
+            if known_provider:
+                _SPEECH_STATS["resumed_provider_jobs"] += 1
+            if ((resume_state.get("state") == "uploading" and not resume_state.get("file_id")) or
+                    (resume_state.get("state") == "creating" and not resume_state.get("transcription_id"))):
+                raise UnknownMediaDelivery("original ASR delivery is unknown; do not create another paid request")
             # Telethon also exposes an attribute `duration` on voice/audio
             # messages (in seconds, integer). Use it as a pre-download hint
             # so the UI shows «аудио 0:42» from the very first event, even
             # before ffprobe has anything to chew on. ffprobe's float reading
             # supersedes it after download.
-            tg_duration = None
+            # Retain the validated file-duration hint when document attributes
+            # omit it; known-provider resumes deliberately have no local file.
             try:
                 doc = getattr(msg.media, "document", None)
                 if doc:
@@ -541,15 +609,32 @@ async def process_media(msg, msg_type, *,
             _emit_media_progress(kind="voice", msg_id=msg.id,
                                  stage="downloading", engine=transcribe_engine,
                                  audio_duration_sec=tg_duration)
-            tmp_path = await msg.download_media(file=f"/tmp/tg_media_{msg.id}")
-            if not tmp_path or not os.path.exists(tmp_path):
+            fence = None
+            budget = _VOICE_POLICY.min_free_bytes
+            if cache and not known_provider:
+                size = getattr(getattr(msg, "file", None), "size", None)
+                expected_bytes = int(size) if isinstance(size, (int, float)) and size > 0 else 0
+                budget += expected_bytes
+                _, fence = media_directory_fence(str(cache.download_path.parent), budget)
+                verify_media_directory_fence(str(cache.download_path.parent), fence, budget)
+            tmp_path = None if known_provider else await msg.download_media(file=str(cache.download_path) if cache else f"/tmp/tg_media_{msg.id}")
+            if cache and not known_provider:
+                verify_media_directory_fence(str(cache.download_path.parent), fence, _VOICE_POLICY.min_free_bytes)
+            if not known_provider and (not tmp_path or not os.path.exists(tmp_path)):
                 raise RuntimeError("download_media returned no path")
             # Pre-flight: silent video (mp4/webm screencast, animation
             # without audio track) → AAI returns "No audio stream found".
             # Cheap to detect locally, expensive to ask the API. Skipping
             # also keeps the user's media_phase.errors counter honest —
             # those weren't *errors*, the file just had no audio to read.
-            has_audio, probed_dur = _probe_audio(tmp_path)
+            has_audio, probed_dur = (True, tg_duration) if known_provider else _probe_audio(tmp_path)
+            if probed_dur is not None:
+                try:
+                    probed_dur = float(probed_dur)
+                    if not math.isfinite(probed_dur) or probed_dur <= 0:
+                        probed_dur = None
+                except (TypeError, ValueError):
+                    probed_dur = None
             if is_video and not has_audio:
                 _emit_media_skipped(kind="voice", msg_id=msg.id,
                                     reason="no audio track (silent video)")
@@ -557,9 +642,13 @@ async def process_media(msg, msg_type, *,
             # ffprobe duration overrides the Telethon hint when available
             # (more accurate — Telethon rounds to integer seconds).
             duration_sec = probed_dur if probed_dur is not None else tg_duration
+            if _VOICE_POLICY.max_seconds is not None and duration_sec is not None and duration_sec > _VOICE_POLICY.max_seconds:
+                _SPEECH_STATS["skipped_duration"] += 1
+                _emit_media_skipped(kind="voice", msg_id=msg.id, reason="duration_limit_after_probe")
+                return
             # AssemblyAI route doesn't touch Gemini at all — accept placeholder
             # key. Gemini route obviously needs a real one.
-            gc = _make_gemini_client(requires_real_key=transcribe_engine != "assemblyai")
+            gc = None if transcribe_engine == "soniox" else _make_gemini_client(requires_real_key=transcribe_engine != "assemblyai")
 
             def _progress(stage, **kw):
                 # AAI fills audio_duration_sec on `queued` from its own
@@ -578,18 +667,50 @@ async def process_media(msg, msg_type, *,
                                      audio_path=tmp_path,
                                      audio_duration_sec=duration_sec)
 
-            text, err = gc.transcribe_audio(
-                tmp_path,
-                engine=transcribe_engine,
-                progress_cb=_progress if transcribe_engine == "assemblyai" else None,
-            )
+            if transcribe_engine == "soniox":
+                from soniox_utils import transcribe_file
+                text, err, _details = await asyncio.to_thread(
+                    transcribe_file, tmp_path, language_hints=_VOICE_LANGUAGE_HINTS,
+                    client_reference_id=f"telegram-{cache.path.stem if cache else msg.id}", progress_callback=_progress,
+                    checkpoint=cache, temporary_dir=_VOICE_POLICY.cache_dir,
+                )
+            else:
+                if cache:
+                    cache.save({"state": "external_processing", "engine": transcribe_engine})
+                try:
+                    text, err = gc.transcribe_audio(
+                        tmp_path, engine=transcribe_engine,
+                        progress_cb=_progress if transcribe_engine == "assemblyai" else None,
+                    )
+                except Exception as failure:
+                    if cache:
+                        raise UnknownMediaDelivery("original non-Soniox provider outcome is unknown; durable GET resume is only supported for Soniox") from failure
+                    raise
             if err:
+                if cache and transcribe_engine != "soniox":
+                    raise UnknownMediaDelivery("non-Soniox checkpoint cannot prove provider rejection; do not automatically repeat this paid attempt")
                 raise RuntimeError(err)
+            if cache and transcribe_engine != "soniox":
+                cache.save({"state": "completed", "text": text or "", "duration_sec": duration_sec,
+                            "result_status": "transcribed" if str(text or "").strip() else "no_speech"})
+            if not str(text or "").strip():
+                _SPEECH_STATS["no_speech"] += 1
+                emit({"type": "media-skipped", "kind": "voice", "msg_id": msg.id,
+                      "reason": "no_speech", "reason_code": "no_speech", "engine": transcribe_engine})
+                return
+            _SPEECH_STATS["transcribed"] += 1
             emit({"type": "transcript",
                   "msg_id": msg.id,
                   "engine": transcribe_engine,
-                  "text": text or ""})
+                  "text": text or "", "resumed_provider": known_provider})
         except Exception as ex:
+            if fatal_media_error(ex):
+                _SPEECH_STATS["blocked_unknown" if getattr(ex, "code", None) == "media_delivery_unknown" else "blocked_storage"] += 1
+                _emit_speech_summary()
+                emit({"type": "error", "code": getattr(ex, "code", "media_storage_unavailable"),
+                      "message": str(ex), "msg_id": msg.id})
+                raise
+            _SPEECH_STATS["failed"] += 1
             _emit_media_error(kind="voice", msg_id=msg.id,
                               message=f"{type(ex).__name__}: {ex}")
         finally:
@@ -628,41 +749,64 @@ async def process_media(msg, msg_type, *,
                 except Exception: pass
         return
 
-    # ── Document / PDF (Gemini extract_pdf) ──
-    # Telethon's "document" bucket is broad: PDFs, DOCX, archives, even
-    # generic videos and audio that didn't match the voice/audio detectors.
-    # We only know how to handle PDF reliably — sniff mime first and skip
-    # otherwise (with a benign info event so the UI doesn't show a scary
-    # error for an unsupported type).
+    # ── Document ──
+    # Text/code attachments are decoded locally; PDFs keep the existing Gemini
+    # extractor.  This distinction matters for forwarded messages: Telegram
+    # gives us the original file, but the old worker discarded everything
+    # except the surrounding caption and skipped e.g. forwarded .md/.txt files.
+    # Other binary formats remain metadata-only instead of being blindly
+    # downloaded (archives/videos can be hundreds of MB).
     if process_docs and msg_type == "document":
-        if _should_skip_processed(_SKIP_PDF, msg.id, "gemini"):
-            _emit_media_skipped(kind="pdf", msg_id=msg.id,
-                                reason="уже обработано")
-            return
-        mime = (getattr(msg.media, "document", None)
-                and getattr(msg.media.document, "mime_type", None)) or ""
-        # Telegram returns 'application/pdf' for PDFs; everything else falls
-        # outside Gemini's PDF extractor.
-        if "pdf" not in mime.lower():
+        attachment = attachment_metadata(msg, msg_type) or {}
+        is_text_doc = is_text_attachment(attachment)
+        is_pdf_doc = is_pdf_attachment(attachment)
+        engine = "local-text" if is_text_doc else "gemini"
+        if not is_text_doc and not is_pdf_doc:
             emit({"type": "doc-skipped",
                   "msg_id": msg.id,
-                  "mime":   mime or "unknown",
-                  "reason": "non-PDF document — only PDFs are supported"})
+                  "mime": attachment.get("content_type") or "unknown",
+                  "file_name": attachment.get("file_name"),
+                  "reason": "unsupported binary document — metadata preserved"})
+            return
+        if is_text_doc and attachment.get("bytes") is not None \
+                and int(attachment["bytes"]) > TEXT_DOCUMENT_MAX_BYTES:
+            emit({"type": "doc-skipped",
+                  "msg_id": msg.id,
+                  "mime": attachment.get("content_type") or "unknown",
+                  "file_name": attachment.get("file_name"),
+                  "reason": f"text document exceeds {TEXT_DOCUMENT_MAX_BYTES} byte safety limit"})
+            return
+        if _should_skip_processed(_SKIP_PDF, msg.id, engine):
+            _emit_media_skipped(kind="pdf", msg_id=msg.id,
+                                reason=f"уже обработано · {engine}")
             return
         tmp_path = None
         try:
-            _emit_media_progress(kind="pdf", msg_id=msg.id, stage="downloading")
-            tmp_path = await msg.download_media(file=f"/tmp/tg_doc_{msg.id}")
+            _emit_media_progress(kind="pdf", msg_id=msg.id, stage="downloading",
+                                 engine=engine,
+                                 file_name=attachment.get("file_name"))
+            tmp_dir = _lib_root() / "tmp" / "telegram"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = await msg.download_media(file=str(tmp_dir / f"tg_doc_{msg.id}"))
             if not tmp_path or not os.path.exists(tmp_path):
                 raise RuntimeError("download_media returned no path")
-            gc = _make_gemini_client(requires_real_key=True)
-            _emit_media_progress(kind="pdf", msg_id=msg.id, stage="extracting")
-            text, err = gc.extract_pdf(tmp_path)
-            if err:
-                raise RuntimeError(err)
+            if is_text_doc:
+                _emit_media_progress(kind="pdf", msg_id=msg.id, stage="reading",
+                                     engine=engine,
+                                     file_name=attachment.get("file_name"))
+                text, _ = read_text_attachment(tmp_path)
+            else:
+                gc = _make_gemini_client(requires_real_key=True)
+                _emit_media_progress(kind="pdf", msg_id=msg.id, stage="extracting",
+                                     engine=engine,
+                                     file_name=attachment.get("file_name"))
+                text, err = gc.extract_pdf(tmp_path)
+                if err:
+                    raise RuntimeError(err)
             emit({"type": "pdf-text",
                   "msg_id": msg.id,
-                  "engine": "gemini",
+                  "engine": engine,
+                  "file_name": attachment.get("file_name"),
                   "text": text or ""})
         except Exception as ex:
             _emit_media_error(kind="pdf", msg_id=msg.id,
@@ -747,7 +891,7 @@ async def resolve_title(text, fuzzy=False, limit=50):
         emit({"type": "error",
               "message": f"Session file '{SESSION_PATH.name}' not found — open Telegram settings and pick or create a session."})
         return 4
-    client = TelegramClient(str(SESSION_PATH).replace(".session", ""),
+    client = TelegramClient(telegram_session(str(SESSION_PATH).replace(".session", "")),
                             TELEGRAM_API_ID, TELEGRAM_API_HASH)
     _bump_session_busy_timeout(client)
     ok, err, code = await connect_authorized(client, session_name=SESSION_PATH.stem)
@@ -895,12 +1039,14 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
               message_ids=None,
               topic_ids=None,
               date_to_str=None):
+    global _SPEECH_STATS
+    _SPEECH_STATS = _speech_stats()
     t0 = time.time()
     if not SESSION_PATH.exists():
         emit({"type": "error",
               "message": f"Session file '{SESSION_PATH.name}' not found — open Telegram settings and pick or create a session."})
         sys.exit(4)
-    client = TelegramClient(str(SESSION_PATH).replace(".session", ""),
+    client = TelegramClient(telegram_session(str(SESSION_PATH).replace(".session", "")),
                             TELEGRAM_API_ID, TELEGRAM_API_HASH)
     _bump_session_busy_timeout(client)
     ok, err, code = await connect_authorized(client, session_name=SESSION_PATH.stem)
@@ -909,6 +1055,13 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
         try: await client.disconnect()
         except Exception: pass
         sys.exit(4)
+
+    me = await client.get_me()
+    if me is None or (_EXPECTED_ACCOUNT_ID is not None and str(me.id) != str(_EXPECTED_ACCOUNT_ID)):
+        emit({"type": "error", "code": "telegram_account_mismatch",
+              "message": "Selected Telegram account does not match the requested account"})
+        await client.disconnect()
+        return 4
 
     # Resolve entity. If target is a numeric chat_id (came from --resolve-title
     # picker), get_entity(int) needs the chat in the session's input-entity
@@ -951,9 +1104,16 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
     # and idempotent — overwrites the same JPG on every fetch so a chat
     # icon update propagates. Failures are non-fatal: emit avatar_path=None
     # and let the UI fall back to initials.
+    if _EXPECTED_PEER_ID is not None:
+        from telethon import utils
+        if utils.get_peer_id(entity) != int(_EXPECTED_PEER_ID):
+            emit({"type": "error", "code": "telegram_peer_mismatch",
+                  "message": "Resolved Telegram peer does not match the requested peer"})
+            await client.disconnect()
+            return 4
     avatar_rel = None
     try:
-        if getattr(entity, "photo", None):
+        if not _SKIP_PROFILE_PHOTO and getattr(entity, "photo", None):
             ap = _avatar_path_for(entity.id)
             saved = await client.download_profile_photo(entity, file=str(ap))
             if saved:
@@ -1030,18 +1190,9 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
         X». Rule: if reply_to_msg_id == reply_to_top_id, it's the topic
         marker — no real reply target. Channel comments (which arrive in
         post_comments table, not items) skip this code path entirely."""
-        rt = getattr(msg, "reply_to", None)
-        if not rt:
-            return None
-        rid = getattr(rt, "reply_to_msg_id", None)
-        top = getattr(rt, "reply_to_top_id", None)
-        if not rid:
-            return None
-        if top and rid == top:
-            return None
-        return rid
+        parent = reply_metadata(msg)["parent_external_id"]
+        return int(parent) if parent is not None else None
 
-    me = await client.get_me()
     sender_names = {me.id: "Я"}
 
     async def sender_label(msg):
@@ -1058,8 +1209,47 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
         except Exception:
             return str(sid)
 
+    async def item_data_for(msg):
+        """One authoritative item payload for single/id-list/history modes.
+
+        Keeping this in one place prevents a media field from being added to
+        one parsing mode while forwarded attachments silently disappear in
+        another.
+        """
+        msg_type = classify(msg)
+        topic_id, topic_title = _topic_for(msg)
+        reply_data = reply_metadata(msg)
+        body_text = (msg.text or "")[:8000]
+        if msg_type == "poll":
+            body_text = render_poll(msg)[:8000] if process_polls else ""
+        duration = 0
+        if msg.media and hasattr(msg.media, "document") and msg.media.document:
+            for attr in msg.media.document.attributes:
+                if hasattr(attr, "duration"):
+                    duration = attr.duration
+                    break
+        return {
+            "id": msg.id,
+            "date": msg.date.isoformat() if msg.date else None,
+            "type": msg_type,
+            "text": body_text,
+            "sender": await sender_label(msg),
+            "has_media": bool(msg.media),
+            "media": message_media(msg, msg_type),
+            "forward": forward_metadata(msg),
+            "duration": duration,
+            "topic_id": topic_id,
+            "topic_title": topic_title,
+            "parent_external_id": reply_data["parent_external_id"],
+            "telegram_reply": reply_data["telegram_reply"],
+            "external_reply": reply_data["external_reply"],
+            "reactions": reactions_for(msg),
+        }
+
     # Mode → iter_messages kwargs
     kwargs = {"entity": entity, "reverse": False}
+    full_head = None
+    traversal_cache = None
     # Optional upper-bound on message.date — set by the from_date branch when
     # --date-to is also passed. Filtered in the consume loop below.
     date_to_cutoff = None
@@ -1089,7 +1279,25 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
             kwargs["limit"] = limit or 200
             emit({"type": "info", "message": "sync_new without since_msgid → last_n fallback"})
     elif mode == "all":
-        pass
+        kwargs["limit"] = None
+        if _FULL_HISTORY_REPORT:
+            if _TRAVERSAL_STATE_DIR and _TRAVERSAL_REQUEST_ID:
+                from telethon import utils
+                traversal_cache = FetchTraversalCache(_TRAVERSAL_STATE_DIR, _TRAVERSAL_REQUEST_ID, me.id, utils.get_peer_id(entity))
+                stored = traversal_cache.load()
+                full_head = stored.get("head_message_id")
+                if full_head is not None and (isinstance(full_head, bool) or not isinstance(full_head, int) or full_head < 0):
+                    raise UnknownMediaDelivery("fetch snapshot checkpoint has an invalid head")
+            if full_head is None:
+                latest = await client.get_messages(entity, limit=1)
+                full_head = int(latest[0].id) if latest else 0
+            if traversal_cache:
+                traversal_cache.save({"state": "reading", "head_message_id": full_head, "remote_eof": False})
+            kwargs["max_id"] = full_head + 1 if full_head else 0
+            kwargs["min_id"] = 0
+            client.flood_sleep_threshold = 0
+            emit({"type": "traversal", "mode": "all", "head_message_id": full_head,
+                  "all_topics": True, "snapshot_bound": True})
     elif mode == "from_date":
         if not date_str:
             emit({"type": "error", "message": "from_date requires --date"})
@@ -1161,34 +1369,19 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
             emit({"type": "error", "message": "Message not found"})
             await client.disconnect()
             return 2
-        topic_id, topic_title = _topic_for(msg)
-        msg_type = classify(msg)
-        reply_to = _reply_to_for(msg)
-        body_text = (msg.text or "")[:8000]
-        if msg_type == "poll":
-            body_text = render_poll(msg)[:8000] if process_polls else ""
-        rx = reactions_for(msg)
-        item_data = {
-            "id": msg.id,
-            "date": msg.date.isoformat() if msg.date else None,
-            "type": msg_type,
-            "text": body_text,
-            "sender": await sender_label(msg),
-            "has_media": bool(msg.media),
-            "topic_id": topic_id,
-            "topic_title": topic_title,
-            "parent_external_id": str(reply_to) if reply_to else None,
-            "reactions": rx,
-        }
+        item_data = await item_data_for(msg)
+        msg_type = item_data["type"]
         emit({"type": "item", "data": item_data})
 
-        # Single-message: legacy contract was "engine present → transcribe
-        # voice/audio only". We preserve that — if process_voice/photo/docs
-        # weren't explicitly set, force voice on so old TelegramSingleMessageForm
-        # callers don't change behaviour. New callers (TelegramConfigForm,
-        # TelegramScreen) pass the flags explicitly.
-        if transcribe_engine and not (process_voice or process_photo or process_docs):
-            process_voice = True
+        # A pasted single-message URL is an explicit request to read that one
+        # message. Once Telegram tells us its physical type, automatically run
+        # the matching processor unless the caller supplied explicit flags.
+        # This keeps bulk/live search metadata-only while preventing a
+        # forwarded photo/document from degrading into caption-only output.
+        if not (process_voice or process_photo or process_docs):
+            process_voice = msg_type in ("voice", "audio", "video")
+            process_photo = msg_type == "photo"
+            process_docs = msg_type == "document"
         await process_media(
             msg, msg_type,
             transcribe_engine=transcribe_engine,
@@ -1234,6 +1427,7 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
                       "posts_total":        1,
                       "comments_collected": comments_collected})
 
+        _emit_speech_summary()
         emit({"type": "done",
               "items_total":          1,
               "comments_collected":   comments_collected,
@@ -1264,34 +1458,9 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
             for msg in rows or []:
                 if msg is None:
                     continue
-                topic_id, topic_title = _topic_for(msg)
-                msg_type = classify(msg)
-                reply_to = _reply_to_for(msg)
-                body_text = (msg.text or "")[:8000]
-                if msg_type == "poll":
-                    body_text = render_poll(msg)[:8000] if process_polls else ""
-                duration = 0
-                if msg.media and hasattr(msg.media, "document") and msg.media.document:
-                    for attr in msg.media.document.attributes:
-                        if hasattr(attr, "duration"):
-                            duration = attr.duration
-                            break
-                emit({
-                    "type": "item",
-                    "data": {
-                        "id": msg.id,
-                        "date": msg.date.isoformat() if msg.date else None,
-                        "type": msg_type,
-                        "text": body_text,
-                        "sender": await sender_label(msg),
-                        "has_media": bool(msg.media),
-                        "duration": duration,
-                        "topic_id": topic_id,
-                        "topic_title": topic_title,
-                        "parent_external_id": str(reply_to) if reply_to else None,
-                        "reactions": reactions_for(msg),
-                    },
-                })
+                data = await item_data_for(msg)
+                msg_type = data["type"]
+                emit({"type": "item", "data": data})
                 if process_voice or process_photo or process_docs:
                     await process_media(
                         msg, msg_type,
@@ -1304,6 +1473,7 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
             emit({"type": "page", "loaded": min(start + len(chunk), len(ids)), "limit": len(ids)})
         if saved == 0:
             emit({"type": "warning", "code": "empty_result", "message": "Выбранные сообщения недоступны или были удалены."})
+        _emit_speech_summary()
         emit({
             "type": "done",
             "items_total": saved,
@@ -1351,11 +1521,15 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
                 )
                 processed += 1
             except Exception as ex:
+                if fatal_media_error(ex):
+                    await client.disconnect()
+                    raise
                 # process_media already emits media-error for its own failures;
                 # this catches anything escaping it so one bad msg doesn't abort
                 # the whole batch.
                 emit({"type": "media-error",
                       "kind": "voice", "msg_id": msg.id, "message": str(ex)})
+        _emit_speech_summary()
         emit({"type": "done",
               "items_total":  processed,
               "duration_sec": round(time.time() - t0, 2)})
@@ -1393,10 +1567,16 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
         # topic). `count` is shared across iterations so the page-progress
         # event reflects total fetched, not per-topic.
         nonlocal_count = {"v": 0}
+        traversal_ids = set()
+        traversal_cursor = 0
+        completed_ids = set()
 
         async def _consume_iter(iter_kwargs):
-            nonlocal date_min, date_max, total_voice_seconds, total_video_seconds
+            nonlocal date_min, date_max, total_voice_seconds, total_video_seconds, traversal_cursor
             async for msg in client.iter_messages(**iter_kwargs):
+                traversal_ids.add(int(msg.id))
+                if _FULL_HISTORY_REPORT and mode == "all" and int(msg.id) in completed_ids:
+                    continue
                 # Upper-bound filter (--date-to). Iteration is reverse=True
                 # (oldest → newest), so once a message is past the cutoff
                 # everything after it is too — break early.
@@ -1425,28 +1605,12 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
                     if msg_type == "voice": total_voice_seconds += duration or 0
                     if msg_type == "video": total_video_seconds += duration or 0
                 else:
-                    topic_id, topic_title = _topic_for(msg)
-                    reply_to = _reply_to_for(msg)
-                    body_text = (msg.text or "")[:8000]
-                    if msg_type == "poll":
-                        body_text = render_poll(msg)[:8000] if process_polls else ""
-                    rx = reactions_for(msg)
-                    emit({
-                        "type": "item",
-                        "data": {
-                            "id": msg.id,
-                            "date": msg.date.isoformat() if msg.date else None,
-                            "type": msg_type,
-                            "text": body_text,
-                            "sender": await sender_label(msg),
-                            "has_media": bool(msg.media),
-                            "duration": duration,
-                            "topic_id": topic_id,
-                            "topic_title": topic_title,
-                            "parent_external_id": str(reply_to) if reply_to else None,
-                            "reactions": rx,
-                        }
-                    })
+                    data = await item_data_for(msg)
+                    emit({"type": "item", "data": data})
+                    # Count the actual metadata event, including the item whose
+                    # media subsequently stops the traversal. Emission is not a
+                    # claim that the desktop has committed that event yet.
+                    nonlocal_count["v"] += 1
                     if process_voice or process_photo or process_docs:
                         await process_media(
                             msg, msg_type,
@@ -1457,9 +1621,25 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
                         )
                     if include_comments and has_discussion:
                         fetched_post_ids.append(msg.id)
-                nonlocal_count["v"] += 1
+                if preview_only:
+                    nonlocal_count["v"] += 1
+                if _FULL_HISTORY_REPORT and mode == "all":
+                    completed_ids.add(int(msg.id))
+                    traversal_cursor = int(msg.id)
                 if nonlocal_count["v"] % PAGE == 0:
                     emit({"type": "page", "loaded": nonlocal_count["v"], "limit": limit})
+
+        def traversal_report(remote_eof, **extra):
+            oldest = min(traversal_ids) if traversal_ids else None
+            newest = max(traversal_ids) if traversal_ids else None
+            return {"type": "traversal", "mode": "all", "remote_eof": remote_eof,
+                "all_topics": True, "head_message_id": full_head,
+                "oldest_message_id": oldest, "newest_message_id": newest,
+                "resume_offset_id": traversal_cursor, "rows_seen": len(traversal_ids),
+                "rows_emitted": nonlocal_count["v"] if not preview_only else 0,
+                "unreturned_id_gaps": max(0, full_head - oldest + 1 - len(traversal_ids)) if oldest else 0,
+                "gap_status": "unknown_deleted_inaccessible_or_service_not_returned",
+                "reconciliation": "accessible_history_up_to_head_not_remote_delete_audit", **extra}
 
         if topic_ids:
             # Forum topic filter: server-side filtering via reply_to=top_msg_id.
@@ -1477,12 +1657,68 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
                 try:
                     await _consume_iter(tkw)
                 except Exception as ex:
+                    if fatal_media_error(ex):
+                        await client.disconnect()
+                        raise
                     emit({"type": "info",
                           "message": f"topic={tid} failed: {type(ex).__name__}: {ex}"})
         else:
-            await _consume_iter(kwargs)
+            if _FULL_HISTORY_REPORT and mode == "all":
+                consecutive_waits = 0
+                last_wait_cursor = None
+                try:
+                    while full_head != 0:
+                        resumed_kwargs = dict(kwargs)
+                        if traversal_cursor:
+                            resumed_kwargs["offset_id"] = traversal_cursor
+                        try:
+                            await _consume_iter(resumed_kwargs)
+                            break
+                        except FloodWaitError as error:
+                            if last_wait_cursor != traversal_cursor:
+                                consecutive_waits = 0
+                            last_wait_cursor = traversal_cursor
+                            consecutive_waits += 1
+                            seconds = max(0, int(getattr(error, "seconds", 0)))
+                            # Several successive 3s FloodWait replies were
+                            # observed at the same cursor in a large history.
+                            # Respect Telegram's minimum, then back off instead
+                            # of repeatedly aborting/replaying the whole head.
+                            backoff = min(60, 2 ** min(6, max(0, consecutive_waits - 2)))
+                            delay = max(seconds, backoff)
+                            error.code = "telegram_flood_wait"
+                            error.retry_after_seconds = delay
+                            state = traversal_report(False, state="waiting_flood", retry_after_seconds=delay,
+                                telegram_retry_after_seconds=seconds, consecutive_waits=consecutive_waits)
+                            if traversal_cache:
+                                traversal_cache.save(state)
+                            emit({**state, "type": "flood-wait"})
+                            if consecutive_waits > 60:
+                                raise
+                            # Telegram's explicit deadline is the only retry
+                            # timer. Cancellation interrupts this await; no
+                            # media/provider submission is repeated by the wait.
+                            await asyncio.sleep(delay + 1)
+                except BaseException as error:
+                    state = traversal_report(False, state="interrupted" if isinstance(error, asyncio.CancelledError) else "failed",
+                                             error_code=getattr(error, "code", type(error).__name__))
+                    emit(state)
+                    _emit_speech_summary()
+                    try:
+                        if traversal_cache:
+                            traversal_cache.save(state)
+                    finally:
+                        await client.disconnect()
+                    raise
+            else:
+                await _consume_iter(kwargs)
 
         count = nonlocal_count["v"]
+        if _FULL_HISTORY_REPORT and mode == "all":
+            state = traversal_report(True, state="completed")
+            if traversal_cache:
+                traversal_cache.save(state)
+            emit(state)
 
     # ── Optional comments pass ───────────────────────────────────────────
     # After main fetch (or directly in comments_only mode), walk fetched
@@ -1604,6 +1840,7 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
                 ),
             })
 
+    _emit_speech_summary()
     emit({
         "type": "done",
         "items_total":         count,
@@ -1617,13 +1854,15 @@ async def run(target, mode, limit, date_str, url, since_msgid=0, preview_only=Fa
 
 def main():
     global SESSION_PATH, _SKIP_VOICE, _SKIP_PHOTO, _SKIP_PDF
+    global _VOICE_POLICY, _VOICE_LANGUAGE_HINTS, _FULL_HISTORY_REPORT
+    global _TRAVERSAL_STATE_DIR, _TRAVERSAL_REQUEST_ID, _EXPECTED_ACCOUNT_ID, _EXPECTED_PEER_ID, _SKIP_PROFILE_PHOTO
     parser = argparse.ArgumentParser()
     parser.add_argument("target", nargs="?", default=None,
                         help="@username, chat_id, or URL (omit when --resolve-title)")
     parser.add_argument("--mode", required=False,
                         choices=["last_n", "all", "from_date", "single", "sync_new",
                                  "id_list", "media_only"])
-    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--date", default=None)
     parser.add_argument("--date-to", default=None,
                         help="Optional upper bound for from_date mode. "
@@ -1648,7 +1887,7 @@ def main():
     # → metadata-only fetch (fast). Engine: 'assemblyai' (long-form, robust)
     # or 'gemini' (cheap, chunked).
     parser.add_argument("--transcribe-engine", default=None,
-                        choices=["assemblyai", "gemini"],
+                        choices=["assemblyai", "gemini", "soniox"],
                         help="Engine for voice/audio/video transcription. "
                              "Without --process-voice this only kicks in for "
                              "single-message mode (legacy compat).")
@@ -1711,7 +1950,37 @@ def main():
                              "Electron passes the snapshot taken at job spawn so "
                              "switching the active session mid-job can't retarget "
                              "an in-flight fetch.")
+    parser.add_argument("--voice-types", default=None, help="Optional comma-separated voice/audio/video allowlist; default preserves all three")
+    parser.add_argument("--voice-max-duration-sec", type=float, default=None, help="Optional inclusive duration cap checked before download; unknown duration is skipped")
+    parser.add_argument("--media-cache-dir", default=None, help="Job-local media download directory; no global storage move")
+    parser.add_argument("--media-state-dir", default=None, help="Application-owned durable ASR checkpoint directory")
+    parser.add_argument("--reuse-transcripts", action="store_true", help="Reuse completed transcript with any engine; do not redo by default")
+    parser.add_argument("--media-min-free-bytes", type=int, default=268435456)
+    parser.add_argument("--full-history-report", action="store_true", help="Bound all history at head and explicitly report traversal EOF/range/gaps")
+    parser.add_argument("--traversal-state-dir", default=None, help="Owned durable frozen-head checkpoints; restart replays metadata, never assumes library commit ACK")
+    parser.add_argument("--traversal-request-id", default=None, help="Original durable fetch request ID for frozen-head reuse")
+    parser.add_argument("--expected-account-id", type=int, default=None, help="Optional exact Telegram account ID fence before history/media")
+    parser.add_argument("--expected-peer-id", type=int, default=None, help="Optional exact signed Telethon peer ID: user positive, chat negative, channel -100...")
+    parser.add_argument("--skip-profile-photo", action="store_true", help="Skip source avatar download for this job; legacy fetch default is unchanged")
     args = parser.parse_args()
+    _VOICE_POLICY = VoicePolicy(kinds=args.voice_types.split(",") if args.voice_types else None,
+                               max_seconds=args.voice_max_duration_sec, cache_dir=args.media_cache_dir,
+                               state_dir=args.media_state_dir, reuse_existing=args.reuse_transcripts,
+                               min_free_bytes=args.media_min_free_bytes)
+    _VOICE_LANGUAGE_HINTS = (args.transcribe_lang or "ru,en").split(",")
+    _FULL_HISTORY_REPORT = args.full_history_report
+    _TRAVERSAL_STATE_DIR, _TRAVERSAL_REQUEST_ID = args.traversal_state_dir, args.traversal_request_id
+    _EXPECTED_ACCOUNT_ID, _EXPECTED_PEER_ID = args.expected_account_id, args.expected_peer_id
+    _SKIP_PROFILE_PHOTO = args.skip_profile_photo
+    if bool(_TRAVERSAL_STATE_DIR) != bool(_TRAVERSAL_REQUEST_ID) or (_TRAVERSAL_STATE_DIR and not _FULL_HISTORY_REPORT):
+        parser.error("traversal checkpoint requires full-history-report and both state-dir/request-id")
+    if (_EXPECTED_ACCOUNT_ID is not None and _EXPECTED_ACCOUNT_ID <= 0) or _EXPECTED_PEER_ID == 0:
+        parser.error("expected account must be positive and expected peer must be nonzero")
+    if _FULL_HISTORY_REPORT and (args.mode != "all" or args.since_msgid or args.topic_ids or
+            args.limit is not None or args.date is not None or args.date_to is not None or
+            args.url is not None or args.message_ids is not None or args.media_only_msg_ids is not None or
+            args.comments_only_post_ids is not None or args.comments_only_source_id is not None):
+        parser.error("full-history-report requires mode=all/all topics/no limit/date/url/message IDs/since ID")
 
     if args.session:
         SESSION_PATH = _resolve_session_path(args.session)
@@ -1839,6 +2108,10 @@ def main():
         sys.exit(130)
     except Exception as ex:
         event = {"type": "error", "message": f"{type(ex).__name__}: {ex}"}
+        if getattr(ex, "code", None):
+            event["code"] = ex.code
+        if getattr(ex, "retry_after_seconds", None) is not None:
+            event["retry_after_seconds"] = ex.retry_after_seconds
         code = _source_unavailable_code(ex)
         if code:
             event["code"] = code

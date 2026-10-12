@@ -61,3 +61,30 @@ test('old extension failure stays unknown and never triggers a blind duplicate o
   assert.equal(result.tabId, null)
   assert.equal(result.openState, 'started_without_tab_ack')
 })
+test('durable caller preserves an unknown outcome when a lost ACK has no remaining tab', async () => {
+  let opens = 0
+  const result = await reconcileResearchTabOpen({
+    openTab: async () => { opens++; throw Object.assign(new Error('ack lost'), { deliveryUnknown: true }) },
+    findTab: async () => ({ success: true, tabId: null }),
+    getSnapshot: () => null,
+    retryAfterMissing: false,
+  })
+  assert.equal(result.openState, 'delivery_unknown')
+  assert.equal(opens, 1)
+})
+test('an explicit extension rejection is a failed open, not an accepted browser request', async () => {
+  const result = await reconcileResearchTabOpen({
+    openTab: async () => ({ success: false, error: 'browser unavailable' }),
+    findTab: async () => { throw new Error('must not retry a known rejection') },
+  })
+  assert.equal(result.openState, 'failed')
+  assert.equal(result.openError, 'browser unavailable')
+})
+
+test('a local opening stage does not prove that the browser received the request', async () => {
+  const result = await reconcileResearchTabOpen({
+    openTab: async () => ({ success: true }),
+    getSnapshot: () => ({ status: 'queued', stage: 'opening' }),
+  })
+  assert.equal(result.openState, 'delivery_unknown')
+})

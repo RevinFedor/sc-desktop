@@ -17,7 +17,7 @@ const EXPAND_LIMIT = 600
 // Which physical message types carry media that can be AI-processed on demand,
 // and which AI pipeline each maps to. Mirrors job-runner's TG_TYPE_TO_MEDIA_KIND
 // and Python's process_media() routing: voice/audio/video → transcription,
-// photo → Vision describe, document → PDF extract. Text/poll/etc. have no
+// photo → Vision describe, document → local text read / PDF extract. Text/poll/etc. have no
 // pipeline, so no action button.
 const MEDIA_KIND_BY_TYPE = {
   voice: 'voice', audio: 'voice', video: 'voice',
@@ -30,7 +30,7 @@ const MEDIA_KIND_BY_TYPE = {
 // honest verb and a matching lucide glyph:
 //   voice/audio/video → расшифровать (Mic)      — speech-to-text
 //   photo             → описать      (ScanEye)  — Vision description
-//   document          → извлечь      (ScanText) — PDF text extraction
+//   document          → извлечь      (ScanText) — text/PDF extraction
 // Bulk over a mixed selection uses the neutral «обработать» (Sparkles).
 const MEDIA_ACTION = {
   voice: { verb: 'расшифровать', Icon: Mic },
@@ -49,6 +49,7 @@ const STAGE_LABEL = {
   queued:       'в очереди',
   transcribing: 'расшифровка',
   describing:   'описываю',
+  reading:      'читаю файл',
   extracting:   'извлекаю',
   completed:    'готово',
 }
@@ -65,6 +66,7 @@ const FIRST_ITEM_INDEX_BASE = 1_000_000
 // Потолок FTS-выдачи (itemsSearch). Достигли — футер честно говорит про
 // обрезку, а не рапортует «200 результатов» как полный список.
 const FTS_LIMIT = 200
+const SEM_MAX_LIMIT = 10_000
 
 const TYPE_ICON = {
   text: '💬', voice: '🎤', video: '🎬', photo: '🖼',
@@ -87,7 +89,8 @@ function ChatView({ sourceId, platform = 'telegram' }) {
   const [query, setQuery] = useState('')
   const [searchActive, setSearchActive] = useState(false)
   // 'fts' = exact-word full-text search (existing FTS5 over caption/transcript)
-  // 'sem' = hybrid semantic search (FTS + vector RRF, see electron/embedder.js).
+  // 'sem' = semantic vector search. Telegram groups matching fragments by message;
+  // YouTube searches bounded transcript chunks and returns the matching passage.
   // Selected mode is captured in `runSearch` so changing it after results
   // appear doesn't silently re-shuffle them — user must press the button again.
   const [searchMode, setSearchMode] = useState('fts')
@@ -95,10 +98,10 @@ function ChatView({ sourceId, platform = 'telegram' }) {
   // Reset to SEM_PAGE on every fresh search via runSearch().
   const SEM_PAGE = 50
   const [semLimit, setSemLimit] = useState(SEM_PAGE)
+  const [semanticMeta, setSemanticMeta] = useState(null)
   // Cosine-similarity floor for semantic results. Items below it are still
   // fetched (so user can drag the slider down without re-querying) but
-  // hidden in the UI. 0.50 is empirically the boundary between "kinda
-  // related" and "noise" for Gemini RETRIEVAL embeddings on Russian text.
+  // hidden in the UI. This is a similarity cutoff, not a confidence level.
   // FTS-only hits have _cos = null and are always shown — exact matches
   // bypass the threshold by definition.
   const [semThreshold, setSemThreshold] = useState(0.50)
@@ -364,6 +367,7 @@ function ChatView({ sourceId, platform = 'telegram' }) {
     setOffset(0)
     setCursor(null)
     setExhausted(false)
+    setSemanticMeta(null)
     setFirstItemIndex(FIRST_ITEM_INDEX_BASE)
     setListEpoch(n => n + 1)
     setExpandedIds(new Set())
@@ -400,16 +404,27 @@ function ChatView({ sourceId, platform = 'telegram' }) {
       let rows
       if (searchActive && query.trim()) {
         if (searchMode === 'sem') {
-          // Hybrid semantic — runs the query through Gemini + RRF over
-          // FTS5 + items_vec. Returns up to `limit` already ranked rows.
+          // Semantic search — platform-specific corpus, one shared UI.
+          // Telegram groups complete current fragments + eligible legacy
+          // messages; YouTube uses transcript chunks.
           // semLimit grows on "Показать ещё +50" — re-query is unavoidable
           // because vec0 needs `k` at MATCH time, can't paginate after.
-          const r = await window.api.tgSearch({
-            sourceId,
-            query: query.trim(),
-            limit: semLimit,
-          })
+          const r = platform === 'youtube' && window.api.ytSemanticSearch
+            ? await window.api.ytSemanticSearch({
+                sourceId,
+                query: query.trim(),
+                limit: semLimit,
+              })
+            : await window.api.tgSearch({
+                sourceId,
+                query: query.trim(),
+                limit: semLimit,
+                min_cos: -1,
+                topic_id: selectedTopic,
+              })
           if (generation !== requestGenerationRef.current) return
+          setSemanticMeta({ diagnostics: r?.diagnostics || null,
+            coverage: r?.coverage || null, error: r?.error || null })
           if (r?.error) {
             console.error('[ChatView] semantic search failed:', r.error)
             window.alert(`Семантический поиск не сработал: ${r.error}`)
@@ -559,7 +574,7 @@ function ChatView({ sourceId, platform = 'telegram' }) {
   // followed by exhausted=false triggers loadPage on the next render
   // through the existing items.length===0 effect.
   function loadMoreSemantic() {
-    setSemLimit(n => n + SEM_PAGE)
+    setSemLimit(n => Math.min(SEM_MAX_LIMIT, n + SEM_PAGE))
     reset()
     setExhausted(false)
   }
@@ -599,7 +614,7 @@ function ChatView({ sourceId, platform = 'telegram' }) {
             // visual order of buttons: FTS first, Semantic on the right).
             runSearch(e.metaKey || e.ctrlKey ? 'sem' : 'fts')
           }}
-          placeholder="Поиск по транскриптам и тексту…  (Enter = FTS, ⌘+Enter = Semantic)"
+          placeholder="Поиск по транскриптам и тексту…  (Enter = точно, ⌘+Enter = по смыслу)"
           className="bg-zinc-900 border border-zinc-700 rounded-md px-3 py-1.5 text-sm flex-1 placeholder-zinc-500 focus:outline-none focus:border-zinc-500"
         />
         {searchActive && (
@@ -628,7 +643,9 @@ function ChatView({ sourceId, platform = 'telegram' }) {
               ? 'bg-emerald-700 text-white'
               : 'bg-emerald-900/60 text-emerald-200 hover:bg-emerald-800/80'
           }`}
-          title="Семантический поиск (Gemini embeddings + FTS, RRF). Длинный текст — нормально."
+          title={platform === 'youtube'
+            ? 'Смысловой поиск по фрагментам расшифровок видео'
+            : 'Смысловой поиск по сообщениям (Gemini embeddings)'}
         ><span className="inline-flex items-center gap-1"><Sparkles size={13} /> Семантика</span></button>
       </div>
 
@@ -676,7 +693,7 @@ function ChatView({ sourceId, platform = 'telegram' }) {
 
       {searchActive && searchMode === 'sem' && (
         <div className="px-3 py-2 border-b border-zinc-800 flex items-center gap-3 text-xs">
-          <span className="text-zinc-400 shrink-0">Порог релевантности</span>
+          <span className="text-zinc-400 shrink-0">Порог сходства</span>
           <input
             type="range"
             min="0"
@@ -693,6 +710,14 @@ function ChatView({ sourceId, platform = 'telegram' }) {
           <span className="text-zinc-500 shrink-0">
             показано {visibleCount(items, semThreshold)} / {items.length}
           </span>
+        </div>
+      )}
+
+      {searchActive && searchMode === 'sem' && platform === 'telegram' && semanticMeta?.coverage && (
+        <div className="px-3 py-1.5 border-b border-zinc-800 text-xs text-zinc-500">
+          Индекс: {semanticMeta.coverage.ready_current_messages || 0} / {semanticMeta.coverage.messages_total || 0} сообщений
+          {semanticMeta.coverage.legacy_only_messages > 0 && ` · старый индекс: ${semanticMeta.coverage.legacy_only_messages}`}
+          {semanticMeta.coverage.stale_messages > 0 && ` · требуют переиндексации: ${semanticMeta.coverage.stale_messages}`}
         </div>
       )}
 
@@ -755,7 +780,16 @@ function ChatView({ sourceId, platform = 'telegram' }) {
             {loading
               ? 'Загружаю…'
               : searchActive
-                ? 'Ничего не найдено'
+                ? semanticMeta?.error
+                  ? 'Поиск завершился с ошибкой'
+                  : searchMode === 'sem' && items.length > 0
+                    ? 'Нет сообщений выше выбранного порога сходства'
+                    : searchMode === 'sem' && semanticMeta?.coverage?.messages_total > 0 &&
+                        Number(semanticMeta.coverage.searchable_messages || 0) === 0
+                      ? 'Индекс этого чата ещё не готов'
+                      : semanticMeta?.diagnostics?.search_budget_exhausted
+                        ? 'В проверенной части выдачи совпадений нет. Поиск ограничен'
+                        : 'Ничего не найдено'
                 : 'В этой коллекции нет сообщений (или они ещё не загружены)'}
           </div>
         ) : (
@@ -802,10 +836,10 @@ function ChatView({ sourceId, platform = 'telegram' }) {
         )}
       </div>
 
-      {searchActive && exhausted && items.length > 0 && (
+      {searchActive && exhausted && !semanticMeta?.error && (searchMode === 'sem' || items.length > 0) && (
         <div className="px-4 py-3 text-center text-xs text-zinc-600 border-t border-zinc-900">
           {searchMode === 'sem' ? (
-            items.length >= semLimit ? (
+            items.length >= semLimit && semLimit < SEM_MAX_LIMIT ? (
               <button
                 onClick={loadMoreSemantic}
                 disabled={loading}
@@ -814,12 +848,23 @@ function ChatView({ sourceId, platform = 'telegram' }) {
                 {loading ? 'Загружаю…' : `Показать ещё +${SEM_PAGE}`}
               </button>
             ) : (
-              <>Всего {items.length} результатов · больше нет</>
+              <>
+                Показано {items.length} результатов в доступном индексе
+                {semanticMeta?.diagnostics?.search_budget_exhausted || semLimit >= SEM_MAX_LIMIT
+                  ? '. Поиск ограничен: совпадений может быть больше. Уточните запрос'
+                  : ''}
+              </>
             )
           ) : (
             items.length >= FTS_LIMIT
               ? `Показаны первые ${FTS_LIMIT} — уточните запрос, чтобы сузить`
               : `${items.length} результатов`
+          )}
+          {searchMode === 'sem' && items.length >= semLimit && semLimit < SEM_MAX_LIMIT &&
+              semanticMeta?.diagnostics?.search_budget_exhausted && (
+            <div className="mt-2 text-amber-400/80">
+              Поиск ограничен: в чате могут быть другие совпадения
+            </div>
           )}
         </div>
       )}
@@ -1099,6 +1144,12 @@ const MessageRow = React.memo(function MessageRow({
       : dt.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' })
   const icon = TYPE_ICON[item.type] || '·'
   const text = (item.caption || '').trim()
+  let itemMeta = item.meta && typeof item.meta === 'object' ? item.meta : {}
+  if (!item.meta && item.raw_meta_json) {
+    try { itemMeta = JSON.parse(item.raw_meta_json) || {} } catch {}
+  }
+  const attachment = Array.isArray(itemMeta.media) ? itemMeta.media[0] : null
+  const forwardSource = itemMeta.forward?.source?.name || itemMeta.forward?.from_name || null
   // "No file" warning is for items the user might want to re-download.
   // Items already processed by AI (voice transcribed, photo described, PDF
   // extracted) have transcribe_status='done' and `caption` carries the
@@ -1126,7 +1177,7 @@ const MessageRow = React.memo(function MessageRow({
     : ''
   ) : ''
 
-  // Semantic-search confidence badge: cosine-similarity score with color band.
+  // Semantic-search similarity badge. Cosine is not factual confidence.
   // FTS branch was removed — all semantic hits are vec-only now, so we don't
   // surface the branch icon anymore.
   const conf = confidenceColor(item._cos)
@@ -1143,13 +1194,13 @@ const MessageRow = React.memo(function MessageRow({
   const isProcessing = !!processing
   const stageLabel = processing ? (STAGE_LABEL[processing.stage] || processing.stage || 'обработка') : null
 
-  // Long-text expand/collapse. Plain (non-search) bodies over EXPAND_LIMIT get
+  // Long-text expand/collapse. Bodies over EXPAND_LIMIT get
   // a «Раскрыть» control; once open, a sticky «Свернуть» rides the top of the
   // message so the user can re-collapse without scrolling back down through a
-  // wall of text. Search results keep their own Highlighted truncation (the
-  // user is scanning for a hit, not reading the whole body), so the control is
-  // plain-view only.
-  const isLong = !highlight && !!text && text.length > EXPAND_LIMIT
+  // wall of text. Fragment-search preview starts at the actual matching
+  // passage; expansion always restores the complete original message.
+  const matchedFragment = item._index_mode === 'telegram_fragments' ? item._matched_chunks?.[0]?.text : null
+  const isLong = !!text && text.length > EXPAND_LIMIT
 
   return (
     <div data-chat-message-row data-message-id={item.id} className={`px-4 py-2 hover:bg-zinc-900/60 flex gap-3 ${selected ? 'bg-emerald-950/20' : ''}`}>
@@ -1182,11 +1233,22 @@ const MessageRow = React.memo(function MessageRow({
             <span className="text-zinc-200 truncate flex-1" title={item.title}>{item.title}</span>
           )}
           <div className="ml-auto flex items-center gap-2 shrink-0">
+            {item.semantic_chunk && item.semantic_chunk.start_seconds != null && (
+              <span
+                className="text-zinc-500 tabular-nums"
+                style={{ fontSize: '13px' }}
+                title={item.semantic_chunk.position_approximate
+                  ? 'Позиция приблизительная: исходная расшифровка была без таймкодов'
+                  : 'Точная позиция из субтитров'}
+              >
+                {item.semantic_chunk.position_approximate ? '≈' : ''}{formatVideoOffset(item.semantic_chunk.start_seconds)}
+              </span>
+            )}
             {conf && (
               <span
                 className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded ${conf.text} bg-zinc-900 border border-zinc-800`}
                 style={{ fontSize: '11px' }}
-                title={`Косинусная близость: ${item._cos.toFixed(3)} (${conf.label})`}
+                title={`Косинусная близость: ${item._cos.toFixed(3)}. Это сходство текста, не уверенность в факте`}
               >
                 <span className={`inline-block w-1.5 h-1.5 rounded-full ${conf.bg}`} />
                 {item._cos.toFixed(2)}
@@ -1214,7 +1276,8 @@ const MessageRow = React.memo(function MessageRow({
             )}
             <div className="text-zinc-300 whitespace-pre-wrap break-words">
               {highlight
-                ? <Highlighted text={text} q={highlight} />
+                ? <Highlighted text={expanded ? text : matchedFragment || text} q={highlight}
+                    truncateEdges={!expanded && !matchedFragment} />
                 : (isLong && !expanded ? truncate(text, EXPAND_LIMIT) : text)}
             </div>
             {isLong && !expanded && (
@@ -1231,6 +1294,20 @@ const MessageRow = React.memo(function MessageRow({
         {!text && placeholder && (
           <div className="text-zinc-500 italic mt-0.5" style={{ fontSize: '14px' }}>
             {placeholder}
+          </div>
+        )}
+        {(attachment || itemMeta.forward) && (
+          <div className="text-zinc-500 mt-1 break-words" style={{ fontSize: '13px' }}>
+            {attachment && (
+              <span>
+                Вложение: {attachment.file_name || TYPE_LABEL[item.type] || attachment.kind || 'файл'}
+                {attachment.content_type ? ` · ${attachment.content_type}` : ''}
+                {attachment.bytes != null ? ` · ${formatBytes(Number(attachment.bytes))}` : ''}
+              </span>
+            )}
+            {itemMeta.forward && (
+              <span>{attachment ? ' · ' : ''}Переслано{forwardSource ? ` от ${forwardSource}` : ''}</span>
+            )}
           </div>
         )}
         {noFile && (
@@ -1288,6 +1365,16 @@ const MessageRow = React.memo(function MessageRow({
   )
 })
 
+function formatVideoOffset(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0))
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const rest = total % 60
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`
+    : `${minutes}:${String(rest).padStart(2, '0')}`
+}
+
 // Compact chip-row for parsed Telegram reactions. Reads the JSON-stringified
 // list from items.reactions; null means "not parsed by this fetch", empty
 // list means "checked, no reactions". We hide both — empty rows would just
@@ -1325,7 +1412,7 @@ function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s
 }
 
-function Highlighted({ text, q }) {
+function Highlighted({ text, q, truncateEdges = true }) {
   if (!q) return <span>{truncate(text, 800)}</span>
   const parts = text.split(new RegExp(`(${escapeRe(q)})`, 'ig'))
   return (
@@ -1333,7 +1420,9 @@ function Highlighted({ text, q }) {
       {parts.map((p, i) =>
         p.toLowerCase() === q.toLowerCase()
           ? <mark key={i} className="bg-yellow-500/30 text-yellow-200 px-0.5 rounded">{p}</mark>
-          : <span key={i}>{i === 0 ? truncate(p, 400) : (i === parts.length - 1 ? truncate(p, 400) : p)}</span>,
+          : <span key={i}>{truncateEdges
+              ? (i === 0 ? truncate(p, 400) : (i === parts.length - 1 ? truncate(p, 400) : p))
+              : p}</span>,
       )}
     </span>
   )

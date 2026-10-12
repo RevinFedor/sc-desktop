@@ -44,6 +44,14 @@ test('base-form homograph keeps syntax as sense metadata but shares one card', (
   )
 })
 
+test('an ing record with a confirmed verb family rejoins its base lemma', () => {
+  const key = Lexeme.identityKey({
+    kind: 'word', sourceLang: 'en', targetLang: 'ru', sourceText: 'following', lemma: 'following',
+    partOfSpeech: 'adjective', partsOfSpeech: ['adjective', 'verb'], analysisConfidence: 'high',
+  })
+  assert.equal(key, 'word|en|ru|follow')
+})
+
 test('derivational prefixes and related words are not merged', () => {
   const documented = Lexeme.identityKey({ kind: 'word', sourceLang: 'en', targetLang: 'ru', sourceText: 'documented', partOfSpeech: 'adjective' })
   const undocumented = Lexeme.identityKey({ kind: 'word', sourceLang: 'en', targetLang: 'ru', sourceText: 'undocumented', partOfSpeech: 'adjective' })

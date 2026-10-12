@@ -42,11 +42,14 @@ test('large aggregate read runs off the parent event loop', async () => {
   assert.equal(rows[0].items_count, 5000)
   assert.ok(heartbeats > 0, `expected parent-loop heartbeats, got ${heartbeats}`)
 
-  assert.deepEqual(await dbRead.request('semanticIndexStatus', sourceId), {
-    state: 'idle',
-    done: 0,
-    total: 5000,
-  })
+  const indexStatus = await dbRead.request('semanticIndexStatus', sourceId)
+  assert.equal(indexStatus.state, 'idle')
+  assert.equal(indexStatus.unit, 'messages')
+  assert.equal(indexStatus.done, 0)
+  assert.equal(indexStatus.total, 5000)
+  assert.equal(indexStatus.ready_current_messages, 0)
+  assert.equal(indexStatus.legacy_only_messages, 0)
+  assert.equal(indexStatus.staged_fragments, 0)
 
   const activity = await dbRead.request('activityHistoryRows')
   assert.deepEqual(Object.keys(activity).sort(), [
@@ -83,6 +86,52 @@ test('large aggregate read runs off the parent event loop', async () => {
   }, exportPath)
   assert.equal(saved.ok, true)
   assert.ok(fs.statSync(exportPath).size > 0)
+})
+
+test('desktop RAG reads preserve fragment metadata, topic scope and progressive limits above 100', async () => {
+  const sourceId = db.upsertSource({ platform: 'telegram', handle: 'worker-rag-source', tg_session: 'fixture' })
+  const query = new Float32Array(db.EMBEDDING_DIM)
+  query[0] = 1
+  const embedding = new Float32Array(db.EMBEDDING_DIM)
+  embedding[0] = 0.8
+  embedding[1] = 0.6
+  const legacy = []
+  for (let n = 1; n <= 150; n++) {
+    const id = db.upsertItem({ source_id: sourceId, external_id: String(n), type: 'text',
+      caption: `legacy ${n}`, topic_id: 8 })
+    legacy.push({ item_id: id, embedding })
+  }
+  db.bulkUpsertVectors(legacy)
+  const modernId = db.upsertItem({ source_id: sourceId, external_id: '200', type: 'text',
+    caption: 'current complete caption', topic_id: 8 })
+  const row = db.getDb().prepare('SELECT * FROM items WHERE id = ?').get(modernId)
+  const generation = db.stageTelegramRagGeneration({ itemId: modernId, sourceId,
+    documentHash: 'worker-rag-document', indexVersion: require('./telegram-rag-index').INDEX_VERSION, targetRevision: 1,
+    targetContentHash: db.telegramRagItemContentHash(row),
+    chunks: [{ chunk_index: 0, start_char: 8, end_char: 16, text: 'complete' }],
+  })
+  db.saveTelegramRagGenerationVectors(generation.generationId, [{ chunk_index: 0, embedding: query }])
+  assert.equal(db.publishTelegramRagGeneration(generation.generationId).published, true)
+
+  const first = await dbRead.request('telegramRagSearch', {
+    source_id: sourceId, query_embedding: query, limit: 50, min_cos: -1, topic_id: 8,
+  })
+  assert.equal(first.rows.length, 50)
+  assert.equal(first.rows[0].id, modernId)
+  assert.equal(first.rows[0].caption, 'current complete caption')
+  assert.equal(first.rows[0]._matched_chunks[0].text, 'complete')
+  assert.equal(first.rows[0].generation_id, generation.generationId)
+  const more = await dbRead.request('telegramRagSearch', {
+    source_id: sourceId, query_embedding: query, limit: 125, min_cos: -1, topic_id: 8,
+  })
+  assert.equal(more.rows.length, 125)
+  assert.equal(new Set(more.rows.map(item => item.id)).size, 125)
+  assert.equal(more.coverage.ready_current_messages, 1)
+  assert.equal(more.coverage.legacy_only_messages, 150)
+  assert.equal(more.diagnostics.candidate_scope, 'source_date_topic_before_knn')
+  assert.equal((await dbRead.request('telegramRagSearch', {
+    source_id: sourceId, query_embedding: query, limit: 125, min_cos: -1, topic_id: 9,
+  })).rows.length, 0)
 })
 
 test('batch transcript lookup, assembly and file reads stay in the worker', async () => {

@@ -432,7 +432,7 @@ function DirectionToggle({ value, onChange }) {
 
 // Two controls in one group: pill «все» (default, value = empty/0) and a free
 // input for any custom number. Mirrors the YouTube comments LimitControl
-// (methodology/design.md::Дискретные пресеты + free input). Empty input = «все».
+// (methodology/дизайн-принципы.md::Дискретные пресеты + free input). Empty input = «все».
 function CommentsLimitControl({ value, onChange }) {
   const isAll = !value || String(value).trim() === ''
   return (

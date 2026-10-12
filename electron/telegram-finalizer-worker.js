@@ -7,6 +7,15 @@ const { formatCommentsBlock } = require('./assemble')
 
 const DEFAULT_CHUNK_SIZE = 500
 
+function telegramRawMeta(item) {
+  const out = {}
+  if (Array.isArray(item?.media) && item.media.length) out.media = item.media
+  if (item?.forward && typeof item.forward === 'object') out.forward = item.forward
+  if (item?.telegram_reply && typeof item.telegram_reply === 'object') out.telegram_reply = item.telegram_reply
+  if (Object.prototype.hasOwnProperty.call(item || {}, 'external_reply')) out.external_reply = item.external_reply
+  return Object.keys(out).length ? out : null
+}
+
 function itemRow(sourceId, item) {
   return {
     source_id: sourceId,
@@ -22,7 +31,7 @@ function itemRow(sourceId, item) {
     comments: null,
     sender: item.sender || null,
     has_media: !!item.has_media,
-    raw_meta: null,
+    raw_meta: telegramRawMeta(item),
     topic_id: item.topic_id != null ? item.topic_id : null,
     topic_title: item.topic_title || null,
     parent_external_id: item.parent_external_id || null,
@@ -34,23 +43,62 @@ function itemRow(sourceId, item) {
 
 function singleBody(payload) {
   const item = payload.items[0] || {}
-  const senderLine = item.sender ? `${item.sender}\n\n` : ''
-  const textLine = item.text ? String(item.text).trim() : ''
-  const isAudio = item.has_media && (item.type === 'voice' || item.type === 'audio')
-  let voiceLine = ''
-  if (isAudio) {
+  const chunks = []
+  if (item.sender) chunks.push(String(item.sender))
+  if (item.text) chunks.push(String(item.text).trim())
+
+  const forwardedBy = item.forward?.source?.name || item.forward?.from_name || null
+  const forwardedDate = item.forward?.date || null
+  if (item.forward) {
+    const details = [forwardedBy, forwardedDate].filter(Boolean).join(' · ')
+    chunks.push(`[пересланное сообщение${details ? ` · ${details}` : ''}]`)
+  }
+
+  for (const media of (Array.isArray(item.media) ? item.media : [])) {
+    const label = media.file_name || media.kind || 'файл'
+    const details = [
+      media.content_type || null,
+      media.bytes != null && Number.isFinite(Number(media.bytes)) ? formatBytes(Number(media.bytes)) : null,
+    ].filter(Boolean)
+    chunks.push(`[вложение: ${label}${details.length ? ` · ${details.join(' · ')}` : ''}]`)
+  }
+
+  const mediaResults = Array.isArray(payload.mediaResults) ? payload.mediaResults : []
+  for (const result of mediaResults) {
+    const text = String(result?.text || '').trim()
+    if (!text) continue
+    const headings = {
+      voice: 'голосовое — расшифровка',
+      photo: 'фото — описание',
+      pdf: 'документ — извлечение',
+    }
+    const heading = headings[result.kind] || 'вложение — содержимое'
+    chunks.push(`[${heading}${result.engine ? ` · ${result.engine}` : ''}]\n${text}`)
+  }
+
+  const isAudio = item.has_media && (item.type === 'voice' || item.type === 'audio' || item.type === 'video')
+  const hasVoiceResult = mediaResults.some(result => result?.kind === 'voice' && String(result?.text || '').trim())
+  if (isAudio && !hasVoiceResult) {
     if (payload.tg_voice?.text) {
       const heading = payload.tg_voice.engine
         ? `[голосовое — расшифровка · ${payload.tg_voice.engine}]`
         : '[голосовое — расшифровка]'
-      voiceLine = `\n\n${heading}\n${String(payload.tg_voice.text).trim()}`
+      chunks.push(`${heading}\n${String(payload.tg_voice.text).trim()}`)
     } else if (payload.tg_voice?.error) {
-      voiceLine = `\n\n[голосовое — расшифровка не удалась: ${payload.tg_voice.error}]`
+      chunks.push(`[голосовое — расшифровка не удалась: ${payload.tg_voice.error}]`)
     } else if (!payload.params?.transcribe_engine) {
-      voiceLine = '\n\n[голосовое сообщение — транскрипция не запрошена]'
+      chunks.push('[голосовое сообщение — транскрипция не запрошена]')
     }
   }
-  return `${senderLine}${textLine}${voiceLine}`.trim() + '\n'
+  return chunks.filter(Boolean).join('\n\n').trim() + '\n'
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return null
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
 }
 
 async function writeJsonSidecarAtomic(filePath, summary, items) {
@@ -202,6 +250,9 @@ function catalogItemRow(payload, item) {
 
 async function finalizeCatalog(requestId, payload) {
   const items = Array.isArray(payload.items) ? payload.items : []
+  if (payload.kind === 'boosty-public-catalog') {
+    return require('./boosty-catalog-store').savePublicCatalog(db, { ...payload, posts: items })
+  }
   if (payload.kind === 'boosty-catalog') {
     if (!payload.entity?.author_handle) throw new Error('Boosty не вернул автора')
     const sourceId = db.upsertBoostyChannel({

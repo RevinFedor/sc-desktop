@@ -111,8 +111,18 @@ function RunningRow({ job, onClose }) {
   // 127.0.0.1:53127 отсюда РЕЗАЛСЯ CORS'ом («Failed to fetch» до сети) —
   // юзер видел «кнопка Стоп тупо не работает». См. fact-research-ui.md.
   async function focusTab() {
-    if (job.tabId == null) return
-    try { await window.api.bridgeTabCommand({ path: 'focus-tab', tabId: job.tabId }) } catch {}
+    try {
+      // У research tabId может устареть после ручного reload/закрытия, а URL
+      // разговора остаётся рабочим. open-url сначала находит уже открытую
+      // вкладку, а при её отсутствии восстанавливает разговор в новой.
+      if (isResearch && job.url) {
+        await window.api.bridgeTabCommand({ path: 'open-url', url: job.url })
+        return
+      }
+      if (job.tabId != null) {
+        await window.api.bridgeTabCommand({ path: 'focus-tab', tabId: job.tabId })
+      }
+    } catch {}
   }
   async function stopJob() {
     if (isResearch) {
@@ -258,6 +268,9 @@ function humanStage(stage) {
     configuring:         'настройка',
     submitting:          'отправка промпта',
     running:             'research идёт',
+    waiting_extended:    'долго думает',
+    waiting_provider_final: 'ждём финал ChatGPT',
+    provider_incomplete: 'ChatGPT не завершил ответ',
     extracting:          'извлечение результата',
     recovered:           'восстановлен',
     stopped:             'остановлен',

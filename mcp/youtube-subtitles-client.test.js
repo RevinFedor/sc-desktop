@@ -4,6 +4,7 @@ const test = require('node:test')
 
 const {
   createYoutubeSubtitlesClient,
+  normalizeSearchArguments,
   normalizeYoutubeVideoUrl,
   paginateText,
 } = require('./youtube-subtitles-client')
@@ -57,6 +58,43 @@ test('accepts only supported single-video YouTube URL shapes', () => {
   )
   assert.equal(normalizeYoutubeVideoUrl('https://instagram.com/reel/ABC123/'), null)
   assert.equal(normalizeYoutubeVideoUrl('https://youtube.com/@channel'), null)
+})
+
+test('normalizes bounded YouTube search arguments', () => {
+  assert.deepEqual(
+    normalizeSearchArguments({ query: '  Bob McGrew  ', limit: 30, offset: 10 }),
+    { query: 'Bob McGrew', limit: 30, offset: 10 },
+  )
+  assert.throws(() => normalizeSearchArguments({ query: ' ' }), /query is required/)
+  assert.throws(() => normalizeSearchArguments({ query: 'Bob', offset: 1001 }), /offset/)
+})
+
+test('searches through the authenticated SC Desktop YouTube endpoint', async t => {
+  const fixture = await startFixtureServer(async (req, res) => {
+    assert.equal(req.headers.authorization, 'Bearer fixture-token')
+    if (req.method === 'POST' && req.url === '/api/youtube/search') {
+      const body = await readJson(req)
+      assert.deepEqual(body, { query: 'Bob McGrew agents', limit: 2, offset: 0 })
+      return sendJson(res, 200, {
+        ok: true,
+        query: body.query,
+        limit: body.limit,
+        offset: body.offset,
+        items: [
+          { video_id: 'abcdefghijk', title: 'First', url: 'https://www.youtube.com/watch?v=abcdefghijk' },
+          { video_id: 'lmnopqrstuv', title: 'Second', url: 'https://www.youtube.com/watch?v=lmnopqrstuv' },
+        ],
+      })
+    }
+    return sendJson(res, 404, { ok: false, error: 'not found' })
+  })
+  t.after(fixture.close)
+
+  const client = createYoutubeSubtitlesClient({ baseUrl: fixture.baseUrl, token: 'fixture-token' })
+  const result = await client.search({ query: 'Bob McGrew agents', limit: 2 })
+  assert.equal(result.count, 2)
+  assert.equal(result.ranking, 'youtube_relevance')
+  assert.equal(result.items[0].title, 'First')
 })
 
 test('rejects a non-YouTube URL before making a POST request', async () => {

@@ -1,8 +1,10 @@
 // SC Browser Parser — automation через chatgpt.com.
 //
-// Два entrypoint'а используют один низкоуровневый compose-layer:
+// Три entrypoint'а используют один низкоуровневый compose-layer:
 //   • ?sc-research=<requestId> — MCP/research job: submit → watcher →
 //     extract answer/images/sources → POST /research-state.
+//     options.readOnlyImport=true превращает этот же tracked flow в импорт
+//     уже существующего final: без model picker, composer, paste и Send.
 //   • ?sc-compose=<requestId> — одноразовый handoff для YouTube +AI:
 //     быстрый режим разворачивает Pasted text в composer; fallback загружает
 //     транскрипт как .txt и вводит prompt отдельно. Обычный ChatGPT-чат
@@ -13,13 +15,12 @@
 // query дублируется в #hash на случай если SPA срежет query до document_idle.
 //
 // Flow:
-//   1. Дождаться #prompt-textarea (ProseMirror contenteditable).
-//   2. Выбрать уровень интеллекта (composer-pill → menuitemradio):
-//      instant/medium/high/xhigh (default) — плоские пункты;
-//      pro/pro-extended — сначала radio «Pro», потом стандартный/расширенный
-//      в сабменю composer-intelligence-pro-thinking-effort-trigger.
-//      Модель выбирается перед effort: GPT-5.5 Instant или GPT-5.6 Sol;
-//      в Work также доступны GPT-5.6 Terra и Luna.
+//   1. Дождаться ProseMirror-композера (старый id или текущий semantic marker).
+//   2. Выбрать модель и уровень интеллекта (composer-pill → integrated picker).
+//      В Chat GPT-6 имеет Instant..Pro; прежний запрос Astra/Pro выбирает
+//      ту же версию6, но обязательно уровень Pro. GPT-5.6 Sol сохраняет 5.6
+//      и на Pro. Модель выбирается перед effort. В Work также доступны
+//      GPT-5.6 Terra и Luna.
 //   3. Paste prompt (ClipboardEvent + DataTransfer — ProseMirror его принимает,
 //      как Lexical у Perplexity).
 //   4. Click [data-testid="send-button"].
@@ -45,6 +46,10 @@
 
   const BRIDGE = 'http://127.0.0.1:53127';
   const TAG = '[SC-GR]'; // gpt-research
+  const PICKER_REVISION = '2026-10-10-chat-gpt6';
+  const UPLOAD_REVISION = '2026-10-10-live-input-preview';
+  const COMPOSER_READINESS_REVISION = '2026-10-05-ui-status';
+  const WATCHER_REVISION = '2026-10-06-api-observation';
   const MAX_FLOW_MS = 30 * 60 * 1000;
 
   function dbgSink() {
@@ -305,6 +310,33 @@
       } catch (_) { resolve(null); }
     });
   }
+  async function markResearchStartupBoot(id, tabId) {
+    if (!id || !Number.isInteger(tabId)) return { ok: false, skipped: true };
+    return await new Promise(resolve => {
+      let settled = false;
+      const finish = value => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value || { ok: false });
+      };
+      const timer = setTimeout(() => finish({ ok: false, error: 'startup boot acknowledgement timeout' }), 2000);
+      try {
+        chrome.runtime.sendMessage({
+          __sc_research_startup_boot: true,
+          researchId: id,
+          tabId,
+          url: location.href,
+          timeStamp: Date.now(),
+        }, response => {
+          const error = chrome.runtime.lastError;
+          finish(error ? { ok: false, error: error.message } : response);
+        });
+      } catch (error) {
+        finish({ ok: false, error: error?.message || String(error) });
+      }
+    });
+  }
   async function recoverIdByTabId() {
     const tabId = await getMyTabId();
     if (tabId == null) { log('recover.no_tabid'); return null; }
@@ -378,11 +410,23 @@
     }
   }
 
-  // ── Селекторы композера. data-testid стабильны между RU/EN локалями. ──
-  function findComposer()  { return document.getElementById('prompt-textarea'); }
+  // Старые id сохранены для прежнего UI. Новый ChatGPT убрал id у редактора,
+  // submit и file inputs; выбираем ровно один видимый редактор его main-формы.
+  function findComposer() {
+    const legacy = document.getElementById('prompt-textarea');
+    if (legacy) return legacy;
+    const editors = Array.from(document.querySelectorAll(
+      'main [data-composer-markdown][contenteditable="true"][role="textbox"]'
+    )).filter(isVisible);
+    return editors.length === 1 ? editors[0] : null;
+  }
   function findSendBtn() {
-    return document.querySelector('[data-testid="send-button"]')
+    const legacy = document.querySelector('[data-testid="send-button"]')
         || document.getElementById('composer-submit-button');
+    if (legacy) return legacy;
+    const buttons = Array.from(composerRoot()?.querySelectorAll('button[type="submit"]') || [])
+      .filter(b => isVisible(b) && /^(?:отправить|send)(?:\s|$)/i.test(b.getAttribute('aria-label') || ''));
+    return buttons.length === 1 ? buttons[0] : null;
   }
   function findStopBtn() {
     const byId = document.querySelector('[data-testid="stop-button"]');
@@ -397,7 +441,7 @@
   }
   function findVoiceBtn() {
     return Array.from(document.querySelectorAll('button[aria-label]'))
-      .find(b => /голосовой режим|voice mode/i.test(b.getAttribute('aria-label') || ''));
+      .find(b => /голосовой (?:режим|разговор)|voice (?:mode|chat|conversation)/i.test(b.getAttribute('aria-label') || ''));
   }
 
   function nativeMouseClick(el) {
@@ -435,12 +479,34 @@
       }
     });
   }
+  async function trustedClick(el) {
+    if (!el) return { ok: false, err: 'no element' };
+    const r = el.getBoundingClientRect();
+    const left = Number.isFinite(r.x) ? r.x : r.left;
+    const top = Number.isFinite(r.y) ? r.y : r.top;
+    const x = left + r.width / 2;
+    const y = top + r.height / 2;
+    if (![x, y].every(Number.isFinite)) return { ok: false, err: 'invalid coordinates' };
+    return await new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage({ __sc_trusted_click: true, x, y }, response => {
+          const error = chrome.runtime.lastError;
+          resolve(error ? { ok: false, err: error.message } : (response || { ok: false, err: 'no response' }));
+        });
+      } catch (error) {
+        resolve({ ok: false, err: error?.message || String(error) });
+      }
+    });
+  }
   function pressEscape() {
     document.dispatchEvent(new KeyboardEvent('keydown', { key:'Escape', code:'Escape', keyCode:27, which:27, bubbles:true }));
     document.dispatchEvent(new KeyboardEvent('keyup',   { key:'Escape', code:'Escape', keyCode:27, which:27, bubbles:true }));
   }
   function isVisible(el) {
     if (!el) return false;
+    // The modern picker keeps both views laid out. Its inactive view is
+    // inert but still has a nonzero rect; those radios are not actionable.
+    if (el.closest?.('[inert]')) return false;
     const r = el.getBoundingClientRect();
     return !!(r.width || r.height || el.getClientRects().length);
   }
@@ -465,7 +531,7 @@
     } catch (_) {}
     try {
       return !!document.querySelector?.(
-        '[data-testid="temporary-chat-label"], button[aria-label*="temporary chat" i], button[aria-label*="временный чат" i]',
+        '[data-testid="temporary-chat-label"], button[aria-label*="turn off temporary chat" i], button[aria-label*="отключить временный чат" i]',
       );
     } catch (_) {
       return false;
@@ -600,13 +666,23 @@
       .filter(item => item.text || item.ariaLabel)
       .slice(0, 30);
   }
-  async function ensureChatgptModeSelected(requestedMode) {
+  async function ensureChatgptModeSelected(requestedMode, conversationModeProof = null) {
     const mode = resolveChatgptMode(requestedMode);
     if (isTemporaryChatPage()) {
       const ok = mode === 'chat';
       const data = { mode, temporaryChat: true, reason: ok ? 'temporary_chat_is_chat' : 'work_unavailable_in_temporary_chat' };
       log(ok ? 'mode.temporary_chat' : 'mode.temporary_chat_work_unavailable', data);
       bridgeLog(ok ? 'gpt.mode.temporary_chat' : 'gpt.mode.temporary_chat_work_unavailable', data, getRequestId() || getComposeId(), null);
+      return ok;
+    }
+    // A completed conversation can have only a model/effort picker, with no
+    // Chat/Work switch. The bridge supplies the verified mode of a previous
+    // successful request to this exact conversation, never the caller's guess.
+    if (!chatgptModeControls().length && conversationModeProof
+        && chatgptConversationIdFromLocation() === conversationModeProof.conversationId
+        && ['chat', 'work'].includes(conversationModeProof.mode)) {
+      const ok = conversationModeProof.mode === mode;
+      log('mode.saved_conversation', { mode, verifiedMode: conversationModeProof.mode, ok });
       return ok;
     }
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -795,7 +871,7 @@
     `;
     overlay.addEventListener('wheel', e => e.preventDefault(), { passive: false });
     overlay.addEventListener('click', e => {
-      if (e.target === overlay && (overlay.dataset.state === 'success' || overlay.dataset.state === 'error')) {
+      if (e.target === overlay && ['success', 'warning', 'error'].includes(overlay.dataset.state)) {
         hideChatGPTExportOverlay();
       }
     });
@@ -825,11 +901,12 @@
     if (!overlay) return;
     overlay.dataset.state = kind;
     const ok = kind === 'success';
+    const heading = ok ? 'Готово' : kind === 'warning' ? 'Экспорт с пропусками' : 'Экспорт прерван';
     const card = overlay.firstElementChild;
     if (!card) return;
     card.innerHTML = `
       <div style="font-size:13px;font-weight:700;color:${ok ? '#69db7c' : '#ff8787'};text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;">
-        ${ok ? 'Готово' : 'Экспорт прерван'}
+        ${heading}
       </div>
       <p style="margin:0 0 18px;color:#e9ecef;font-size:13px;line-height:1.5;white-space:pre-wrap;">${escapeHtml(message)}</p>
       <button type="button" id="${CHATGPT_EXPORT_OVERLAY_ID}-close" style="
@@ -843,7 +920,7 @@
     const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn-"]'))
       .filter(t => t.querySelector('[data-message-author-role]'));
     if (turns.length) return turns;
-    return Array.from(document.querySelectorAll('[data-message-author-role]'));
+    return conversationMessageElements();
   }
 
   function roleLabel(role) {
@@ -949,18 +1026,24 @@
   }
 
   function extractMessageRoot(turn) {
-    return turn.querySelector?.('[data-message-author-role]') || turn;
+    return turn.querySelector?.('[data-message-author-role], [data-chatgpt-search-unit-key]') || turn;
+  }
+
+  function exportMessageRole(messageEl) {
+    return messageEl?.getAttribute?.('data-message-author-role')
+      || messageEl?.getAttribute?.('data-chatgpt-search-unit-key')?.split(':').pop()
+      || 'message';
   }
 
   function extractMessageTextMarkdown(messageEl, role) {
     if (!messageEl) return '';
     if (role === 'assistant') {
-      const mds = Array.from(messageEl.querySelectorAll('.markdown'))
+      const mds = Array.from(messageEl.querySelectorAll('.markdown, .chatgpt-markdown'))
         .filter(m => !m.classList.contains('result-thinking'));
       const md = mds[mds.length - 1];
       if (md) return markdownFromDom(md);
     }
-    const textContainers = Array.from(messageEl.querySelectorAll('.whitespace-pre-wrap, .prose, .markdown'))
+    const textContainers = Array.from(messageEl.querySelectorAll('.whitespace-pre-wrap, .prose, .markdown, .chatgpt-markdown'))
       .filter(el => !el.classList.contains('result-thinking'));
     if (textContainers.length) return markdownFromDom(textContainers[textContainers.length - 1]);
     return normalizeMarkdownText(messageEl.textContent || '');
@@ -1126,11 +1209,7 @@
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const sessionRes = await fetch('/api/auth/session', { credentials: 'include', signal: controller.signal });
-      if (!sessionRes.ok) throw new Error('ChatGPT session fetch failed: HTTP ' + sessionRes.status);
-      const session = await sessionRes.json();
-      const accessToken = session?.accessToken;
-      if (!accessToken) throw new Error('ChatGPT session has no access token');
+      const accessToken = await chatgptExportAccessToken(controller.signal);
       const res = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
         credentials: 'include',
         headers: { Authorization: `Bearer ${accessToken}` },
@@ -1146,6 +1225,14 @@
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async function chatgptExportAccessToken(signal, fetcher = fetch) {
+    const response = await fetcher('/api/auth/session', { credentials: 'include', signal });
+    if (!response.ok) throw new Error('ChatGPT session fetch failed: HTTP ' + response.status);
+    const session = await response.json();
+    if (!session?.accessToken) throw new Error('ChatGPT session has no access token');
+    return session.accessToken;
   }
 
   function chatgptCurrentPathNodes(data) {
@@ -1236,17 +1323,201 @@
     return out.filter(Boolean).join('\n\n');
   }
 
-  function apiAttachmentsMarkdown(node) {
+  function exportAttachmentName(attachment) {
+    return attachment.name || attachment.file_name || attachment.title || attachment.id || 'attachment';
+  }
+
+  function exportAttachmentMime(attachment) {
+    return String(attachment.mime_type || attachment.content_type || attachment.file_mime_type || '').split(';')[0].toLowerCase();
+  }
+
+  function exportAttachmentKey(attachment) {
+    return attachment.id || attachment.file_id || attachment.url || attachment.download_url || attachment.file_url || exportAttachmentName(attachment);
+  }
+
+  function isExportImageAttachment(attachment) {
+    return exportAttachmentMime(attachment).startsWith('image/')
+      || /\.(?:png|jpe?g|gif|webp|avif|heic|bmp|svg)$/i.test(exportAttachmentName(attachment));
+  }
+
+  function isExportTextAttachment(attachment) {
+    if (isExportImageAttachment(attachment)) return false;
+    const mime = exportAttachmentMime(attachment);
+    return attachment.is_big_paste === true
+      || mime.startsWith('text/')
+      || /^application\/(?:json|(?:[\w.-]+\+)?xml|javascript|x-yaml|yaml|toml|sql)$/.test(mime)
+      || /\.(?:txt|md|markdown|jsonl?|csv|tsv|log|xml|html?|ya?ml|toml|ini|cfg|conf|py|[mc]?js|[cm]?tsx?|jsx|css|scss|sh|sql|srt|vtt|tex|rs|go|c|cpp|h|java|swift)$/i.test(exportAttachmentName(attachment));
+  }
+
+  function exportTextFileBlock(text) {
+    const longestFence = (String(text).match(/`{3,}/g) || []).reduce((n, fence) => Math.max(n, fence.length), 2);
+    const fence = '`'.repeat(longestFence + 1);
+    return `${fence}text\n${text}${String(text).endsWith('\n') ? '' : '\n'}${fence}\n`;
+  }
+
+  // Pasted text и YouTube transcript — это файлы, их bytes не находятся в
+  // conversation mapping. Используем тот же download resolver, который
+  // открывает native preview; виртуализированный preview не является полным
+  // источником длинного документа. Bearer никогда не уходит на signed CDN URL.
+  async function fetchChatGPTTextAttachment(attachment, deps = {}) {
+    const fetcher = deps.fetch || fetch;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    const maxBytes = 20 * 1024 * 1024;
+    const declaredBytes = Number(attachment.size ?? attachment.file_size_bytes);
+    try {
+      assertPopupExportNotCancelled();
+      if (declaredBytes > maxBytes) throw new Error('Документ превышает защитный предел 20 MiB; текст не обрезан');
+      const id = attachment.id || attachment.file_id;
+      if (!/^file[-_][a-z0-9_-]+$/i.test(String(id || ''))) throw new Error('У документа нет доступного file ID');
+      const token = deps.accessToken || await chatgptExportAccessToken(controller.signal, fetcher);
+      const resolver = await fetcher(`/backend-api/files/download/${encodeURIComponent(id)}`, {
+        credentials: 'include', headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal, redirect: 'error',
+      });
+      if (!resolver.ok) throw new Error(`Загрузка документа: HTTP ${resolver.status}`);
+      const download = await resolver.json();
+      if (attachment.verifyName === true && download.file_name !== exportAttachmentName(attachment)) {
+        throw new Error('Download-запись относится к другому документу');
+      }
+      if (deps.metadataOnly === true) return { ok: true, id, name: download.file_name };
+      const url = new URL(download.download_url || download.url || download.file_url || '', location.href);
+      const page = new URL(location.href);
+      const sameOrigin = url.origin === page.origin;
+      const allowedCdn = /(?:^|\.)oaiusercontent\.com$|(?:^|\.)blob\.core\.windows\.net$/i.test(url.hostname);
+      if (url.protocol !== 'https:' || url.username || url.password || (!sameOrigin && !allowedCdn)
+          || (sameOrigin && !/^\/backend-api\/(?:estuary\/content|files\/)/.test(url.pathname))) {
+        throw new Error('Ссылка документа не принадлежит поддерживаемому хранилищу ChatGPT');
+      }
+      const response = await fetcher(url.href, {
+        credentials: sameOrigin ? 'include' : 'omit',
+        ...(sameOrigin ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+        signal: controller.signal, redirect: 'error',
+      });
+      if (!response.ok) throw new Error(`Чтение документа: HTTP ${response.status}`);
+      if (Number(response.headers.get('content-length')) > maxBytes) throw new Error('Документ превышает защитный предел 20 MiB; текст не обрезан');
+      const bytes = await response.arrayBuffer();
+      if (bytes.byteLength > maxBytes) throw new Error('Документ превышает защитный предел 20 MiB; текст не обрезан');
+      const expected = Number(download.file_size_bytes ?? attachment.size);
+      if (Number.isFinite(expected) && expected >= 0 && bytes.byteLength !== expected) {
+        throw new Error(`Размер документа не совпал: получено ${bytes.byteLength}, ожидалось ${expected}`);
+      }
+      assertPopupExportNotCancelled();
+      let text;
+      try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); }
+      catch (_) { throw new Error('Документ не является поддерживаемым UTF-8 текстом'); }
+      return { ok: true, text, bytes: bytes.byteLength, name: exportAttachmentName(attachment) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function resolveChatGPTExportAttachments(data, deps = {}) {
+    const texts = new Map();
+    const read = deps.read || fetchChatGPTTextAttachment;
+    let bytesRead = 0;
+    for (const node of chatgptCurrentPathNodes(data)) {
+      if (!node?.message || isHiddenApiMessage(node)) continue;
+      for (const attachment of node.message.metadata?.attachments || []) {
+        if (!isExportTextAttachment(attachment)) continue;
+        const key = exportAttachmentKey(attachment);
+        if (texts.has(key)) continue;
+        assertPopupExportNotCancelled();
+        updateChatGPTExportOverlay('Читаю текст вложений...', `Документ ${texts.size + 1}: ${exportAttachmentName(attachment)}`);
+        try {
+          const result = await read(attachment);
+          if (!result?.ok || typeof result.text !== 'string') throw new Error('Содержимое документа не получено');
+          bytesRead += result.bytes || 0;
+          if (bytesRead > 100 * 1024 * 1024) throw new Error('Суммарный текст превышает защитный предел 100 MiB; текст не обрезан');
+          texts.set(key, result);
+          log('popup_export.document_read', { id: attachment.id || null, bytes: result.bytes, chars: result.text.length });
+        } catch (error) {
+          assertPopupExportNotCancelled();
+          const message = error?.message || String(error);
+          texts.set(key, { ok: false, name: exportAttachmentName(attachment), error: message });
+          log('popup_export.document_failed', { id: attachment.id || null, error: message });
+        }
+      }
+    }
+    return texts;
+  }
+
+  function domExportDocumentCards(scope) {
+    const cards = [];
+    for (const button of scope.querySelectorAll('button[aria-label]')) {
+      const name = button.getAttribute('aria-label') || '';
+      const attachment = { name };
+      // Resource-card button carries the exact filename; citations use a
+      // sentence such as "Открыть предпросмотр файла ..." and are not inputs.
+      if (!name || /^(?:Открыть|Open|Скачать|Download)\s/i.test(name)
+          || !isExportTextAttachment(attachment)) continue;
+      cards.push({ button, attachment });
+    }
+    return cards;
+  }
+
+  function previewDownloadFileIds(since = 0) {
+    const ids = [];
+    for (const entry of performance.getEntriesByType('resource')) {
+      if (entry.startTime < since) continue;
+      const match = new URL(entry.name, location.href).pathname.match(/^\/backend-api\/files\/download\/(file[-_][a-z0-9_-]+)$/i);
+      if (match && !ids.includes(match[1])) ids.push(match[1]);
+    }
+    return ids.reverse();
+  }
+
+  async function resolveDOMExportDocument(card, deps = {}) {
+    const read = deps.read || fetchChatGPTTextAttachment;
+    const since = performance.now();
+    if (!deps.downloadIds) nativeMouseClick(card.button);
+    let ids = [];
+    let freshProof = true;
+    try {
+      ids = deps.downloadIds ? await deps.downloadIds() : await waitFor(() => {
+        assertPopupExportNotCancelled();
+        const fresh = previewDownloadFileIds(since);
+        return fresh.length ? fresh : null;
+      }, 'document preview download response', 5000, 150);
+    } catch (error) {
+      assertPopupExportNotCancelled();
+      // A previously opened preview can be in React's cache. Only provider
+      // download routes observed on this page are candidates; filename is
+      // verified from their metadata before any file content is read.
+      ids = previewDownloadFileIds().slice(0, 20);
+      freshProof = false;
+    }
+    const matches = [];
+    for (const id of ids) {
+      try {
+        const attachment = { ...card.attachment, id, verifyName: true };
+        await read(attachment, { metadataOnly: true });
+        matches.push(attachment);
+        if (freshProof && ids.length === 1) break;
+      } catch (error) {
+        assertPopupExportNotCancelled();
+        if (error?.message !== 'Download-запись относится к другому документу') throw error;
+      }
+    }
+    if (matches.length > 1) throw new Error('Несколько документов имеют одинаковое имя; точный файл в кэше предпросмотра не определён');
+    if (!matches.length) throw new Error('Полный файл не найден в download-записи предпросмотра');
+    return read(matches[0]);
+  }
+
+  function apiAttachmentsMarkdown(node, settings = { includeImages: true }, texts = new Map()) {
     const attachments = node?.message?.metadata?.attachments;
     if (!Array.isArray(attachments) || !attachments.length) return '';
-    let md = `\n\n### Вложения\n\n`;
+    let md = '';
     for (const a of attachments) {
-      const name = a.name || a.file_name || a.title || a.id || 'attachment';
-      const mime = a.mime_type || a.content_type || a.file_mime_type || '';
+      if (isExportImageAttachment(a) && !settings.includeImages) continue;
+      const name = exportAttachmentName(a);
+      const mime = exportAttachmentMime(a);
       const url = a.url || a.download_url || a.file_url || '';
       md += `- ${name}${mime ? ` (${mime})` : ''}${url ? ` — ${url}` : ''}\n`;
+      const content = texts.get(exportAttachmentKey(a));
+      if (content?.ok) md += `\n${exportTextFileBlock(content.text)}\n`;
+      else if (content && !content.ok) md += `\n_[Содержимое вложения не получено: ${markdownEscapeInline(content.error)}.]_\n\n`;
     }
-    return md;
+    return md ? `\n\n### Вложения\n\n${md}` : '';
   }
 
   function apiAttachmentCount(node) {
@@ -1340,6 +1611,44 @@
     return out;
   }
 
+  function isApiTurnTailNode(nodes, index) {
+    for (let i = index + 1; i < nodes.length; i++) {
+      // A following user starts another turn, so this node was the previous
+      // turn's tail. Any other visible node proves that it was not the tail.
+      return apiMessageRole(nodes[i]) === 'user';
+    }
+    return true;
+  }
+
+  // Current provider contract: an assistant text result is terminal only
+  // when BOTH channel=final and end_turn=true are explicit. end_turn alone is
+  // also emitted on real commentary preambles, including Astra tool runs.
+  //
+  // Older channel-less records retain a narrower compatibility path: the
+  // message must be a non-preamble finished assistant addressed to `all`,
+  // carry end_turn=true, and be the visible tail of its user turn. A later
+  // tool/commentary node invalidates that weaker proof.
+  function apiAssistantFinalKind(node, { isTurnTail = false } = {}) {
+    const message = node?.message || {};
+    const type = apiMessageContentType(node);
+    if (apiMessageRole(node) !== 'assistant') return null;
+    if (type !== 'text' && type !== 'multimodal_text') return null;
+    if (message.metadata?.is_thinking_preamble_message) return null;
+    if (message.status === 'in_progress') return null;
+    if (message.channel === 'final' && message.end_turn === true) return 'explicit_final';
+
+    const channelMissing = message.channel == null || message.channel === '';
+    const recipient = String(message.recipient || 'all').toLowerCase();
+    if (channelMissing
+        && message.end_turn === true
+        && message.status === 'finished_successfully'
+        && recipient === 'all'
+        && isTurnTail) {
+      return 'legacy_tail_final';
+    }
+    return null;
+  }
+
   // DOM Work-ответа содержит промежуточные commentary-сообщения («Думаю»,
   // «Проверяю…»). Между tool-фазами Stop может кратко исчезнуть, поэтому
   // только его исчезновения недостаточно. Backend conversation API явно
@@ -1355,15 +1664,17 @@
       if (apiMessageRole(nodes[i]) === 'user') lastUser = i;
     }
     const turnNodes = nodes.slice(lastUser + 1);
-    const finals = turnNodes.filter(node => {
-      const message = node?.message || {};
-      const type = apiMessageContentType(node);
-      if (apiMessageRole(node) !== 'assistant') return false;
-      if (type !== 'text' && type !== 'multimodal_text') return false;
-      if (!(message.channel === 'final' || message.end_turn === true)) return false;
-      return message.status !== 'in_progress';
-    });
-    const finalNode = finals[finals.length - 1] || null;
+    const finals = turnNodes.map((node, index) => ({
+      node,
+      kind: apiAssistantFinalKind(node, { isTurnTail: index === turnNodes.length - 1 }),
+    })).filter(item => item.kind);
+    const final = finals[finals.length - 1] || null;
+    const finalNode = final?.node || null;
+    const candidateNode = [...turnNodes].reverse().find(node =>
+      apiMessageRole(node) === 'assistant'
+      && ['text', 'multimodal_text'].includes(apiMessageContentType(node))) || null;
+    const candidateMessage = candidateNode?.message || {};
+    const tailNode = turnNodes[turnNodes.length - 1] || null;
     const sources = [];
     const activity = [];
     const reasoning = [];
@@ -1381,13 +1692,29 @@
     }
     return {
       ready: !!finalNode,
-      reason: finalNode ? 'api_final' : 'api_final_pending',
+      reason: finalNode
+        ? (final.kind === 'legacy_tail_final' ? 'api_legacy_final' : 'api_final')
+        : 'api_final_pending',
+      proof_kind: final?.kind || null,
       text: finalNode ? apiMessageText(finalNode) : '',
       reasoning_text: reasoning.join('\n\n---\n\n').trim(),
       links: dedupeSourceLinks(sources),
       activity_items: dedupeActivityItems(activity),
       title: data.title || document.title,
-      message_id: finalNode?.id || finalNode?.message?.id || null,
+      message_id: finalNode?.message?.id || finalNode?.id || null,
+      candidate_message_id: candidateMessage.id || candidateNode?.id || null,
+      candidate_channel: candidateMessage.channel ?? null,
+      candidate_end_turn: candidateMessage.end_turn ?? null,
+      candidate_preamble: !!candidateMessage.metadata?.is_thinking_preamble_message,
+      candidate_status: candidateMessage.status || null,
+      tail_message_id: tailNode?.message?.id || tailNode?.id || null,
+      tail_role: apiMessageRole(tailNode) || null,
+      tail_content_type: apiMessageContentType(tailNode) || null,
+      conversation_id: data.conversation_id || null,
+      user_text: lastUser >= 0 ? apiMessageText(nodes[lastUser]) : null,
+      user_id: nodes[lastUser]?.message?.id || nodes[lastUser]?.id || null,
+      user_ids: nodes.filter(node => apiMessageRole(node) === 'user')
+        .map(node => node.message?.id || node.id).filter(Boolean),
     };
   }
 
@@ -1409,6 +1736,167 @@
       };
     }
     return proof;
+  }
+
+  function conversationMessageId(el) {
+    return el?.getAttribute('data-message-id')
+      || el?.getAttribute('data-chatgpt-selection-message-id')
+      || el?.getAttribute('data-chatgpt-search-message-ids')?.split(/\s+/)[0]
+      || null;
+  }
+  function conversationMessageKey(el) {
+    return conversationMessageId(el)
+      || el?.getAttribute('data-chatgpt-search-unit-key')
+      || el?.closest('[data-testid^="conversation-turn-"]')?.getAttribute('data-testid')
+      || null;
+  }
+  function conversationMessageElements(role = null) {
+    const legacy = Array.from(document.querySelectorAll(
+      role ? `[data-message-author-role="${role}"]` : '[data-message-author-role]'
+    ));
+    if (legacy.length) return legacy;
+    const selector = role
+      ? `[data-chatgpt-search-unit-key$=":${role}"]`
+      : '[data-chatgpt-search-unit-key]';
+    return Array.from(document.querySelectorAll(selector));
+  }
+  function userMessageElements() {
+    return conversationMessageElements('user');
+  }
+  function createTurnBoundary(apiBaseline = null, resumed = false, { prompt } = {}) {
+    const users = userMessageElements();
+    const messages = conversationMessageElements();
+    const conversationId = apiBaseline?.conversation_id
+      || (resumed ? chatgptConversationIdFromLocation() : null);
+    return {
+      resumed,
+      // A provisional local-chatgpt URL can become the real conversation
+      // after hydration. Only pin a stable provider identity.
+      conversationId: conversationId && !/^local-chatgpt(?::|%3a)/i.test(conversationId)
+        ? conversationId : null,
+      expectedUserText: typeof prompt === 'string' && prompt.trim() ? prompt.trim() : null,
+      previousUsers: new Set(users),
+      previousUserKeys: new Set(users.map(conversationMessageKey).filter(Boolean)),
+      previousApiUsers: apiBaseline?.user_ids ? new Set(apiBaseline.user_ids) : null,
+      previousTail: messages[messages.length - 1] || null,
+      previousAssistantKeys: new Set(conversationMessageElements('assistant')
+        .map(conversationMessageKey).filter(Boolean)),
+      userId: null,
+      userKey: null,
+      userEl: null,
+    };
+  }
+  function submittedUserElement(boundary) {
+    if (!boundary) return null;
+    const users = userMessageElements();
+    let user;
+    if (boundary.userId || boundary.userKey || boundary.userEl) {
+      user = users.find(el => (boundary.userId && conversationMessageId(el) === boundary.userId)
+        || (!conversationMessageId(el) && (boundary.userKey
+          ? conversationMessageKey(el) === boundary.userKey : el === boundary.userEl)));
+    } else {
+      const tailKey = conversationMessageKey(boundary.previousTail);
+      const tail = tailKey ? conversationMessageElements()
+        .find(el => conversationMessageKey(el) === tailKey) : boundary.previousTail;
+      user = boundary.resumed ? users[users.length - 1] : users.find(el =>
+        !boundary.previousUsers.has(el)
+        && !boundary.previousUserKeys.has(conversationMessageKey(el))
+        && !boundary.previousApiUsers?.has(conversationMessageId(el))
+        && (!tail || followsMessage(tail, el)));
+    }
+    if (user) {
+      boundary.userEl = user;
+      boundary.userId = conversationMessageId(user) || boundary.userId;
+      boundary.userKey = conversationMessageKey(user);
+    }
+    return user || null;
+  }
+  function followsMessage(a, b) {
+    const position = a?.compareDocumentPosition(b) || 0;
+    return !(position & Node.DOCUMENT_POSITION_DISCONNECTED)
+      && !!(position & Node.DOCUMENT_POSITION_FOLLOWING);
+  }
+  function belongsToSubmittedTurn(el, boundary) {
+    const user = submittedUserElement(boundary);
+    if (!user || !el || !followsMessage(user, el)) return false;
+    const nextUser = userMessageElements().find(candidate => followsMessage(user, candidate));
+    return !nextUser || followsMessage(el, nextUser);
+  }
+  function submittedAssistantElement(boundary, accepted = null) {
+    const assistants = conversationMessageElements('assistant');
+    if (accepted) {
+      // Keep the accepted answer through React remounts; never move extraction
+      // to another reply that arrived while sources/images were being read.
+      return assistants.find(el => (accepted.id && conversationMessageId(el) === accepted.id)
+        || (!accepted.id || !conversationMessageId(el))
+          && (accepted.key ? conversationMessageKey(el) === accepted.key : el === accepted.el)) || null;
+    }
+    const own = assistants.filter(el => belongsToSubmittedTurn(el, boundary)
+      && (boundary.resumed || !boundary.previousAssistantKeys.has(conversationMessageKey(el))));
+    return own[own.length - 1] || null;
+  }
+  function assistantTarget(el, apiFinal) {
+    return {
+      id: apiFinal?.message_id || conversationMessageId(el),
+      key: conversationMessageKey(el),
+      el,
+    };
+  }
+  function apiProofForSubmittedTurn(proof, boundary) {
+    const pageConversationId = chatgptConversationIdFromLocation();
+    if (proof.conversation_id && pageConversationId
+        && !/^local-chatgpt(?::|%3a)/i.test(pageConversationId)
+        && proof.conversation_id !== pageConversationId) {
+      return { ...proof, ready: false, reason: 'api_not_current_conversation' };
+    }
+    if (boundary.conversationId && chatgptConversationIdFromLocation() !== boundary.conversationId) {
+      return { ...proof, ready: false, reason: 'page_not_submitted_conversation' };
+    }
+    if (boundary.conversationId && proof.conversation_id
+        && proof.conversation_id !== boundary.conversationId) {
+      return { ...proof, ready: false, reason: 'api_not_submitted_conversation' };
+    }
+    if (proof.fallback) return proof;
+    if (!proof.user_id) return proof.ready
+      ? { ready: true, fallback: true, reason: 'api_turn_unmapped_dom_fallback' } : proof;
+    // A resumed job has no pre-Send DOM baseline. Its retained input must
+    // match before an unrendered latest API user can become its exact turn.
+    if (boundary.resumed && boundary.expectedUserText !== null
+        && boundary.expectedUserText !== undefined && proof.user_text !== boundary.expectedUserText) {
+      return { ...proof, ready: false, reason: 'api_user_prompt_mismatch' };
+    }
+    submittedUserElement(boundary);
+    if (boundary.userId) {
+      if (proof.user_id !== boundary.userId) return { ...proof, ready: false, reason: 'api_user_not_submitted_turn' };
+      if (!boundary.conversationId && proof.conversation_id) boundary.conversationId = proof.conversation_id;
+      return proof;
+    }
+    if (!boundary.resumed && (boundary.previousApiUsers?.has(proof.user_id)
+        || boundary.previousUserKeys.has(proof.user_id))) {
+      return { ...proof, ready: false, reason: 'api_user_precedes_submission' };
+    }
+    if (proof.user_id && (boundary.resumed
+        || (boundary.previousApiUsers && !boundary.previousApiUsers.has(proof.user_id)))) {
+      boundary.userId = proof.user_id;
+      if (!boundary.conversationId && proof.conversation_id) boundary.conversationId = proof.conversation_id;
+      return proof;
+    }
+    // A failed API baseline does not make an old final new. DOM identity can
+    // still prove this turn when the page does not expose API message IDs.
+    return proof.ready ? { ready: true, fallback: true, reason: 'api_turn_unmapped_dom_fallback' } : proof;
+  }
+  function createTerminalProbe(boundary, snapshot = latestApiTurnSnapshot) {
+    let failures = 0;
+    return async () => {
+      try {
+        const proof = terminalProofForCurrentPage(await snapshot(8000));
+        failures = 0;
+        return apiProofForSubmittedTurn(proof, boundary);
+      } catch (error) {
+        if (++failures < 3) throw error;
+        return apiProofForSubmittedTurn({ ready: true, fallback: true, reason: 'api_unavailable_dom_fallback' }, boundary);
+      }
+    };
   }
 
   function renderApiSourcesMarkdown(links) {
@@ -1442,13 +1930,14 @@
     return md;
   }
 
-  function buildChatGPTApiMarkdown(data, settings, stats, mode) {
+  function buildChatGPTApiMarkdown(data, settings, stats, mode, attachmentTexts = new Map()) {
     const nodes = chatgptCurrentPathNodes(data)
       .filter(node => node?.message && apiMessageRole(node) !== 'system' && !isHiddenApiMessage(node));
     const turns = [];
     let current = null;
 
-    for (const node of nodes) {
+    for (let nodeIndex = 0; nodeIndex < nodes.length; nodeIndex++) {
+      const node = nodes[nodeIndex];
       assertPopupExportNotCancelled();
       const role = apiMessageRole(node);
       const type = apiMessageContentType(node);
@@ -1466,7 +1955,7 @@
         if (type === 'reasoning_recap' || type === 'thoughts' || msg.metadata?.is_thinking_preamble_message) {
           const text = apiMessageText(node);
           if (text) current.reasoning.push(text);
-        } else if (type === 'text' && (msg.channel === 'final' || msg.end_turn === true)) {
+        } else if (apiAssistantFinalKind(node, { isTurnTail: isApiTurnTailNode(nodes, nodeIndex) })) {
           const text = apiMessageText(node);
           if (text) current.assistant.push(text);
         } else if (type === 'code' || type === 'model_editable_context') {
@@ -1496,15 +1985,16 @@
     for (const turn of turns) {
       assertPopupExportNotCancelled();
       const userText = turn.user ? apiMessageText(turn.user) : '';
-      const userAttachments = turn.user ? apiAttachmentsMarkdown(turn.user) : '';
-      const userAttachmentCount = turn.user ? apiAttachmentCount(turn.user) : 0;
+      const userAttachments = turn.user ? apiAttachmentsMarkdown(turn.user, settings, attachmentTexts) : '';
+      const attachments = turn.user?.message?.metadata?.attachments || [];
       const assistantText = turn.assistant.join('\n\n---\n\n').trim();
       const links = dedupeLinks(turn.sources);
 
       if (userText || userAttachments) {
         stats.user++;
-        if (settings.includeImages) stats.images += userAttachmentCount;
-        parts.push(`## User\n\n${userText || '_[Пустое сообщение]_'}${settings.includeImages ? userAttachments : ''}`.trim() + '\n');
+        if (settings.includeImages) stats.images += attachments.filter(isExportImageAttachment).length;
+        stats.documents = (stats.documents || 0) + attachments.filter(a => !isExportImageAttachment(a)).length;
+        parts.push(`## User\n\n${userText || '_[Пустое сообщение]_'}${userAttachments}`.trim() + '\n');
       }
       if (assistantText || turn.reasoning.length || links.length || turn.activity.length) {
         stats.assistant++;
@@ -1532,13 +2022,18 @@
     markdown += `> Режим: ${providerLabel}  \n`;
     markdown += `> Источник: ChatGPT backend API  \n`;
     markdown += `> User-сообщений: ${stats.user}; ответов ChatGPT: ${stats.assistant}  \n`;
-    markdown += `> Источников: ${stats.sources}; activity-шагов: ${stats.activity}; картинок/вложений: ${stats.images}  \n`;
+    markdown += `> Источников: ${stats.sources}; activity-шагов: ${stats.activity}; картинок: ${stats.images}; документов: ${stats.documents || 0}  \n`;
+    const failedDocuments = [...attachmentTexts.values()].filter(item => !item.ok);
+    if (failedDocuments.length) {
+      markdown += `> ВНИМАНИЕ: содержимое ${failedDocuments.length} текстовых вложений не удалось получить; подробности рядом с файлами.  \n`;
+    }
     markdown += `> URL: ${location.href}  \n`;
     markdown += `> Экспортировано: ${exportedAt}\n\n---\n\n`;
-    return { markdown: markdown + parts.join('\n---\n\n') + '\n', turnCount: parts.length, source: 'api' };
+    return { markdown: markdown + parts.join('\n---\n\n') + '\n', turnCount: parts.length, source: 'api',
+      failedDocuments: failedDocuments.length, textDocuments: [...attachmentTexts.values()].filter(item => item.ok).length };
   }
 
-  async function runChatGPTPopupExport(rawSettings) {
+  async function runChatGPTPopupExport(rawSettings, deps = {}) {
     if (popupExportRunning) {
       if (!document.getElementById(CHATGPT_EXPORT_OVERLAY_ID)) showChatGPTExportOverlay();
       return { success: false, message: 'Экспорт уже запущен' };
@@ -1557,12 +2052,16 @@
       assertPopupExportNotCancelled();
       updateChatGPTExportOverlay('Запрашиваю историю ChatGPT...', 'Шаг 1/3: полный JSON диалога');
       let apiBuilt = null;
+      let apiData = null;
       try {
-        const apiData = await fetchChatGPTConversationJson();
+        apiData = await (deps.fetchConversation || fetchChatGPTConversationJson)();
         assertPopupExportNotCancelled();
-        if (apiData) apiBuilt = buildChatGPTApiMarkdown(apiData, settings, stats, exportMode);
       } catch (apiError) {
         log('popup_export.api_fallback', { err: apiError?.message || String(apiError) });
+      }
+      if (apiData) {
+        const attachmentTexts = await resolveChatGPTExportAttachments(apiData);
+        apiBuilt = buildChatGPTApiMarkdown(apiData, settings, stats, exportMode, attachmentTexts);
       }
 
       if (apiBuilt?.markdown && apiBuilt.turnCount > 0) {
@@ -1579,31 +2078,37 @@
           sources: stats.sources,
           activity: stats.activity,
           images: stats.images,
+          textDocuments: apiBuilt.textDocuments,
+          failedDocuments: apiBuilt.failedDocuments,
           elapsed,
         });
-        showChatGPTExportTerminal('success',
-          `Записей: ${apiBuilt.turnCount}; источников: ${stats.sources}; activity-шагов: ${stats.activity}\n` +
+        showChatGPTExportTerminal(apiBuilt.failedDocuments ? 'warning' : 'success',
+          `Записей: ${apiBuilt.turnCount}; текстовых документов: ${apiBuilt.textDocuments}; источников: ${stats.sources}\n` +
+          (apiBuilt.failedDocuments ? `Не прочитано документов: ${apiBuilt.failedDocuments}. Причины указаны в экспорте.\n` : '') +
           (delivery === 'clipboard'
             ? 'Markdown скопирован в буфер обмена'
             : delivery === 'download-fallback'
               ? `Буфер обмена был недоступен, скачан файл: ${filename}`
           : `Файл: ${filename}`));
-        return { success: true, message: `Экспорт ${exportProviderLabel} завершён`, chatgptMode: exportMode };
+        return { success: true, complete: !apiBuilt.failedDocuments,
+          message: `Экспорт ${exportProviderLabel} завершён`, chatgptMode: exportMode };
       }
       if (apiBuilt?.markdown) {
         log('popup_export.api_empty_fallback', { turns: apiBuilt.turnCount });
       }
 
       updateChatGPTExportOverlay('Сканирую сообщения ChatGPT...', 'Шаг 1/3: DOM fallback');
-      await waitFor(() => document.querySelector('[data-message-author-role]'), 'ChatGPT messages', 8000, 200);
+      await waitFor(() => conversationMessageElements().length, 'ChatGPT messages', 8000, 200);
       const turns = chatgptConversationTurns();
       if (!turns.length) throw new Error('Сообщения ChatGPT не найдены на странице');
+      let domTextDocuments = 0;
+      let domFailedDocuments = 0;
 
       for (let i = 0; i < turns.length; i++) {
         assertPopupExportNotCancelled();
         const turn = turns[i];
         const messageEl = extractMessageRoot(turn);
-        const role = messageEl?.getAttribute?.('data-message-author-role') || 'message';
+        const role = exportMessageRole(messageEl);
         if (role === 'user') stats.user++;
         if (role === 'assistant') stats.assistant++;
         try { turn.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
@@ -1614,6 +2119,24 @@
         const text = extractMessageTextMarkdown(messageEl, role);
         const images = settings.includeImages ? extractImagesForExportTurn(turn) : [];
         if (text) md += `${text}\n`;
+        if (role === 'user') {
+          for (const card of domExportDocumentCards(messageEl)) {
+            assertPopupExportNotCancelled();
+            const key = exportAttachmentName(card.attachment);
+            updateChatGPTExportOverlay('Читаю текст вложения...', key);
+            try {
+              const content = await resolveDOMExportDocument(card);
+              md += `\n\n### Вложение: ${markdownEscapeInline(key)}\n\n${exportTextFileBlock(content.text)}`;
+              domTextDocuments += 1;
+              log('popup_export.document_read', { source: 'dom_preview_download', bytes: content.bytes, chars: content.text.length });
+            } catch (error) {
+              assertPopupExportNotCancelled();
+              domFailedDocuments += 1;
+              md += `\n\n### Вложение: ${markdownEscapeInline(key)}\n\n_[Содержимое не получено: ${markdownEscapeInline(error?.message || String(error))}.]_\n`;
+              log('popup_export.document_failed', { source: 'dom_preview_download', error: error?.message || String(error) });
+            }
+          }
+        }
         if (settings.includeReasoning && role === 'assistant') {
           const reasoning = extractReasoningMarkdownForMessage(messageEl);
           if (reasoning) md += `\n\n### Рассуждения ChatGPT\n\n${reasoning}\n`;
@@ -1637,7 +2160,9 @@
 
       updateChatGPTExportOverlay('Собираю markdown...', 'Шаг 3/3: упаковка');
       const body = parts.join('\n---\n\n');
-      const markdown = buildChatGPTExportHeader(turns.length, stats, exportMode) + body + '\n';
+      const warning = domFailedDocuments
+        ? `> ВНИМАНИЕ: не прочитано текстовых вложений: ${domFailedDocuments}.\n\n` : '';
+      const markdown = buildChatGPTExportHeader(turns.length, stats, exportMode) + warning + body + '\n';
       const filename = `chatgpt-${exportMode}-${safeFilenamePart(document.title || 'chat')}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.md`;
       const delivery = await deliverMarkdown(markdown, filename, settings.__export.downloadFile);
       const elapsed = ((performance.now() - started) / 1000).toFixed(1);
@@ -1648,16 +2173,20 @@
         sources: stats.sources,
         activity: stats.activity,
         images: stats.images,
+        textDocuments: domTextDocuments,
+        failedDocuments: domFailedDocuments,
         elapsed,
       });
-      showChatGPTExportTerminal('success',
-        `Сообщений: ${turns.length}; источников: ${stats.sources}; картинок: ${stats.images}\n` +
+      showChatGPTExportTerminal(domFailedDocuments ? 'warning' : 'success',
+        `Сообщений: ${turns.length}; текстовых документов: ${domTextDocuments}; источников: ${stats.sources}\n` +
+        (domFailedDocuments ? `Не прочитано документов: ${domFailedDocuments}. Причины указаны в экспорте.\n` : '') +
         (delivery === 'clipboard'
           ? 'Markdown скопирован в буфер обмена'
           : delivery === 'download-fallback'
             ? `Буфер обмена был недоступен, скачан файл: ${filename}`
             : `Файл: ${filename}`));
-      return { success: true, message: `Экспорт ${exportProviderLabel} завершён`, chatgptMode: exportMode };
+      return { success: true, complete: !domFailedDocuments,
+        message: `Экспорт ${exportProviderLabel} завершён`, chatgptMode: exportMode };
     } catch (e) {
       const msg = e?.message || String(e);
       log('popup_export.failed', { err: msg });
@@ -1675,7 +2204,7 @@
   // расширенный выбирается в сабменю. match покрывает RU («Очень высокий») и EN.
   // xhigh — дефолт для reasoning-моделей; GPT-5.5 поддерживает только Instant.
   const EFFORTS = [
-    { key: 'low',          match: /^(Low|Низкий)$/i,                     sub: false, aliases: ['low', 'низкий'] },
+    { key: 'low',          match: /^(Low|Light|Низкий|Л[её]гкий)$/i,    sub: false, aliases: ['low', 'light', 'низкий', 'лёгкий', 'легкий'] },
     { key: 'instant',      match: /^(Instant|Мгновенный)(?:\s*\d+(?:\.\d+)?)?$/i, sub: false, aliases: ['instant', 'мгновенный'] },
     { key: 'medium',       match: /^(Medium|Средний)$/i,                 sub: false, aliases: ['medium', 'mid', 'средний'] },
     { key: 'high',         match: /^(High|Высокий)$/i,                   sub: false, aliases: ['high', 'высокий'] },
@@ -1699,6 +2228,84 @@
     return ({ low: 'Low', instant: 'Instant', medium: 'Medium', high: 'High', xhigh: 'Очень высокий',
               pro: 'Pro стандартный', 'pro-extended': 'Pro усиленный', max: 'Max', ultra: 'Ultra' })[key] || key;
   }
+  function effortKeyFromText(text) {
+    const label = String(text || '').replace(/\s+/g, ' ').trim();
+    return EFFORTS.find(eff => eff.match.test(label))?.key || null;
+  }
+  const CHAT_EFFORT_SLIDER_KEYS = Object.freeze(['instant', 'medium', 'high', 'xhigh', 'pro']);
+  const WORK_EFFORT_SLIDER_KEYS = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+  function workEffortKeys(modelKey) {
+    if (modelKey === '5.5') return WORK_EFFORT_SLIDER_KEYS.slice(0, 4);
+    if (modelKey === '6-luna' || modelKey === '5.6-luna') return WORK_EFFORT_SLIDER_KEYS.slice(0, 5);
+    return ['6.1-sol', '6-sol', '6-astra', '5.6-sol', '5.6-terra'].includes(modelKey)
+      ? WORK_EFFORT_SLIDER_KEYS : null;
+  }
+  function effortSliderKeys(minValue, maxValue, mode = null, modelKey = null) {
+    const min = Number(minValue);
+    const max = Number(maxValue);
+    if (min !== 0) return null;
+    if (mode === 'work') {
+      const keys = workEffortKeys(modelKey);
+      return keys && keys.length === max - min + 1 ? keys : null;
+    }
+    if (mode === 'chat') return max === 4 ? CHAT_EFFORT_SLIDER_KEYS : null;
+    if (max === 4) return CHAT_EFFORT_SLIDER_KEYS;
+    if (max === 5) return WORK_EFFORT_SLIDER_KEYS;
+    return null;
+  }
+  function effortKeyFromSliderValue(value, minValue, maxValue, mode = null, modelKey = null) {
+    const keys = effortSliderKeys(minValue, maxValue, mode, modelKey);
+    const index = Number(value) - Number(minValue);
+    return keys && Number.isInteger(index) ? (keys[index] || null) : null;
+  }
+  function effortSliderValueForKey(key, minValue, maxValue, mode = null, modelKey = null) {
+    const keys = effortSliderKeys(minValue, maxValue, mode, modelKey);
+    const index = keys ? keys.indexOf(key) : -1;
+    return index >= 0 ? Number(minValue) + index : null;
+  }
+  function findEffortSlider() {
+    return visibleAll('[role="slider"][aria-valuemin][aria-valuemax][aria-valuenow]')
+      .find(el => el.getAttribute('role') === 'slider') || null;
+  }
+  function currentEffortKeyFromSlider(slider = findEffortSlider(), mode = currentChatgptMode(), modelKey = null) {
+    if (!slider) return null;
+    if (mode === 'work' && !modelKey) {
+      modelKey = visibleAll('[role="menuitemradio"][aria-checked="true"]')
+        .map(el => modelKeyFromText(nodeText(el))).find(key => key && key !== 'latest')
+        || modelKeyFromText(nodeText(findEffortTrigger()));
+    }
+    return effortKeyFromSliderValue(
+      slider.getAttribute('aria-valuenow'),
+      slider.getAttribute('aria-valuemin'),
+      slider.getAttribute('aria-valuemax'),
+      mode,
+      modelKey,
+    );
+  }
+  function effortSliderTicks(slider) {
+    const control = slider?.closest?.('[role="menuitem"]') || slider?.parentElement;
+    if (!control) return [];
+    return Array.from(control.querySelectorAll('span'))
+      .filter(el => /(?:^|\s)(?:[^\s]*_Tick|Tick-[^\s]+)(?:\s|$)/.test(String(el.className || '')))
+      .filter(isVisible)
+      .sort((a, b) => a.getBoundingClientRect().x - b.getBoundingClientRect().x);
+  }
+  async function selectEffortSliderValue(slider, targetValue) {
+    const min = Number(slider?.getAttribute('aria-valuemin'));
+    const max = Number(slider?.getAttribute('aria-valuemax'));
+    const target = Number(targetValue);
+    if (![min, max, target].every(Number.isFinite) || target < min || target > max) {
+      throw new Error('invalid effort slider target');
+    }
+    const ticks = effortSliderTicks(slider);
+    const expected = max - min + 1;
+    if (ticks.length !== expected) {
+      throw new Error(`effort slider ticks mismatch: ${ticks.length}/${expected}`);
+    }
+    const clicked = await trustedClick(ticks[target - min]);
+    if (!clicked?.ok) throw new Error('trusted effort slider click failed: ' + (clicked?.err || 'unknown'));
+    await sleep(600);
+  }
 
   // ── Реестр моделей. В меню composer-pill'а текущая модель раскрывает
   // сабменю с radio. Реестр намеренно статический: новые доступные в UI модели
@@ -1706,6 +2313,11 @@
   // ChatGPT запоминает выбор per-аккаунт — поэтому модель ВСЕГДА верифицируем,
   // не «скип если дефолт»: прошлый job мог оставить другую модель.
   const MODELS = [
+    { key: '6',         label: 'GPT-6', aliases: ['6', 'gpt-6', 'gpt 6'] },
+    { key: '6.1-sol',   label: 'GPT-6.1 Sol', aliases: ['6.1-sol', 'gpt-6.1-sol', 'gpt-6.1 sol', '6.1 sol'] },
+    { key: '6-sol',     label: 'GPT-6 Sol', aliases: ['6-sol', 'gpt-6-sol', 'gpt-6 sol', '6 sol'] },
+    { key: '6-luna',    label: 'GPT-6 Luna', aliases: ['6-luna', 'gpt-6-luna', 'gpt-6 luna', '6 luna'] },
+    { key: '6-astra',   label: 'GPT-6 Astra', aliases: ['6-astra', 'gpt-6-astra', 'gpt 6 astra', 'gpt-6 astra', '6 astra', 'astra'] },
     { key: '5.6-terra', label: 'GPT-5.6 Terra', aliases: ['5.6-terra', 'gpt-5.6 terra', 'gpt-5.6-terra', 'terra'] },
     { key: '5.6-luna',  label: 'GPT-5.6 Luna',  aliases: ['5.6-luna', 'gpt-5.6 luna', 'gpt-5.6-luna', 'luna'] },
     { key: '5.6-sol',   label: 'GPT-5.6 Sol',   aliases: ['5.6-sol', 'gpt-5.6 sol', 'gpt-5.6-sol', 'sol', '5.6', 'gpt-5.6', 'gpt5.6', 'gpt 5.6'] },
@@ -1716,6 +2328,8 @@
   function resolveModel(input) {
     if (!input) return DEFAULT_MODEL;
     const q = String(input).trim().toLowerCase();
+    const parsed = modelKeyFromText(q);
+    if (parsed) return parsed;
     const hit = MODELS.find(m => m.key === q)
              || MODELS.find(m => m.aliases.includes(q))
              || MODELS.find(m => m.aliases.some(a => q.includes(a)));
@@ -1723,13 +2337,15 @@
   }
   function modelDisplay(key) { return MODELS.find(model => model.key === key)?.label || key; }
 
-  // Composer-pill — триггер меню интеллекта. Класс __composer-pill +
-  // aria-haspopup="menu"; текст = текущий уровень (короткий: Pro / High / …).
-  // Фильтр по тексту отсекает сайдбарные haspopup-кнопки («Недавние чаты»).
+  // Современный триггер имеет semantic marker; его textContent включает
+  // скрытую измерительную подпись и уже не обязан быть коротким «Pro / High».
+  // Старые class/text пути сохраняются для прежнего UI.
   function findEffortTrigger() {
     const pills = Array.from(document.querySelectorAll('button[aria-haspopup="menu"]'))
       .filter(isVisible);
-    return pills.find(b => (b.className || '').includes('__composer-pill'))
+    return pills.find(b => b.getAttribute('data-codex-intelligence-trigger') === 'true'
+          || b.getAttribute('data-composer-navigation-target') === 'reasoning')
+        || pills.find(b => (b.className || '').includes('__composer-pill'))
         || pills.find(b => {
              const t = nodeText(b);
              return t.length < 30 && /^(Pro|Instant|Low|Medium|High|Max|Ultra|Очень высокий|Very\s*high|Extra\s*high|Auto)/i.test(t);
@@ -1739,11 +2355,34 @@
     return visibleAll('[role="menuitemradio"]')
       .find(el => eff.match.test(nodeText(el)));
   }
-  // Work хранит уровни во вложенном пункте «Уровень → …», тогда как Chat
-  // показывает те же radio сразу в корневом меню composer-pill'а.
+  // Уровень может быть вложенным пунктом «Усилие → …» либо строкой с
+  // текущим значением («Очень высокий») без aria-haspopup. Обе формы
+  // раскрываются через aria-expanded и должны считаться одним триггером.
   function findEffortSubTrigger() {
-    return visibleAll('[role="menuitem"][aria-haspopup="menu"]')
-      .find(el => /^(?:Усилие|Effort|Уровень|Level)/i.test(nodeText(el))) || null;
+    return visibleAll('[role="menuitem"]')
+      .find(el => {
+        if (el.getAttribute('role') !== 'menuitem') return false;
+        const text = nodeText(el);
+        const opensSubmenu = el.getAttribute('aria-haspopup') === 'menu'
+          || el.getAttribute('aria-expanded') != null;
+        return opensSubmenu && (
+          /^(?:Усилие|Effort|Уровень|Level)/i.test(text)
+          || !!effortKeyFromText(text)
+        );
+      }) || null;
+  }
+  function currentEffortKeyFromOpenMenu(mode = currentChatgptMode(), modelKey = null) {
+    const sliderKey = currentEffortKeyFromSlider(findEffortSlider(), mode, modelKey);
+    if (sliderKey) return sliderKey;
+    const checked = visibleAll('[role="menuitemradio"][aria-checked="true"]')
+      .filter(el => el.getAttribute('role') === 'menuitemradio' && el.getAttribute('aria-checked') === 'true')
+      .map(el => effortKeyFromText(nodeText(el)))
+      .find(Boolean);
+    if (checked) return checked;
+    const trigger = findEffortSubTrigger();
+    const fromTrigger = trigger ? effortKeyFromText(nodeText(trigger)) : null;
+    if (fromTrigger) return fromTrigger;
+    return effortKeyFromText(nodeText(findEffortTrigger()));
   }
   function findProMainItem() {
     return visibleAll('[role="menuitemradio"]')
@@ -1754,15 +2393,31 @@
       .find(el => /^(Pro стандартный|Pro standard|Pro усиленный|Pro расширенный|Pro extended)$/i.test(nodeText(el)));
   }
   function effortMenuSnapshot() {
-    return visibleAll('[role="menuitemradio"], [role="menuitem"]')
+    const items = visibleAll('[role="menuitemradio"], [role="menuitem"], [role="menuitemcheckbox"]')
       .map(el => ({
         text: nodeText(el),
         role: el.getAttribute('role'),
         checked: el.getAttribute('aria-checked'),
         expanded: el.getAttribute('aria-expanded'),
+        ariaLabel: el.getAttribute('aria-label'),
         testid: el.getAttribute('data-testid'),
       }))
-      .filter(x => x.text || x.testid);
+      .filter(x => x.text || x.testid || x.ariaLabel);
+    const slider = findEffortSlider();
+    if (slider) {
+      items.push({
+        text: currentEffortKeyFromSlider(slider),
+        role: 'slider',
+        checked: null,
+        expanded: null,
+        ariaLabel: slider.getAttribute('aria-label'),
+        testid: null,
+        value: slider.getAttribute('aria-valuenow'),
+        min: slider.getAttribute('aria-valuemin'),
+        max: slider.getAttribute('aria-valuemax'),
+      });
+    }
+    return items;
   }
   function findProSubTrigger() {
     return visibleAll('[data-testid="composer-intelligence-pro-thinking-effort-trigger"]')[0] || null;
@@ -1772,12 +2427,21 @@
   function modelKeyFromText(text) {
     const label = String(text || '').replace(/\s+/g, ' ').trim();
     if (/^o3(?:\s|$)/i.test(label)) return 'o3';
+    if (/^(?:Последняя|Latest)$/i.test(label)) return 'latest';
+    // Read generation AND tier before any broad GPT-6 alias. Labels can
+    // concatenate the effort ("GPT-6.1 SolMax") or prefix "Latest •".
+    const explicit = label.match(/(?:^|[^\d.])(6\.1|6|5\.6)[\s-]*(Astra|Sol|Terra|Luna)/i);
+    if (explicit) return `${explicit[1]}-${explicit[2].toLowerCase()}`;
     const tier = label.match(/\b(Sol|Terra|Luna)\b/i)?.[1]?.toLowerCase() || null;
     const gpt = label.match(/(?:GPT|Model|Модель)[\s-]*(\d+(?:\.\d+)?)(?=\D|$)/i);
+    if (gpt?.[1] === '6') return '6';
     if (gpt?.[1] === '5.6') return `5.6-${tier || 'sol'}`;
     if (gpt?.[1] === '5.5') return '5.5';
+    if (tier && /(?:^|\D)5\.6(?:\D|$)/.test(label)) return `5.6-${tier}`;
     if (tier && /^(?:Sol|Terra|Luna)$/i.test(label)) return `5.6-${tier}`;
+    if (/^6\s*(?:Astra|Pro)$/i.test(label)) return '6-astra';
     const bare = label.match(/^(\d+(?:\.\d+)?)$/);
+    if (bare?.[1] === '6') return '6';
     if (bare?.[1] === '5.6') return '5.6-sol';
     return bare?.[1] === '5.5' ? '5.5' : null;
   }
@@ -1808,64 +2472,144 @@
   }
   // Пункт модели в раскрытом сабменю — radio. Подпись бывает короткой («5.5»)
   // или полной («GPT-5.5»), поэтому сравниваем разобранный ключ.
-  function findModelItem(modelKey) {
-    return visibleAll('[role="menuitemradio"]')
-      .find(el => modelKeyFromText(nodeText(el)) === modelKey);
+  function findModelItem(modelKey, mode = currentChatgptMode()) {
+    const rows = visibleAll('[role="menuitemradio"]');
+    return rows.find(el => modelKeyFromText(nodeText(el)) === modelKey)
+      || (mode === 'chat' && modelKey === '6-astra'
+        ? rows.find(el => modelKeyFromText(nodeText(el)) === '6') : null)
+      // Chat's Latest exposes Astra only at Pro. This is a candidate row,
+      // not final model proof: verifyChatgptSelection checks both axes.
+      || (mode === 'chat' && ['6', '6-astra'].includes(modelKey)
+        ? rows.find(el => modelKeyFromText(nodeText(el)) === 'latest') : null);
   }
-  function currentModelKeyFromOpenMenu() {
+  function modelSelectionMatches(mode, requested, shown, effort = null) {
+    if (shown === requested) return true;
+    // The new Chat row is a family, not Astra identity at every power level.
+    // Accept the legacy Astra request only with Pro in the final pair guard.
+    return mode === 'chat' && ((requested === '6-astra' && shown === '6')
+      || (requested === '6' && shown === '6-astra')) && (effort == null || effort === 'pro');
+  }
+  function findModelViewToggle() {
+    return visibleAll('[role="menuitem"][aria-label]')
+      .find(el => /(?:Выбрать модель|Select model)/i.test(el.getAttribute('aria-label') || '')) || null;
+  }
+  function currentModelKeyFromOpenMenu(mode = currentChatgptMode()) {
+    const selectedRows = visibleAll('[role="menuitemradio"][aria-checked="true"]');
+    // Selection state can legitimately live in the inert model-list view.
+    // Read that state only within the currently open menu, while clicks
+    // still use visibleAll and never target an inactive view.
+    for (const menu of visibleAll('[role="menu"]')) {
+      selectedRows.push(...Array.from(menu.querySelectorAll?.(
+        '[role="menuitemradio"][aria-checked="true"][data-model-selected="true"]'
+      ) || []));
+    }
+    const selectedKeys = new Set(selectedRows
+      .filter(el => el.getAttribute('role') === 'menuitemradio' && el.getAttribute('aria-checked') === 'true')
+      .map(el => modelKeyFromText(nodeText(el)))
+      .filter(Boolean));
+    if (selectedKeys.size > 1) return null;
+    const checked = [...selectedKeys][0];
+    if (checked) {
+      if (checked === 'latest' && mode === 'chat'
+          && currentEffortKeyFromSlider(findEffortSlider(), 'chat') === 'pro'
+          && modelKeyFromText(nodeText(findModelViewToggle())) === '6-astra') return '6-astra';
+      return checked;
+    }
     const explicit = visibleAll('[role="menuitem"][aria-haspopup="menu"]')
       .find(el => /^(?:Модель|Model)/i.test(nodeText(el)));
     const explicitKey = explicit ? modelKeyFromText(nodeText(explicit)) : null;
     if (explicitKey) return explicitKey;
-    return modelKeyFromText(nodeText(findEffortTrigger()));
+    const currentView = modelKeyFromText(nodeText(findModelViewToggle()));
+    if (currentView) return currentView;
+    const trigger = findEffortTrigger();
+    const label = trigger?.querySelector?.('[class*="ModelPickerTriggerLabel-"]');
+    return modelKeyFromText(nodeText(label || trigger));
   }
-  async function openModelSubmenu(modelKey) {
+  function chatgptSelectionError(mode, modelKey, effortKey) {
+    if (mode === 'chat') {
+      if (modelKey === '6-astra') {
+        return effortKey === 'pro'
+          ? null
+          : 'chatgpt_selection_unsupported: GPT-6 Astra в Chat доступна только как Pro';
+      }
+      if (modelKey === '5.5') {
+        return effortKey === 'instant'
+          ? null
+          : 'chatgpt_selection_unsupported: GPT-5.5 в Chat доступна только как Instant';
+      }
+      if (modelKey === '6' || modelKey === '5.6-sol') {
+        return CHAT_EFFORT_SLIDER_KEYS.includes(effortKey)
+          ? null
+          : `chatgpt_selection_unsupported: ${modelDisplay(modelKey)} не поддерживает effort=${effortKey} в Chat`;
+      }
+      return `chatgpt_selection_unsupported: модель ${modelDisplay(modelKey)} недоступна в Chat`;
+    }
+    const supportedEfforts = workEffortKeys(modelKey);
+    if (!supportedEfforts) {
+      return `chatgpt_selection_unsupported: модель ${modelDisplay(modelKey)} не проверена для Work`;
+    }
+    return supportedEfforts.includes(effortKey)
+      ? null
+      : `chatgpt_selection_unsupported: ${modelDisplay(modelKey)} не поддерживает effort=${effortKey} в Work`;
+  }
+  async function openModelSubmenu(modelKey, mode = currentChatgptMode()) {
+    const viewToggle = findModelViewToggle();
+    if (viewToggle && viewToggle.getAttribute('aria-expanded') !== 'true') {
+      const clicked = await trustedClick(viewToggle);
+      if (!clicked?.ok) throw new Error('trusted model-view click failed: ' + (clicked?.err || 'unknown'));
+      await sleep(450);
+    }
+    const direct = findModelItem(modelKey, mode);
+    if (direct) return { sub: null, item: direct };
     const sub = await waitFor(() => findModelSubTrigger(), 'model submenu trigger (GPT / o-series)', 8000);
     nativeHover(sub);
     await sleep(700);
-    if (!findModelItem(modelKey)) {
+    if (!findModelItem(modelKey, mode)) {
       nativeMouseClick(sub);
       await sleep(700);
     }
-    const item = await waitFor(() => findModelItem(modelKey), 'model item: ' + modelKey, 8000);
+    const item = await waitFor(() => findModelItem(modelKey, mode), 'model item: ' + modelKey, 8000);
     return { sub, item };
   }
 
   // Выбор модели — verify-and-retry, та же механика что ensureEffortSelected.
   // Вызывающий flow делает провал фатальным: нельзя молча отправить запрос
   // sticky-моделью, отличающейся от запрошенной.
-  async function ensureModelSelected(modelKey) {
+  async function ensureModelSelected(modelKey, mode = currentChatgptMode()) {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         await openEffortMenu();
-        const current = currentModelKeyFromOpenMenu();
-        if (current === modelKey) {
+        const current = currentModelKeyFromOpenMenu(mode);
+        if (modelSelectionMatches(mode, modelKey, current)) {
           log('model.already_set', { model: modelKey, shown: current });
           bridgeLog('gpt.model.already_set', { model: modelKey }, getRequestId(), null);
           pressEscape(); await sleep(200);
           return true;
         }
-        const { sub, item } = await openModelSubmenu(modelKey);
+        const { sub, item } = await openModelSubmenu(modelKey, mode);
         if (item.getAttribute('aria-checked') === 'true') {
           log('model.already_set', { model: modelKey, shown: modelKeyFromText(nodeText(sub)) });
           bridgeLog('gpt.model.already_set', { model: modelKey }, getRequestId(), null);
           pressEscape(); await sleep(200);
           return true;
         }
-        nativeMouseClick(item);
+        const clicked = await trustedClick(item);
+        if (!clicked?.ok) throw new Error('trusted model click failed: ' + (clicked?.err || 'unknown'));
         await sleep(600);
         // Verify через переоткрытие: подпись родителя и checked у visible radio
         // должны указывать на запрошенную модель. Закрытые меню ChatGPT оставляет
         // в DOM, поэтому читаем только visibleAll.
         await openEffortMenu();
-        const shown = currentModelKeyFromOpenMenu();
-        let checkedItem = findModelItem(modelKey);
-        if (!checkedItem && shown !== modelKey) {
-          try { ({ item: checkedItem } = await openModelSubmenu(modelKey)); } catch (_) {}
+        const shown = currentModelKeyFromOpenMenu(mode);
+        let checkedItem = findModelItem(modelKey, mode);
+        if (!checkedItem && !modelSelectionMatches(mode, modelKey, shown)) {
+          try { ({ item: checkedItem } = await openModelSubmenu(modelKey, mode)); } catch (_) {}
         }
-        const checked = shown === modelKey
+        const latestCandidate = mode === 'chat' && ['6', '6-astra'].includes(modelKey) && shown === 'latest';
+        const matches = modelSelectionMatches(mode, modelKey, shown);
+        const checked = (matches || latestCandidate)
           && (!checkedItem || checkedItem.getAttribute('aria-checked') === 'true');
-        const ok = shown === modelKey && checked;
+        const ok = (matches || latestCandidate) && checked;
         const items = ok ? null : modelMenuSnapshot();
         pressEscape(); await sleep(200);
         if (ok) {
@@ -1893,16 +2637,41 @@
     const trigger = await waitFor(() => findEffortTrigger(), 'effort trigger (composer pill)', 15000);
     if (trigger.getAttribute('aria-expanded') !== 'true') {
       nativeMouseClick(trigger);
-      await sleep(500);
+      await sleep(350);
       if (trigger.getAttribute('aria-expanded') !== 'true') {
-        nativeMouseClick(trigger);
+        const clicked = await trustedClick(trigger);
+        if (!clicked?.ok) throw new Error('trusted effort-picker click failed: ' + (clicked?.err || 'unknown'));
         await sleep(500);
       }
     }
     return trigger;
   }
+  async function openEffortControlsMenu() {
+    const trigger = await openEffortMenu();
+    const openPicker = () => visibleAll('[data-model-picker-view]')
+      .find(el => isVisible(el.closest('[role="menu"]')));
+    const picker = openPicker();
+    if (picker?.getAttribute('data-model-picker-view') === 'advanced') {
+      // Selecting even the already checked model returns this two-view picker
+      // to its slider. Escape/reopen alone can keep the model list active.
+      // Never read/click the inert slider or choose a different model to exit.
+      const selected = Array.from(picker.querySelectorAll(
+        '[role="menuitemradio"][aria-checked="true"][data-model-selected="true"]'
+      )).filter(isVisible);
+      if (selected.length !== 1) throw new Error('ambiguous selected model in advanced picker');
+      const selectedText = nodeText(selected[0]);
+      const clicked = await trustedClick(selected[0]);
+      if (!clicked?.ok) throw new Error('trusted effort-view return failed: ' + (clicked?.err || 'unknown'));
+      await waitFor(() => openPicker()?.getAttribute('data-model-picker-view') === 'simple',
+        'effort slider view after selected model', 4000);
+      const data = { from: 'advanced', to: 'simple', selected: selectedText, revision: PICKER_REVISION };
+      log('effort.view_return', data);
+      bridgeLog('gpt.effort.view_return', data, getRequestId() || getComposeId(), null);
+    }
+    return trigger;
+  }
   async function openEffortItemsMenu(eff) {
-    await openEffortMenu();
+    await openEffortControlsMenu();
     const direct = findEffortItem(eff);
     if (direct) return direct;
 
@@ -1981,11 +2750,46 @@
   // живой probe: после клика Instant pill ещё показывал «Pro»). Вызывающий
   // flow обязан считать false фатальным: sticky-уровень аккаунта может не
   // совпадать с явно выбранным юзером.
-  async function ensureEffortSelected(effortKey) {
+  async function ensureEffortSelected(effortKey, mode = currentChatgptMode(), modelKey = null) {
     const eff = EFFORTS.find(e => e.key === effortKey);
     if (!eff) { log('effort.unknown', { effortKey }); return false; }
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
+        await openEffortControlsMenu();
+        if (currentEffortKeyFromOpenMenu(mode, modelKey) === eff.key) {
+          log('effort.already_set', { effort: eff.key });
+          bridgeLog('gpt.effort.already_set', { effort: eff.key }, getRequestId() || getComposeId(), null);
+          pressEscape(); await sleep(200);
+          return true;
+        }
+        const slider = findEffortSlider();
+        if (slider) {
+          const targetValue = effortSliderValueForKey(
+            eff.key,
+            slider.getAttribute('aria-valuemin'),
+            slider.getAttribute('aria-valuemax'),
+            mode,
+            modelKey,
+          );
+          if (targetValue == null) {
+            throw new Error(`effort ${eff.key} is unavailable on slider ${slider.getAttribute('aria-valuemin')}..${slider.getAttribute('aria-valuemax')}`);
+          }
+          await selectEffortSliderValue(slider, targetValue);
+          await openEffortControlsMenu();
+          const afterSlider = findEffortSlider();
+          const applied = currentEffortKeyFromSlider(afterSlider, mode, modelKey);
+          const sliderItems = applied === eff.key ? null : effortMenuSnapshot();
+          pressEscape(); await sleep(200);
+          if (applied === eff.key) {
+            log('effort.slider.selected', { effort: eff.key, value: targetValue, attempt });
+            bridgeLog('gpt.effort.slider.selected', { effort: eff.key, value: targetValue, attempt }, getRequestId() || getComposeId(), null);
+            return true;
+          }
+          const data = { effort: eff.key, targetValue, applied, attempt, items: sliderItems };
+          log('effort.slider.verify_failed', data);
+          bridgeLog('gpt.effort.slider.verify_failed', data, getRequestId() || getComposeId(), null);
+          continue;
+        }
         if (eff.sub) {
           const top = await ensureProMainSelected(attempt);
           if (!top.ok) continue;
@@ -2035,6 +2839,32 @@
     return false;
   }
 
+  async function verifyChatgptSelection(mode, modelKey, effortKey) {
+    try {
+      const unsupported = chatgptSelectionError(mode, modelKey, effortKey);
+      if (unsupported) throw new Error(unsupported);
+      await openEffortControlsMenu();
+      await waitFor(() => modelSelectionMatches(mode, modelKey, currentModelKeyFromOpenMenu(mode), effortKey)
+        && currentEffortKeyFromOpenMenu(mode, modelKey) === effortKey,
+      'exact ChatGPT model and effort selection', 8000, 150);
+      const data = { mode, model: modelKey, effort: effortKey,
+        shownModel: currentModelKeyFromOpenMenu(mode), revision: PICKER_REVISION };
+      log('selection.verified', data);
+      bridgeLog('gpt.selection.verified', data, getRequestId() || getComposeId(), null);
+      return true;
+    } catch (error) {
+      const data = { mode, model: modelKey, effort: effortKey,
+        shownModel: currentModelKeyFromOpenMenu(mode),
+        shownEffort: currentEffortKeyFromOpenMenu(mode, modelKey),
+        err: error?.message || String(error) };
+      log('selection.verify_failed', data);
+      bridgeLog('gpt.selection.verify_failed', data, getRequestId() || getComposeId(), null);
+      return false;
+    } finally {
+      pressEscape();
+    }
+  }
+
   const SPEEDS = [
     { key: 'standard', match: /^(?:Стандартный|Standard)(?:\s|$)/i, aliases: ['standard', 'default', 'стандартный'] },
     { key: 'fast', match: /^(?:Быстро|Fast)(?:\s|$)/i, aliases: ['fast', 'быстро'] },
@@ -2045,6 +2875,23 @@
   }
   function speedLabel(key) {
     return key === 'fast' ? 'Быстро' : 'Стандартный';
+  }
+  function findFastModeToggle() {
+    return visibleAll('[role="menuitemcheckbox"]')
+      .find(el => {
+        const label = el.getAttribute('aria-label') || '';
+        return /(?:быстр|fast|стандарт|standard)/i.test(label)
+          || !!el.querySelector?.('[data-testid="composer-model-picker-fast-service-tier-icon"]');
+      }) || null;
+  }
+  function speedKeyFromFastModeToggle(toggle) {
+    if (!toggle) return null;
+    const label = toggle.getAttribute('aria-label') || '';
+    // aria-label describes the ACTION, not the current state.
+    if (/(?:Включить стандартный|Switch to standard|Use standard)/i.test(label)) return 'fast';
+    if (/(?:Включить быстрый|Switch to fast|Use fast)/i.test(label)) return 'standard';
+    if (toggle.querySelector?.('[data-testid="composer-model-picker-fast-service-tier-icon"]')) return 'fast';
+    return toggle.getAttribute('aria-checked') === 'true' ? 'fast' : 'standard';
   }
   function findSpeedSubTrigger() {
     return visibleAll('[role="menuitem"][aria-haspopup="menu"]')
@@ -2069,6 +2916,34 @@
     const speed = SPEEDS.find(item => item.key === resolveSpeed(speedKey));
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
+        await openEffortMenu();
+        const fastToggle = findFastModeToggle();
+        if (fastToggle) {
+          const current = speedKeyFromFastModeToggle(fastToggle);
+          if (current === speed.key) {
+            log('speed.already_set', { speed: speed.key, picker: 'integrated' });
+            bridgeLog('gpt.speed.already_set', { speed: speed.key, picker: 'integrated' }, getRequestId() || getComposeId(), null);
+            pressEscape(); await sleep(200);
+            return true;
+          }
+          const clicked = await trustedClick(fastToggle);
+          if (!clicked?.ok) throw new Error('trusted speed toggle click failed: ' + (clicked?.err || 'unknown'));
+          await sleep(600);
+          await openEffortMenu();
+          const afterToggle = findFastModeToggle();
+          const applied = speedKeyFromFastModeToggle(afterToggle);
+          const speedItems = applied === speed.key ? null : effortMenuSnapshot();
+          pressEscape(); await sleep(200);
+          if (applied === speed.key) {
+            log('speed.selected', { speed: speed.key, attempt, picker: 'integrated' });
+            bridgeLog('gpt.speed.selected', { speed: speed.key, attempt, picker: 'integrated' }, getRequestId() || getComposeId(), null);
+            return true;
+          }
+          const data = { speed: speed.key, attempt, applied, items: speedItems };
+          log('speed.verify_failed', data);
+          bridgeLog('gpt.speed.verify_failed', data, getRequestId() || getComposeId(), null);
+          continue;
+        }
         const item = await openSpeedItem(speed);
         if (item.getAttribute('aria-checked') === 'true') {
           log('speed.already_set', { speed: speed.key });
@@ -2152,13 +3027,13 @@
 
   function findPastedTextChip() {
     const root = composerRoot();
-    const candidates = Array.from(root.querySelectorAll([
+    const candidates = Array.from(root?.querySelectorAll([
       '[data-testid*="attachment"]',
       '[data-testid*="file"]',
       '[class*="attachment"]',
       'button',
       '[role="button"]',
-    ].join(','))).filter(isVisible);
+    ].join(',')) || []).filter(isVisible);
     return candidates.find(el => isPastedTextChipLabel(inlineControlText(el))) || null;
   }
 
@@ -2192,6 +3067,7 @@
     let hoverAttempted = false;
     let hoverOk = false;
     let chipOpened = false;
+    let attachmentReadySince = 0;
     let lastState = '';
 
     while (performance.now() - t0 < timeoutMs) {
@@ -2224,6 +3100,28 @@
       }
 
       const showControl = findShowInTextFieldControl();
+      // Current ChatGPT can keep a long paste as a complete document without
+      // showing either the old "too long" label or a show-inline action. The
+      // document is an existing supported fallback, but accept it only after
+      // hover/open was attempted and the composer is stably ready to send.
+      if (chip && chipOpened && !showControl
+          && (!promptText || composerContainsInlineText(promptText))
+          && composerBusySnapshot([promptText]).ready) {
+        if (!attachmentReadySince) attachmentReadySince = performance.now();
+        if (performance.now() - attachmentReadySince >= 3000) {
+          const result = {
+            method: 'pasted_text_attachment',
+            waitedMs: Math.round(performance.now() - t0),
+            chars: inlineText.length,
+            reason: 'inline_control_unavailable_after_ready_chip',
+          };
+          log('compose.pasted_text_attachment_ready', result);
+          bridgeLog('gpt.compose.pasted_text_attachment_ready', result, id, null);
+          return result;
+        }
+      } else {
+        attachmentReadySince = 0;
+      }
       const state = `${showControl ? 1 : 0}|${chip ? 1 : 0}|${showClicked ? 1 : 0}|${hoverAttempted ? 1 : 0}|${hoverOk ? 1 : 0}|${chipOpened ? 1 : 0}`;
       if (state !== lastState) {
         lastState = state;
@@ -2288,7 +3186,23 @@
       || !!el.closest('[aria-disabled="true"]');
   }
 
-  function composerBusySnapshot(ignoredTexts = []) {
+  function composerStatusText(root, editor, fileNames = []) {
+    if (!root || root === editor) return '';
+    // Read status UI, not user data. Cutting the form to 500 chars before
+    // removing the prompt made filenames consume its prefix and left words
+    // such as "loading error" masquerading as an upload status.
+    const statusRoot = root.cloneNode(true);
+    for (const field of statusRoot.querySelectorAll('[contenteditable], [role="textbox"], textarea, input')) field.remove();
+    const filenameKey = value => compactText(value).replace(/\(\d+\)(?=\.[^.]+$)/, '');
+    const names = new Set(fileNames.map(filenameKey).filter(Boolean));
+    for (const label of statusRoot.querySelectorAll('*')) {
+      if (label.children.length || label.closest('[role="status"], [role="progressbar"], [aria-live], [aria-busy="true"]')) continue;
+      if (names.has(filenameKey(label.textContent))) label.remove();
+    }
+    return compactText(statusRoot.textContent);
+  }
+
+  function composerBusySnapshot(_ignoredTexts = [], fileNames = []) {
     const root = composerRoot();
     const ed = findComposer();
     const send = findSendBtn();
@@ -2304,17 +3218,10 @@
       'svg[aria-label*="loading" i]',
       'svg[aria-label*="загруз" i]',
     ].join(',');
-    const busyNodes = Array.from(root.querySelectorAll(busySelectors)).filter(isVisible);
-    const rootText = compactText(root.textContent).slice(0, 500);
-    let statusText = rootText;
-    for (const value of ignoredTexts) {
-      const ignored = compactText(value);
-      if (!ignored) continue;
-      const visiblePart = ignored.slice(0, 500);
-      if (visiblePart.length >= 3) statusText = statusText.split(visiblePart).join(' ');
-      if (ignored.length <= 500) statusText = statusText.split(ignored).join(' ');
-    }
-    const busyText = /(?:uploading|loading|processing|attaching|загруз|обработ|прикреп|подождите|please wait)/i.test(statusText);
+    const busyNodes = Array.from(root?.querySelectorAll(busySelectors) || []).filter(isVisible);
+    const statusText = composerStatusText(root, ed, fileNames);
+    const busyTextMatch = statusText.match(/(?:uploading|loading|processing|attaching|загруз|обработ|прикреп|подождите|please wait)/i);
+    const busyText = !!busyTextMatch;
     const composerDisabled = isDisabled(ed)
       || ed?.getAttribute('contenteditable') === 'false'
       || ed?.getAttribute('aria-disabled') === 'true';
@@ -2327,11 +3234,12 @@
       composerDisabled,
       busyCount: busyNodes.length,
       busyText,
-      textHead: rootText.slice(0, 160),
+      busyTextToken: busyTextMatch?.[0]?.toLowerCase() || null,
+      textHead: statusText.slice(0, 160),
     };
   }
 
-  function waitComposerReadyAfterPaste(id, timeoutMs = 120000, ignoredTexts = []) {
+  function waitComposerReadyAfterPaste(id, timeoutMs = 120000, ignoredTexts = [], fileNames = []) {
     const t0 = performance.now();
     return new Promise((resolve, reject) => {
       let done = false;
@@ -2341,13 +3249,15 @@
       const observer = new MutationObserver(scheduleCheck);
       const poll = setInterval(checkNow, 500);
       const timer = setTimeout(() => {
-        const snap = composerBusySnapshot(ignoredTexts);
+        const snap = composerBusySnapshot(ignoredTexts, fileNames);
         finish(null, new Error('chatgpt_composer_not_ready_after_paste: ' + JSON.stringify({
           sendVisible: snap.sendVisible,
           sendDisabled: snap.sendDisabled,
           composerDisabled: snap.composerDisabled,
           busyCount: snap.busyCount,
           busyText: snap.busyText,
+          busyTextToken: snap.busyTextToken,
+          readinessRevision: COMPOSER_READINESS_REVISION,
         })));
       }, timeoutMs);
 
@@ -2383,6 +3293,8 @@
           composerDisabled: snap.composerDisabled,
           busyCount: snap.busyCount,
           busyText: snap.busyText,
+          busyTextToken: snap.busyTextToken,
+          readinessRevision: COMPOSER_READINESS_REVISION,
         };
         log('composer.wait_after_paste', data);
         bridgeLog('gpt.composer.wait_after_paste', data, id, null);
@@ -2394,7 +3306,7 @@
         // в промежутке между paste-event и первым React-коммитом loader'а.
         readyTimer = setTimeout(() => {
           readyTimer = null;
-          const snap = composerBusySnapshot(ignoredTexts);
+          const snap = composerBusySnapshot(ignoredTexts, fileNames);
           if (!snap.ready) {
             emitWaitLog(snap);
             return;
@@ -2406,7 +3318,7 @@
       }
       function checkNow() {
         if (done) return;
-        const snap = composerBusySnapshot(ignoredTexts);
+        const snap = composerBusySnapshot(ignoredTexts, fileNames);
         if (snap.ready) {
           verifyReadyAfterQuiet();
         } else {
@@ -2461,7 +3373,18 @@
     return '.png';
   }
   function composerRoot() {
-    return findComposer()?.closest('form') || document.body;
+    const ed = findComposer();
+    const form = ed?.closest('form');
+    if (form) return form;
+    // Some composer layouts have no form. Walk only its branch, stopping
+    // before conversation history; body text is never attachment/upload proof.
+    let root = ed;
+    for (let parent = ed?.parentElement; parent && parent !== document.body
+        && parent !== document.documentElement; parent = parent.parentElement) {
+      if (parent.querySelector('[data-message-author-role], [data-testid^="conversation-turn-"]')) break;
+      root = parent;
+    }
+    return root;
   }
   function findUploadInputFor(files) {
     const list = Array.isArray(files) ? files : [files];
@@ -2472,7 +3395,13 @@
           || document.querySelector('input[type="file"][accept*="image"]')
           || document.querySelector('#upload-files');
     }
-    return document.querySelector('#upload-files') || document.querySelector('input[type="file"]');
+    const legacy = document.querySelector('#upload-files');
+    if (legacy) return legacy;
+    // Первый input в новом UI принимает только photo/video. Текстовые документы
+    // должны попасть в общий file input без accept-фильтра, а не в media picker.
+    const inputs = Array.from(composerRoot()?.querySelectorAll('input[type="file"]') || [])
+      .filter(input => !String(input.getAttribute('accept') || '').trim());
+    return inputs.length === 1 ? inputs[0] : null;
   }
   async function fetchAttachmentFile(id, meta) {
     const r = await bfetch('/research-attachment?id=' + encodeURIComponent(id) + '&index=' + encodeURIComponent(meta.index));
@@ -2492,8 +3421,9 @@
 
   function composerFilePreviewState(files) {
     const root = composerRoot();
-    const names = files.map(file => file?.name).filter(Boolean);
-    const text = root.textContent || '';
+    const ed = findComposer();
+    const outsideEditor = el => el !== ed && !ed?.contains(el) && !el.contains(ed)
+      && !el.matches('input');
     const previewSelector = [
       '[data-testid*="attachment"]:not(input)',
       '[data-testid*="file"]:not(input)',
@@ -2501,29 +3431,120 @@
       '[aria-label*="Remove"]',
       '[aria-label*="preview" i]',
     ].join(',');
+    const candidates = Array.from(root?.querySelectorAll(previewSelector) || []).filter(outsideEditor);
+    const removeNodes = candidates.filter(el => /удалить|remove/i.test(el.getAttribute('aria-label') || ''));
+    const removers = removeNodes.filter(el => !removeNodes.some(other => other !== el && other.contains(el)));
+    // A card, its remove button and its image are one preview, not three files.
+    const cards = candidates.filter(el => !candidates.some(other => other !== el && other.contains(el)));
+    const labels = Array.from(root?.querySelectorAll('*') || []).filter(outsideEditor);
+    const nameCounts = Object.create(null);
+    for (const name of new Set(files.map(file => file.name))) {
+      const matches = labels.filter(el => [el.textContent, el.getAttribute('title'), el.getAttribute('alt')]
+        .some(text => text?.trim() === name));
+      nameCounts[name] = matches.filter(el => !matches.some(child => child !== el && el.contains(child))).length;
+    }
     return {
-      named: names.some(name => text.includes(name)),
-      candidateCount: root.querySelectorAll(previewSelector).length,
-      imageCount: files.some(file => String(file?.type || '').startsWith('image/'))
-        ? root.querySelectorAll('img').length
-        : 0,
+      nameCounts,
+      cards,
+      removers,
+      imageKeys: Array.from(root?.querySelectorAll('img') || []).filter(outsideEditor)
+        .map(img => img.currentSrc || img.src).filter(Boolean),
     };
   }
 
-  function composerHasFilePreview(files, baseline) {
+  function composerHasFilePreview(files, baseline, accepted = null) {
     const current = composerFilePreviewState(files);
-    if (current.named) return true;
-    if (!baseline) return current.candidateCount > 0 || current.imageCount > 0;
-    return current.candidateCount > baseline.candidateCount
-      || current.imageCount > baseline.imageCount;
+    const required = new Map();
+    for (const file of files) required.set(file.name, (required.get(file.name) || 0) + 1);
+    const allNamesAdded = [...required].every(([name, count]) =>
+      (current.nameCounts[name] || 0) - (baseline?.nameCounts[name] || 0) >= count);
+    const allCardsAdded = ['cards', 'removers'].some(kind => accepted
+      ? accepted[kind].filter(card => !baseline?.[kind]?.includes(card) && current[kind].includes(card)).length >= files.length
+      : current[kind].length - (baseline?.[kind]?.length || 0) >= files.length);
+    const oldImages = new Set(baseline?.imageKeys || []);
+    const allImagesAdded = files.every(file => String(file.type || '').startsWith('image/'))
+      && current.imageKeys.filter(key => !oldImages.has(key) && (!accepted || accepted.imageKeys.includes(key))).length >= files.length;
+    return files.length > 0 && (allNamesAdded || allCardsAdded || allImagesAdded);
+  }
+
+  function uploadPreviewDiagnostic(files, baseline, input) {
+    const state = composerFilePreviewState(files);
+    return {
+      revision: UPLOAD_REVISION,
+      documentTimeOrigin: performance.timeOrigin,
+      inputId: input?.id || null,
+      inputConnected: input?.isConnected !== false,
+      inputIsCurrent: findUploadInputFor(files) === input,
+      inputDisabled: !!input?.disabled || input?.getAttribute('aria-disabled') === 'true',
+      inputFileCount: input?.files?.length ?? null,
+      pickerExpanded: findEffortTrigger()?.getAttribute('aria-expanded') || null,
+      nameCounts: state.nameCounts,
+      baselineNameCounts: baseline?.nameCounts || {},
+      cards: state.cards.length,
+      baselineCards: baseline?.cards?.length || 0,
+      removers: state.removers.length,
+      baselineRemovers: baseline?.removers?.length || 0,
+      images: state.imageKeys.length,
+    };
+  }
+
+  function waitUploadPreview(id, files, baseline, input, eventPrefix, timeoutMs = 60000) {
+    const t0 = performance.now();
+    return new Promise(resolve => {
+      let done = false, checkPending = false, lastSignature = '';
+      const observer = new MutationObserver(() => scheduleCheck('mutation'));
+      const fallback = setInterval(() => checkNow('fallback'), 500);
+      const deadline = setTimeout(() => finish(false, 'deadline'), timeoutMs);
+      function finish(ok, observedBy) {
+        if (done) return;
+        done = true;
+        observer.disconnect();
+        clearInterval(fallback);
+        clearTimeout(deadline);
+        resolve({ ok, observedBy, waitedMs: Math.round(performance.now() - t0),
+          ...uploadPreviewDiagnostic(files, baseline, input) });
+      }
+      function checkNow(observedBy) {
+        if (done) return;
+        if (composerHasFilePreview(files, baseline)) { finish(true, observedBy); return; }
+        const snapshot = uploadPreviewDiagnostic(files, baseline, input);
+        const signature = JSON.stringify(snapshot);
+        if (signature !== lastSignature) {
+          lastSignature = signature;
+          const data = { ...snapshot, observedBy, waitedMs: Math.round(performance.now() - t0) };
+          log(eventPrefix + '.preview_progress', data);
+          bridgeLog('gpt.' + eventPrefix + '.preview_progress', data, id, null);
+        }
+      }
+      function scheduleCheck(observedBy) {
+        if (done || checkPending) return;
+        checkPending = true;
+        queueMicrotask(() => { checkPending = false; checkNow(observedBy); });
+      }
+      observer.observe(document.body || document.documentElement, {
+        subtree: true, childList: true, characterData: true, attributes: true,
+        attributeFilter: ['title', 'alt', 'aria-label', 'data-testid', 'class', 'hidden'],
+      });
+      checkNow('initial');
+    });
   }
 
   async function uploadFiles(id, files, options = {}) {
-    if (!files.length) return [];
+    if (!files.length) return { files, hasPreview: () => true };
     if (files.length > 20) throw new Error('chatgpt_attachment_limit: maximum 20 files per message');
     const eventPrefix = options.eventPrefix || 'attachments';
+    // Awaiting a receiver yields to React. Do not retain that node across the
+    // await: reselect and take the preview baseline in the same dispatch frame.
+    const inputDeadline = performance.now() + 15000;
+    let input;
+    do {
+      const remaining = inputDeadline - performance.now();
+      if (remaining <= 0) throw new Error('timeout: live upload file input');
+      await waitFor(() => !!findUploadInputFor(files), 'upload file input', remaining, 250);
+      input = findUploadInputFor(files);
+    } while (!input || input.isConnected === false);
     const previewBaseline = composerFilePreviewState(files);
-    const input = await waitFor(() => findUploadInputFor(files), 'upload file input', 15000, 250);
+    const beforeDispatch = uploadPreviewDiagnostic(files, previewBaseline, input);
     const dt = new DataTransfer();
     for (const file of files) dt.items.add(file);
     input.files = dt.files;
@@ -2533,46 +3554,46 @@
     bridgeLog('gpt.' + eventPrefix + '.change_dispatched', {
       count: files.length,
       names: files.map(file => file.name),
+      bytes: files.map(file => file.size),
+      mimeTypes: files.map(file => file.type),
+      before: beforeDispatch,
+      after: uploadPreviewDiagnostic(files, previewBaseline, input),
     }, id, null);
 
-    const ok = await (async () => {
-      const t0 = performance.now();
-      while (performance.now() - t0 < 60000) {
-        if (composerHasFilePreview(files, previewBaseline)) return true;
-        await sleep(500);
-      }
-      return false;
-    })();
-    log(eventPrefix + '.preview_wait_done', { ok, count: files.length });
-    bridgeLog('gpt.' + eventPrefix + '.preview_wait_done', { ok, count: files.length }, id, null);
+    const receipt = await waitUploadPreview(id, files, previewBaseline, input, eventPrefix);
+    const { ok } = receipt;
+    log(eventPrefix + '.preview_wait_done', { ...receipt, count: files.length });
+    bridgeLog('gpt.' + eventPrefix + '.preview_wait_done', { ...receipt, count: files.length }, id, null);
     if (!ok && options.requirePreview) {
       throw new Error('chatgpt_attachment_preview_missing: ' + files.map(file => file.name).join(', '));
     }
+    const acceptedPreview = composerFilePreviewState(files);
     return {
       files,
-      hasPreview: () => composerHasFilePreview(files, previewBaseline),
+      hasPreview: () => composerHasFilePreview(files, previewBaseline, acceptedPreview),
     };
   }
 
   async function uploadAttachments(id, metas) {
     const list = Array.isArray(metas) ? metas : [];
-    if (!list.length) return [];
     const files = [];
     for (const meta of list) files.push(await fetchAttachmentFile(id, meta));
-    await uploadFiles(id, files, { requirePreview: true });
-    return files;
+    return await uploadFiles(id, files, { requirePreview: true });
   }
 
-  async function clickSend() {
+  async function clickSend(boundary = createTurnBoundary(), upload = null) {
     // Send-button рендерится только когда composer содержит текст или файл
     // (в idle вместо него кнопка голосового режима).
     const btn = await waitEnabledSendButton();
+    if (upload && !upload.hasPreview()) {
+      throw new Error('chatgpt_attachment_disappeared_before_submit: ' + upload.files.map(file => file.name).join(', '));
+    }
     btn.click();
-    if (await waitSubmitAccepted()) return;
+    if (await waitSubmitAccepted(boundary)) return;
     // Fallback: полный pointer-chain.
     const again = findSendBtn();
-    if (again) nativeMouseClick(again);
-    if (await waitSubmitAccepted()) return;
+    if (again && (!upload || upload.hasPreview())) nativeMouseClick(again);
+    if (await waitSubmitAccepted(boundary)) return;
     throw new Error('chatgpt_submit_failed: send click had no effect');
   }
 
@@ -2598,7 +3619,7 @@
       function checkNow() {
         if (done) return;
         const b = findSendBtn();
-        if (b && isVisible(b) && !isDisabled(b)) finish(b);
+        if (b && isVisible(b) && !isDisabled(b) && !findStopBtn()) finish(b);
       }
       function scheduleCheck() {
         if (done || checkPending) return;
@@ -2618,7 +3639,7 @@
     });
   }
 
-  function waitSubmitAccepted(timeoutMs = 120000) {
+  function waitSubmitAccepted(boundary, timeoutMs = 120000) {
     return new Promise(resolve => {
       let done = false;
       let checkPending = false;
@@ -2638,9 +3659,9 @@
       }
       function checkNow() {
         if (done) return;
-        // Успех: stop появился ИЛИ send исчез/стал неактивным (началась генерация).
-        const send = findSendBtn();
-        if (findStopBtn() || !send || !isVisible(send) || isDisabled(send)) finish(true);
+        // A fast reply may finish before Stop is observed. The new user turn
+        // proves submission; an idle/disabled Send on its own does not.
+        if (findStopBtn() || submittedUserElement(boundary)) finish(true);
       }
       function scheduleCheck() {
         if (done || checkPending) return;
@@ -2660,13 +3681,11 @@
     });
   }
 
-  // ── Extract: последний assistant-ответ ──────────────────────────────
-  function lastAssistantEl() {
-    const all = document.querySelectorAll('[data-message-author-role="assistant"]');
-    return all[all.length - 1] || null;
+  // ── Extract: принятый assistant-ответ текущего user-turn ─────────────
+  function assistantTurn(el) {
+    return el?.closest('[data-turn="assistant"], [data-testid^="conversation-turn-"], [data-content-search-turn-key]') || el;
   }
-  function readAnswerText() {
-    const el = lastAssistantEl();
+  function readAnswerText(el) {
     if (!el) return '';
     // У thinking-ответов (xhigh/pro) ДВА .markdown: сводка рассуждений
     // (.result-thinking.markdown) и финальный ответ. Thinking исключаем,
@@ -2674,39 +3693,44 @@
     const mds = Array.from(el.querySelectorAll('.markdown'))
       .filter(m => !m.classList.contains('result-thinking'));
     const md = mds[mds.length - 1];
+    // Current ChatGPT renders the answer in a semantic MarkdownRoot without
+    // the old .markdown class. Preserve paragraph breaks when layout is live;
+    // textContent remains the hidden-tab fallback.
+    if (!md) {
+      const current = el.querySelector('[data-markdown-text-style="assistant-message"]');
+      if (current) return (current.innerText || current.textContent || '').trim();
+    }
     // textContent first — innerText в hidden tab пуст (Blink не делает layout
     // для скрытых вкладок, innerText построен на layout). Тот же шрам что в
     // aistudio-core.js::parseLastTurn. Без этого watcher.done никогда не
     // срабатывал в фоновой вкладке: hasAnswer всегда 0.
     return ((md || el).textContent || (md || el).innerText || '').trim();
   }
-  function hasFinalAnswerAction() {
-    const el = lastAssistantEl();
+  function hasFinalAnswerAction(el) {
     if (!el) return false;
-    const turn = el.closest('[data-turn="assistant"], [data-testid^="conversation-turn-"]') || el;
-    return !!turn.querySelector('[data-testid="copy-turn-action-button"], [aria-label*="Копировать ответ"], [aria-label*="Copy response" i]');
+    const turn = assistantTurn(el);
+    return !!turn.querySelector('[data-testid="copy-turn-action-button"], [aria-label*="Копировать ответ"], [aria-label*="Copy response" i], button[aria-label="Копировать"], button[aria-label="Copy"]');
   }
   // «Думал на протяжении 2m 20s» — кнопка-сводка thinking-блока над ответом.
-  function readThinkingLine() {
-    const m = (document.body.textContent || '').match(/(?:Думал[а]? на протяжении|Thought for)\s+[^\n]{1,30}/g);
+  function readThinkingLine(el) {
+    const m = (assistantTurn(el)?.textContent || '').match(/(?:Думал[а]? на протяжении|Thought for)\s+[^\n]{1,30}/g);
     return m ? m[m.length - 1].trim() : null;
   }
-  function readThinkingText() {
-    const el = lastAssistantEl();
+  function readThinkingText(el) {
     if (!el) return '';
     const mds = Array.from(el.querySelectorAll('.markdown.result-thinking, .result-thinking.markdown'));
     const md = mds[mds.length - 1];
     return ((md?.textContent || md?.innerText || '')).trim();
   }
 
-  async function extractAnswerStable() {
+  async function extractAnswerStable(getAssistant) {
     // Ответ стримится прогрессивно; ждём стабилизации длины (2 пробы × 800мс),
     // cap 30с — паттерн perplexity-research.js::extractAnswerText шаг 2.
     const STABLE_REPS = 2, PROBE_MS = 800, MAX_MS = 30000;
     const t0 = performance.now();
     let lastLen = -1, stable = 0, best = '';
     while (performance.now() - t0 < MAX_MS) {
-      const txt = readAnswerText();
+      const txt = readAnswerText(getAssistant());
       if (txt) {
         best = txt;
         if (txt.length === lastLen) {
@@ -2719,14 +3743,15 @@
     return best;
   }
 
-  function collectGeneratedImages(excludeKeys) {
+  function collectGeneratedImages(excludeKeys, boundary = null) {
     const exclude = new Set(Array.isArray(excludeKeys) ? excludeKeys : []);
     const out = [];
     const lastUserTurn = lastUserConversationTurn();
     const containers = Array.from(document.querySelectorAll('div[id^="image-"]'));
     for (const c of containers) {
+      if (boundary && !belongsToSubmittedTurn(c, boundary)) continue;
       const turn = c.closest('[data-testid^="conversation-turn-"]');
-      if (lastUserTurn && turn && !(lastUserTurn.compareDocumentPosition(turn) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+      if (!boundary && lastUserTurn && turn && !(lastUserTurn.compareDocumentPosition(turn) & Node.DOCUMENT_POSITION_FOLLOWING)) {
         continue;
       }
       const imgs = Array.from(c.querySelectorAll('img[src]'));
@@ -2774,12 +3799,12 @@
     }
     return null;
   }
-  async function extractGeneratedImagesStable(excludeKeys) {
+  async function extractGeneratedImagesStable(excludeKeys, boundary) {
     const STABLE_REPS = 2, PROBE_MS = 800, MAX_MS = 30000;
     const t0 = performance.now();
     let stable = 0, lastSig = '', best = [];
     while (performance.now() - t0 < MAX_MS) {
-      const cur = collectGeneratedImages(excludeKeys);
+      const cur = collectGeneratedImages(excludeKeys, boundary);
       if (cur.length) {
         const sig = cur.map(x => x.key + ':' + x.width + 'x' + x.height).join('|');
         best = cur;
@@ -2825,23 +3850,181 @@
     return out;
   }
 
+  function importProofLogData(proof) {
+    return {
+      ready: !!proof?.ready,
+      reason: proof?.reason || null,
+      proofKind: proof?.proof_kind || null,
+      messageId: proof?.message_id || null,
+      textLen: proof?.text?.length || 0,
+      candidateMessageId: proof?.candidate_message_id || null,
+      candidateChannel: proof?.candidate_channel ?? null,
+      candidateEndTurn: proof?.candidate_end_turn ?? null,
+      candidatePreamble: !!proof?.candidate_preamble,
+      candidateStatus: proof?.candidate_status || null,
+      tailMessageId: proof?.tail_message_id || null,
+      tailRole: proof?.tail_role || null,
+      tailContentType: proof?.tail_content_type || null,
+    };
+  }
+
+  // Импорт по URL — это наблюдение уже существующего provider-turn, а не
+  // облегчённый research-submit. Он обязан пройти тот же строгий API-final
+  // proof, но никогда не открывает picker/composer и не вызывает Send.
+  // Зависимости инжектируются только для offline-regression fixtures.
+  async function runReadOnlyConversationImport(id, job, myTabId, deps = {}) {
+    const options = job?.options || {};
+    const snapshot = deps.snapshot || (() => latestApiTurnSnapshot(30000));
+    const updateState = deps.updateState || postState;
+    const writeTerminal = deps.writeTerminal || postTerminalState;
+    const wait = deps.wait || sleep;
+    const now = deps.now || (() => Date.now());
+    const currentUrl = deps.currentUrl || (() => {
+      const conversationId = chatgptConversationIdFromLocation();
+      return conversationId
+        ? `https://chatgpt.com/c/${encodeURIComponent(conversationId)}`
+        : location.href;
+    });
+    const currentTitle = deps.currentTitle || (() => document.title);
+    const getImages = deps.getImages || (() => collectGeneratedImages([], null));
+    const stabilizeImages = deps.stabilizeImages || (() => extractGeneratedImagesStable([], null));
+    const saveImages = deps.saveImages || (images => persistGeneratedImages(id, images));
+    const waitForFinal = options.importWaitForFinal === true;
+    const timeoutMs = Math.max(10000, Math.min(1800000,
+      Number(options.importTimeoutMs) || 1800000));
+    const startedAt = now();
+
+    await updateState(id, {
+      status: 'running', stage: 'importing', error: '',
+      ...(typeof myTabId === 'number' ? { tabId: myTabId } : {}),
+      url: currentUrl(), title: currentTitle(),
+    });
+    log('import.start', { waitForFinal, timeoutMs, tabId: myTabId });
+    bridgeLog('gpt.import.start', { waitForFinal, timeoutMs }, id, myTabId);
+
+    let proof = null;
+    let lastProbeError = null;
+    let waitingStatePosted = false;
+    while (true) {
+      try {
+        proof = await snapshot();
+        lastProbeError = null;
+      } catch (error) {
+        lastProbeError = error?.message || String(error);
+        proof = { ready: false, reason: 'api_probe_failed' };
+      }
+
+      const proofData = importProofLogData(proof);
+      log(proof?.ready ? 'import.api_final' : 'import.api_pending', proofData);
+      bridgeLog(proof?.ready ? 'gpt.import.api_final' : 'gpt.import.api_pending', proofData, id, myTabId);
+      if (proof?.ready) break;
+
+      if (!waitForFinal) {
+        if (lastProbeError) throw new Error(`chatgpt_import_read_failed: ${lastProbeError}`);
+        throw new Error('chatgpt_import_final_pending: current user-turn has no final');
+      }
+      const elapsed = now() - startedAt;
+      if (elapsed >= timeoutMs) {
+        throw new Error('chatgpt_import_final_timeout: timed out waiting for the current user-turn final');
+      }
+      if (!waitingStatePosted) {
+        waitingStatePosted = true;
+        await updateState(id, {
+          status: 'running', stage: 'import_waiting_final',
+          url: currentUrl(), title: currentTitle(),
+        });
+      }
+      await wait(Math.min(2000, timeoutMs - elapsed));
+    }
+
+    const answerText = String(proof.text || '');
+    const initialImages = getImages() || [];
+    const generatedImages = (initialImages.length || !answerText.trim())
+      ? await stabilizeImages()
+      : [];
+    const persistedImages = generatedImages.length ? await saveImages(generatedImages) : [];
+    const savedImageCount = persistedImages.filter(image => image?.file_path && !image?.error).length;
+    if (!answerText.trim() && savedImageCount === 0) {
+      throw new Error('chatgpt_import_empty_final: final has no extractable text or generated image');
+    }
+
+    const links = Array.isArray(proof.links) ? proof.links : [];
+    const allActivityItems = Array.isArray(proof.activity_items) ? proof.activity_items : [];
+    const includeActivity = options.importIncludeActivity === true;
+    const activityItems = includeActivity ? allActivityItems : [];
+    const reasoningText = String(proof.reasoning_text || '').trim();
+    let outText = answerText;
+    if (options.sources === true && links.length) {
+      const block = links.map((link, index) => `${index + 1}. ${link.title || link.url} — ${link.url}`).join('\n');
+      outText += `\n\n---\nИсточники (${links.length}):\n${block}`;
+    }
+    const isClarifying = outText.length > 0 && outText.length < 800 && /\?\s*$/.test(outText);
+    const result = {
+      url: currentUrl(),
+      title: proof.title || currentTitle(),
+      text: outText,
+      answer_text: answerText,
+      images: persistedImages,
+      image_count: savedImageCount,
+      reasoning_text: reasoningText || null,
+      text_kind: savedImageCount ? 'image' : 'answer',
+      is_image: savedImageCount > 0,
+      is_research: links.length > 0,
+      is_clarifying: isClarifying,
+      sources: links,
+      // API activity may contain complete file/tool payloads and can dwarf the
+      // answer. URL import is answer-first: keep it only behind an explicit
+      // forensic opt-in and store it once in sources_meta (not duplicated here).
+      source_activity: [],
+      sources_meta: {
+        activity: null,
+        activity_items: activityItems,
+        activity_count: allActivityItems.length,
+        activity_omitted: !includeActivity && allActivityItems.length > 0,
+        thinking: reasoningText ? [reasoningText] : [],
+        thinking_last: null,
+        thinking_text: reasoningText || null,
+        chip_present: false,
+        panel_opened: false,
+        source: 'api',
+      },
+      read_only_import: true,
+      source_message_id: proof.message_id || null,
+      final_proof_kind: proof.proof_kind || null,
+    };
+    const confirmed = await writeTerminal(id, {
+      status: 'done', stage: 'done',
+      url: result.url, title: result.title, result,
+    });
+    log('import.done', {
+      confirmed, messageId: result.source_message_id,
+      textLen: outText.length, images: savedImageCount, links: links.length,
+      activity: allActivityItems.length, activityIncluded: includeActivity,
+    });
+    bridgeLog('gpt.import.done', {
+      confirmed, messageId: result.source_message_id,
+      textLen: outText.length, images: savedImageCount, links: links.length,
+      activity: allActivityItems.length, activityIncluded: includeActivity,
+    }, id, myTabId);
+    return { confirmed, result, proof };
+  }
+
   // ── Источники (правая панель «Детали рассуждения») ──────────────────
   // Чип «Источники» в action-bar последнего ответа → клик → справа панель:
   //   Активность · 2m 20s / «Думал на протяжении X» / Источники · N / ссылки
   //   + activity/tool steps (GitHub fetches, bash/python command snippets).
   // Парсим ВСЕГДА; в text включается только при options.sources (см. main).
-  function findSourcesChip() {
-    const chips = Array.from(document.querySelectorAll('button[aria-label]'))
-      .filter(b => /^(Источники|Sources)$/i.test(b.getAttribute('aria-label') || '') && b.offsetParent);
-    return chips[chips.length - 1] || null;
+  function findSourcesChip(el) {
+    const turn = assistantTurn(el);
+    return turn ? findSourcesChipInTurn(turn) : null;
   }
   function findSourcesPanel() {
     return Array.from(document.querySelectorAll('section[aria-label]'))
       .find(s => /рассужден|reasoning/i.test(s.getAttribute('aria-label') || '') && s.offsetParent);
   }
-  async function extractSources() {
+  async function extractSources(el) {
     const out = { links: [], activity_items: [], activity: null, thinking: [], chip_present: false, panel_opened: false };
-    const chip = findSourcesChip();
+    const chip = findSourcesChip(el);
     if (!chip) { log('sources.no_chip'); return out; }
     out.chip_present = true;
     chip.click();
@@ -2984,9 +4167,9 @@
   }
 
   // ── Done-watcher ─────────────────────────────────────────────────────
-  // Базовое условие: stop-button исчез И (send ИЛИ voice виден) после quiet 3с.
-  // 3 состояния кнопки композера: голос (пусто) → отправить (текст) →
-  // остановить (стримит); done возвращает голос/отправить.
+  // API observation of an already-submitted turn does not depend on the
+  // composer being rendered. Stop/quiet and own-turn DOM proof still guard
+  // DOM fallback; a missing idle button is not proof of provider inactivity.
   //
   // escalation — render-freeze fallback. В hidden tab ChatGPT НЕ коммитит
   // streamed-токены ответа в DOM (message-узел есть, textContent пуст даже
@@ -2997,7 +4180,7 @@
   // мгновенный done. Решение как в aistudio-mcp.js::studio_ready: один раз
   // __sc_focus_self (кратко на передний план) → React дорисовывает → done →
   // restore фокуса в done-handler'е main().
-  function startDoneWatcher(onDone, onProgress, escalation, getDoneImages, terminalProbe) {
+  function startDoneWatcher(onDone, onProgress, escalation, getDoneImages, terminalProbe, boundary, options = {}) {
     let stopAppeared = false;
     let lastUrl = location.href;
     const armedAt = Date.now();
@@ -3007,15 +4190,29 @@
     // логин-волл и т.п.). 120с с запасом: Pro-режимы стартуют генерацию
     // мгновенно (stop появляется <1с, живой probe), долгая фаза — само мышление.
     const NO_STOP_FAIL_MS = 120000;
+    // После исчезновения Stop backend может на несколько секунд показать
+    // commentary/tool хвост раньше настоящего final. Это нормальная eventual
+    // consistency, поэтому одного pending-снимка недостаточно. Но если
+    // ChatGPT уже вернулся в idle, а один и тот же незавершённый API-хвост
+    // не меняется пять минут, provider-turn фактически оборван: новый финал
+    // нельзя получить дополнительным polling/WebSocket без нового сообщения.
+    const INCOMPLETE_FINAL_GRACE_MS = 5 * 60 * 1000;
+    const INCOMPLETE_FINAL_MAX_SAMPLE_GAP_MS = 90 * 1000;
     let lastStopSeenAt = 0;
     let fired = false;
     let terminalProbePending = false;
     let lastTerminalProbeAt = 0;
     let lastTerminalProbeSig = '';
+    let pendingFinalSig = '';
+    let pendingFinalSince = 0;
+    let pendingFinalLastSeenAt = 0;
+    let pendingFinalSamples = 0;
+    let pendingFinalStagePosted = false;
 
     const requestDone = (meta) => {
       if (typeof terminalProbe !== 'function') {
-        onDone(meta);
+        if (!meta.domReady) return false;
+        onDone({ ...meta, assistant: assistantTarget(submittedAssistantElement(boundary)) });
         return true;
       }
       const now = Date.now();
@@ -3026,26 +4223,129 @@
         .then(() => terminalProbe(meta))
         .then((proof) => {
           terminalProbePending = false;
-          if (fired) return;
+          // Stop can return while the API request is in flight. Do not commit
+          // a candidate (including provider_incomplete) over live generation.
+          if (fired || findStopBtn()) return;
           const sig = `${proof?.ready ? 1 : 0}|${proof?.reason || ''}|${proof?.message_id || ''}`;
           if (sig !== lastTerminalProbeSig) {
             lastTerminalProbeSig = sig;
             const data = {
+              watcherRevision: WATCHER_REVISION,
+              observationReason: meta.observationReason || 'stop_quiet',
+              domReady: !!meta.domReady,
+              uiIdle: !!meta.uiIdle,
+              userId: proof?.user_id || null,
+              conversationId: proof?.conversation_id || null,
               ready: !!proof?.ready,
               reason: proof?.reason || null,
+              proofKind: proof?.proof_kind || null,
               messageId: proof?.message_id || null,
               textLen: proof?.text?.length || 0,
+              candidateMessageId: proof?.candidate_message_id || null,
+              candidateChannel: proof?.candidate_channel ?? null,
+              candidateEndTurn: proof?.candidate_end_turn ?? null,
+              candidatePreamble: !!proof?.candidate_preamble,
+              candidateStatus: proof?.candidate_status || null,
+              tailMessageId: proof?.tail_message_id || null,
+              tailRole: proof?.tail_role || null,
+              tailContentType: proof?.tail_content_type || null,
             };
             log(proof?.ready ? 'watcher.api_final' : 'watcher.api_pending', data);
             bridgeLog(proof?.ready ? 'gpt.watcher.api_final' : 'gpt.watcher.api_pending', data, getRequestId(), null);
           }
-          if (!proof?.ready) return;
+          if (!proof?.ready) {
+            const providerIdle = (meta.stopWasSeen || boundary?.resumed)
+              && meta.uiIdle
+              && meta.quietPassed
+              && !meta.domReady;
+            const incompleteTail = proof?.reason === 'api_final_pending'
+              && !!proof?.user_id
+              && !!proof?.candidate_message_id
+              && proof?.candidate_channel === 'commentary'
+              && proof?.candidate_preamble === true
+              && !!proof?.tail_message_id;
+            if (providerIdle && incompleteTail) {
+              const pendingSig = [
+                proof.user_id,
+                proof.candidate_message_id,
+                proof.tail_message_id,
+                proof.tail_role || '',
+                proof.tail_content_type || '',
+              ].join('|');
+              if (pendingSig !== pendingFinalSig) {
+                pendingFinalSig = pendingSig;
+                pendingFinalSince = Date.now();
+                pendingFinalLastSeenAt = pendingFinalSince;
+                pendingFinalSamples = 1;
+                const data = {
+                  candidateMessageId: proof.candidate_message_id,
+                  tailMessageId: proof.tail_message_id,
+                  tailRole: proof.tail_role || null,
+                  tailContentType: proof.tail_content_type || null,
+                };
+                log('watcher.api_progress', data);
+                bridgeLog('gpt.watcher.api_progress', data, getRequestId(), null);
+              } else {
+                const now = Date.now();
+                // Нельзя назвать хвост стабильным, если API был недоступен
+                // слишком долго: за этот разрыв graph мог измениться и снова
+                // вернуться к похожей форме. Нужна непрерывная серия proof'ов.
+                if (now - pendingFinalLastSeenAt > INCOMPLETE_FINAL_MAX_SAMPLE_GAP_MS) {
+                  pendingFinalSince = now;
+                  pendingFinalSamples = 1;
+                } else {
+                  pendingFinalSamples += 1;
+                }
+                pendingFinalLastSeenAt = now;
+              }
+              if (!pendingFinalStagePosted) {
+                pendingFinalStagePosted = true;
+                onProgress({
+                  stage: 'waiting_provider_final',
+                  url: meta.url,
+                  title: meta.title,
+                });
+              }
+              const stableMs = Date.now() - pendingFinalSince;
+              if (pendingFinalSamples >= 2 && stableMs >= INCOMPLETE_FINAL_GRACE_MS) {
+                const data = {
+                  stableMs,
+                  samples: pendingFinalSamples,
+                  candidateMessageId: proof.candidate_message_id,
+                  tailMessageId: proof.tail_message_id,
+                  tailRole: proof.tail_role || null,
+                  tailContentType: proof.tail_content_type || null,
+                };
+                log('watcher.provider_incomplete', data);
+                bridgeLog('gpt.watcher.provider_incomplete', data, getRequestId(), null);
+                fired = true;
+                onProgress({
+                  stage: 'provider_incomplete',
+                  url: meta.url,
+                  title: meta.title,
+                  providerProof: data,
+                });
+              }
+            }
+            return;
+          }
+          const assistant = submittedAssistantElement(boundary);
+          const imageCount = typeof getDoneImages === 'function' ? getDoneImages().length : 0;
+          const domReady = !!submittedUserElement(boundary)
+            && ((readAnswerText(assistant).length > 0 && hasFinalAnswerAction(assistant)) || imageCount > 0);
+          // API failure/Temporary Chat still use DOM, but only a final after
+          // this submission. Old Copy/Voice controls cannot finish a new job.
+          if (proof.fallback && (!domReady || findStopBtn())) return;
+          // Image-only API finals can precede decoded DOM images. Preserve
+          // the media wait instead of committing an empty result immediately.
+          if (!proof.fallback && !proof.text?.trim() && !domReady) return;
           fired = true;
-          onDone({ ...meta, apiFinal: proof });
+          onDone({ ...meta, imageCount, assistant: assistantTarget(assistant, proof.fallback ? null : proof), apiFinal: proof });
         })
         .catch((error) => {
           terminalProbePending = false;
-          const data = { err: error?.message || String(error) };
+          const data = { err: error?.message || String(error), watcherRevision: WATCHER_REVISION,
+            observationReason: meta.observationReason || 'stop_quiet' };
           log('watcher.api_probe_failed', data);
           bridgeLog('gpt.watcher.api_probe_failed', data, getRequestId(), null);
         });
@@ -3059,7 +4359,18 @@
       const send = findSendBtn();
       const voice = findVoiceBtn();
       const now = Date.now();
-      if (stop) { stopAppeared = true; lastStopSeenAt = now; }
+      if (stop) {
+        stopAppeared = true;
+        lastStopSeenAt = now;
+        // Возобновившийся Stop — самостоятельное доказательство новой
+        // provider-активности. Старое окно «хвост не меняется» больше не
+        // относится к текущему состоянию.
+        pendingFinalSig = '';
+        pendingFinalSince = 0;
+        pendingFinalLastSeenAt = 0;
+        pendingFinalSamples = 0;
+        pendingFinalStagePosted = false;
+      }
       if (location.href !== lastUrl) {
         lastUrl = location.href;
         onProgress({ stage: 'running', url: lastUrl, title: document.title });
@@ -3071,24 +4382,45 @@
       const sig = [!!stop, !!send, !!voice, stopAppeared, quietPassed].join(',');
       if (sig !== lastTickSig) {
         lastTickSig = sig;
-        const dbg = { n: tickN, stop: !!stop, send: !!send, voice: !!voice, stopAppeared, quiet: quietPassed, vis: document.visibilityState };
+        const dbg = { n: tickN, stop: !!stop, send: !!send, voice: !!voice, stopAppeared,
+          quiet: quietPassed, vis: document.visibilityState, watcherRevision: WATCHER_REVISION };
         log('watcher.tick', dbg);
         bridgeLog('gpt.watcher.tick', dbg, getRequestId(), null);
       }
       if (!armed) return false;
       const imageCount = typeof getDoneImages === 'function' ? getDoneImages().length : 0;
-      const hasAnswer = readAnswerText().length > 0 && hasFinalAnswerAction();
+      const assistant = submittedAssistantElement(boundary);
+      const hasAnswer = readAnswerText(assistant).length > 0 && hasFinalAnswerAction(assistant);
+      const domReady = hasAnswer || imageCount > 0;
       if (!stopAppeared) {
-        if ((hasAnswer || imageCount > 0) && (send || voice)) {
-          if (!terminalProbePending) {
+        // На reload Stop уже закономерно отсутствует. Такой watcher не имеет
+        // права задним числом объявлять доказанную исходную отправку
+        // submit_failed только потому, что DOM/API ещё не гидратировали user.
+        if (!boundary?.resumed
+            && now - armedAt > NO_STOP_FAIL_MS
+            && !submittedUserElement(boundary)
+            && !boundary.userId) {
+          onProgress({ stage: 'submit_failed' });
+          return true;
+        }
+        const submitted = boundary?.resumed || boundary?.userId || submittedUserElement(boundary);
+        if (submitted || send || voice) {
+          if (domReady && !terminalProbePending) {
             log('watcher.done_without_stop', { hasAnswer, imageCount });
             bridgeLog('gpt.watcher.done_without_stop', { hasAnswer, imageCount }, getRequestId(), null);
           }
-          return requestDone({ url: location.href, title: document.title, imageCount });
-        }
-        if (now - armedAt > NO_STOP_FAIL_MS) {
-          onProgress({ stage: 'submit_failed' });
-          return true; // terminal
+          return requestDone({
+            url: location.href,
+            title: document.title,
+            imageCount,
+            domReady,
+            stopWasSeen: false,
+            uiIdle: !!(send || voice),
+            observationReason: boundary?.resumed ? 'resumed_turn' : submitted ? 'submitted_turn' : 'ui_idle',
+            // API final proof is independent of idle UI. Incomplete-provider
+            // diagnosis still needs a recognized idle state, not absent DOM.
+            quietPassed: !!boundary?.resumed && !!(send || voice),
+          });
         }
         return false;
       }
@@ -3099,13 +4431,21 @@
         // hidden-tab render-freeze (см. комментарий над watcher'ом). Просим
         // main() один раз сфокусировать вкладку — React дорисует за <1с.
         if (escalation && quietPassed) escalation();
-        return false;
       }
-      if (!terminalProbePending) {
+      if (domReady && !terminalProbePending) {
         log('watcher.done', { stop_seen: stopAppeared, hasAnswer, imageCount });
         bridgeLog('gpt.watcher.done', { stop_seen: stopAppeared, hasAnswer, imageCount }, getRequestId(), null);
       }
-      return requestDone({ url: location.href, title: document.title, imageCount });
+      return requestDone({
+        url: location.href,
+        title: document.title,
+        imageCount,
+        domReady,
+        stopWasSeen: stopAppeared,
+        quietPassed,
+        uiIdle: !!(send || voice),
+        observationReason: 'stop_quiet',
+      });
     };
 
     const wrappedTick = () => {
@@ -3130,6 +4470,13 @@
     window.__scResearchPoke = pokeHandler;
 
     const hardTimer = setTimeout(() => {
+      // Pro can legitimately think longer than the old 30-minute transport
+      // ceiling. Keep its real completion observer alive; a wall-clock
+      // milestone is not a provider failure or permission to duplicate work.
+      if (options.extended === true) {
+        if (!fired) onProgress({ stage: 'waiting_extended', url: location.href, title: document.title });
+        return;
+      }
       try { mo.disconnect(); } catch {}
       clearInterval(iv);
       if (!fired) onProgress({ stage: 'timeout', url: location.href });
@@ -3190,6 +4537,8 @@
       const effortKey = resolveEffort(job.effort);
       const modelKey = resolveModel(job.model);
       const speedKey = mode === 'work' ? resolveSpeed(job.speed) : null;
+      const selectionError = chatgptSelectionError(mode, modelKey, effortKey);
+      if (selectionError) throw new Error(selectionError);
       log('compose.payload', {
         id,
         promptLen: job.prompt.length,
@@ -3224,17 +4573,20 @@
         return;
       }
 
-      await waitFor(() => findComposer(), 'composer (#prompt-textarea — логин?)', 20000);
+      await waitFor(() => findComposer(), 'composer (editable ChatGPT input)', 20000);
       const okMode = await ensureChatgptModeSelected(mode);
       if (!okMode) throw new Error(`chatgpt_mode_select_failed: не удалось выбрать ChatGPT · ${chatgptModeLabel(mode)}`);
       await waitFor(() => findComposer(), 'composer after Chat/Work selection', 15000);
-      const okModel = await ensureModelSelected(modelKey);
+      const okModel = await ensureModelSelected(modelKey, mode);
       if (!okModel) throw new Error(`chatgpt_model_select_failed: не удалось выбрать модель ${modelDisplay(modelKey)}`);
-      const okEffort = await ensureEffortSelected(effortKey);
+      const okEffort = await ensureEffortSelected(effortKey, mode, modelKey);
       if (!okEffort) throw new Error(`chatgpt_effort_select_failed: не удалось выбрать интеллект ${effortLabel(effortKey)}`);
       if (mode === 'work') {
         const okSpeed = await ensureSpeedSelected(speedKey);
         if (!okSpeed) throw new Error(`chatgpt_speed_select_failed: не удалось выбрать скорость ${speedLabel(speedKey)}`);
+      }
+      if (!await verifyChatgptSelection(mode, modelKey, effortKey)) {
+        throw new Error('chatgpt_selection_verify_failed: фактическая модель или усилие не совпали с запросом');
       }
 
       let uploadedDocument = null;
@@ -3276,14 +4628,14 @@
       await waitComposerReadyAfterPaste(id, 120000, [
         inlineText || job.prompt,
         uploadedDocument?.name || '',
-      ]);
+      ], uploadedDocument ? [uploadedDocument.name] : []);
       if (uploadedDocument && !documentUpload?.hasPreview()) {
         throw new Error('chatgpt_attachment_disappeared_before_submit: ' + uploadedDocument.name);
       }
       if (requirePastedTextChip && !findPastedTextChip()) {
         throw new Error('chatgpt_pasted_text_attachment_disappeared_before_submit');
       }
-      await clickSend();
+      await clickSend(undefined, documentUpload);
       submitted = true;
       job = await updateComposeJob(id, {
         submitAcceptedAt: Date.now(),
@@ -3336,21 +4688,29 @@
 
   async function main() {
     const myTabId = await getMyTabId();
+    const composeId = getComposeId();
+    const initialResearchId = composeId ? null : getRequestId();
     const bootInfo = {
       url: location.href, query: location.search || '',
       hasWindowName: !!window.name, windowName: (window.name || '').slice(0, 80),
-      visibility: document.visibilityState, tabId: myTabId,
+      visibility: document.visibilityState, tabId: myTabId, pickerRevision: PICKER_REVISION,
+      attachmentUploadRevision: UPLOAD_REVISION,
+      composerReadinessRevision: COMPOSER_READINESS_REVISION,
+      watcherRevision: WATCHER_REVISION,
     };
     log('cs.boot', bootInfo);
+    const startupBoot = await markResearchStartupBoot(initialResearchId, myTabId);
+    if (!startupBoot?.ok && initialResearchId) {
+      log('cs.startup_boot_ack_failed', { err: startupBoot?.error || 'unknown' });
+    }
     bridgeLog('cs.boot', bootInfo, null, myTabId);
 
-    const composeId = getComposeId();
     if (composeId) {
       await runComposeHandoff(composeId, myTabId);
       return;
     }
 
-    let id = getRequestId();
+    let id = initialResearchId;
     let recovered = false;
     if (!id) {
       log('main.no_id_try_recover');
@@ -3378,6 +4738,45 @@
       return;
     }
 
+    if (job.options?.readOnlyImport === true) {
+      const keepTabAfterDone = scKeepResearchTabAfterDone(job.options);
+      try {
+        window.scResearchBadge?.show({
+          jobId: id,
+          providerLabel: 'ChatGPT · импорт по ссылке',
+          modelTitle: 'Только чтение',
+          prompt: '',
+        });
+      } catch {}
+      try {
+        const imported = await runReadOnlyConversationImport(id, job, myTabId);
+        stopHb();
+        try { window.scResearchBadge?.hide(); } catch {}
+        await detachFocusEmulation(myTabId);
+        if (imported.confirmed) {
+          stopKeepAlive();
+          if (keepTabAfterDone) log('import.keep_tab_open');
+          else closeSelfTab('conversation_import_done');
+        } else {
+          log('import.unconfirmed_keep_tab_open');
+        }
+      } catch (error) {
+        const message = error?.message || String(error);
+        log('import.flow_err', { err: message });
+        bridgeLog('gpt.import.error', { err: message }, id, myTabId);
+        const confirmed = await postTerminalState(id, {
+          status: 'error', stage: 'import_failed',
+          url: location.href, title: document.title, error: message,
+        });
+        stopHb();
+        if (confirmed) stopKeepAlive();
+        try { window.scResearchBadge?.hide(); } catch {}
+        await detachFocusEmulation(myTabId);
+        // Ошибка импорта оставляет вкладку открытой для ручной проверки.
+      }
+      return;
+    }
+
     // options.model и options.effort — разные оси: tier модели и уровень
     // рассуждения. Раньше effort фолбэчился на options.model — теперь model
     // занят настоящей моделью, фолбэк убран.
@@ -3385,6 +4784,7 @@
     const effortKey = resolveEffort(job.options?.effort);
     const modelKey = resolveModel(job.options?.model);
     const speedKey = mode === 'work' ? resolveSpeed(job.options?.speed) : null;
+    const selectionError = chatgptSelectionError(mode, modelKey, effortKey);
     const wantSourcesInText = !!job.options?.sources;
     const keepTabAfterDone = scKeepResearchTabAfterDone(job.options);
     const attachmentMetas = Array.isArray(job.attachments) ? job.attachments : [];
@@ -3403,21 +4803,20 @@
     // только watcher, никакого повторного paste (иначе дубль-сообщение в чате).
     const isReloadRestart = recovered || job.status === 'running';
     const imageBaselineKeys = collectGeneratedImageKeys();
-    let apiBaselineFinalId = null;
+    let apiBaseline = null;
     if (!isReloadRestart) {
       try {
-        const baseline = await latestApiTurnSnapshot();
-        if (baseline.ready) apiBaselineFinalId = baseline.message_id || null;
+        apiBaseline = await latestApiTurnSnapshot();
       } catch (error) {
         log('api.baseline_failed', { err: error?.message || String(error) });
       }
     }
-    let apiProbeFailures = 0;
+    let turnBoundary = isReloadRestart ? createTurnBoundary(null, true, { prompt: job.prompt }) : null;
 
     try {
-      await waitFor(() => findComposer(), 'composer (#prompt-textarea — логин?)', 20000);
       if (!isReloadRestart) {
-        await postState(id, { status: 'running', stage: 'configuring',
+        await waitFor(() => findComposer(), 'composer (editable ChatGPT input)', 20000);
+        await postState(id, { status: 'running', stage: 'configuring', error: '',
           ...(typeof myTabId === 'number' ? { tabId: myTabId } : {}) });
         const failConfiguration = async (error) => {
           const ok = await postTerminalState(id, {
@@ -3428,24 +4827,28 @@
           if (ok) stopKeepAlive(); // не подтвердилось → порт живой, fallback вооружён
           try { window.scResearchBadge?.hide(); } catch {}
         };
+        if (selectionError) {
+          await failConfiguration(selectionError);
+          return;
+        }
 
         // Режим выбирается первым: переключение Chat/Work может пересобрать
         // composer и вернуть sticky-модель/уровень этого режима. После него
         // отдельно верифицируем модель и интеллект. Любое несовпадение fatal:
         // ответ на другом режиме/модели/уровне хуже явной ошибки.
-        const okMode = await ensureChatgptModeSelected(mode);
+        const okMode = await ensureChatgptModeSelected(mode, job.conversationModeProof);
         if (!okMode) {
           await failConfiguration(`chatgpt_mode_select_failed: не удалось выбрать ChatGPT · ${chatgptModeLabel(mode)}`);
           return;
         }
         await waitFor(() => findComposer(), 'composer after Chat/Work selection', 15000);
 
-        const okModel = await ensureModelSelected(modelKey);
+        const okModel = await ensureModelSelected(modelKey, mode);
         if (!okModel) {
           await failConfiguration(`chatgpt_model_select_failed: не удалось выбрать модель ${modelDisplay(modelKey)} (ChatGPT помнит модель per-аккаунт — мог ответить прошлой)`);
           return;
         }
-        const okEffort = await ensureEffortSelected(effortKey);
+        const okEffort = await ensureEffortSelected(effortKey, mode, modelKey);
         if (!okEffort) {
           await failConfiguration(`chatgpt_effort_select_failed: не удалось выбрать интеллект ${effortLabel(effortKey)} (запрос не отправлен с другим sticky-уровнем)`);
           return;
@@ -3457,19 +4860,26 @@
             return;
           }
         }
-        let uploadedAttachmentFiles = [];
+        if (!await verifyChatgptSelection(mode, modelKey, effortKey)) {
+          await failConfiguration('chatgpt_selection_verify_failed: фактическая модель или усилие не совпали с запросом');
+          return;
+        }
+        let attachmentUpload = null;
         if (attachmentMetas.length) {
           await postState(id, { stage: 'uploading' });
-          uploadedAttachmentFiles = await uploadAttachments(id, attachmentMetas);
+          attachmentUpload = await uploadAttachments(id, attachmentMetas);
           await sleep(800);
         }
         await postState(id, { stage: 'submitting' });
         pasteIntoComposer(job.prompt);
         await waitComposerReadyAfterPaste(id, 120000, [
           job.prompt,
-          ...uploadedAttachmentFiles.map(file => file.name),
-        ]);
-        await clickSend();
+          ...(attachmentUpload?.files || []).map(file => file.name),
+        ], (attachmentUpload?.files || []).map(file => file.name));
+        // Capture rendered history immediately before Send, after all composer
+        // configuration/paste awaits; a missing API baseline still has a DOM boundary.
+        turnBoundary = createTurnBoundary(apiBaseline);
+        await clickSend(turnBoundary, attachmentUpload);
         await postState(id, { stage: 'running' });
       } else {
         log('main.skip_submit_after_reload');
@@ -3514,13 +4924,14 @@
             while (document.visibilityState === 'hidden' && performance.now() - tf < 4000) await sleep(200);
             await sleep(800); // дать React дорисовать после unfreeze
           }
-          const text = apiFinal?.text || await extractAnswerStable();
+          const getAssistant = () => submittedAssistantElement(turnBoundary, final.assistant);
+          const text = apiFinal?.text || await extractAnswerStable(getAssistant);
           const generatedImages = final.imageCount > 0
-            ? await extractGeneratedImagesStable(imageBaselineKeys)
+            ? await extractGeneratedImagesStable(imageBaselineKeys, turnBoundary)
             : [];
           const persistedImages = await persistGeneratedImages(id, generatedImages);
-          const thinkingLine = readThinkingLine();
-          const thinkingText = apiFinal?.reasoning_text || readThinkingText();
+          const thinkingLine = readThinkingLine(getAssistant());
+          const thinkingText = apiFinal?.reasoning_text || readThinkingText(getAssistant());
           // Источники парсим ВСЕГДА (в result.sources). В text — только по
           // options.sources: дефолтный ответ чистый, источники по параметру.
           const src = apiFinal
@@ -3533,7 +4944,7 @@
                 panel_opened: false,
                 source: 'api',
               }
-            : await extractSources();
+            : await extractSources(getAssistant());
           let outText = text || '';
           if (wantSourcesInText && src.links.length) {
             const block = src.links.map((l, i) => `${i + 1}. ${l.title || l.url} — ${l.url}`).join('\n');
@@ -3612,30 +5023,31 @@
             try { window.scResearchBadge?.hide(); } catch {}
             return;
           }
+          if (prog.stage === 'provider_incomplete') {
+            const ok = await postTerminalState(id, {
+              status: 'error',
+              stage: 'provider_incomplete',
+              url: prog.url,
+              title: prog.title,
+              error: 'ChatGPT прекратил генерацию без финального ответа: остался стабильный commentary/tool-хвост. Новый запрос автоматически не отправлялся.',
+            });
+            try { stopWatcher(); } catch {}
+            stopHb();
+            if (ok) stopKeepAlive();
+            try { window.scResearchBadge?.hide(); } catch {}
+            restoreFocus();
+            await detachFocusEmulation(myTabId);
+            // Разговор сохраняем открытым: пользователь может прочитать
+            // промежуточный след и осознанно отправить continuation.
+            return;
+          }
           await postState(id, { stage: prog.stage, url: prog.url, title: prog.title });
         },
         escalateFocus,
-        () => collectGeneratedImages(imageBaselineKeys),
-        async () => {
-          try {
-            const proof = terminalProofForCurrentPage(await latestApiTurnSnapshot(8000));
-            apiProbeFailures = 0;
-            if (proof.ready && apiBaselineFinalId && proof.message_id === apiBaselineFinalId) {
-              return { ...proof, ready: false, reason: 'api_final_same_as_baseline' };
-            }
-            return proof;
-          } catch (error) {
-            apiProbeFailures++;
-            if (apiProbeFailures >= 3) {
-              return {
-                ready: true,
-                fallback: true,
-                reason: 'api_unavailable_dom_fallback',
-              };
-            }
-            throw error;
-          }
-        }
+        () => collectGeneratedImages(imageBaselineKeys, turnBoundary),
+        createTerminalProbe(turnBoundary),
+        turnBoundary,
+        { extended: effortKey === 'pro' }
       );
     } catch (e) {
       const msg = e?.message || String(e);

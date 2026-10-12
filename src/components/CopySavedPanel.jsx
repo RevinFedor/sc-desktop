@@ -45,7 +45,7 @@ export default function CopySavedPanel({
   const [topicId, setTopicId] = useState(null)        // null = все темы
   // Append per-post comment threads to each post in the assembled output.
   // Default off — копировать только посты по умолчанию (как и было), комменты
-  // явный opt-in. См. methodology/design.md::Default = безопасный для денег.
+  // явный opt-in. См. methodology/дизайн-принципы.md::Default = безопасный для денег.
   const [withComments, setWithComments] = useState(false)
 
   // The current items version for this source — re-runs estimate after a

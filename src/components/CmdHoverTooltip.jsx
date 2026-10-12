@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
 
 // Cmd+hover tooltip, anchored to a trigger element. Implements the
-// methodology/переносимый-дизайн pattern (tooltip-resize-modal.md):
+// methodology/дизайн-принципы pattern (tooltip-resize-modal.md):
 //
 //   • visible = cmdPressed && triggerHovered  — opt-in, never on bare hover, so
 //     sliding the mouse across the action-row doesn't spray popovers.

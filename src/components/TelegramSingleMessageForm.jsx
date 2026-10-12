@@ -142,6 +142,12 @@ const TelegramSingleMessageForm = forwardRef(function TelegramSingleMessageForm(
         // engine selector below before pressing Enter.
         transcribe_engine: 'assemblyai',
         transcribe_lang:   'ru',
+        // A pasted message link means «read this message», including its one
+        // Telegram attachment. Python only executes the branch matching the
+        // actual type, so these flags do not download unrelated media.
+        process_voice: true,
+        process_photo: true,
+        process_docs:  true,
         // Comments side-fetch — split-chip «+ comm» on PasteScreen sets
         // the prop, or post-hoc «↻ Получить» on the Комментарии done-row
         // sets it via loadComments(). job-runner buffers the
@@ -231,7 +237,7 @@ const TelegramSingleMessageForm = forwardRef(function TelegramSingleMessageForm(
 
   // Combined-copy lives in the header (right of the title) — keeps the
   // primary done-row uncluttered and matches the «empty space → primary
-  // action» rule from methodology/design.md. Only visible when both files
+  // action» rule from methodology/дизайн-принципы.md. Only visible when both files
   // exist AND there are actually comments to combine — concatenating an
   // «under this post there are no comments» placeholder onto the message
   // is just noise in the clipboard.
@@ -240,6 +246,13 @@ const TelegramSingleMessageForm = forwardRef(function TelegramSingleMessageForm(
     && !!job?.file_path_comments
     && !!job?.file_path
     && commentsCollected > 0
+  const attachmentName = job?.tg_attachment?.file_name || null
+  const attachmentProcessed = Object.values(job?.media_phase || {})
+    .some(slot => Number(slot?.done || 0) > 0)
+  const messageSub = [
+    job?.entity_title || null,
+    attachmentName ? `${attachmentName}${attachmentProcessed ? ' · прочитан' : ''}` : null,
+  ].filter(Boolean).join(' · ') || null
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-6">
       <div className="flex items-start gap-3 mb-4">
@@ -265,7 +278,7 @@ const TelegramSingleMessageForm = forwardRef(function TelegramSingleMessageForm(
       {/* Step indicator: a TG single-message run is two distinct phases
           and the user shouldn't see them as one anonymous spinner.
             1. Fetch metadata via Telethon          (text + has_media)
-            2. If voice/audio → download + transcribe via AssemblyAI/Gemini
+            2. If media exists → process the concrete attachment type
           We render both rows always (after fetch starts), each with its own
           state: pending · running · done · skipped. */}
       {(stage === 'idle' || stage === 'fetching') && (
@@ -274,52 +287,37 @@ const TelegramSingleMessageForm = forwardRef(function TelegramSingleMessageForm(
             label="Загружаем сообщение"
             state={
               stage === 'idle' ? 'pending' :
-              stage === 'fetching' && !job?.tg_voice?.stage ? 'running' :
+              stage === 'fetching' && !Object.keys(job?.type_breakdown || {}).length ? 'running' :
               'done'
             }
           />
-          {/* Voice step: only visible once we know whether the message has
-              audio. The "skipped" state appears for text-only messages so
-              the user understands why nothing's happening on this row. */}
+          {/* Attachment step appears only after Telegram reports the physical
+              message type. Text-only messages need no artificial second row. */}
           {(() => {
-            // First TG event with item data is what tells us whether voice
-            // exists. Until then we don't commit to a state for this row.
-            const item   = job?.params ? null : null
-            const tv     = job?.tg_voice
-            const isAudioMsg =
-              job?.type_breakdown && (job.type_breakdown.voice || job.type_breakdown.audio)
-            // While metadata is still loading, we don't know yet — hide row
-            // until either tg_voice info shows up or job moves to done.
-            const knowAudio = !!tv || !!isAudioMsg
-            if (!knowAudio) return null
-            const needTranscribe = !!tv || isAudioMsg
-            if (!needTranscribe) {
-              return (
-                <StepRow
-                  label="Транскрибируем голосовое"
-                  state="skipped"
-                  hint="нет голосового — только текст"
-                />
-              )
-            }
-            const eng = tv?.engine || 'assemblyai'
-            // AAI emits 'uploading' → 'queued' → 'transcribing' (repeats) →
-            // 'completed'; Gemini stays on 'downloading' → 'transcribing'.
-            // 'done' is the final synthesised state when transcript landed.
-            const state =
-              tv?.stage === 'done'         ? 'done' :
-              tv?.stage === 'completed'    ? 'done' :
-              tv?.stage === 'transcribing' ? 'running' :
-              tv?.stage === 'queued'       ? 'running' :
-              tv?.stage === 'uploading'    ? 'running' :
-              tv?.stage === 'downloading'  ? 'running' :
-              tv?.stage === 'error'        ? 'error' :
-              stage === 'done'             ? 'done' :
-              'pending'
-            const subLabel = formatVoiceSubLabel(tv, eng)
+            const breakdown = job?.type_breakdown || {}
+            const type = ['voice', 'audio', 'video', 'photo', 'document']
+              .find(key => Number(breakdown[key] || 0) > 0)
+            if (!type) return null
+            const kind = type === 'photo' ? 'photo' : type === 'document' ? 'pdf' : 'voice'
+            const phase = job?.media_phase?.[kind] || null
+            const current = phase?.current || null
+            const label = kind === 'photo'
+              ? 'Описываем фото'
+              : kind === 'pdf'
+                ? 'Читаем документ'
+                : type === 'video' ? 'Транскрибируем видео' : 'Транскрибируем аудио'
+            const engine = current?.engine || (kind === 'voice' ? 'assemblyai' : null)
+            const state = phase?.errors > 0 ? 'error'
+              : phase?.done > 0 ? 'done'
+                : phase?.skipped > 0 ? 'skipped'
+                  : current ? 'running'
+                    : stage === 'done' ? 'done' : 'pending'
+            const subLabel = kind === 'voice'
+              ? formatVoiceSubLabel(job?.tg_voice, engine)
+              : current?.file_name || current?.stage || null
             return (
               <StepRow
-                label={`Транскрибируем голосовое · ${eng}`}
+                label={`${label}${engine ? ` · ${engine}` : ''}`}
                 state={state}
                 hint={subLabel}
               />
@@ -375,7 +373,7 @@ const TelegramSingleMessageForm = forwardRef(function TelegramSingleMessageForm(
             kind="ok"
             icon="✓"
             label="Сообщение"
-            sub={job?.entity_title || null}
+            sub={messageSub}
             action={
               <CopyBtn
                 label={<span className="inline-flex items-center gap-1.5"><Copy size={14}/>Скопировать</span>}

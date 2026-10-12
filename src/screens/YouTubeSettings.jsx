@@ -1,5 +1,6 @@
 import React from 'react'
 import Checkbox from '../components/Checkbox'
+import ToggleSwitch from '../components/ToggleSwitch'
 import Select from '../components/Select'
 import { useAppSettingsSection } from '../lib/appSettings'
 
@@ -11,9 +12,13 @@ const DEFAULTS = {
   learning_subtitle_position: 'bottom',
   learning_subtitle_language_order: 'source_first',
   learning_subtitle_width_px: 1600,
+  learning_subtitle_source_font_px: 34,
+  learning_subtitle_target_font_percent: 73.53,
   learning_controls_mirrored: false,
   learning_translation_mode: 'always',
+  learning_translation_order: 'natural',
   learning_hide_native_subtitles: true,
+  learning_hover_word_translation: false,
   engine: 'gemini',
   with_comments: false,
   target: 'aistudio',
@@ -42,6 +47,13 @@ export default function YouTubeSettings() {
     state.setValue(prev => ({ ...(prev || {}), [key]: value }))
   }
 
+  function stepSetting(key, direction, min, max) {
+    const value = Math.max(min, Math.min(max, Math.round((Number(settings[key]) + direction) * 100) / 100))
+    state.patch({ [key]: value })
+  }
+
+  const stepStyle = { flex: '0 0 24px', width: 24, height: 28, padding: 0, border: '1px solid #3f3f46', borderRadius: 6, background: '#27272a', color: '#d4d4d8', fontSize: 17 }
+
   function saveText(key) {
     const value = state.value?.[key]
     state.patch({ [key]: typeof value === 'string' ? value : '' })
@@ -57,25 +69,23 @@ export default function YouTubeSettings() {
         <SettingsCard>
           <ControlRow label="Предпочитаемый язык" hint="Сначала ищем субтитры на этом языке, затем пробуем запасные.">
             <div className="w-56" data-setting="youtube-language">
-              <Select compact hideHint value={settings.preferred_lang} onChange={v => state.patch({ preferred_lang: v })} options={[
-                { id: 'ru', label: 'Русский' },
-                { id: 'en', label: 'English' },
-              ]} />
+              <ToggleSwitch label="Предпочитаемый язык" checked={settings.preferred_lang === 'en'}
+                onChange={v => state.patch({ preferred_lang: v ? 'en' : 'ru' })} onLabel="English" offLabel="Русский" />
             </div>
           </ControlRow>
           <ControlRow label="Если субтитров нет" hint="Движок для расшифровки звука.">
             <div className="w-56" data-setting="youtube-engine">
-              <Select compact hideHint value={settings.engine} onChange={v => state.patch({ engine: v })} options={[
-                { id: 'gemini', label: 'Gemini' },
-                { id: 'assemblyai', label: 'AssemblyAI' },
-              ]} />
+              <ToggleSwitch label="Движок без субтитров" checked={settings.engine === 'assemblyai'}
+                onChange={v => state.patch({ engine: v ? 'assemblyai' : 'gemini' })} onLabel="AssemblyAI" offLabel="Gemini" />
             </div>
           </ControlRow>
           <ControlRow label="Комментарии" hint="Добавлять комментарии к тексту перед отправкой в AI.">
-            <Checkbox checked={!!settings.with_comments} onChange={v => state.patch({ with_comments: v })} label="Добавлять по умолчанию" />
+            <ToggleSwitch label="Комментарии" checked={!!settings.with_comments} onChange={v => state.patch({ with_comments: v })}
+              onLabel="Добавлять по умолчанию" offLabel="Не добавлять" />
           </ControlRow>
           <ControlRow label="Интерактивный слой" hint="Включается штатной кнопкой CC в плеере YouTube.">
-            <Checkbox checked={!!settings.learning_enabled} onChange={v => state.patch({ learning_enabled: v })} label="Включён" />
+            <ToggleSwitch label="Интерактивный слой" checked={!!settings.learning_enabled} onChange={v => state.patch({ learning_enabled: v })}
+              onLabel="Включён" offLabel="Выключен" />
           </ControlRow>
           <ControlRow label="Azure Translator" hint="Ключ хранится только локально и не передаётся расширению.">
             <span className={`text-sm ${settings.translator_configured ? 'text-emerald-400' : 'text-amber-300'}`}>
@@ -98,31 +108,37 @@ export default function YouTubeSettings() {
               ]} />
             </div>
           </ControlRow>
-          <ControlRow label="Показывать перевод" hint="«При наведении» заранее готовит вторую строку без сдвига субтитров; «Никогда» оставляет только основной язык.">
+          <ControlRow label="Показывать перевод" hint="В скрытом режиме место второй строки сохраняется; Cmd в активной вкладке временно показывает перевод.">
             <div className="w-56">
-              <Select compact hideHint value={settings.learning_translation_mode} onChange={v => state.patch({ learning_translation_mode: v })} options={[
-                { id: 'always', label: 'Всегда' },
-                { id: 'hover', label: 'При наведении' },
-                { id: 'never', label: 'Никогда' },
-              ]} />
+              <ToggleSwitch label="Показывать перевод" checked={settings.learning_translation_mode === 'always'}
+                onChange={v => state.patch({ learning_translation_mode: v ? 'always' : 'never' })}
+                onLabel="Всегда" offLabel="Скрыт" data-setting="learning_translation_mode" />
             </div>
           </ControlRow>
           <ControlRow label="Порядок строк" hint="Положение всей плашки меняется перетаскиванием прямо на видео.">
             <div className="w-56">
-              <Select compact hideHint value={settings.learning_subtitle_language_order} onChange={v => state.patch({ learning_subtitle_language_order: v })} options={[
-                { id: 'source_first', label: 'English → Русский' },
-                { id: 'target_first', label: 'Русский → English' },
-              ]} />
+              <ToggleSwitch label="Порядок строк" checked={settings.learning_subtitle_language_order === 'target_first'}
+                onChange={v => state.patch({ learning_subtitle_language_order: v ? 'target_first' : 'source_first' })}
+                onLabel="Русский → English" offLabel="English → Русский" data-setting="learning_subtitle_language_order" />
             </div>
           </ControlRow>
-          <ControlRow label="Ширина субтитров" hint="Хранится в пикселях и автоматически уменьшается, если плеер стал уже.">
-            <div className="w-56 flex items-center gap-3">
+          <ControlRow label="Порядок перевода" hint="Естественный русский или порядок слов ближе к английскому оригиналу.">
+            <div className="w-56">
+              <ToggleSwitch label="Порядок перевода" checked={settings.learning_translation_order === 'source'}
+                onChange={v => state.patch({ learning_translation_order: v ? 'source' : 'natural' })}
+                onLabel="Как в английском" offLabel="Естественный" data-setting="learning_translation_order" />
+            </div>
+          </ControlRow>
+          <ControlRow label="Ширина субтитров" hint="Выбранная ширина сохраняется; узкий плеер ограничивает только её фактический размер.">
+            <div className="w-56 flex items-center" style={{ gap: 6 }}>
+              <button type="button" style={stepStyle} aria-label="Уменьшить ширину субтитров" disabled={settings.learning_subtitle_width_px <= 320}
+                onClick={() => stepSetting('learning_subtitle_width_px', -1, 320, 2400)}>−</button>
               <input
                 className="min-w-0 flex-1 accent-purple-500"
                 type="range"
                 min="320"
                 max="2400"
-                step="20"
+                step="1"
                 value={settings.learning_subtitle_width_px}
                 onChange={event => setLocal('learning_subtitle_width_px', Number(event.target.value))}
                 onPointerUp={event => state.patch({ learning_subtitle_width_px: Number(event.currentTarget.value) })}
@@ -132,16 +148,45 @@ export default function YouTubeSettings() {
               <span className="w-16 text-right text-sm tabular-nums text-zinc-400">
                 {Math.round(settings.learning_subtitle_width_px)} px
               </span>
+              <button type="button" style={stepStyle} aria-label="Увеличить ширину субтитров" disabled={settings.learning_subtitle_width_px >= 2400}
+                onClick={() => stepSetting('learning_subtitle_width_px', 1, 320, 2400)}>+</button>
             </div>
           </ControlRow>
+          {[
+            { key: 'learning_subtitle_source_font_px', label: 'English · шрифт', min: 16, max: 64, step: 1, unit: 'px' },
+            { key: 'learning_subtitle_target_font_percent', label: 'Русский · шрифт', min: 20, max: 325, step: 0.01, unit: '%' },
+          ].map(font => (
+            <ControlRow key={font.key} label={font.label} hint={font.unit === '%' ? 'Доля от английского шрифта; меняется вместе с его размером.' : 'Базовый размер двух строк.'}>
+              <div className="w-56 flex items-center" style={{ gap: 6 }}>
+                <button type="button" style={stepStyle} aria-label={`Уменьшить ${font.label}`} disabled={settings[font.key] <= font.min}
+                  onClick={() => stepSetting(font.key, -1, font.min, font.max)}>−</button>
+                <input type="range" className="min-w-0 flex-1 accent-purple-500" data-setting={font.key}
+                  min={font.min} max={font.max} step={font.step} value={settings[font.key]}
+                  onChange={event => setLocal(font.key, Number(event.target.value))}
+                  onPointerUp={event => state.patch({ [font.key]: Number(event.currentTarget.value) })}
+                  onKeyUp={event => state.patch({ [font.key]: Number(event.currentTarget.value) })}
+                  onBlur={event => state.patch({ [font.key]: Number(event.currentTarget.value) })} />
+                <span className="w-16 text-right text-sm tabular-nums text-zinc-400">{settings[font.key]}{font.unit}</span>
+                <button type="button" style={stepStyle} aria-label={`Увеличить ${font.label}`} disabled={settings[font.key] >= font.max}
+                  onClick={() => stepSetting(font.key, 1, font.min, font.max)}>+</button>
+              </div>
+            </ControlRow>
+          ))}
           <ControlRow label="Автопауза" hint="Останавливать видео в конце каждой реплики.">
-            <Checkbox checked={!!settings.learning_auto_pause} onChange={v => state.patch({ learning_auto_pause: v })} label="Включена" />
+            <ToggleSwitch label="Автопауза" checked={!!settings.learning_auto_pause} onChange={v => state.patch({ learning_auto_pause: v })}
+              onLabel="Включена" offLabel="Выключена" />
           </ControlRow>
           <ControlRow label="Стороны управления" hint="Меняет местами навигацию по репликам и настройки.">
-            <Checkbox checked={!!settings.learning_controls_mirrored} onChange={v => state.patch({ learning_controls_mirrored: v })} label="Поменять местами" />
+            <ToggleSwitch label="Стороны управления" checked={!!settings.learning_controls_mirrored} onChange={v => state.patch({ learning_controls_mirrored: v })}
+              onLabel="Поменять местами" offLabel="Обычный порядок" />
           </ControlRow>
           <ControlRow label="Родные субтитры YouTube" hint="Когда слой SC активен, родной текст скрывается, чтобы строки не дублировались.">
-            <Checkbox checked={!!settings.learning_hide_native_subtitles} onChange={v => state.patch({ learning_hide_native_subtitles: v })} label="Скрывать" />
+            <ToggleSwitch label="Родные субтитры YouTube" checked={!!settings.learning_hide_native_subtitles} onChange={v => state.patch({ learning_hide_native_subtitles: v })}
+              onLabel="Скрывать" offLabel="Показывать" />
+          </ControlRow>
+          <ControlRow label="Перевод слова при наведении" hint="Показывать один мгновенный перевод; дополнительные значения остаются в полной карточке по клику.">
+            <ToggleSwitch label="Перевод слова при наведении" checked={!!settings.learning_hover_word_translation} onChange={v => state.patch({ learning_hover_word_translation: v })}
+              onLabel="Показывать" offLabel="Выключен" />
           </ControlRow>
         </SettingsCard>
       </Section>

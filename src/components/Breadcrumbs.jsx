@@ -150,6 +150,7 @@ function crumbFor(screen, sources, folders) {
         tg_fetch:             'Telegram fetch',
         tg_preview:           'Telegram preview',
         tg_index:             'Семантический индекс',
+        yt_index:             'YouTube · смысловой поиск',
         tg_reply_backfill:    'Reply backfill',
         yt_transcribe:        'YouTube транскрипт',
         yt_channel_fetch:     'YouTube канал',

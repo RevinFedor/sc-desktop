@@ -206,7 +206,11 @@ def main():
                    help="Max comments (top-level + replies if --with-replies). 0 = no limit.")
     p.add_argument("--with-replies", action="store_true",
                    help="Include reply threads (default: top-level only).")
+    p.add_argument("--archive-json", help="Explicit app-owned structured original path")
+    p.add_argument("--expected-channel-id", help="Canonical channel identity for structured jobs")
     args = p.parse_args()
+    if args.archive_json and not args.expected_channel_id:
+        p.error("--archive-json requires --expected-channel-id")
 
     t0 = time.time()
     vid = extract_video_id(args.url)
@@ -215,7 +219,7 @@ def main():
         return 2
 
     # Fetch metadata first — small + fast, gives renderer a video header.
-    meta = fetch_meta(args.url) or {
+    meta = (None if args.archive_json else fetch_meta(args.url)) or {
         "id": vid, "title": "", "channel": "",
         "webpage_url": args.url, "comment_count": 0,
     }
@@ -260,6 +264,11 @@ def main():
             "-o", "%(id)s.%(ext)s",
             args.url,
         ]
+        if args.archive_json:
+            # Capture warnings rather than turn an early/partial extraction
+            # into apparent complete coverage. Never download media/subtitles.
+            cmd.remove("--no-warnings")
+            cmd.insert(-1, "--no-playlist")
 
         emit({"type": "info", "message": f"yt-dlp comments fetch · sort={args.sort} · limit={args.limit or 'all'}"})
 
@@ -273,12 +282,15 @@ def main():
         )
         last_got = -1
         last_expected = 0
+        archive_warnings = []
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
                 line = line.rstrip()
                 if not line:
                     continue
+                if args.archive_json and re.search(r"\b(?:WARNING|ERROR)\b", line):
+                    archive_warnings.append(line[-2000:])
                 m = RE_PAGE.search(line)
                 if m:
                     got = int(m.group(1))
@@ -317,7 +329,19 @@ def main():
             return 2
 
         comments = data.get("comments") or []
-        if not comments:
+        archive_path, archive_hash, archive_report = None, None, None
+        if args.archive_json:
+            from yt_comments_archive import build_archive, write_archive
+            archive = build_archive(data, video_id=vid,
+                                    expected_channel_id=args.expected_channel_id,
+                                    sort=args.sort, limit=args.limit,
+                                    include_replies=args.with_replies,
+                                    warnings=archive_warnings)
+            archive_path = args.archive_json
+            archive_hash = write_archive(archive_path, archive)
+            archive_report = archive["report"]
+            meta = {**meta, **data, "webpage_url": f"https://www.youtube.com/watch?v={vid}"}
+        if not comments and not args.archive_json:
             emit({"type": "error", "message": "Видео не имеет комментариев или они отключены"})
             return 2
 
@@ -347,6 +371,8 @@ def main():
             "count_total":   len(comments),
             "count_top":     top_count,
             "count_replies": reply_count,
+            **({"archive_path": archive_path, "archive_sha256": archive_hash,
+                "archive_report": archive_report} if archive_path else {}),
         })
         emit({"type": "done", "duration_sec": round(time.time() - t0, 2)})
         return 0

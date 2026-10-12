@@ -1,193 +1,79 @@
 # SC Desktop
 
-<p align="center">
-  <img src="assets/readme/sc-desktop-home.png" alt="SC Desktop main library view with Telegram source details and MCP activity" width="1100"/>
-</p>
+SC Desktop — приложение для macOS, которое собирает Telegram, YouTube, Instagram, TikTok, Reddit и Boosty в локальную медиатеку. Python workers получают материалы, Electron показывает задания и результаты, а расширение работает с вашим обычным Chromium-браузером. Есть локальная транскрипция, поиск по архиву, экспорт AI-диалогов и external research.
 
-SC Desktop is a macOS Electron app plus MCP host for collecting, indexing, and reusing social/chat data in local AI workflows. It sits between raw sources and the agent: Telegram chats, Reddit threads, browser-only research flows, semantic search, then MCP tools on top of the same local library.
+Начать можно с одного из двух файлов. Их можно отправить знакомому целиком: каждый содержит поручение для его AI, команды установки и критерии проверки.
 
-The project is not just a viewer. It is the orchestration layer around a local data pipeline: Electron for the UI and jobs, Python workers for source fetches, a browser extension for sites that only work inside a real logged-in browser, and an MCP server that exposes the resulting archive back to Claude/Codex and other desktop AI tools.
+| Что нужно | Инструкция | Что должно работать |
+|---|---|---|
+| Управлять вкладками и читать страницы через MCP | [Browser MCP и расширение](docs/setup/браузер-mcp.prompt.md) | Node.js, локальный MCP-клиент, Chrome/Yandex с расширением |
+| Медиатека, парсинг и external research | [Полный SC Desktop](docs/setup/sc-desktop.prompt.md) | Всё из первого варианта, Electron, Python и доступы к выбранным источникам |
 
-## Related Repositories
+```text
+Browser MCP:
+локальный AI → stdio MCP → loopback WebSocket → расширение → ваша вкладка
 
-- [AI Mac Electron](https://github.com/RevinFedor/ai-mac-electron) — desktop AI chat/voice app that uses SC Desktop MCP for Telegram, Reddit, and attached file workflows.
-- [docs_search MCP](https://github.com/RevinFedor/docs_search_mcp) — semantic documentation router used across this project and the adjacent Electron apps.
-- [custom-terminal](https://github.com/RevinFedor/custom-terminal) — Claude/Codex terminal orchestrator in the same local AI stack.
-- [GT Editor](https://github.com/RevinFedor/gt-editor) — markdown workspace whose files and notes also participate in the broader MCP workflow.
-
-## What It Does
-
-- Imports Telegram chats through Telethon-backed Python workers, including preview, catch-up, indexing, and multi-session account handling.
-- Fetches Reddit search results and thread trees through free cookie-backed `.json` endpoints, with explicit paid fallback paths when needed.
-- Runs browser-only flows through a real browser extension for AI Studio, Claude, Perplexity, and YouTube cases that a plain CLI cannot parse reliably.
-- Stores everything in a local library, builds semantic indexes, and exposes search/fetch/read tools through `mcp/server.js`.
-- Gives the user one desktop UI for source inventory, parse history, semantic coverage, MCP jobs, and research results.
-
-## Architecture
-
-SC Desktop has four working parts:
-
-- **Electron app** — the visible desktop shell: library sidebar, center screens, activity/history, job progress, settings, semantic index controls.
-- **`python-workers/` Python workers** — Telegram/Reddit/YouTube/TikTok/Instagram/local fetchers that emit ndjson and write into the same library.
-- **`browser-extension/`** — the real-browser parser bridge for AI Studio, Claude, Perplexity, YouTube, and other cookie/CSP-protected flows.
-- **`mcp/server.js`** — the MCP layer that lets another agent query the same local archive instead of screen-scraping the UI.
-
-The practical result is one local data bus: UI and MCP read the same library, jobs update one activity stream, and semantic search runs on top of the same stored items.
-
-## Current State
-
-As a codebase, `sc-desktop` is already structured as the main desktop shell for the whole system.
-
-The desktop runtime is self-contained for the worker code that Electron launches:
-
-- Python workers live in `python-workers/`, not in the old `cli-tools` submodule.
-- Electron resolves workers from `python-workers/` in dev and from app resources in packaged builds.
-- Service keys are read from environment variables or `~/.config/sc/settings.json`.
-- Telegram session files and runtime data stay under `~/Library/Application Support/sc-desktop/`.
-
-A fresh checkout still needs normal local setup: Node dependencies, a local Python environment from `python-workers/requirements.txt`, and user-specific credentials/sessions. The browser extension is now tracked directly in this repository under `browser-extension/` (previously a git submodule link), so a clone gets its source without a separate fetch. Its own machine-specific material — runtime logs, the signing private key, and the generated native-messaging wrapper — stays untracked through the extension's `.gitignore`.
-
-## MCP Workflows
-
-This repository is heavily MCP-oriented.
-
-`mcp/server.js` exposes Telegram semantic search, Telegram neighbors/reply-graph tools, Reddit search/thread tools, Twitter/X tools, and GT Editor-related access from the same desktop runtime. In practice this is the layer that lets an external AI ask things like:
-
-- "find the relevant messages in this Telegram chat"
-- "pull this Reddit thread and give me the comment tree"
-- "open or read the exact file I need from the local workspace"
-
-That same MCP surface is also used by `AI Mac Electron`, so the desktop AI chat can call into SC Desktop instead of reimplementing Telegram/Reddit/browser parsing on its own.
-
-## Browser MCP And App Dependency
-
-There are two separate browser bridges, and they depend on the desktop app differently. This distinction matters when deciding whether SC Desktop has to be running.
-
-**Live browser automation (`mcp__browser__*`) does not need the app.** Tools like `list_tabs`, `click`, `fill`, `evaluate`, and `snapshot` flow through a standalone bridge:
-
-```
-Agent → mcp/browser/index.js → bridge.js (ws :3458 → :3457) → extension → DOM
+External research:
+локальный AI / SC UI → Electron HTTP bridge → расширение → AI-сайт
+                               ↑                  ↓
+                         status + result ← сохранённый финал
 ```
 
-`bridge.js` is its own Node process. It auto-spawns on the first tool call, is shared by all agent sessions, and keeps running after SC Desktop closes. For this path you only need a Chromium-based browser open with the extension enabled — the desktop app can be fully quit.
+Browser MCP работает без запущенного SC Desktop, Python, API-ключей и Noted Terminal. Это `list_tabs`, `snapshot`, `get_text`, `click`, `fill`, `evaluate` и другие операции с реальными вкладками. Его сервер — `mcp/browser/index.js`.
 
-**Deeper flows do need SC Desktop running.** The app itself hosts a second bridge in `electron/browser-bridge.js`, bound to loopback `127.0.0.1`:
+External research требует работающий SC Desktop и вход в выбранный AI-сайт. Прямой HTTP-вход доступен обычному локальному агенту; автоматическое возвращение результата в отдельную сессию Noted Terminal требует дополнительно совместимый Noted Terminal и его Terminal MCP. Настройка SC Desktop сама по себе этого не устанавливает. Обычный браузерный ChatGPT-чат не запускает локальный stdio-сервер по этому README; нужен локальный клиент с shell/MCP.
 
-- `:53127` — HTTP bridge for research channels (`/research-start`, polled `/research-status`) and `/yt-fetch`, plus writes back into the local library.
-- `:53129` — WebSocket channel that hot-reloads the extension after edits to `browser-extension/*.js`.
+## Быстрый вход
 
-Without the app, those endpoints have no listener: research runs cannot start, fetched data is not persisted, and extension hot-reload falls back to manual reload.
-
-Rule of thumb: ad-hoc browsing and DOM parsing → browser + extension only; long-running research, persistence into `library.db`, and auto hot-reload → SC Desktop must be running.
-
-## Telegram / Reddit / Browser Parsing
-
-Telegram is the deepest path in the project: local session-aware fetches, preview-only runs, incremental catch-up, semantic indexing, and MCP search over the same archive.
-
-Reddit has a strict cost model: free cookie-backed API mode by default, explicit `auto`/`apify` paid fallback only when chosen on purpose. This matters because SC Desktop is built to preserve deterministic local workflows and not silently spend money when a free path fails.
-
-The browser extension exists for the cases where CLI and public APIs are not enough: AI Studio, Perplexity, Claude chat export, YouTube-to-AI handoff, and other flows that need a real logged-in browser with real cookies and DOM state.
-
-## Install On Mac
-
-Requirements:
-
-- macOS
-- Node.js 18+
-- Python 3 for the worker scripts
-- `jq` for the docs/indexer tooling
-- a checkout where `browser-extension/` is present for browser-only flows
-- local runtime config in environment variables or `~/.config/sc/settings.json`
-
-Install desktop dependencies:
+Поддерживаемый здесь путь — macOS, Node.js 22.12+ из ветки 22, Git и актуальный Chrome либо Yandex. Для полного приложения нужен Python 3.10+. Проверка этого выпуска выполняется на macOS arm64; Windows/Linux и Intel Mac не проходят эту же приёмку.
 
 ```bash
-npm install
+git clone --depth 1 https://github.com/RevinFedor/sc-desktop.git
+cd sc-desktop
+npm ci --prefix mcp/browser
 ```
 
-Create the local Python environment for workers:
+Загрузите папку `browser-extension/` через страницу расширений браузера → Developer mode → Load unpacked. Затем настройте локальный MCP-клиент по [первой инструкции](docs/setup/браузер-mcp.prompt.md). Корневой `npm ci` для этого варианта не нужен. В checkout уже есть собранная options page расширения.
+
+Для полного приложения после установки расширения:
 
 ```bash
+npm ci
 npm run python:setup
-```
-
-Run in development:
-
-```bash
+npm run rebuild
 npm run dev
 ```
 
-Build and install into `/Applications`:
+Парсинг YouTube/медиа дополнительно использует `yt-dlp` и `ffmpeg` в PATH. Авторизации Telegram/Instagram, API-ключи ASR/embedding и доступные модели AI-сайта настраивает сам пользователь. Они не нужны для бесплатной проверки Browser MCP. `npm run python:setup` выбирает Python 3.10+ и сообщает об ошибке версии до установки; при необходимости задайте `SC_DESKTOP_SETUP_PYTHON` абсолютным путём.
+
+## Сборка приложения
 
 ```bash
-npm run build:install
+npm run build:app
 ```
 
-If `better-sqlite3` ABI drifts after an Electron upgrade:
+Эта команда собирает renderer, расширение и локальный `.app` с ad-hoc подписью. До неё должны быть установлены `.venv` и Node-зависимости. Результат остаётся в `release/mac-arm64/SC Desktop.app` (на Intel путь другой); приложение не копируется в `/Applications` и не запускается автоматически. Это локальная сборка без notarization, а не готовый подписанный установщик для раздачи. После обновления ad-hoc сборки macOS может снова запросить доступы к папкам.
+
+Старый `build:install` — отдельный режим разработчика: требует собственного сертификата для подписи, останавливает установленный SC Desktop и заменяет его в `/Applications`. Для первой установки по этим инструкциям используйте `dev` или `build:app`.
+
+## Проверки
 
 ```bash
-npm run rebuild
+node --test mcp/browser/bridge.test.js
 ```
 
-## Browser Extension Setup
+Это изолированная проверка stdio/WebSocket, защиты от browser origins, раздельных ответов клиентам и Native Messaging. В ней расширение подменено; она не доказывает загрузку настоящего расширения. В [инструкции Browser MCP](docs/setup/браузер-mcp.prompt.md) есть отдельное чтение локальной страницы через реальный браузер.
 
-The extension is a required part of the full workflow, not an optional demo.
+HTTP `GET http://127.0.0.1:53127/healthz` подтверждает только Electron bridge. Прочитанная страница подтверждает Browser MCP. Только согласованный Send провайдеру, подтверждённый терминальный статус и проверенный `result.text` подтверждают external research. Бесплатная установка не запускает модельный запрос автоматически.
 
-Bootstrap the Native Messaging Host:
+## Данные и доступы
 
-```bash
-cd browser-extension
-node nmh/setup.js
-```
+Рабочая медиатека, sessions и результаты находятся в `~/Library/Application Support/sc-desktop/`. Общие настройки сервисов читаются из `~/.config/sc/settings.json` или переменных окружения. Эти настройки, cookies, базы, ключи, экспорты, логи и скриншоты не входят в текущий публикуемый набор. [Пример MCP-конфига](.mcp.example.json) содержит placeholders; [список переменных](examples/credentials.env.example) не загружается автоматически.
 
-Then open your Chromium-based browser, go to the extensions page, and load `browser-extension/` unpacked.
+Browser MCP получает доступ к реальному browser profile и широкие разрешения расширения, включая cookies и debugger. Устанавливайте его в выбранный вами профиль и подключайте только доверенного локального AI. WebSocket/HTTP listeners привязаны к `127.0.0.1`; не открывайте их в LAN или туннель в интернет. MCP-клиенты — локальные процессы, а веб-страницы не могут подключаться к командному WebSocket. Отсутствие SC Desktop не даёт Native Messaging-логам или research дополнительных возможностей.
 
-After extension code changes:
+## Для разработчика
 
-- reload the extension in the browser
-- reload the target tabs if the content-script set changed
+Runtime-код Python находится в `python-workers/`, а не во внешнем CLI. Новая БД-схема должна быть согласована в `electron/database.js` и `python-workers/shared/library_db.py`. Electron main/preload требуют полного перезапуска вашего экземпляра; renderer обновляется через Vite. При активном research расширение откладывает reload до подтверждённого простоя — не обходите этот gate.
 
-## Local Config And Data
-
-Runtime state is local:
-
-- `~/Library/Application Support/sc-desktop/library.db`
-- `~/Library/Application Support/sc-desktop/jobs/`
-- `~/Library/Application Support/sc-desktop/output/`
-- `~/Library/Application Support/sc-desktop/sessions/`
-- `~/.config/sc/settings.json`
-
-Service keys can be provided through environment variables or the shared settings file. Live keys, session files, browser cookies, generated job output, and local databases are runtime material and should not be published.
-
-## Documentation Search MCP
-
-This project actively relies on [docs_search MCP](https://github.com/RevinFedor/docs_search_mcp). The codebase has enough Telegram/Reddit/browser/MCP-specific scars that a generic agent will miss important constraints if it only reads `README.md`.
-
-The intended flow is:
-
-1. the agent calls `docs_search`
-2. it receives the relevant `fact-*`, `fix-*`, and methodology files from `.semantic-index.json`
-3. only then it edits code or reasons about the pipeline
-
-After documentation changes, rebuild the index through MCP `docs_reindex` with this repository as `projectPath`. Repo-local shell indexers are not used.
-
-## Repository Notes
-
-The old `cli-tools` tree is no longer a runtime dependency of the desktop app. The worker scripts Electron launches are tracked in `python-workers/`, and generated output is intentionally kept outside the repository.
-
-`browser-extension/` is now vendored directly into this repository (it used to be a submodule gitlink with no `.gitmodules`, which rendered as a dead link and shipped no files). It is required for the browser-only workflows, while Telegram, Reddit, YouTube/TikTok worker launches, local transcription, and Instagram worker entry points live in this repository.
-
-## Security
-
-The desktop app and MCP server are local-first. The important boundary is not "does the repo mention a host or a path", but "does it publish live tokens, session files, or keys that allow someone else to act as the user".
-
-For this repo family, the critical things that must stay local are:
-
-- service keys
-- Telegram session files
-- browser cookies
-- local config with runtime secrets
-
-The repo should describe these files and workflows, but not publish their live contents.
-
-> ! Documentation is routed through `docs_search MCP`: agents call `docs_search`, receive relevant files from `.semantic-index.json`, and read those files into context before non-trivial code changes.
+Optional-интеграции с Voice Record, GT Editor, YouGile и Noted Terminal требуют свои приложения/доступы и отдельно проверяются. Учебный словарь с синхронизацией использует Voice Record; установка одного SC Desktop не создаёт этот сервис.

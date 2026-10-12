@@ -8,7 +8,6 @@ import {
 import { pushScreen } from '../lib/store'
 import { refreshSources } from '../lib/sources'
 import YouTubeBatchPicker from './YouTubeBatchPicker'
-import YouTubeScopeFields, { DEFAULT_YT_RANGE } from './YouTubeScopeFields'
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
@@ -63,19 +62,15 @@ function handleFromUrl(u) {
  * we forward to the picker's trigger (run batch on selection).
  */
 const YouTubeChannelForm = forwardRef(function YouTubeChannelForm({ url, onStarted }, ref) {
-  // Stages: 'idle' | 'kickoff' | 'fetching' | 'ready' | 'error'
-  //   kickoff = no cache yet, showing scope-fields so the user picks
-  //             limit + direction BEFORE the network call (paste-flow used
-  //             to auto-fetch with limit=200, which silently downloaded a
-  //             lot for big channels — now the user is in control).
+  // Stages: 'idle' | 'fetching' | 'ready' | 'error'. A new channel starts a
+  // complete metadata-catalog pass automatically. This is the free inventory
+  // phase; transcript/AI work still requires an explicit picker action.
   const [stage, setStage] = useState('idle')
   const [channelInfo, setChannelInfo] = useState(null)
   const [fetchJob, setFetchJob] = useState(null)
   const [err, setErr] = useState(null)
-  // Scope-fields state — used by the kickoff stage; ignored once we have
-  // a fetch job in flight (re-fetch from SourceDetail uses its own form).
-  const [range, setRange] = useState(DEFAULT_YT_RANGE)
   const pickerRef = React.useRef(null)
+  const autoStartedRef = React.useRef(null)
 
   // On mount: cache lookup → if found, render ready. Else show kickoff
   // scope-fields and wait for the user to start the fetch.
@@ -89,6 +84,8 @@ const YouTubeChannelForm = forwardRef(function YouTubeChannelForm({ url, onStart
       if (!alive) return
 
       if (cached && cached.items_count) {
+        let meta = {}
+        try { meta = JSON.parse(cached.meta_json || '{}') || {} } catch {}
         setChannelInfo({
           source_id:           cached.id,
           channel_id:          cached.external_id,
@@ -97,6 +94,9 @@ const YouTubeChannelForm = forwardRef(function YouTubeChannelForm({ url, onStart
           avatar_url:          cached.avatar_url,
           subs_count:          (() => { try { return JSON.parse(cached.meta_json || '{}').subs_count || null } catch { return null } })(),
           items_total:         cached.items_count,
+          loaded_count:        cached.items_count,
+          catalog_total:       meta.catalog_total ?? null,
+          catalog_complete:    meta.catalog_complete === true,
           total_duration_sec:  null,    // computed below from items
           date_min:            null,
           date_max:            null,
@@ -105,7 +105,7 @@ const YouTubeChannelForm = forwardRef(function YouTubeChannelForm({ url, onStart
         // Aggregate stats from items table (fast)
         if (window.api?.itemsList) {
           const items = await window.api.itemsList({
-            source_id: cached.id, limit: 1000, offset: 0,
+            source_id: cached.id, limit: 20000, offset: 0,
             order: 'published_at DESC', type: 'video',
           })
           if (!alive) return
@@ -118,9 +118,10 @@ const YouTubeChannelForm = forwardRef(function YouTubeChannelForm({ url, onStart
           })
         }
         setStage('ready')
-      } else {
-        // No cache → wait for the user to confirm limit/direction.
-        setStage('kickoff')
+      } else if (autoStartedRef.current !== url) {
+        autoStartedRef.current = url
+        setStage('fetching')
+        void kickOffFetch(false, { limit: 0, reverse: false })
       }
     })()
 
@@ -128,17 +129,21 @@ const YouTubeChannelForm = forwardRef(function YouTubeChannelForm({ url, onStart
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url])
 
-  async function kickOffFetch(silent = false) {
+  async function kickOffFetch(silent = false, request = null) {
     if (!silent) setStage('fetching')
     setErr(null)
     try {
-      const limit = Math.max(0, Number(range.limit) || 0)
-      const reverse = range.direction === 'oldest'
+      const limit = request ? Math.max(0, Number(request.limit) || 0) : 0
+      const reverse = request ? !!request.reverse : false
       const id = await startYoutubeChannelFetch({ target: url, limit, reverse })
       if (id == null) { setErr('Электрон-IPC недоступен'); setStage('error'); return }
       const off = watchJob(id, snap => {
         setFetchJob(snap)
-        if (snap.yt_channel) {
+        if (snap.yt_channel && (
+          snap.yt_channel.channel_id
+          || snap.yt_channel.title
+          || snap.yt_channel.handle
+        )) {
           setChannelInfo(prev => ({
             ...(prev || {}),
             source_id:          snap.source_id || prev?.source_id,
@@ -148,6 +153,9 @@ const YouTubeChannelForm = forwardRef(function YouTubeChannelForm({ url, onStart
             avatar_url:         snap.yt_channel.avatar_url || prev?.avatar_url,
             subs_count:         snap.yt_channel.subs_count ?? prev?.subs_count,
             items_total:        snap.yt_channel.items_total ?? prev?.items_total,
+            loaded_count:       snap.yt_channel.loaded_count ?? snap.yt_channel.items_total ?? prev?.loaded_count,
+            catalog_total:      snap.yt_channel.catalog_total ?? prev?.catalog_total,
+            catalog_complete:   snap.yt_channel.catalog_complete ?? prev?.catalog_complete,
             total_duration_sec: snap.yt_channel.total_duration_sec ?? prev?.total_duration_sec,
             date_min:           snap.yt_channel.date_min ?? prev?.date_min,
             date_max:           snap.yt_channel.date_max ?? prev?.date_max,
@@ -155,15 +163,18 @@ const YouTubeChannelForm = forwardRef(function YouTubeChannelForm({ url, onStart
           }))
         }
         if (snap.status === 'done') {
+          autoStartedRef.current = null
           refreshSources()
           if (!silent) setStage('ready')
           off()
         }
         if (snap.status === 'error') {
+          autoStartedRef.current = null
           setErr(snap.error || 'channel fetch failed'); setStage('error'); off()
         }
       })
     } catch (e) {
+      autoStartedRef.current = null
       setErr(String(e?.message || e)); setStage('error')
     }
   }
@@ -179,7 +190,7 @@ const YouTubeChannelForm = forwardRef(function YouTubeChannelForm({ url, onStart
   // Enter from PasteScreen → first start fetch, then advance picker (run batch).
   useImperativeHandle(ref, () => ({
     trigger() {
-      if (stage === 'idle' || stage === 'error' || stage === 'kickoff') return kickOffFetch(false)
+      if (stage === 'error') return kickOffFetch(false, { limit: 0, reverse: false })
       if (stage === 'ready' && pickerRef.current?.trigger) pickerRef.current.trigger()
     },
   }), [stage])
@@ -187,22 +198,6 @@ const YouTubeChannelForm = forwardRef(function YouTubeChannelForm({ url, onStart
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-950 overflow-hidden">
       {stage === 'idle' && !channelInfo && <FetchingHeader fetchJob={null} onCancel={null} />}
-      {stage === 'kickoff' && (
-        <div className="p-6">
-          <div className="mb-4 text-zinc-300">
-            <span className="font-medium">YouTube · канал</span>
-            <span className="text-zinc-700 mx-2">·</span>
-            <span className="text-zinc-500 truncate">{url}</span>
-          </div>
-          <YouTubeScopeFields range={range} onRangeChange={setRange} />
-          <div className="flex items-center justify-end border-t border-zinc-800 pt-3 mt-4">
-            <button
-              onClick={() => kickOffFetch(false)}
-              className="px-5 py-2 rounded-md font-medium bg-zinc-100 text-zinc-900 hover:bg-white"
-            >Спарсить</button>
-          </div>
-        </div>
-      )}
       {stage === 'fetching' && !channelInfo && <FetchingHeader fetchJob={fetchJob} onCancel={cancelFetch} />}
       {channelInfo && (
         <>
@@ -226,7 +221,7 @@ const YouTubeChannelForm = forwardRef(function YouTubeChannelForm({ url, onStart
         <div className="px-6 py-4 text-red-400 border-t border-red-900/50 bg-red-950/20">
           {err}
           <button
-            onClick={() => kickOffFetch(false)}
+            onClick={() => kickOffFetch(false, { limit: 0, reverse: false })}
             className="ml-3 px-2 py-1 rounded text-xs bg-red-900/40 hover:bg-red-900/60"
           >Повторить</button>
         </div>
@@ -245,7 +240,7 @@ function FetchingHeader({ fetchJob, onCancel }) {
     <div className="px-6 py-5 flex items-center gap-3">
       <div className="text-zinc-300 flex items-center gap-2">
         <span className="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-        Загружаем канал…
+        Загружаем полный каталог…
       </div>
       {loaded > 0 && (
         <div className="text-zinc-500" style={{ fontSize: '14px' }}>
@@ -270,6 +265,9 @@ function ChannelHeader({ info, fetchJob, onClick }) {
   const dateRange = (dMin && dMax) ? `${dMin} – ${dMax}` : null
   const refreshing = fetchJob && fetchJob.status === 'running' && info.fromCache
   const clickable = !!onClick
+  const loaded = Number(info.loaded_count ?? info.items_total ?? 0)
+  const total = info.catalog_total == null ? null : Number(info.catalog_total)
+  const complete = info.catalog_complete === true
 
   return (
     <div
@@ -298,8 +296,15 @@ function ChannelHeader({ info, fetchJob, onClick }) {
           )}
         </div>
         <div className="text-zinc-400 mt-1 flex items-center gap-3" style={{ fontSize: '14px' }}>
-          {info.items_total != null && (
-            <span><span className="tabular-nums text-zinc-200">{info.items_total.toLocaleString()}</span> видео</span>
+          {loaded > 0 && (
+            <span>
+              {complete
+                ? <><span className="tabular-nums text-zinc-200">{loaded.toLocaleString()}</span> видео</>
+                : <><span className="text-zinc-500">загружено</span> <span className="tabular-nums text-zinc-200">{loaded.toLocaleString()}</span>{total != null ? <> из {total.toLocaleString()}</> : null}</>}
+            </span>
+          )}
+          {complete && (
+            <><span className="text-zinc-700">·</span><span className="text-emerald-500/80">каталог полный</span></>
           )}
           {info.total_duration_sec ? (
             <>

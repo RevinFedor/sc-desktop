@@ -6,7 +6,7 @@ import { useToasts, dismissToast } from '../lib/toast'
 // fixed top-right just below the 40px titlebar. Every toast shares the same
 // geometry (height, radius, ✕ position, left icon as a diff-marker, ellipsis
 // for long text) — only icon + border-color vary by type. This is the
-// «Единая форма» rule from methodology/переносимый-дизайн.md.
+// «Единая форма» rule from methodology/дизайн-принципы.md.
 
 const VARIANTS = {
   error:   { icon: CircleAlert,    border: 'border-red-700/70',     iconCls: 'text-red-400' },

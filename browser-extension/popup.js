@@ -485,6 +485,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const delivery = exportSettings.downloadFile ? 'Скачается' : 'Скопируется';
       const s = readChatGPTSettings();
       const extras = [
+        'текстом вложений',
         s.includeSources ? 'источниками' : '',
         s.includeReasoning ? 'рассуждениями' : '',
         s.includeImages ? 'картинками-ссылками' : '',

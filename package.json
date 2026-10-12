@@ -1,22 +1,27 @@
 {
   "name": "sc-desktop",
   "version": "0.1.0",
-  "description": "SC Desktop — GUI for the sc CLI (Instagram / Telegram / YouTube / TikTok)",
+  "description": "SC Desktop — local media library, browser automation and external research",
   "main": "electron/main.js",
   "scripts": {
+    "postbuild:install": "node scripts/cleanup-build-artifacts.cjs",
     "dev": "concurrently \"vite\" \"npm run electron:dev\"",
     "electron:dev": "wait-on http://localhost:5156 && NODE_ENV=development electron . --remote-debugging-port=9223",
     "electron": "electron .",
     "build": "npm run build:extension && vite build",
-    "build:extension": "vite build --config vite.extension.config.js",
-    "build:install": "pkill -f 'SC Desktop' || true && (test -x .venv/bin/python3 || npm run python:setup) && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder && rm -rf /Applications/SC\\ Desktop.app && cp -R release/mac-arm64/SC\\ Desktop.app /Applications/ && open /Applications/SC\\ Desktop.app",
+    "build:extension": "node scripts/build-study-extension.cjs",
+    "sign:local": "bash scripts/codesign/sign-local-fast.sh \"release/mac-arm64/SC Desktop.app\"",
+    "build:install": "(test -x .venv/bin/python3 || npm run python:setup) && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder && (pkill -f 'SC Desktop' || true) && rm -rf /Applications/SC\\ Desktop.app && cp -R release/mac-arm64/SC\\ Desktop.app /Applications/ && open /Applications/SC\\ Desktop.app",
     "build:i": "npm run build:install",
     "rebuild": "electron-rebuild -f -w better-sqlite3",
-    "python:setup": "PYTHON_BIN=${SC_DESKTOP_SETUP_PYTHON:-/usr/bin/python3} && test -x \"$PYTHON_BIN\" && rm -rf .venv && \"$PYTHON_BIN\" -m venv .venv && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r python-workers/requirements.txt",
-    "instagram:login": ".venv/bin/python3 python-workers/instagram/ig_login_ndjson.py"
+    "python:setup": "node scripts/setup-python.cjs",
+    "instagram:login": ".venv/bin/python3 python-workers/instagram/ig_login_ndjson.py",
+    "build:app": "npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false SC_DESKTOP_CODESIGN_MODE=adhoc electron-builder --mac dir",
+    "test:setup": "node --test mcp/browser/bridge.test.js scripts/codesign/after-pack.test.cjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@nebelov/yougile-mcp": "1.0.5",
     "@tailwindcss/vite": "^4.1.18",
     "better-sqlite3": "^12.6.2",
     "imapflow": "^1.7.1",
@@ -32,19 +37,23 @@
     "ws": "^8.20.0"
   },
   "devDependencies": {
+    "@babel/parser": "^7.29.9",
     "@electron/rebuild": "^4.0.1",
     "@vitejs/plugin-react": "^4.3.4",
     "code-inspector-plugin": "^1.5.1",
     "concurrently": "^9.2.1",
     "electron": "^34.5.8",
     "electron-builder": "^25.1.8",
+    "typescript": "^5.9.3",
     "vite": "^6.0.7",
     "wait-on": "^9.0.3"
   },
   "build": {
     "appId": "com.sc.desktop",
     "productName": "SC Desktop",
+    "afterPack": "scripts/codesign/after-pack.cjs",
     "mac": {
+      "identity": null,
       "category": "public.app-category.productivity",
       "icon": "build-resources/icon.icns",
       "target": "dir"
@@ -87,5 +96,8 @@
         ]
       }
     ]
+  },
+  "engines": {
+    "node": ">=22.12.0 <23"
   }
 }

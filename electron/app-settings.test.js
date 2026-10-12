@@ -9,12 +9,27 @@ const {
   sanitizeExtensionYoutube,
 } = require('./app-settings')
 
-test('Main defaults external research tab auto-close to off', () => {
-  assert.equal(publicAppSettings({}).main.external_research_auto_close, false)
+test('Main defaults external research tab auto-close to on', () => {
+  assert.equal(publicAppSettings({}).main.external_research_auto_close, true)
   assert.equal(
     publicAppSettings({ main: { external_research_auto_close: true } }).main.external_research_auto_close,
     true,
   )
+})
+
+test('Main keeps independent temporary ChatGPT defaults for research and YouTube AI', () => {
+  const defaults = publicAppSettings({}).main
+  assert.equal(defaults.external_research_temporary_chat, true)
+  assert.equal(defaults.youtube_ai_temporary_chat, true)
+
+  const customized = publicAppSettings({
+    main: {
+      external_research_temporary_chat: false,
+      youtube_ai_temporary_chat: true,
+    },
+  }).main
+  assert.equal(customized.external_research_temporary_chat, false)
+  assert.equal(customized.youtube_ai_temporary_chat, true)
 })
 
 test('Main persists the external research auto-close toggle without touching other sections', () => {
@@ -27,6 +42,28 @@ test('Main persists the external research auto-close toggle without touching oth
   assert.equal(result.external_research_auto_close, false)
   assert.equal(stored.main.external_research_auto_close, false)
   assert.equal(stored.telegram.session, 'keep-me')
+})
+
+test('Main persists both temporary-chat switches independently', () => {
+  let stored = { main: { external_research_auto_close: false }, youtube: { engine: 'gemini' } }
+  const result = patchAppSettings(
+    () => structuredClone(stored),
+    next => { stored = structuredClone(next); return { ok: true } },
+    {
+      section: 'main',
+      patch: {
+        external_research_temporary_chat: false,
+        youtube_ai_temporary_chat: true,
+      },
+    },
+  )
+
+  assert.equal(result.external_research_temporary_chat, false)
+  assert.equal(result.youtube_ai_temporary_chat, true)
+  assert.equal(stored.main.external_research_temporary_chat, false)
+  assert.equal(stored.main.youtube_ai_temporary_chat, true)
+  assert.equal(stored.main.external_research_auto_close, false)
+  assert.equal(stored.youtube.engine, 'gemini')
 })
 
 test('Telegram auto master switch defaults on and persists explicit off', () => {
@@ -109,11 +146,15 @@ test('desktop defaults inline transcript mode on and preserves explicit off', ()
 test('desktop preserves the global contextual word explanation toggle', () => {
   assert.equal(sanitizeExtensionYoutube({}).learning_ai_explanation, true)
   assert.equal(sanitizeExtensionYoutube({ learning_ai_explanation: false }).learning_ai_explanation, false)
+  assert.equal(sanitizeExtensionYoutube({}).learning_hover_word_translation, false)
+  assert.equal(sanitizeExtensionYoutube({ learning_hover_word_translation: true }).learning_hover_word_translation, true)
+  assert.equal(sanitizeExtensionYoutube({}).learning_practice_hide_translations, true)
+  assert.equal(sanitizeExtensionYoutube({ learning_practice_hide_translations: false }).learning_practice_hide_translations, false)
 })
 
 test('desktop persists the selected translation word order', () => {
   assert.equal(sanitizeExtensionYoutube({}).learning_translation_mode, 'always')
-  assert.equal(sanitizeExtensionYoutube({ learning_translation_mode: 'hover' }).learning_translation_mode, 'hover')
+  assert.equal(sanitizeExtensionYoutube({ learning_translation_mode: 'hover' }).learning_translation_mode, 'never')
   assert.equal(sanitizeExtensionYoutube({ learning_translation_mode: 'never' }).learning_translation_mode, 'never')
   assert.equal(sanitizeExtensionYoutube({ learning_translation_mode: 'unknown' }).learning_translation_mode, 'always')
   assert.equal(sanitizeExtensionYoutube({}).learning_translation_order, 'natural')
@@ -139,19 +180,60 @@ test('desktop keeps card autoplay off by default and persists opt-in', () => {
   assert.equal(sanitizeExtensionYoutube({ learning_subtitle_target_font_px: 1 }).learning_subtitle_target_font_px, 14)
 })
 
-test('desktop accepts current Chat o3 and Instant on GPT-5.6', () => {
-  const o3 = sanitizeExtensionYoutube({
+test('font migration persists the ratio on the first English edit and survives a fresh read', () => {
+  for (const initialized of [true, false]) {
+    let stored = initialized ? { browser_extension: { youtube_schema_version: 2, youtube: {
+      learning_subtitle_source_font_px: 40, learning_subtitle_target_font_px: 32,
+    } }, telegram: { session: 'keep-me' } } : { telegram: { session: 'keep-me' } }
+    const read = () => structuredClone(stored)
+    const write = next => { stored = structuredClone(next); return { ok: true } }
+    const before = publicAppSettings(stored).youtube
+    patchAppSettings(read, write, { section: 'youtube', patch: { learning_subtitle_source_font_px: 50 } })
+    const after = publicAppSettings(stored).youtube
+    assert.equal(after.learning_subtitle_target_font_percent, before.learning_subtitle_target_font_percent)
+    assert.equal(stored.telegram.session, 'keep-me')
+    if (!initialized) patchExtensionYoutubeSettings(read, write, { learning_enabled: true })
+    patchExtensionYoutubeSettings(read, write, { learning_subtitle_target_font_percent: 60 })
+    assert.equal(publicAppSettings(stored).youtube.learning_subtitle_target_font_px, 30)
+    patchExtensionYoutubeSettings(read, write, { learning_subtitle_target_font_px: 35 })
+    assert.equal(publicAppSettings(stored).youtube.learning_subtitle_target_font_percent, 70)
+    const oldEcho = { ...publicAppSettings(stored).youtube, learning_subtitle_source_font_px: 60 }
+    delete oldEcho.learning_subtitle_target_font_percent
+    patchExtensionYoutubeSettings(read, write, oldEcho)
+    assert.equal(publicAppSettings(stored).youtube.learning_subtitle_target_font_percent, 70)
+    assert.equal(publicAppSettings(stored).youtube.learning_subtitle_target_font_px, 42)
+  }
+})
+
+test('desktop accepts Chat Astra only as Pro and retires o3', () => {
+  const astra = sanitizeExtensionYoutube({
+    chatgpt_chat_model: 'gpt-6-astra',
+    chatgpt_chat_effort: 'xhigh',
+  })
+  assert.equal(astra.chatgpt_chat_model, '6-astra')
+  assert.equal(astra.chatgpt_chat_effort, 'pro')
+
+  const retired = sanitizeExtensionYoutube({
     chatgpt_chat_model: 'o3',
     chatgpt_chat_effort: 'medium',
   })
-  assert.equal(o3.chatgpt_chat_model, 'o3')
-  assert.equal(o3.chatgpt_chat_effort, 'medium')
+  assert.equal(retired.chatgpt_chat_model, '5.6-sol')
+  assert.equal(retired.chatgpt_chat_effort, 'medium')
 
   const instant = sanitizeExtensionYoutube({
     chatgpt_chat_model: '5.6-sol',
     chatgpt_chat_effort: 'instant',
   })
   assert.equal(instant.chatgpt_chat_effort, 'instant')
+})
+
+test('desktop preserves GPT-6 Chat and its explicit non-Pro effort', () => {
+  for (const model of ['6', 'gpt-6']) {
+    const settings = sanitizeExtensionYoutube({ chatgpt_chat_model: model, chatgpt_chat_effort: 'xhigh' })
+    assert.equal(settings.chatgpt_chat_model, '6')
+    assert.equal(settings.chatgpt_chat_effort, 'xhigh')
+    assert.equal(settings.chatgpt_model, '6')
+  }
 })
 
 test('desktop defaults Work speed to standard and preserves explicit fast', () => {

@@ -8,7 +8,9 @@ const {
   instagramPathParts,
   isCancellableImport,
   isInstagramHost,
+  normalizeImportOrigin,
   publicRequest,
+  normalizeYoutubeSearchRequest,
   reconcilePersistedRequest,
   resolveInstagramShareUrl,
   youtubeCacheTitle,
@@ -49,6 +51,32 @@ test('classifies supported YouTube single-video URL shapes', () => {
     assert.equal(classifyUrl(url).externalId, id)
   }
   assert.equal(classifyUrl('https://youtube.com/@channel'), null)
+})
+
+test('normalizes plain and filtered YouTube search requests', () => {
+  assert.deepEqual(
+    normalizeYoutubeSearchRequest({ query: '  Bob McGrew agents  ', limit: 12, offset: 4 }),
+    { query: 'Bob McGrew agents', limit: 12, offset: 4 },
+  )
+  const filtered = normalizeYoutubeSearchRequest({
+    query: 'https://www.youtube.com/results?search_query=Bob+McGrew&sp=CAISAhAB',
+  })
+  assert.match(filtered.query, /^https:\/\/www\.youtube\.com\/results\?/)
+  assert.equal(new URL(filtered.query).searchParams.get('sp'), 'CAISAhAB')
+  assert.equal(filtered.limit, 20)
+  assert.equal(filtered.offset, 0)
+})
+
+test('rejects arbitrary URLs and invalid YouTube search windows', () => {
+  assert.throws(
+    () => normalizeYoutubeSearchRequest({ query: 'https://example.com/results?search_query=x' }),
+    /YouTube results URL/,
+  )
+  assert.throws(
+    () => normalizeYoutubeSearchRequest({ query: 'https://youtube.com/watch?v=dQw4w9WgXcQ' }),
+    /YouTube results URL/,
+  )
+  assert.throws(() => normalizeYoutubeSearchRequest({ query: 'x', limit: 101 }), /limit/)
 })
 
 test('recognizes only exact Instagram share-link paths', () => {
@@ -201,4 +229,28 @@ test('allows cancellation only while an import can still do work', () => {
   for (const status of ['done', 'error', 'cancelled']) {
     assert.equal(isCancellableImport({ status }), false, status)
   }
+})
+
+test('import origin marks only MCP requests as clipboard-free', () => {
+  // The MCP client sends origin:'mcp'; the SC Desk iOS app sends nothing.
+  // Only the first one suppresses automatic clipboard delivery and its sound.
+  assert.equal(normalizeImportOrigin('mcp'), 'mcp')
+  assert.equal(normalizeImportOrigin('MCP'), 'mcp')
+  assert.equal(normalizeImportOrigin(' mcp '), 'mcp')
+  assert.equal(normalizeImportOrigin(undefined), 'client')
+  assert.equal(normalizeImportOrigin(''), 'client')
+  assert.equal(normalizeImportOrigin('ios'), 'client')
+  assert.equal(normalizeImportOrigin('mcp-ish'), 'client')
+})
+
+test('persisted imports without an origin are restored as human requests', () => {
+  // History written before `origin` existed must not become silent after an
+  // app restart — an unknown origin always degrades to the sounding path.
+  const legacy = { status: 'done', resultFile: null }
+  reconcilePersistedRequest(legacy)
+  assert.equal(legacy.origin, 'client')
+
+  const legacyMcp = { status: 'done', resultFile: null, origin: 'mcp' }
+  reconcilePersistedRequest(legacyMcp)
+  assert.equal(legacyMcp.origin, 'mcp')
 })

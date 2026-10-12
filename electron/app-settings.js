@@ -3,9 +3,9 @@ const YOUTUBE_MODELS = new Set([
   'Gemini 3.1 Pro Preview',
 ])
 const CLAUDE_MODELS = new Set(['Opus 4.7', 'Sonnet 4.6', 'Haiku 4.5'])
-const CHATGPT_CHAT_MODELS = new Set(['5.5', '5.6-sol', 'o3'])
+const CHATGPT_CHAT_MODELS = new Set(['6', '6-astra', '5.6-sol', '5.5'])
 const CHATGPT_WORK_MODELS = new Set(['5.6-sol', '5.6-terra', '5.6-luna'])
-const CHATGPT_RETIRED_MODELS = new Set(['5.4', '5.3', '5.2', '4.5'])
+const CHATGPT_RETIRED_MODELS = new Set(['o3', '5.4', '5.3', '5.2', '4.5'])
 const CHATGPT_KNOWN_MODELS = new Set([
   ...CHATGPT_CHAT_MODELS,
   ...CHATGPT_WORK_MODELS,
@@ -16,13 +16,13 @@ const CHATGPT_EFFORTS = new Set([
   'low', 'xhigh', 'high', 'medium', 'instant', 'pro', 'pro-extended', 'max', 'ultra',
 ])
 const CHATGPT_CHAT_55_EFFORTS = new Set(['instant'])
+const CHATGPT_CHAT_6_ASTRA_EFFORTS = new Set(['pro'])
 const CHATGPT_CHAT_56_EFFORTS = new Set(['instant', 'medium', 'high', 'xhigh', 'pro'])
-const CHATGPT_CHAT_O3_EFFORTS = new Set(['medium'])
 const CHATGPT_WORK_56_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
 const CHATGPT_WORK_SPEEDS = new Set(['standard', 'fast'])
 const YOUTUBE_SUBTITLE_POSITIONS = new Set(['top', 'bottom'])
 const YOUTUBE_SUBTITLE_LANGUAGE_ORDERS = new Set(['source_first', 'target_first'])
-const YOUTUBE_TRANSLATION_MODES = new Set(['never', 'hover', 'always'])
+const YOUTUBE_TRANSLATION_MODES = new Set(['never', 'always'])
 const YOUTUBE_TRANSLATION_ORDERS = new Set(['natural', 'source'])
 const EXTENSION_YOUTUBE_SCHEMA_VERSION = 2
 
@@ -40,12 +40,15 @@ const EXTENSION_YOUTUBE_DEFAULTS = Object.freeze({
   learning_subtitle_width_px: 1600,
   learning_subtitle_source_font_px: 34,
   learning_subtitle_target_font_px: 25,
+  learning_subtitle_target_font_percent: 73.53,
   learning_controls_mirrored: false,
   learning_translation_mode: 'always',
   learning_translation_order: 'natural',
   learning_hide_native_subtitles: true,
+  learning_hover_word_translation: false,
   learning_ai_explanation: true,
   learning_card_autoplay: false,
+  learning_practice_hide_translations: true,
   engine: 'gemini',
   target: 'aistudio',
   system_instruction: '',
@@ -109,14 +112,14 @@ function chatgptModelsForMode(mode) {
 
 function chatgptEffortsFor(mode, model) {
   if (mode === 'work') return CHATGPT_WORK_56_EFFORTS
+  if (model === '6-astra') return CHATGPT_CHAT_6_ASTRA_EFFORTS
   if (model === '5.5') return CHATGPT_CHAT_55_EFFORTS
-  if (model === 'o3') return CHATGPT_CHAT_O3_EFFORTS
   return CHATGPT_CHAT_56_EFFORTS
 }
 
 function defaultChatgptEffort(mode, model) {
+  if (mode === 'chat' && model === '6-astra') return 'pro'
   if (mode === 'chat' && model === '5.5') return 'instant'
-  if (mode === 'chat' && model === 'o3') return 'medium'
   return 'xhigh'
 }
 
@@ -124,6 +127,8 @@ function normalizeChatgptPair(mode, rawModel, rawEffort) {
   let model = typeof rawModel === 'string' ? rawModel : '5.6-sol'
   let effort = typeof rawEffort === 'string' ? rawEffort : ''
 
+  if (model === 'gpt-6-astra') model = '6-astra'
+  if (['gpt-6', '6'].includes(model)) model = mode === 'work' ? '6-astra' : '6'
   if (model === '5.6') model = '5.6-sol'
   if (effort === 'pro-extended') effort = 'pro'
   if (mode === 'work') {
@@ -136,6 +141,19 @@ function normalizeChatgptPair(mode, rawModel, rawEffort) {
   if (!chatgptModelsForMode(mode).has(model)) model = '5.6-sol'
   if (!chatgptEffortsFor(mode, model).has(effort)) effort = defaultChatgptEffort(mode, model)
   return { model, effort }
+}
+
+function subtitleFontSettings(raw = {}) {
+  const source = Math.round(clampedNumberValue(raw.learning_subtitle_source_font_px, 34, 16, 64))
+  const legacyTarget = Math.round(clampedNumberValue(raw.learning_subtitle_target_font_px, 25, 14, 52))
+  const supplied = Number(raw.learning_subtitle_target_font_percent)
+  const percent = Math.round(Math.max(20, Math.min(325,
+    Number.isFinite(supplied) && supplied > 0 ? supplied : legacyTarget * 100 / source)) * 100) / 100
+  return {
+    learning_subtitle_source_font_px: source,
+    learning_subtitle_target_font_percent: percent,
+    learning_subtitle_target_font_px: Math.max(14, Math.min(52, Math.round(source * percent / 100))),
+  }
 }
 
 function sanitizeExtensionYoutube(raw = {}) {
@@ -170,11 +188,10 @@ function sanitizeExtensionYoutube(raw = {}) {
     learning_subtitle_offset_x: clampedNumberValue(input.learning_subtitle_offset_x, 0, -1, 1),
     learning_subtitle_offset_y: clampedNumberValue(input.learning_subtitle_offset_y, 0, -1, 1),
     learning_subtitle_width_px: Math.round(clampedNumberValue(input.learning_subtitle_width_px, 1600, 320, 2400)),
-    learning_subtitle_source_font_px: Math.round(clampedNumberValue(input.learning_subtitle_source_font_px, 34, 16, 64)),
-    learning_subtitle_target_font_px: Math.round(clampedNumberValue(input.learning_subtitle_target_font_px, 25, 14, 52)),
+    ...subtitleFontSettings(input),
     learning_controls_mirrored: booleanValue(input.learning_controls_mirrored, false),
     learning_translation_mode: enumValue(
-      input.learning_translation_mode,
+      input.learning_translation_mode === 'hover' ? 'never' : input.learning_translation_mode,
       YOUTUBE_TRANSLATION_MODES,
       'always',
     ),
@@ -184,8 +201,10 @@ function sanitizeExtensionYoutube(raw = {}) {
       'natural',
     ),
     learning_hide_native_subtitles: booleanValue(input.learning_hide_native_subtitles, true),
+    learning_hover_word_translation: booleanValue(input.learning_hover_word_translation, false),
     learning_ai_explanation: booleanValue(input.learning_ai_explanation, true),
     learning_card_autoplay: booleanValue(input.learning_card_autoplay, false),
+    learning_practice_hide_translations: booleanValue(input.learning_practice_hide_translations, true),
     engine: enumValue(input.engine, new Set(['gemini', 'assemblyai']), 'gemini'),
     target: enumValue(input.target, new Set(['aistudio', 'claude', 'chatgpt']), 'aistudio'),
     system_instruction: stringValue(input.system_instruction, '', 8000),
@@ -232,9 +251,19 @@ function effectiveExtensionYoutubePatch(current, patch) {
 }
 
 function applyExtensionYoutubePatch(current, patch) {
+  const font = subtitleFontSettings(current)
+  const effective = effectiveExtensionYoutubePatch(current, patch)
+  if (Object.hasOwn(patch, 'learning_subtitle_target_font_px')
+      && !Object.hasOwn(patch, 'learning_subtitle_target_font_percent')
+      && Number(patch.learning_subtitle_target_font_px) !== font.learning_subtitle_target_font_px) {
+    effective.learning_subtitle_target_font_percent = subtitleFontSettings({
+      ...current, ...patch, learning_subtitle_target_font_percent: undefined,
+    }).learning_subtitle_target_font_percent
+  }
   return sanitizeExtensionYoutube({
     ...current,
-    ...effectiveExtensionYoutubePatch(current, patch),
+    learning_subtitle_target_font_percent: font.learning_subtitle_target_font_percent,
+    ...effective,
   })
 }
 
@@ -320,6 +349,12 @@ function persistedExtensionYoutube(raw, patch, next, initialize, deriveAliases =
       persisted[key] = value
     }
   }
+  // Materialize the ratio before the next read: persisting only a changed
+  // source size would recompute it from the stale legacy absolute size.
+  if (['learning_subtitle_source_font_px', 'learning_subtitle_target_font_px',
+    'learning_subtitle_target_font_percent'].some(key => Object.hasOwn(effective, key))) {
+    Object.assign(persisted, subtitleFontSettings(next))
+  }
   const changesChatgptPair = Object.keys(effective).some(key => (
     key === 'chatgpt_mode' || /chatgpt_(?:chat_|work_)?(?:model|effort)$/.test(key)
   ))
@@ -394,7 +429,9 @@ function publicAppSettings(settings = {}) {
   return {
     main: {
       configured: true,
-      external_research_auto_close: booleanValue(main.external_research_auto_close, false),
+      external_research_auto_close: booleanValue(main.external_research_auto_close, true),
+      external_research_temporary_chat: booleanValue(main.external_research_temporary_chat, true),
+      youtube_ai_temporary_chat: booleanValue(main.youtube_ai_temporary_chat, true),
     },
     telegram: {
       session: typeof telegram.session === 'string' ? telegram.session : null,
@@ -542,6 +579,12 @@ function patchAppSettings(readScSettings, writeScSettings, payload = {}) {
     settings.main = isPlainObject(settings.main) ? settings.main : {}
     if (typeof patch.external_research_auto_close === 'boolean') {
       settings.main.external_research_auto_close = patch.external_research_auto_close
+    }
+    if (typeof patch.external_research_temporary_chat === 'boolean') {
+      settings.main.external_research_temporary_chat = patch.external_research_temporary_chat
+    }
+    if (typeof patch.youtube_ai_temporary_chat === 'boolean') {
+      settings.main.youtube_ai_temporary_chat = patch.youtube_ai_temporary_chat
     }
   } else if (section === 'reddit') {
     settings.reddit = isPlainObject(settings.reddit) ? settings.reddit : {}

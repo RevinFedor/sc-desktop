@@ -69,7 +69,7 @@ export default function YouTubeQuickFetchForm({ target, onStarted, platform = 'y
               ? 'bg-zinc-800 text-zinc-600 cursor-not-allowed'
               : 'bg-zinc-100 text-zinc-900 hover:bg-white'
           }`}
-        >{busy ? 'Запускаю…' : 'Спарсить'}</button>
+        >{busy ? 'Обновляю…' : 'Обновить каталог'}</button>
       </div>
     </div>
   )

@@ -17,3 +17,10 @@ test('YouTube AI opens Work summaries as normal chats so Work remains selectable
   assert.equal(url.searchParams.has('temporary-chat'), false);
   assert.equal(url.searchParams.get('sc-compose'), 'compose-work');
 });
+
+test('YouTube AI can open Chat summaries as normal chats from the Main setting', () => {
+  const url = new URL(scChatgptComposeEntryUrl('compose-persistent', 'chat', false));
+
+  assert.equal(url.searchParams.has('temporary-chat'), false);
+  assert.equal(url.searchParams.get('sc-compose'), 'compose-persistent');
+});

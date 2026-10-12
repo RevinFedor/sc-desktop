@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import math
 import os
 import shutil
 import signal
@@ -105,6 +106,7 @@ def human_hours(seconds):
 
 def estimate_plan(videos, price_per_hour=DEFAULT_AAI_PRICE_PER_HOUR):
     duration = sum(float(row.get("duration_sec") or 0) for row in videos)
+    unknown = sum(1 for row in videos if float(row.get("duration_sec") or 0) <= 0)
     audio_bytes = int(duration * AUDIO_BITRATE / 8 * 1.08)
     hours = duration / 3600
     # Async throughput varies with upload speed and provider load. This range
@@ -113,11 +115,13 @@ def estimate_plan(videos, price_per_hour=DEFAULT_AAI_PRICE_PER_HOUR):
     wall_max = max(wall_min, hours * 0.15 + len(videos) * 0.50 / 60)
     return {
         "videos": len(videos),
-        "duration_sec": duration,
-        "audio_bytes": audio_bytes,
-        "wall_hours_min": wall_min,
-        "wall_hours_max": wall_max,
-        "estimated_cost_usd": hours * float(price_per_hour),
+        "known_duration_sec": duration,
+        "unknown_duration_count": unknown,
+        "duration_sec": None if unknown else duration,
+        "audio_bytes": None if unknown else audio_bytes,
+        "wall_hours_min": None if unknown else wall_min,
+        "wall_hours_max": None if unknown else wall_max,
+        "estimated_cost_usd": None if unknown else hours * float(price_per_hour),
     }
 
 
@@ -126,6 +130,7 @@ def atomic_json(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".part")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.chmod(temporary, 0o600)
     os.replace(temporary, path)
 
 
@@ -182,11 +187,14 @@ def load_json(path, fallback):
         return fallback
 
 
-def collect_catalog(author, token):
+def collect_catalog(author, token, *, with_summary=False):
     entity = profile(author, token)
     posts = []
-    for page, _extra in iter_posts(author, token, limit=0, order="desc"):
+    extra = {}
+    pages = 0
+    for page, extra in iter_posts(author, token, limit=0, order="desc"):
         posts.extend(page)
+        pages += 1
     videos = []
     for post in posts:
         if post.get("has_access") is not True:
@@ -203,7 +211,77 @@ def collect_catalog(author, token):
                 "duration_sec": video.get("duration_sec") or 0,
                 "author": entity.get("title") or author,
             })
-    return entity, posts, videos
+    summary = {"remote_eof": extra.get("is_last") is True, "pages": pages,
+               "stop_reason": extra.get("stop_reason") or "eof_unverified"}
+    return (entity, posts, videos, summary) if with_summary else (entity, posts, videos)
+
+
+def probe_durations(posts, videos, auth, config, progress=None):
+    """Read player metadata only; unknown remains unknown, never neighbor fallback."""
+    from boosty_single_ndjson import load_metadata, write_cookie_file
+    from shared.boosty_storage import inspect_storage
+    work = Path(config['audio_dir']).parent / 'metadata-probe'
+    parts = work.parts
+    if len(parts) < 3 or parts[1] != 'Volumes':
+        raise RuntimeError('Metadata cookie/temp probe requires the admitted external USB')
+    strict = {**config, 'work_dir': work, 'library_root': app_root()}
+    inspect_storage(strict, external_mount=str(Path('/Volumes') / parts[2]))
+    work.mkdir(parents=True, exist_ok=True)
+    grouped = {}
+    for video in videos:
+        if not video.get('duration_sec'):
+            grouped.setdefault(video['url'], []).append(video)
+    with tempfile.TemporaryDirectory(prefix='own-duration-', dir=work) as temporary:
+        cookie = write_cookie_file(temporary, auth['value'], auth.get('expirationDate'))
+        for i, (url, pending) in enumerate(grouped.items(), 1):
+            try:
+                info = load_metadata(url, cookie)
+                entries = info.get('entries') or [info]
+                by_id = {str(v.get('id')): v for v in entries if isinstance(v, dict)}
+                for video in pending:
+                    value = (by_id.get(video['video_id']) or {}).get('duration')
+                    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+                        video['duration_sec'] = value
+                        for post in posts:
+                            for child in post.get('videos') or []:
+                                if str(child.get('video_id')) == video['video_id']: child['duration_sec'] = value
+            except Exception:
+                pass
+            if progress: progress(i, len(grouped), sum(not v.get('duration_sec') for v in videos))
+
+
+def safe_plan_report(conn, source_id, entity, posts, videos, remaining, config, summary):
+    """Supported CLI preflight projection: no bodies, cookies or signed media URLs."""
+    from shared.boosty_storage import describe_config
+    import hashlib
+    result = {"version": 1, "auth_mode": "account", "checked_at": int(time.time()),
+              "source_id": source_id, "handle": entity.get("author_handle"),
+              "subscription": entity.get("subscription"), "posts": [], "children": [],
+              "storage": describe_config({**config, "library_root": app_root()}),
+              "catalogue": summary,
+              "duration": {"known_seconds": sum(v.get('duration_sec') or 0 for v in remaining),
+                           "unknown_count": sum(1 for v in remaining if not v.get('duration_sec'))},
+              "media_downloads": 0, "ASR": 0}
+    missing = {v["video_id"] for v in remaining}
+    for post in posts:
+        row = conn.execute("SELECT id,caption FROM items WHERE source_id=? AND external_id=?",
+                           (source_id, post["external_id"])).fetchone()
+        body = row["caption"] if row else None
+        result["posts"].append({"item_id": row["id"] if row else None, "post_id": post["post_id"],
+            "url": post["canonical_url"], "has_access": post.get("has_access"),
+            "remote_full_text_chars": len(post.get("text") or "") if post.get("has_access") is True else None,
+            "assets_metadata": post.get('assets_metadata') or [],
+            "content_counters": post.get('content_counters') or {},
+            "saved_text_chars": len(body or ""),
+            "saved_text_sha256": hashlib.sha256((body or "").encode()).hexdigest()})
+    for video in videos:
+        row = conn.execute("SELECT id,transcript_path FROM items WHERE source_id=? AND external_id=?",
+                           (source_id, video["video_id"])).fetchone()
+        result["children"].append({"item_id": row["id"] if row else None, "post_id": video["post_id"],
+            "video_id": video["video_id"], "url": video["url"], "duration_sec": video["duration_sec"],
+            "identity_kind": 'external_reference_local_key' if video['video_id'].startswith('external-') else 'upstream_video_id',
+            "has_access": True, "missing_text": video["video_id"] in missing})
+    return result
 
 
 def ensure_catalog_rows(conn, entity, posts):
@@ -266,13 +344,13 @@ def ensure_catalog_rows(conn, entity, posts):
                 type="boosty_post",
                 url=post.get("canonical_url"),
                 title=post.get("title"),
-                caption=post.get("text"),
+                caption=post.get("text") if post.get("has_access") is True else None,
                 published_at=post.get("publish_time") or post.get("created_at"),
                 raw_meta={
                     "platform": "boosty",
                     "entity_kind": "post",
                     "post_id": post.get("post_id"),
-                    "access_state": "accessible" if post.get("has_access") else "locked",
+                    "access_state": "accessible" if post.get("has_access") is True else "locked" if post.get("has_access") is False else "unknown",
                     "video_count": post.get("video_count") or 0,
                 },
             )
@@ -470,6 +548,9 @@ def main(argv=None):
     )
     parser.add_argument("url", help="ссылка вида https://boosty.to/<автор>")
     parser.add_argument("--plan", action="store_true", help="только показать объём, время и свободное место")
+    parser.add_argument("--probe-durations", action="store_true", help="с --plan: проверить неизвестные длительности по metadata, без скачивания/ASR")
+    parser.add_argument("--plan-report", help="при --plan: безопасный JSON preflight внутри app-support/tmp")
+    parser.add_argument("--storage-info", action="store_true", help="показать реальные storage roots без auth/download/ASR")
     parser.add_argument("--yes", action="store_true", help="не спрашивать подтверждение перед платным запуском")
     parser.add_argument("--download-only", action="store_true", help="скачать аудио без AssemblyAI")
     parser.add_argument("--with-video", action="store_true", help="также архивировать видео до 1080p")
@@ -478,29 +559,51 @@ def main(argv=None):
     parser.add_argument("--aai-price", type=float, default=DEFAULT_AAI_PRICE_PER_HOUR, help="цена AssemblyAI за час для оценки")
     parser.add_argument("--auth-timeout", type=float, default=20.0, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.probe_durations and not args.plan:
+        raise RuntimeError('--probe-durations requires --plan; no media/ASR started')
 
     author = canonicalize_author(args.url)
+    if args.storage_info:
+        from shared.boosty_storage import describe_config
+        print(json.dumps(describe_config({**storage_config(), "library_root": app_root()}), ensure_ascii=False))
+        return 0
     print("Получаю авторизацию Boosty из браузера…", flush=True)
     auth = request_browser_auth(max(3.0, args.auth_timeout))
     token = decode_auth_cookie(auth["value"])
-    entity, posts, videos = collect_catalog(author, token)
+    entity, posts, videos, catalogue_summary = collect_catalog(author, token, with_summary=True)
+    if catalogue_summary["remote_eof"] is not True:
+        raise RuntimeError("Account catalogue не подтвердил EOF; ASR не запущен")
     config = storage_config(with_video=args.with_video)
+    if args.probe_durations:
+        probe_durations(posts, videos, auth, config,
+            progress=lambda i, n, unknown: print(f'Metadata длительности: пост {i}/{n} · неизвестно видео {unknown}', flush=True))
+    if args.plan_report and not args.plan:
+        raise RuntimeError("--plan-report требует --plan; платная обработка не запущена")
     conn = open_db()
     source_id = ensure_catalog_rows(conn, entity, posts)
+    if args.probe_durations:
+        for v in videos:
+            if v.get('duration_sec'):
+                conn.execute("UPDATE items SET duration_seconds=?,updated_at=unixepoch() WHERE source_id=? AND external_id=? AND COALESCE(duration_seconds,0)=0",
+                             (v['duration_sec'], source_id, v['video_id']))
     mode = "download" if args.download_only else "transcribe"
     remaining = videos if args.force else remaining_selection(conn, source_id, videos, mode, args.with_video)
     plan = estimate_plan(remaining, args.aai_price)
     disk = disk_snapshot(config["audio_dir"])
-    required = plan["audio_bytes"] + int(max(0, args.min_free_gb) * GIB)
+    required = (plan["audio_bytes"] or 0) + int(max(0, args.min_free_gb) * GIB)
 
     print(f"Автор: {entity.get('title') or author} · @{entity.get('author_handle') or author}")
     print(f"Каталог: {len(posts)} постов · {len(videos)} видео · доступно текущему аккаунту")
-    print(f"Осталось: {plan['videos']} видео · {human_hours(plan['duration_sec'])}")
-    print(f"Аудио 96 Кбит/с: примерно {human_bytes(plan['audio_bytes'])}")
+    if plan['unknown_duration_count']:
+        print(f"Осталось: {plan['videos']} видео · длительность неизвестна для {plan['unknown_duration_count']}; известная часть {human_hours(plan['known_duration_sec'])}")
+        print("Размер, цена и время всего прогона неизвестны; это не 0. Нужна отдельная metadata duration проверка.")
+    else:
+        print(f"Осталось: {plan['videos']} видео · {human_hours(plan['duration_sec'])}")
+        print(f"Аудио 96 Кбит/с: примерно {human_bytes(plan['audio_bytes'])}")
     print(f"Папка аудио: {config['audio_dir']}")
     print(f"Свободно: {human_bytes(disk['free'])} · резерв после запуска: {args.min_free_gb:.1f} ГБ")
-    if not args.download_only:
-        print(f"AssemblyAI: ориентир ${plan['estimated_cost_usd']:.2f} при ${args.aai_price:.2f}/ч")
+    if not args.download_only and not plan['unknown_duration_count']:
+        print(f"AssemblyAI: ориентир ${plan['estimated_cost_usd']:.2f} при ${args.aai_price:.2f}/ч (это заданная цена, не live billing)")
         print(f"Время последовательного прогона: ориентировочно {plan['wall_hours_min']:.1f}–{plan['wall_hours_max']:.1f} ч")
     if args.with_video:
         print(f"Видео: ВКЛЮЧЕНО · папка {config['video_dir']}")
@@ -518,6 +621,13 @@ def main(argv=None):
         )
         return 5
     if args.plan:
+        if args.plan_report:
+            target = Path(args.plan_report).expanduser().absolute()
+            permitted = (app_root() / "tmp").resolve()
+            if not target.parent.resolve().is_relative_to(permitted):
+                raise RuntimeError("Preflight report должен оставаться внутри app-support/tmp")
+            atomic_json(target, safe_plan_report(conn, source_id, entity, posts, videos, remaining, config, catalogue_summary))
+            print(f"Preflight report: {target}")
         return 0
     if not args.yes:
         answer = input("Запустить последовательную обработку? [y/N] ").strip().lower()

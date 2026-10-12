@@ -685,10 +685,9 @@ if (window.__mcpContentLoaded) {
         return;
       }
 
-      // ── Wait for a selector to appear (polling) ───────────────────
+      // Observe DOM readiness; background tabs can throttle chained timers to minutes.
       if (action === 'mcp_wait_for_selector') {
         const timeout = message.timeout || 10000;
-        const interval = message.interval || 200;
         const visible = !!message.visible;
         const start = Date.now();
         const isVisible = (el) => {
@@ -703,15 +702,34 @@ if (window.__mcpContentLoaded) {
           if (el && (!visible || isVisible(el))) return el;
           return null;
         };
-        const poll = () => new Promise((resolve) => {
-          (function loop() {
-            const el = check();
-            if (el) return resolve({ found: true, elapsedMs: Date.now() - start });
-            if (Date.now() - start >= timeout) return resolve({ found: false, elapsedMs: Date.now() - start });
-            setTimeout(loop, interval);
-          })();
+        const wait = () => new Promise((resolve) => {
+          let done = false, timer;
+          const events = ['load', 'transitionend', 'animationend', 'visibilitychange', 'resize'];
+          const finish = result => {
+            if (done) return;
+            done = true;
+            observer.disconnect();
+            clearTimeout(timer);
+            for (const name of events) window.removeEventListener(name, changed, true);
+            window.removeEventListener('pagehide', left);
+            resolve({ ...result, elapsedMs: Date.now() - start });
+          };
+          const timedOut = () => finish({ found: false, error: 'Selector not found before deadline', errorCode: 'SELECTOR_TIMEOUT' });
+          const probe = observedBy => {
+            if (Date.now() - start >= timeout) { timedOut(); return; }
+            try { if (check()) finish({ found: true, observedBy }); }
+            catch (error) { finish({ found: false, error: error.message, errorCode: 'INVALID_SELECTOR' }); }
+          };
+          const changed = event => probe(event.type);
+          const left = () => finish({ found: false, error: 'Document changed while waiting', errorCode: 'DOCUMENT_CHANGED' });
+          const observer = new MutationObserver(() => probe('mutation'));
+          observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true });
+          for (const name of events) window.addEventListener(name, changed, true);
+          window.addEventListener('pagehide', left, { once: true });
+          timer = setTimeout(timedOut, timeout);
+          probe('initial');
         });
-        poll().then(r => sendResponse({ success: r.found, ...r }));
+        wait().then(r => sendResponse({ success: r.found, ...r }));
         return true; // keep channel open for async sendResponse
       }
 

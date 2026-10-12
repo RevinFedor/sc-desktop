@@ -11,12 +11,16 @@
 
 // MCP-Bridge подключается в SW через importScripts (MV3 разрешает).
 // mcp-handlers.js сам вызывает connectMcpBridge() в конце файла.
-try { importScripts('english-lexeme.js', 'learning-store.js'); }
+try { importScripts('english-lexeme.js', 'vendor/ts-fsrs-5.4.1.js', 'study-state.js', 'review-scheduler.js', 'learning-store.js'); }
 catch (e) { console.warn('[SC-BG] learning-store load failed:', e); }
 try { importScripts('mcp-window-model.js'); }
 catch (e) { console.warn('[SC-BG] mcp-window-model load failed:', e); }
+try { importScripts('mcp-native-dialogs.js'); }
+catch (e) { console.warn('[SC-BG] mcp-native-dialogs load failed:', e); }
 try { importScripts('research-tab-registry.js'); }
 catch (e) { console.warn('[SC-BG] research-tab-registry load failed:', e); }
+try { importScripts('research-startup-recovery.js'); }
+catch (e) { console.warn('[SC-BG] research-startup-recovery load failed:', e); }
 try { importScripts('mcp-handlers.js'); }
 catch (e) { console.warn('[SC-BG] mcp-handlers load failed:', e); }
 try { importScripts('tab-placement.js'); }
@@ -34,6 +38,7 @@ const POLL_PERIOD_MIN = 0.1; // 6 seconds — minimum supported by chrome.alarms
 const TRACKER_TTL_MS = 30 * 60 * 1000; // считаем job stale через полчаса
 const MAX_RESUME_ATTEMPTS = 3; // awaiting_ai → /yt-resume-ai retry cap до 'error'
 const YOUTUBE_SETTINGS_PATH = '/extension-settings/youtube';
+const MAIN_SETTINGS_PATH = '/extension-settings/main';
 const SC_EXTENSION_ID = 'phnlfhkblebijojjnnlbcbklijgcijgf';
 const VOCABULARY_SYNC_ALARM = 'sc-vocabulary-sync';
 
@@ -137,7 +142,7 @@ async function persistYoutubeSettingsPatch(rawPatch) {
     if (Object.prototype.hasOwnProperty.call(YOUTUBE_DEFAULT_SETTINGS, key)) allowedPatch[key] = value;
   }
   const current = await loadFreshYoutubeSettings();
-  const next = sanitizeYoutubeSettings({ ...current, ...allowedPatch });
+  const next = applyYoutubeSettingsPatch(current, allowedPatch);
   const patch = diffYoutubeSettings(current, next);
   if (!Object.keys(patch).length) return { settings: next, online: true };
   await storageSyncSet({ __yt: next });
@@ -185,6 +190,18 @@ async function fetchBridgeJson(path, init = {}, timeoutMs = 1800) {
     return data;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function loadMainAutomationSettings() {
+  try {
+    const remote = await fetchBridgeJson(MAIN_SETTINGS_PATH);
+    return {
+      youtubeAiTemporaryChat: remote?.settings?.youtube_ai_temporary_chat !== false,
+    };
+  } catch (error) {
+    scBgDbg('main.settings.fallback_defaults', { err: error?.message || String(error) });
+    return { youtubeAiTemporaryChat: true };
   }
 }
 
@@ -497,6 +514,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 let port = null;
 let queue = [];
 let lastConnectError = null;
+let exporterBufferWriteChain = Promise.resolve();
 
 function connect() {
   if (port) return port;
@@ -538,14 +556,22 @@ function connect() {
 
 function sendToHost(evt) {
   // Mirror to chrome.storage.local (last 500 events) — fallback if NMH not installed.
-  try {
-    chrome.storage.local.get({ __aise_buffer: [] }, (res) => {
-      const buf = res.__aise_buffer || [];
-      buf.push(evt);
-      if (buf.length > 500) buf.splice(0, buf.length - 500);
-      chrome.storage.local.set({ __aise_buffer: buf });
-    });
-  } catch (_) {}
+  // Writes must be serialized: a burst of turn logs otherwise performs many
+  // concurrent get+set pairs and old snapshots overwrite newer events.
+  exporterBufferWriteChain = exporterBufferWriteChain
+    .catch(() => {})
+    .then(() => new Promise(resolve => {
+      try {
+        chrome.storage.local.get({ __aise_buffer: [] }, (res) => {
+          const buf = Array.isArray(res.__aise_buffer) ? res.__aise_buffer : [];
+          buf.push(evt);
+          if (buf.length > 500) buf.splice(0, buf.length - 500);
+          chrome.storage.local.set({ __aise_buffer: buf }, resolve);
+        });
+      } catch (_) {
+        resolve();
+      }
+    }));
 
   const p = port || connect();
   if (!p) {
@@ -836,6 +862,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 //
 // См. fact-aistudio-mcp.md::chrome.debugger strategy для деталей.
 const SC_DEBUGGER_ATTACHED = new Set(); // tabId'ы где attach уже сделан
+globalThis.scIsFocusEmulationAttached = tabId => SC_DEBUGGER_ATTACHED.has(tabId);
 
 // Какие вкладки держим под focus-emulation (attach при открытии + авто-reattach
 // в onDetach/watchdog). НЕ только aistudio: research-вкладки (chatgpt/claude/
@@ -915,7 +942,9 @@ async function attachFocusEmulation(tabId) {
     return { ok: true, alreadyAttached: true };
   }
   try {
-    await chrome.debugger.attach({ tabId }, '1.3');
+    if (!globalThis.scMcpNativeDialogs?.hasAttachment(tabId)) {
+      await chrome.debugger.attach({ tabId }, '1.3');
+    }
     SC_DEBUGGER_ATTACHED.add(tabId);
     scBgDbg('debugger.attach.ok', { tabId });
     // Главная команда: setFocusEmulationEnabled. Page::IsPageVisible()
@@ -953,6 +982,10 @@ async function attachFocusEmulation(tabId) {
     return { ok: false, err: msg };
   }
 }
+// Startup recovery is imported before this declaration but runs after its
+// first storage await. Expose the canonical helper so a re-injected research
+// watcher restores the same debugger bookkeeping and can detach cleanly.
+globalThis.scAttachFocusEmulation = attachFocusEmulation;
 
 async function detachFocusEmulation(tabId) {
   if (!SC_DEBUGGER_ATTACHED.has(tabId)) {
@@ -964,7 +997,9 @@ async function detachFocusEmulation(tabId) {
     try {
       await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: false });
     } catch {}
-    await chrome.debugger.detach({ tabId });
+    if (!globalThis.scMcpNativeDialogs?.hasAttachment(tabId)) {
+      await chrome.debugger.detach({ tabId });
+    }
     SC_DEBUGGER_ATTACHED.delete(tabId);
     scBgDbg('debugger.detach.ok', { tabId });
     try {
@@ -1082,10 +1117,17 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
             scBgDbg('bridge_cmd.open_url.created', { tabId: t.id })
           }
         } else if (it.cmd === 'reload_extension') {
-          // Force-reload по запросу из sc-desktop / Claude — обходим
-          // hot-reload polling (grace+cooldown) и применяем свежий код сразу.
+          // Reload is still explicit, but an active browser job must keep its
+          // watcher. The shared gate persists this request and applies it as
+          // soon as two consecutive live checks show no active research.
           scBgDbg('bridge_cmd.reload_extension', { ts: it.ts })
-          setTimeout(() => { try { chrome.runtime.reload() } catch {} }, 100)
+          const gate = globalThis.scResearchReloadGate
+          if (gate?.request) {
+            const outcome = await gate.request('bridge_command')
+            scBgDbg('bridge_cmd.reload_extension.outcome', outcome)
+          } else {
+            scBgDbg('bridge_cmd.reload_extension.deferred', { reason: 'reload_gate_unavailable' })
+          }
         } else if (it.cmd === 'boosty_auth' && it.requestId) {
           // Short-lived authenticated handoff for the desktop Boosty worker.
           // The value is posted straight to Electron and never logged or put
@@ -1222,6 +1264,16 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 // chrome.alarms — единственный надёжный способ tick'нуть hidden tab.
 const RESEARCH_TABS = new Set();
 const RESEARCH_ALARM = 'sc-research-watchdog';
+// Startup recovery state lives in storage.local and therefore survives an
+// MV3 service-worker respin. Rehydrate lifecycle tracking before a new CS
+// keepalive port has a chance to reconnect.
+Promise.resolve(globalThis.scResearchStartupRestore)
+  .then(states => {
+    for (const state of states || []) {
+      if (Number.isInteger(state?.tabId)) RESEARCH_TABS.add(state.tabId);
+    }
+  })
+  .catch(() => {});
 chrome.runtime.onConnect.addListener(port => {
   if (port.name !== 'sc-research-keepalive') return;
   const tabId = port.sender?.tab?.id;
@@ -1694,8 +1746,10 @@ async function __sc_pollExtVersion() {
     // ПОТОМ перезагружаемся. Если crash до reload'а — следующий
     // tick после respin'а увидит уже обновлённый `last` и не зациклится.
     await chrome.storage.local.set({ __sc_ext_mtime: mt, __sc_last_reload_ts: Date.now() });
-    scBgDbg('reload.firing', { from: last, to: mt, sinceBoot, sinceReload }).catch(() => {});
-    chrome.runtime.reload();
+    scBgDbg('reload.requested', { from: last, to: mt, sinceBoot, sinceReload }).catch(() => {});
+    const gate = globalThis.scResearchReloadGate;
+    if (gate?.request) await gate.request('http_mtime');
+    else scBgDbg('reload.deferred', { reason: 'reload_gate_unavailable' }).catch(() => {});
   } catch (e) {
     // Bridge недоступен или storage упал — silent (в проде ОК).
   }
@@ -1746,7 +1800,9 @@ function __sc_connectReloadWs() {
     const data = String(ev.data || '');
     if (data === 'reload' || data.startsWith('reload:')) {
       console.log('[SC-BG] hot-reload triggered via WS');
-      chrome.runtime.reload();
+      const gate = globalThis.scResearchReloadGate;
+      if (gate?.request) gate.request('ws_mtime').catch(() => {});
+      else scBgDbg('reload.deferred', { reason: 'reload_gate_unavailable', source: 'ws_mtime' }).catch(() => {});
     }
   });
   __sc_reloadWs.addEventListener('close', () => {
@@ -1918,6 +1974,7 @@ async function deliverChatgptComposeResult(requestId, result, stored = {}) {
     effort: terminalResult.effort,
     speed: terminalResult.speed,
     ytVideoId: route.ytVideoId,
+    error: terminalResult.error,
   }).catch(() => {});
 
   let delivery;
@@ -2268,14 +2325,17 @@ async function openChatgptBackground(payload) {
   const commentsText = payload.cachedCommentsFilePath
     ? await fetchYoutubeArtifactText(payload.cachedCommentsFilePath)
     : '';
+  const mainSettings = await loadMainAutomationSettings();
   const composeContent = buildYoutubeChatgptComposeContent(payload, transcriptText, commentsText);
   const requestId = newRequestId();
+  const mode = normalizeChatgptMode(payload.mode);
   const job = {
     requestId,
     prompt: composeContent.prompt,
     document: composeContent.document,
     showInTextField: payload.showInTextField !== false,
-    mode: normalizeChatgptMode(payload.mode),
+    mode,
+    temporaryChat: mode === 'chat' && mainSettings.youtubeAiTemporaryChat,
     model: payload.model || '5.6-sol',
     effort: payload.effort || 'xhigh',
     speed: normalizeChatgptMode(payload.mode) === 'work' ? (payload.speed || 'standard') : null,
@@ -2294,6 +2354,7 @@ async function openChatgptBackground(payload) {
     documentChars: job.document.text.length,
     documentName: job.document.name,
     showInTextField: job.showInTextField,
+    temporaryChat: job.temporaryChat,
     hasComments: !!commentsText,
   });
   await new Promise(resolve => {
@@ -2303,7 +2364,7 @@ async function openChatgptBackground(payload) {
   let tab;
   try {
     tab = await createTabBesideSourceAsync({
-      url: scChatgptComposeEntryUrl(requestId, job.mode),
+      url: scChatgptComposeEntryUrl(requestId, job.mode, job.temporaryChat),
       active: false,
     }, job.ytTabId, { requestId, feature: 'youtube-chatgpt-compose' });
   } catch (error) {

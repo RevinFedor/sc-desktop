@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { fixture } = require('./helpers/chatgpt-flow-fixture.cjs');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'chatgpt-research.js'), 'utf8');
 const exportMarker = "  if (document.readyState === 'loading') {";
@@ -18,12 +19,18 @@ const instrumented = source.replace(exportMarker, `
     modelKeyFromText,
     resolveModel,
     modelDisplay,
+    chatgptSelectionError,
     currentModelKeyFromOpenMenu,
     findEffortSubTrigger,
+    currentEffortKeyFromOpenMenu,
+    effortKeyFromSliderValue,
+    effortSliderValueForKey,
     resolveEffort,
     resolveSpeed,
     speedLabel,
+    speedKeyFromFastModeToggle,
     latestApiTurnSnapshotFromData,
+    buildChatGPTApiMarkdown,
     terminalProofForCurrentPage,
     normalizeComposeDocument,
     normalizeComposeJobPayload,
@@ -86,12 +93,18 @@ const {
   modelKeyFromText,
   resolveModel,
   modelDisplay,
+  chatgptSelectionError,
   currentModelKeyFromOpenMenu,
   findEffortSubTrigger,
+  currentEffortKeyFromOpenMenu,
+  effortKeyFromSliderValue,
+  effortSliderValueForKey,
   resolveEffort,
   resolveSpeed,
   speedLabel,
+  speedKeyFromFastModeToggle,
   latestApiTurnSnapshotFromData,
+  buildChatGPTApiMarkdown,
   terminalProofForCurrentPage,
   normalizeComposeDocument,
   normalizeComposeJobPayload,
@@ -140,6 +153,17 @@ test('temporary chat is already Chat and rejects Work without waiting for a miss
   context.location.search = '';
 });
 
+test('a normal Chat home with an enable-temporary-chat button is still eligible for Work', () => {
+  const previousLocation = context.window.location;
+  const previousQuery = documentMock.querySelector;
+  context.window.location = { href: 'https://chatgpt.com/' };
+  context.location.href = context.window.location.href;
+  documentMock.querySelector = selector => selector.includes('button[aria-label*="temporary chat"')
+    ? control('', { 'aria-label': 'Temporary Chat' }) : null;
+  try { assert.equal(isTemporaryChatPage(), false); }
+  finally { context.window.location = previousLocation; documentMock.querySelector = previousQuery; }
+});
+
 test('temporary chat accepts the already-proven DOM final when no conversation URL exists', () => {
   context.window.location = { href: 'https://chatgpt.com/?temporary-chat=true' };
   context.location.href = context.window.location.href;
@@ -156,6 +180,24 @@ test('temporary chat accepts the already-proven DOM final when no conversation U
   const ordinary = terminalProofForCurrentPage({ ready: false, reason: 'conversation_url_pending' });
   assert.equal(ordinary.ready, false);
   assert.equal(ordinary.fallback, undefined);
+});
+
+test('a saved conversation without Chat/Work controls reuses its exact server-proven mode', async () => {
+  const previous = { ...context.location };
+  context.location.href = 'https://chatgpt.com/c/verified-conversation';
+  context.location.pathname = '/c/verified-conversation';
+  context.location.search = '';
+  context.window.location = context.location;
+  documentMock.controls = [];
+  try {
+    const proof = { conversationId: 'verified-conversation', mode: 'chat' };
+    assert.equal(await ensureChatgptModeSelected('chat', proof), true);
+    assert.equal(await ensureChatgptModeSelected('work', proof), false);
+  } finally {
+    Object.assign(context.location, previous);
+    delete context.location.pathname;
+    context.window.location = context.location;
+  }
 });
 
 test('selected mode supports radio, tab and generic toggle state attributes', () => {
@@ -186,14 +228,72 @@ test('tablist fallback reads the single tabbable Russian mode', () => {
 });
 
 test('GPT-5.6 model labels distinguish Sol, Terra and Luna', () => {
+  assert.equal(modelKeyFromText('Последняя'), 'latest');
+  assert.equal(modelKeyFromText('Latest'), 'latest');
+  assert.equal(modelKeyFromText('6 Pro'), '6-astra');
+  assert.equal(modelKeyFromText('GPT-6 Astra'), '6-astra');
   assert.equal(modelKeyFromText('GPT-5.6 Sol'), '5.6-sol');
   assert.equal(modelKeyFromText('GPT-5.6 Terra'), '5.6-terra');
   assert.equal(modelKeyFromText('GPT-5.6 Luna'), '5.6-luna');
+  assert.equal(modelKeyFromText('5.6 Sol'), '5.6-sol');
+  assert.equal(modelKeyFromText('5.6 Terra'), '5.6-terra');
+  assert.equal(modelKeyFromText('5.6 Luna'), '5.6-luna');
+  assert.equal(modelKeyFromText('5.6 SolОчень высокий'), '5.6-sol');
   assert.equal(modelKeyFromText('Sol'), '5.6-sol');
   assert.equal(modelKeyFromText('Terra'), '5.6-terra');
   assert.equal(modelKeyFromText('Luna'), '5.6-luna');
   assert.equal(modelKeyFromText('GPT-5.5 Instant'), '5.5');
   assert.equal(modelKeyFromText('o3 Доступна до 26 августа'), 'o3');
+});
+
+test('current GPT-6 Work labels and Latest with an explicit version preserve exact model identity', () => {
+  assert.equal(modelKeyFromText('GPT-6.1 Sol'), '6.1-sol');
+  assert.equal(modelKeyFromText('GPT-6 Sol'), '6-sol');
+  assert.equal(modelKeyFromText('GPT-6 Luna'), '6-luna');
+  assert.equal(modelKeyFromText('Последняя • 6.1 Sol'), '6.1-sol');
+  assert.equal(modelKeyFromText('GPT-6.1 SolMax'), '6.1-sol');
+  assert.equal(resolveModel('gpt-6.1-sol'), '6.1-sol');
+  assert.equal(resolveModel('gpt-6-sol'), '6-sol');
+  assert.equal(resolveModel('gpt-6-luna'), '6-luna');
+});
+
+test('GPT-6 Chat family is distinct from explicit Astra, Sol, Luna and dynamic Latest', () => {
+  assert.equal(modelKeyFromText('GPT-6'), '6');
+  assert.equal(modelKeyFromText('6'), '6');
+  assert.equal(resolveModel('gpt-6'), '6');
+  assert.equal(resolveModel('6'), '6');
+  assert.equal(modelDisplay('6'), 'GPT-6');
+  for (const effort of ['instant', 'medium', 'high', 'xhigh', 'pro']) {
+    assert.equal(chatgptSelectionError('chat', '6', effort), null);
+  }
+  assert.match(chatgptSelectionError('chat', '6', 'ultra'), /не поддерживает/);
+  assert.match(chatgptSelectionError('work', '6', 'xhigh'), /не проверена/);
+});
+
+test('five-position Work Luna and four-position Work 5.5 sliders never use the Chat effort map', () => {
+  assert.equal(effortKeyFromSliderValue(0, 0, 4, 'work', '6-luna'), 'low');
+  assert.equal(effortKeyFromSliderValue(4, 0, 4, 'work', '6-luna'), 'max');
+  assert.equal(effortSliderValueForKey('ultra', 0, 4, 'work', '6-luna'), null);
+  assert.equal(effortKeyFromSliderValue(3, 0, 3, 'work', '5.5'), 'xhigh');
+  assert.equal(effortKeyFromSliderValue(4, 0, 4, 'chat', '5.6-sol'), 'pro');
+  assert.equal(effortKeyFromSliderValue(4, 0, 5, 'work', '6.1-sol'), 'max');
+  assert.equal(effortKeyFromSliderValue(1, 0, 5, 'work', 'latest'), null);
+});
+
+test('Latest is only Astra proof at Chat Pro; Work default never proves an explicit model', () => {
+  const latest = control('Latest', { role: 'menuitemradio', 'aria-checked': 'true' });
+  const attrs = { role: 'slider', 'aria-valuemin': '0', 'aria-valuemax': '4', 'aria-valuenow': '3' };
+  const slider = control('', attrs);
+  const version = control('6Pro', { role: 'menuitem', 'aria-label': 'Выбрать модель' });
+  documentMock.controls = [latest, slider, version];
+  try {
+    assert.equal(currentModelKeyFromOpenMenu('chat'), 'latest');
+    attrs['aria-valuenow'] = '4';
+    assert.equal(currentModelKeyFromOpenMenu('chat'), '6-astra');
+    assert.equal(currentModelKeyFromOpenMenu('work'), 'latest');
+    version.textContent = '7Pro';
+    assert.equal(currentModelKeyFromOpenMenu('chat'), 'latest');
+  } finally { documentMock.controls = []; }
 });
 
 test('current ChatGPT effort submenu uses the Усилие label', () => {
@@ -202,15 +302,84 @@ test('current ChatGPT effort submenu uses the Усилие label', () => {
   assert.equal(findEffortSubTrigger(), effort);
 });
 
+test('current ChatGPT root menu recognizes an already checked model and current effort row', () => {
+  const effort = control('Очень высокий', { role: 'menuitem', 'aria-expanded': 'false' });
+  const model = control('GPT-5.6 Sol', { role: 'menuitemradio', 'aria-checked': 'true' });
+  const otherModel = control('GPT-5.5', { role: 'menuitemradio', 'aria-checked': 'false' });
+  documentMock.controls = [effort, model, otherModel];
+
+  assert.equal(currentModelKeyFromOpenMenu(), '5.6-sol');
+  assert.equal(findEffortSubTrigger(), effort);
+  assert.equal(currentEffortKeyFromOpenMenu(), 'xhigh');
+});
+
+test('new Chat effort slider maps five positions to Instant through Pro', () => {
+  assert.equal(effortKeyFromSliderValue(0, 0, 4), 'instant');
+  assert.equal(effortKeyFromSliderValue(1, 0, 4), 'medium');
+  assert.equal(effortKeyFromSliderValue(2, 0, 4), 'high');
+  assert.equal(effortKeyFromSliderValue(3, 0, 4), 'xhigh');
+  assert.equal(effortKeyFromSliderValue(4, 0, 4), 'pro');
+  assert.equal(effortSliderValueForKey('xhigh', 0, 4), 3);
+  assert.equal(effortSliderValueForKey('low', 0, 4), null);
+});
+
+test('new Work effort slider maps six positions to Low through Ultra', () => {
+  assert.equal(effortKeyFromSliderValue(0, 0, 5), 'low');
+  assert.equal(effortKeyFromSliderValue(1, 0, 5), 'medium');
+  assert.equal(effortKeyFromSliderValue(2, 0, 5), 'high');
+  assert.equal(effortKeyFromSliderValue(3, 0, 5), 'xhigh');
+  assert.equal(effortKeyFromSliderValue(4, 0, 5), 'max');
+  assert.equal(effortKeyFromSliderValue(5, 0, 5), 'ultra');
+  assert.equal(effortSliderValueForKey('max', 0, 5), 4);
+  assert.equal(effortSliderValueForKey('instant', 0, 5), null);
+});
+
+test('current effort is read from the slider before legacy menu rows', () => {
+  const slider = control('', {
+    role: 'slider',
+    'aria-valuemin': '0',
+    'aria-valuemax': '4',
+    'aria-valuenow': '3',
+  });
+  const staleLegacyRow = control('Высокий', { role: 'menuitem', 'aria-expanded': 'true' });
+  documentMock.controls = [staleLegacyRow, slider];
+
+  assert.equal(currentEffortKeyFromOpenMenu(), 'xhigh');
+});
+
 test('retired Pro detail aliases collapse to the single current Pro option', () => {
   assert.equal(resolveEffort('pro-extended'), 'pro');
   assert.equal(resolveEffort('Pro расширенный'), 'pro');
+});
+
+test('Astra retains Chat Pro while Work generations expose only their supported effort ranges', () => {
+  assert.equal(chatgptSelectionError('chat', '6-astra', 'pro'), null);
+  assert.match(chatgptSelectionError('chat', '6-astra', 'xhigh'), /только как Pro/);
+  assert.equal(chatgptSelectionError('chat', '5.6-sol', 'xhigh'), null);
+  assert.equal(chatgptSelectionError('chat', '5.6-sol', 'pro'), null);
+  assert.equal(chatgptSelectionError('work', '6-astra', 'max'), null);
+  assert.equal(chatgptSelectionError('work', '6.1-sol', 'ultra'), null);
+  assert.equal(chatgptSelectionError('work', '6-sol', 'high'), null);
+  assert.equal(chatgptSelectionError('work', '6-luna', 'max'), null);
+  assert.match(chatgptSelectionError('work', '6-luna', 'ultra'), /не поддерживает/);
+  assert.match(chatgptSelectionError('work', '5.6-luna', 'ultra'), /не поддерживает/);
+  assert.equal(chatgptSelectionError('work', '5.5', 'xhigh'), null);
+  assert.match(chatgptSelectionError('work', '5.5', 'max'), /не поддерживает/);
+  assert.match(chatgptSelectionError('chat', '6.1-sol', 'xhigh'), /недоступна в Chat/);
 });
 
 test('Work speed defaults to quota-safer standard mode', () => {
   assert.equal(resolveSpeed(), 'standard');
   assert.equal(resolveSpeed('быстро'), 'fast');
   assert.equal(speedLabel('fast'), 'Быстро');
+  assert.equal(speedKeyFromFastModeToggle(control('', {
+    'aria-label': 'Включить стандартный режим',
+    'aria-checked': 'true',
+  })), 'fast');
+  assert.equal(speedKeyFromFastModeToggle(control('', {
+    'aria-label': 'Включить быстрый режим',
+    'aria-checked': 'false',
+  })), 'standard');
 });
 
 test('API terminal proof ignores commentary and returns only the final channel', () => {
@@ -274,9 +443,9 @@ test('API terminal proof ignores commentary and returns only the final channel',
   assert.deepEqual(Array.from(snapshot.activity_items), []);
 });
 
-test('API terminal proof stays pending while Work has commentary only', () => {
+test('API terminal proof stays pending for end_turn commentary followed by a tool', () => {
   const data = {
-    current_node: 'commentary',
+    current_node: 'tool',
     mapping: {
       user: {
         id: 'user', parent: null,
@@ -285,8 +454,16 @@ test('API terminal proof stays pending while Work has commentary only', () => {
       commentary: {
         id: 'commentary', parent: 'user',
         message: {
-          author: { role: 'assistant' }, channel: 'commentary', end_turn: false,
-          status: 'finished_successfully', content: { content_type: 'text', parts: ['Думаю'] }, metadata: {},
+          author: { role: 'assistant' }, channel: 'commentary', end_turn: true,
+          status: 'finished_successfully', content: { content_type: 'text', parts: ['Прослежу результат'] },
+          metadata: { is_thinking_preamble_message: true },
+        },
+      },
+      tool: {
+        id: 'tool', parent: 'commentary',
+        message: {
+          author: { role: 'tool', name: 'container.exec' },
+          status: 'finished_successfully', content: { content_type: 'execution_output', text: 'still working' },
         },
       },
     },
@@ -296,7 +473,87 @@ test('API terminal proof stays pending while Work has commentary only', () => {
   assert.equal(snapshot.text, '');
 });
 
+test('API terminal proof requires final plus end_turn for the current provider contract', () => {
+  const data = {
+    current_node: 'assistant',
+    mapping: {
+      user: {
+        id: 'user', parent: null,
+        message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['task'] } },
+      },
+      assistant: {
+        id: 'assistant', parent: 'user',
+        message: {
+          author: { role: 'assistant' }, channel: 'final', end_turn: false,
+          status: 'finished_successfully', content: { content_type: 'text', parts: ['not terminal yet'] }, metadata: {},
+        },
+      },
+    },
+  };
+  assert.equal(latestApiTurnSnapshotFromData(data).ready, false);
+});
+
+test('legacy channel-less final is accepted only as the finished tail of its turn', () => {
+  const base = {
+    user: {
+      id: 'user', parent: null,
+      message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['legacy task'] } },
+    },
+    legacy: {
+      id: 'legacy', parent: 'user',
+      message: {
+        author: { role: 'assistant' }, end_turn: true, status: 'finished_successfully', recipient: 'all',
+        content: { content_type: 'text', parts: ['OK'] }, metadata: {},
+      },
+    },
+  };
+  const accepted = latestApiTurnSnapshotFromData({ current_node: 'legacy', mapping: base });
+  assert.equal(accepted.ready, true);
+  assert.equal(accepted.reason, 'api_legacy_final');
+  assert.equal(accepted.text, 'OK');
+
+  const withTool = {
+    ...base,
+    tool: {
+      id: 'tool', parent: 'legacy',
+      message: {
+        author: { role: 'tool', name: 'container.exec' },
+        status: 'finished_successfully', content: { content_type: 'execution_output', text: 'continued' },
+      },
+    },
+  };
+  assert.equal(latestApiTurnSnapshotFromData({ current_node: 'tool', mapping: withTool }).ready, false);
+});
+
+test('API export never promotes commentary end_turn into the assistant answer', () => {
+  const data = {
+    title: 'Pending turn',
+    current_node: 'commentary',
+    mapping: {
+      user: {
+        id: 'user', parent: null,
+        message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['task'] } },
+      },
+      commentary: {
+        id: 'commentary', parent: 'user',
+        message: {
+          author: { role: 'assistant' }, channel: 'commentary', end_turn: true,
+          status: 'finished_successfully', content: { content_type: 'text', parts: ['still working'] }, metadata: {},
+        },
+      },
+    },
+  };
+  const stats = { user: 0, assistant: 0, sources: 0, activity: 0, images: 0 };
+  const built = buildChatGPTApiMarkdown(data, {
+    includeImages: false, includeReasoning: false, includeSources: false, includeSourceActivity: false,
+  }, stats, 'chat');
+  assert.doesNotMatch(built.markdown, /## ChatGPT\n\nstill working/);
+});
+
 test('legacy numeric GPT-5.6 resolves to Sol', () => {
+  assert.equal(resolveModel('gpt-6-astra'), '6-astra');
+  assert.equal(resolveModel('Astra'), '6-astra');
+  assert.equal(modelDisplay('6-astra'), 'GPT-6 Astra');
   assert.equal(resolveModel('5.6'), '5.6-sol');
   assert.equal(resolveModel('GPT-5.6 Terra'), '5.6-terra');
   assert.equal(modelDisplay('5.6-luna'), 'GPT-5.6 Luna');
@@ -352,25 +609,16 @@ test('compose document becomes a UTF-8 text File without merging the prompt', ()
 });
 
 test('attachment proof requires a new preview, not the permanent upload control', () => {
-  const preview = { text: '', candidates: 1, images: 0 };
-  const root = {
-    get textContent() { return preview.text; },
-    querySelectorAll(selector) {
-      const count = selector === 'img' ? preview.images : preview.candidates;
-      return Array.from({ length: count }, () => ({}));
-    },
-  };
-  documentMock.composer = { closest: () => root };
+  const f = fixture();
+  f.composer.appendChild(new f.Element('button', { 'data-testid': 'upload-files-button' }));
   const files = [{ name: 'video.txt', type: 'text/plain' }];
-  const baseline = composerFilePreviewState(files);
-
-  assert.equal(composerHasFilePreview(files, baseline), false);
-  preview.candidates = 2;
-  assert.equal(composerHasFilePreview(files, baseline), true);
-  preview.candidates = 1;
-  preview.text = 'video.txt';
-  assert.equal(composerHasFilePreview(files, baseline), true);
-  documentMock.composer = null;
+  const baseline = f.composerFilePreviewState(files);
+  assert.equal(f.composerHasFilePreview(files, baseline), false);
+  const preview = f.preview('video.txt');
+  assert.equal(f.composerHasFilePreview(files, baseline), true);
+  preview.remove();
+  f.editor.textContent = 'video.txt';
+  assert.equal(f.composerHasFilePreview(files, baseline), false);
 });
 
 test('show-in-text-field controls support current Russian and English labels', () => {
@@ -421,6 +669,36 @@ test('oversized Pasted Text becomes a ready attachment without waiting for a mis
   assert.equal(result.method, 'pasted_text_attachment');
   assert.equal(result.reason, 'too_long_for_text_field');
   documentMock.composer = null;
+});
+
+test('current Pasted Text chip without inline control falls back only after a stable send-ready attachment', async () => {
+  const f = fixture();
+  const prompt = 'Задача:\nперескажи кратко видео';
+  f.editor.textContent = prompt;
+  const chip = f.composer.appendChild(new f.Element('button', { 'aria-label': 'Вставленный текст.txt' }));
+  f.composer.appendChild(f.send);
+
+  const pending = f.showPastedTextInComposer('video-compose', `${prompt}\n\n${'исходный материал '.repeat(4000)}`, prompt);
+  await f.clock.advance(3500);
+  assert.equal(f.composer.contains(chip), true);
+  await f.clock.advance(6500);
+  const result = await pending;
+  assert.equal(result.method, 'pasted_text_attachment');
+  assert.equal(result.reason, 'inline_control_unavailable_after_ready_chip');
+  assert(result.waitedMs >= 7000 && result.waitedMs < 10000);
+});
+
+test('the same chip cannot fall back while Send is disabled', async () => {
+  const f = fixture();
+  const prompt = 'Задача:\nперескажи кратко видео';
+  f.editor.textContent = prompt;
+  f.composer.appendChild(new f.Element('button', { 'aria-label': 'Вставленный текст.txt' }));
+  f.send.setAttribute('disabled', '');
+  f.composer.appendChild(f.send);
+
+  const pending = f.showPastedTextInComposer('uploading-video', `${prompt}\n\nисходный материал`, prompt, 9000);
+  await f.clock.advance(10000);
+  await assert.rejects(pending, /chatgpt_show_in_text_field_failed/);
 });
 
 test('compose job enables inline mode only when explicitly requested', () => {

@@ -20,20 +20,31 @@ function normalizeChatgptConversationUrl(raw) {
   return u.toString()
 }
 
-function chatgptResearchEntryUrl({ id, mode, conversationUrl = '' }) {
+function chatgptResearchEntryUrl({ id, mode, conversationUrl = '', temporaryChat = true }) {
   if (!id) throw new Error('research id required')
   if (conversationUrl) {
     return appendResearchId(normalizeChatgptConversationUrl(conversationUrl), id)
   }
   const u = new URL('https://chatgpt.com/')
-  if (chatgptMode(mode) === 'chat') u.searchParams.set('temporary-chat', 'true')
+  if (chatgptMode(mode) === 'chat' && temporaryChat !== false) {
+    u.searchParams.set('temporary-chat', 'true')
+  }
   u.searchParams.set('sc-research', id)
   u.hash = 'sc-research=' + encodeURIComponent(id)
   return u.toString()
+}
+
+function chatgptConversationIdentity(rawUrl) {
+  try {
+    const conversationUrl = normalizeChatgptConversationUrl(rawUrl)
+    if (!conversationUrl) return null
+    return { conversationUrl, conversationId: new URL(conversationUrl).pathname.split('/')[2] }
+  } catch (_) { return null }
 }
 
 module.exports = {
   appendResearchId,
   normalizeChatgptConversationUrl,
   chatgptResearchEntryUrl,
+  chatgptConversationIdentity,
 }

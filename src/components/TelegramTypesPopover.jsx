@@ -14,7 +14,7 @@ export const CONTENT_TYPES = [
   { id: 'voice',    label: 'Голосовые',    processor: 'транскрибация',            default: false },
   { id: 'video',    label: 'Видео',        processor: 'транскрибация',            default: false },
   { id: 'photo',    label: 'Фото',         processor: 'Gemini Vision (описание)', default: false },
-  { id: 'docs',     label: 'Документы',    processor: 'Gemini PDF extract',       default: false },
+  { id: 'docs',     label: 'Документы',    processor: 'текстовые локально · PDF через Gemini', default: false },
   // Comments are channel-only (linked discussion group). On folder pages we
   // don't pass per-channel `hasDiscussion`, so we hide that row by default
   // there; single-chat form keeps it for the per-channel awareness.

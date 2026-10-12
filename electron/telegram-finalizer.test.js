@@ -78,6 +78,78 @@ test('worker finalizes a large Telegram payload without parking the parent loop'
   assert.ok(heartbeats > 0, `expected parent-loop heartbeats, got ${heartbeats}`)
 })
 
+test('forwarded Telegram attachment survives persistence and single-message export', async () => {
+  const item = {
+    id: 4981,
+    type: 'document',
+    text: 'Короткая подпись',
+    date: '2026-08-08T14:32:54Z',
+    sender: 'Я',
+    has_media: true,
+    media: [{
+      kind: 'document',
+      file_name: 'эвалы-агентов-для-чата.md',
+      content_type: null,
+      bytes: 5496,
+      media_type: 'MessageMediaDocument',
+    }],
+    forward: {
+      date: '2026-08-08T14:32:54Z',
+      source: { id: 8765872682, kind: 'user', name: 'Друг', username: null },
+    },
+  }
+  const singlePath = path.join(tempRoot, 'jobs', 'forwarded-single.txt')
+  await finalizeTelegramJob({
+    id: 2,
+    source_id: null,
+    items: [item],
+    params: { mode: 'single', process_docs: true },
+    outcomeStatus: 'done',
+    type_breakdown: { document: 1 },
+    mediaResults: [{
+      msg_id: '4981', kind: 'pdf', engine: 'local-text',
+      text: '# Содержимое прикреплённого файла',
+    }],
+    commentsBuffer: [],
+    isSingle: true,
+    isMediaOnly: false,
+    filePath: singlePath,
+    commentsFilePath: null,
+    summary: { id: 2, type: 'tg_fetch', status: 'done', items_total: 1 },
+  })
+  const body = fs.readFileSync(singlePath, 'utf8')
+  assert.match(body, /\[пересланное сообщение · Друг/)
+  assert.match(body, /\[вложение: эвалы-агентов-для-чата\.md · 5\.4 KB\]/)
+  assert.match(body, /\[документ — извлечение · local-text\]/)
+  assert.match(body, /Содержимое прикреплённого файла/)
+
+  const sourceId = db.upsertSource({
+    platform: 'telegram', handle: 'forwarded-attachment-fixture',
+    display_name: 'Forwarded attachment fixture', external_id: '99002',
+    meta: { kind: 'group' }, is_explicit: true,
+  })
+  const batchPath = path.join(tempRoot, 'jobs', 'forwarded-batch.json')
+  await finalizeTelegramJob({
+    id: 3,
+    source_id: sourceId,
+    items: [item],
+    params: { mode: 'id_list' },
+    outcomeStatus: 'done',
+    type_breakdown: { document: 1 },
+    mediaResults: [],
+    commentsBuffer: [],
+    isSingle: false,
+    isMediaOnly: false,
+    filePath: batchPath,
+    commentsFilePath: null,
+    summary: { id: 3, type: 'tg_fetch', status: 'done', items_total: 1 },
+  })
+  const row = db.getItemsByExternalIds(sourceId, ['4981'])[0]
+  const meta = JSON.parse(row.raw_meta_json)
+  assert.equal(meta.media[0].file_name, 'эвалы-агентов-для-чата.md')
+  assert.equal(meta.forward.source.name, 'Друг')
+})
+
 test('folder synchronization and pruning stay in the persistence worker', async () => {
   const chats = Array.from({ length: 1200 }, (_, index) => ({
     handle: `folder-chat-${index}`,

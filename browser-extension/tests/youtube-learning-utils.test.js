@@ -6,17 +6,27 @@ const {
   parseVttCues,
   pairAdjacentAsrCues,
   splitTimedCuesToFit,
+  layoutTimedCuesToFit,
   findCueIndex,
   examplesForTerm,
   expressionMatchesForCue,
+  pendingSaveWordIndexes,
   batchTexts,
   cueLookaheadItems,
+  cuePrefetchItems,
+  fullSubtitleRevealActive,
+  nextTranslationMode,
+  translationBufferSnapshot,
+  subtitleClipboardText,
+  externalMediaSpaceAction,
   inclusiveWordRange,
   cueWordRangeForPhrase,
   phraseTextAcrossCues,
   annotatedTextSegments,
   cueNavigationDelta,
   dictionaryMeaningPairs,
+  quickWordTranslationRows,
+  quickWordPopoverLeft,
   mergeDictionaryMeaningPairs,
   dictionaryExampleRows,
   classifyRepeatedWordClick,
@@ -40,12 +50,25 @@ const {
   learningExamplePresentation,
   sentenceForTerm,
   sentenceForCueTerm,
+  parallelSentenceForTerm,
   sentenceIsComplete,
   segmentWords,
   isDesktopChromiumSpeech,
   preferredEnglishSpeechVoice,
   shouldAutoplayCard,
 } = require('../youtube-learning-utils')
+
+test('pending phrase saves mark whole occurrences, aliases and overlapping jobs across cues', () => {
+  const cues = [{ text: 'We warmed up before work. Warm soup is ready.' }, { text: 'Take it' }, { text: 'off now.' }]
+  const operation = { key: 'warm up', term: 'warm up', observedForms: ['warmed up'], phase: 'preparing' }
+  assert.deepEqual(pendingSaveWordIndexes(cues, 0, [operation], 'en'), [1, 2])
+  for (const phase of ['ready', 'error', 'reconciled']) assert.deepEqual(pendingSaveWordIndexes(cues, 0, [{ ...operation, phase }], 'en'), [])
+  const split = { term: 'take off', observedForms: ['take it off'], phase: 'saving' }
+  assert.deepEqual(pendingSaveWordIndexes(cues, 1, [split], 'en'), [0, 1])
+  assert.deepEqual(pendingSaveWordIndexes(cues, 2, [split], 'en'), [0])
+  assert.deepEqual(pendingSaveWordIndexes([{ text: 'They look up to us.' }], 0,
+    [{ term: 'look up', phase: 'saving' }, { term: 'up to', phase: 'preparing' }], 'en'), [1, 2, 3])
+})
 
 test('desktop Chromium selects the installed study voice without changing iPhone WebKit', () => {
   assert.equal(isDesktopChromiumSpeech('Mozilla/5.0 Chrome/148.0.0.0 Safari/537.36'), true)
@@ -165,6 +188,51 @@ test('long subtitles become timed one-line iterations without hiding words', () 
 test('shift-click phrase range works in both directions', () => {
   assert.deepEqual(inclusiveWordRange(2, 7), { fromWordIndex: 2, toWordIndex: 7 })
   assert.deepEqual(inclusiveWordRange(7, 2), { fromWordIndex: 2, toWordIndex: 7 })
+})
+
+test('available width combines complete consecutive source fragments and sentences', () => {
+  const source = [
+    { startMs: 21438, endMs: 22320, text: '- That is wild.' },
+    { startMs: 22320, endMs: 25200, text: "It's at the same temperature now as it would be inside" },
+    { startMs: 25200, endMs: 26640, text: 'the jet engine.' },
+    { startMs: 26640, endMs: 28702, text: "But here, they're liquid." },
+  ]
+  const wide = layoutTimedCuesToFit(source, { maxWidth: 180, measureText: text => text.length })
+  assert.equal(wide.length, 1)
+  assert.equal(wide[0].text, source.map(c => c.text).join(' '))
+  assert.equal(wide[0].startMs, 21438)
+  assert.equal(wide[0].endMs, 28702)
+  assert.equal(wide[0].sourceCueIndex, 0)
+  assert.equal(wide[0].sourceCueEndIndex, 3)
+  const narrow = layoutTimedCuesToFit(source, { maxWidth: 70, measureText: text => text.length })
+  assert.ok(narrow.length > wide.length)
+  assert.equal(narrow.map(c => c.text).join(' '), wide[0].text)
+  assert.ok(narrow.every(c => c.text.length <= 70 && c.endMs > c.startMs))
+  assert.equal(narrow[0].endMs, 22320, 'An intact sentence keeps its original boundary')
+  assert.equal(narrow.at(-1).endMs, 28702)
+  narrow.slice(1).forEach((cue, i) => assert.ok(cue.startMs >= narrow[i].endMs))
+})
+
+test('subtitle packing does not bridge a real pause and does not duplicate overlaps', () => {
+  const source = [
+    { startMs: 0, endMs: 1200, text: 'First part' },
+    { startMs: 1000, endMs: 2000, text: 'continues here.' },
+    { startMs: 3500, endMs: 4500, text: 'After a pause.' },
+  ]
+  const result = layoutTimedCuesToFit(source, { maxWidth: 500, measureText: text => text.length })
+  assert.deepEqual(result.map(c => c.text), ['First part continues here.', 'After a pause.'])
+  assert.equal(result[0].endMs, 2000)
+  assert.equal(result[1].startMs, 3500)
+  assert.equal(findCueIndex(result, 3000), -1)
+})
+
+test('a repeated word in packed sentences uses the clicked occurrence for its context and translation', () => {
+  const source = 'I set a record. I record audio.'
+  const cues = [{ text: source, startMs: 0, endMs: 4000 }]
+  assert.equal(sentenceForCueTerm(cues, 0, 'record', 'en', 5), 'I record audio.')
+  const pair = parallelSentenceForTerm(source, 'Я установил рекорд. Я записываю звук.', 'record', 'en', 'ru', 5)
+  assert.equal(pair.sourceText, 'I record audio.')
+  assert.equal(pair.translation, 'Я записываю звук.')
 })
 
 test('hyphenated compounds are one clickable word without joining spaced dashes', () => {
@@ -289,6 +357,95 @@ test('physical A, D and square brackets navigate cues independently of keyboard 
   assert.equal(cueNavigationDelta('BracketLeft'), -1)
   assert.equal(cueNavigationDelta('BracketRight'), 1)
   assert.equal(cueNavigationDelta('KeyF'), 0)
+})
+
+test('Cmd reveals a fully hidden subtitle anywhere in the active page', () => {
+  assert.equal(fullSubtitleRevealActive({
+    translationMode: 'never',
+    subtitleHovered: true,
+    metaKeyDown: true,
+  }), true)
+  assert.equal(fullSubtitleRevealActive({
+    translationMode: 'never',
+    subtitleHovered: true,
+    metaKeyDown: false,
+  }), false)
+  assert.equal(fullSubtitleRevealActive({
+    translationMode: 'never',
+    subtitleHovered: false,
+    metaKeyDown: true,
+  }), true)
+  assert.equal(fullSubtitleRevealActive({
+    translationMode: 'hover',
+    subtitleHovered: true,
+    metaKeyDown: true,
+  }), false)
+})
+
+test('translation rail button toggles between visible and hidden modes', () => {
+  assert.equal(nextTranslationMode('always'), 'never')
+  assert.equal(nextTranslationMode('hover'), 'always')
+  assert.equal(nextTranslationMode('never'), 'always')
+  assert.equal(nextTranslationMode('unexpected'), 'always')
+})
+
+test('quick hover translation keeps at most three unique dictionary rows before fallbacks', () => {
+  assert.deepEqual(quickWordTranslationRows({
+    dictionary: {
+      translations: [
+        { displayTarget: 'делать', posTag: 'VERB' },
+        { normalizedTarget: 'создавать', posTag: 'VERB' },
+        { displayTarget: 'делать', posTag: 'OTHER' },
+        { displayTarget: 'заставлять', posTag: 'VERB' },
+        { displayTarget: 'производить', posTag: 'VERB' },
+      ],
+    },
+  }, ['делать', 'изготавливать']), [
+    { value: 'делать', partOfSpeech: 'VERB' },
+    { value: 'создавать', partOfSpeech: 'VERB' },
+    { value: 'заставлять', partOfSpeech: 'VERB' },
+  ])
+  assert.deepEqual(quickWordTranslationRows(null, ['подходить']), [
+    { value: 'подходить', partOfSpeech: '' },
+  ])
+  assert.deepEqual(quickWordTranslationRows(null, ['The', 'определённый артикль'], 3, 'the'), [
+    { value: 'определённый артикль', partOfSpeech: '' },
+  ])
+  assert.deepEqual(quickWordTranslationRows({
+    dictionary: { translations: [{ displayTarget: 'клиент' }, { displayTarget: 'заказчик' }] },
+  }, [], 1, 'customer'), [
+    { value: 'клиент', partOfSpeech: '' },
+  ])
+  assert.deepEqual(quickWordTranslationRows(null, ["Musk's"], 1, "Musk's"), [
+    { value: "Musk's", partOfSpeech: '' },
+  ])
+  assert.deepEqual(quickWordTranslationRows(null, ["Musk's", 'Маска'], 1, "Musk's"), [
+    { value: 'Маска', partOfSpeech: '' },
+  ])
+})
+
+test('quick hover popover is centered over its word and clamps only at viewport edges', () => {
+  assert.equal(quickWordPopoverLeft({
+    anchorLeft: 200,
+    anchorWidth: 80,
+    popoverWidth: 120,
+    viewportWidth: 800,
+    margin: 10,
+  }), 180)
+  assert.equal(quickWordPopoverLeft({
+    anchorLeft: 4,
+    anchorWidth: 30,
+    popoverWidth: 80,
+    viewportWidth: 800,
+    margin: 10,
+  }), 10)
+  assert.equal(quickWordPopoverLeft({
+    anchorLeft: 770,
+    anchorWidth: 30,
+    popoverWidth: 80,
+    viewportWidth: 800,
+    margin: 10,
+  }), 710)
 })
 
 test('dictionary examples are selected per meaning without an arbitrary group cap', () => {
@@ -663,6 +820,97 @@ test('literal subtitle lookahead starts at the active cue, clamps at the end, an
     [3],
   )
   assert.deepEqual(cueLookaheadItems(cues, -1, 16), [])
+})
+
+test('stable translation prefetch prioritizes current and future cues before recent history', () => {
+  const cues = [
+    { text: 'past-2' },
+    { text: 'past-1' },
+    { text: 'current' },
+    { text: 'next-1' },
+    { text: 'next-2' },
+    { text: 'next-3' },
+    { text: 'outside' },
+  ]
+  assert.deepEqual(
+    cuePrefetchItems(cues, 2, 3, 2).map(item => item.index),
+    [2, 3, 4, 5, 1, 0],
+  )
+  assert.deepEqual(cuePrefetchItems(cues, -1, 16, 2), [])
+})
+
+test('buffer indicator reports only the consecutive ready reserve ahead of playback', () => {
+  const cues = ['current', 'next-1', 'next-2', 'next-3', 'next-4'].map(text => ({ text }))
+  const ready = translationBufferSnapshot({
+    cues,
+    currentIndex: 0,
+    ahead: 4,
+    translationMode: 'always',
+    translationOrder: 'source',
+    literalNeeded: true,
+    naturalReady: cues.map(item => item.text),
+    literalReady: ['current', 'next-1', 'next-2', 'next-4'],
+    literalPending: ['next-3'],
+  })
+  assert.equal(ready.stage, 'ready')
+  assert.equal(ready.currentReady, true)
+  assert.equal(ready.readyAhead, 2)
+  assert.equal(ready.targetAhead, 4)
+  assert.equal(ready.literalPendingInWindow, 1)
+
+  const hiddenReady = translationBufferSnapshot({
+    cues,
+    currentIndex: 0,
+    ahead: 4,
+    translationMode: 'never',
+    translationOrder: 'source',
+    literalNeeded: true,
+    naturalReady: cues.map(item => item.text),
+    literalReady: cues.map(item => item.text),
+  })
+  assert.equal(hiddenReady.stage, 'ready')
+  assert.equal(hiddenReady.readyAhead, 4)
+
+  const caughtUp = translationBufferSnapshot({
+    cues,
+    currentIndex: 3,
+    ahead: 1,
+    translationMode: 'always',
+    translationOrder: 'source',
+    literalNeeded: true,
+    naturalReady: cues.map(item => item.text),
+    literalReady: ['current', 'next-1', 'next-2'],
+    literalPending: ['next-3'],
+  })
+  assert.equal(caughtUp.stage, 'gemini')
+  assert.equal(caughtUp.currentReady, false)
+  assert.equal(caughtUp.readyAhead, 0)
+})
+
+test('full subtitle copy keeps readable cue lines without consecutive duplicates', () => {
+  assert.equal(subtitleClipboardText([
+    { text: ' First  line. ' },
+    { text: 'First line.' },
+    { text: 'Second\nline.' },
+  ]), 'First line.\nSecond line.')
+})
+
+test('Space globally toggles external video without hijacking text fields or modal controls', () => {
+  const base = {
+    external: true,
+    code: 'Space',
+    modifier: false,
+    editable: false,
+    interactive: false,
+    repeat: false,
+    interactionOpen: false,
+  }
+  assert.equal(externalMediaSpaceAction(base), 'toggle')
+  assert.equal(externalMediaSpaceAction({ ...base, repeat: true }), 'block')
+  assert.equal(externalMediaSpaceAction({ ...base, interactionOpen: true }), 'block')
+  assert.equal(externalMediaSpaceAction({ ...base, editable: true }), 'ignore')
+  assert.equal(externalMediaSpaceAction({ ...base, interactive: true }), 'ignore')
+  assert.equal(externalMediaSpaceAction({ ...base, external: false }), 'ignore')
 })
 
 test('pairs adjacent rolling ASR fragments into longer readable cues', () => {
